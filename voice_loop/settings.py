@@ -79,7 +79,7 @@ class VisionConfig:
     camera_index: int = 0
     warmup_frames: int = 4           # 丢掉前几帧（自动曝光还没稳，画面偏黑/偏黄）
     max_side: int = 1024             # 摄像头图片最长边（越小上传越快）
-    screen_max_side: int = 1568      # 截图最长边（大一点字才认得清）
+    screen_max_side: int = 1024      # 截图最长边（实测本机 1568 要 61 秒，1024 只要 33 秒）
     jpeg_quality: int = 82
     save_dir: str = "data/vision"    # 拍下来的图 / 截图存这里，方便回头核对模型看了什么
     keep_images: int = 40            # 只保留最近这么多张，超了自动删最旧的
