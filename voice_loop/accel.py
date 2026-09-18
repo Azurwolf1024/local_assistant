@@ -20,7 +20,9 @@ Ollama 那一边（LLM / 视觉模型）在 Windows + Intel 核显上仍然是 1
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import requests
 
@@ -102,6 +104,122 @@ def ollama_usage(cfg: LlmConfig) -> tuple[dict[str, int], bool]:
         return {}, False
 
 
+# --------------------------------------------------------------------------- #
+# Ollama 用不用核显（Windows 上默认**丢掉**核显，要 OLLAMA_IGPU_ENABLE=1）
+# --------------------------------------------------------------------------- #
+OLLAMA_LOG = Path.home() / "AppData" / "Local" / "Ollama" / "server.log"
+IGPU_ENV = "OLLAMA_IGPU_ENABLE"
+
+
+def _ollama_log_files() -> list[Path]:
+    """server.log + 轮转出来的 server-1.log、server-2.log …（新的在前）。"""
+    d = OLLAMA_LOG.parent
+    files: list[Path] = []
+    if OLLAMA_LOG.exists():
+        files.append(OLLAMA_LOG)
+    for f in sorted(d.glob("server-*.log"), key=lambda p: p.name):
+        files.append(f)
+    return files
+
+
+_LOG_TS = re.compile(r"^time=([0-9T:.+\-]+)\s")
+_IGPU_COMPUTE_LINE = re.compile(
+    r'library=(\w+).*?name=(\w+).*?description="([^"]*)"'
+)
+
+
+def ollama_gpu_state() -> dict:
+    """Ollama 最后选了哪个设备（从它自己的日志里读）。
+
+    为什么要读日志：没加载模型时 ``/api/ps`` 是空的，判断不了；日志里每次启动都会写
+    一行 ``inference compute``（选中的设备），核显被丢时则写
+    ``dropping integrated GPU; to enable, set OLLAMA_IGPU_ENABLE=1``。
+
+    注意日志是**轮转**的（server.log / server-1.log / server-2.log…），
+    所以要跨文件按时间戳取最新那条，不能只看当前文件的尾巴。
+    """
+    out: dict = {"dropped_igpu": False, "device": "", "library": "", "log": str(OLLAMA_LOG)}
+    newest_drop = ""
+    newest_compute = ""
+    for f in _ollama_log_files():
+        try:
+            text = f.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            if "dropping integrated" not in line and "inference compute" not in line:
+                continue
+            m = _LOG_TS.match(line)
+            ts = m.group(1) if m else ""
+            if "dropping integrated" in line:
+                if ts >= newest_drop:
+                    newest_drop = ts
+                continue
+            if "inference compute" not in line or "library=cpu" in line:
+                continue
+            if ts >= newest_compute:
+                m2 = _IGPU_COMPUTE_LINE.search(line)
+                if m2:
+                    newest_compute = ts
+                    out["library"] = m2.group(1)
+                    out["device"] = m2.group(3)
+    # 丢掉核显那条比选中设备那条更「新」，说明现在还在丢
+    out["dropped_igpu"] = bool(newest_drop) and newest_drop > newest_compute
+    return out
+
+
+def enable_igpu(persist: bool = True) -> list[str]:
+    """把 ``OLLAMA_IGPU_ENABLE=1`` 设到用户环境变量（新起的进程才读得到）。
+
+    不会重启 Ollama —— 托盘程序得由调用方重启（``restart_ollama()``）。
+    """
+    notes: list[str] = []
+    if persist:
+        try:
+            import winreg  # type: ignore
+
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER, r"Environment", 0, winreg.KEY_SET_VALUE
+            )
+            winreg.SetValueEx(key, IGPU_ENV, 0, winreg.REG_SZ, "1")
+            winreg.CloseKey(key)
+            notes.append(f"已写入用户环境变量 {IGPU_ENV}=1（新开进程/重启 Ollama 后生效）")
+        except Exception as exc:  # noqa: BLE001
+            notes.append(f"写用户环境变量失败：{exc}（可以在「编辑用户环境变量」里手动加）")
+    return notes
+
+
+def restart_ollama() -> list[str]:
+    """重启 Ollama（托盘程序 + 服务），并把 IGPU_ENABLE 注入到新进程里。"""
+    import os
+    import subprocess
+    import time
+
+    notes: list[str] = []
+    exe = Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama" / "ollama app.exe"
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/IM", "ollama app.exe", "/IM", "ollama.exe"],
+            capture_output=True, timeout=20,
+        )
+        notes.append("已停掉旧的 Ollama 进程")
+    except Exception as exc:  # noqa: BLE001
+        notes.append(f"停止 Ollama 失败：{exc}")
+    if not exe.exists():
+        notes.append(f"没找到 {exe}：请从开始菜单重新打开 Ollama")
+        return notes
+    env = dict(os.environ)
+    env[IGPU_ENV] = "1"
+    try:
+        subprocess.Popen([str(exe)], env=env, close_fds=True)
+        time.sleep(6)
+        notes.append("已用 OLLAMA_IGPU_ENABLE=1 重新拉起 Ollama（等它起完约 5~10 秒）")
+    except Exception as exc:  # noqa: BLE001
+        notes.append(f"拉起 Ollama 失败：{exc}，请手动打开")
+    return notes
+
+
+
 def pick_whisper_devices(want: str) -> list[str]:
     """Whisper 要按什么顺序尝试哪些设备。
 
@@ -175,20 +293,36 @@ def report(settings: Settings, logger: logging.Logger | None = None) -> list[str
 
     if not acc.ollama_seen:
         lines.append("Ollama：连不上（模型只能跑 CPU 或没启动）")
-    elif not acc.ollama_vram:
-        lines.append("Ollama：当前没有模型驻留（问一句它就加载了，那时再看 `ollama ps`）")
     else:
-        for name, vram in acc.ollama_vram.items():
-            pct = "GPU" if vram > 0 else "CPU（Intel 核显要装 IPEX-LLM 版 ollama）"
-            lines.append(f"Ollama/{name}：显存占用 {vram / 2**30:.1f} GB → {pct}")
+        state = ollama_gpu_state()
+        if state["dropped_igpu"] and state["library"].lower() != "vulkan":
+            lines.append(f"Ollama：{IGPU_ENV} 没开，核显被丢掉了")
+        if state["device"]:
+            lines.append(
+                f"Ollama 选中设备：{state['device']}（{state['library']}，{'核显' if 'vulkan' in state['library'].lower() else state['library']}）"
+            )
+        if state["dropped_igpu"] and "iGPU" not in state.get("device", ""):
+            lines.append(
+                f"  → 想用核显：{IGPU_ENV}=1 后重启 Ollama（一条命令：python main.py gpu --enable-igpu）"
+            )
+        if not acc.ollama_vram:
+            lines.append("Ollama：当前没有模型驻留（问一句它就加载了，那时再看 `ollama ps`）")
+        else:
+            for name, vram in acc.ollama_vram.items():
+                where = "核显/显存" if vram > 0 else "CPU"
+                lines.append(f"Ollama/{name}：占用 {vram / 2**30:.1f} GiB → {where}")
     return lines
 
 
 __all__ = [
     "Accelerators",
+    "IGPU_ENV",
     "detect",
+    "enable_igpu",
     "llm_options",
+    "ollama_gpu_state",
     "ollama_usage",
     "pick_whisper_devices",
     "report",
+    "restart_ollama",
 ]

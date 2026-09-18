@@ -33,5 +33,8 @@ data/backup/
 !.vscode/launch.json
 !.vscode/tasks.json
 
+# 提交信息临时文件（git commit -F commitmsg.txt 用的，别入库）
+commitmsg.txt
+
 # 看图拍下来的画面（屏幕截图 / 摄像头照片都是隐私，绝不入库）
 data/vision/

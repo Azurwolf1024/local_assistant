@@ -402,11 +402,14 @@ class Skills:
     # ======================================================================
     # 入口
     # ======================================================================
-    def handle(self, text: str, dialog: list[str] | None = None) -> SkillResult | None:
+    def handle(
+        self, text: str, dialog: list[str] | None = None, now: datetime | None = None
+    ) -> SkillResult | None:
         """尝试用技能回答；返回 None 表示应该交给 LLM。
 
         ``dialog``：最近几轮「你说 / 助手答」的原文，指代解析（它、那个、刚才那条）
         在上面找候选——技能本身不猜，找不到就问。
+        ``now``：默认取当前时间；测试里传固定时间就能写死期望值（不然跨零点会飘）。
         """
         if dialog is not None:
             self.dialog = [str(x) for x in dialog if str(x).strip()][-10:]
@@ -415,7 +418,7 @@ class Skills:
         raw = (text or "").strip()
         if not raw:
             return None
-        now = datetime.now()
+        now = now or datetime.now()
         for fn in (
             self._handle_vision_reply,   # 先接「是 / 第一个」这种确认，别被别的技能抢走
             self._handle_help,
@@ -703,7 +706,16 @@ class Skills:
     )
     # 在问「是什么」——必须同时指着看得到的东西，或就是【这是什么】这种短问句，
     # 否则「导师见面那件事是什么时候」也会被当成看图（这个坑踩过）
-    _VISION_WHAT = re.compile(r"(?:是什么|是啥|什么东西|写了什么|写的什么|有什么|讲了什么|什么颜色)")
+    # 注意：不包含裸的「有什么」——「这个月有什么」「下周有什么」是查询
+    _VISION_WHAT = re.compile(
+        r"(?:是什么|是啥|什么东西|写了什么|写的什么|讲了什么|什么颜色|什么字)"
+    )
+    # 「屏幕上有什么」「里面有什么」：这种「有什么」前面跟着看得见的东西才算看图
+    _VISION_HAVE = re.compile(
+        r"(?:屏幕|显示器|桌面|窗口|界面|画面|镜头|摄像头|相机|照片|图片|截图|剪贴板|"
+        r"文件|文档|表格|图上|图里|照片里|上面|上头|里头|里面|手里|手上|桌上|窗外)"
+        r"[^，,。;；?？]{0,4}有(?:什么|哪些)"
+    )
     _VISION_TINY = re.compile(
         r"^[这那](?:个|张|幅|些|是|块|只|台|本)?\s*(?:是什么|是啥|什么东西|写的什么)"
     )
@@ -742,6 +754,7 @@ class Skills:
         obj = bool(self._VISION_OBJECT.search(text))     # 屏幕 / 文件 / 这个
         what = bool(self._VISION_WHAT.search(text))      # 是什么 / 写了什么
         tiny = bool(self._VISION_TINY.match(text))       # 「这是什么」这种短问句
+        have = bool(self._VISION_HAVE.search(text))      # 「屏幕上有什么」
         if not (read or last) and self._VISION_NOT.search(text):
             return None                     # 「看看这周有什么安排」是查询
         wanted = (
@@ -749,6 +762,7 @@ class Skills:
             or last                                       # 「刚才那张图」
             or (look and (obj or what))                   # 「看看我的屏幕」「看看这是什么」
             or (what and (obj or tiny))                   # 「屏幕上写了什么」「它是什么颜色」
+            or have                                       # 「屏幕上有什么」「里面有什么」
         )
         if not wanted:
             return None
@@ -978,6 +992,8 @@ class Skills:
         r"|未来|接下来|最近|这几天|这两天|这个?周末|下个?周末)"
         r"[^，,。;；?？]{0,8}(?:有什么|有哪些|有没有|有课|安排|日程|行程|吗|呢|咋样|怎么样)"
     )
+    # 这些是问别的事，不是问日程（「今天天气怎么样」的「怎么样」会撞上 _RANGE_ASK）
+    _NOT_SCHEDULE_Q = re.compile(r"(天气|气温|温度|下雨|下雪|雨|雪|新闻|股票|汇率|价格|几点开会?)")
     # 问句里也可能带「每周五下午两点」这种时刻，不能当成新增
     _SCHEDULE_ASK = re.compile(r"(有什么|有哪些|有没有|是什么|多少|查一下|查询|看看|看一下|列出|列表|吗|呢)")
     # 「帮我记录晚上7点半有跆拳道课」「明天下午三点安排组会」都应该当新增
@@ -1137,7 +1153,9 @@ class Skills:
             return listed
 
         if self._SCHEDULE_Q.search(text) or self._RANGE_ASK.search(text):
-            return self._day_items(text, now)
+            if not self._NOT_SCHEDULE_Q.search(text):
+                return self._day_items(text, now)
+            return None          # 「今天天气怎么样」交给模型去答
 
         return None
 
@@ -1766,7 +1784,7 @@ class Skills:
         total = 0
         day = start
         while day <= end:
-            items = self._occurrences_on(day, ignore_reminder=True)
+            items = self._occurrences_on(day, ignore_reminder=True, now=now)
             if items:
                 total += len(items)
                 detail = "、".join(
@@ -1797,7 +1815,7 @@ class Skills:
         best: tuple[datetime, dict] | None = None
         for offset in range(0, 15):
             day = now.date() + timedelta(days=offset)
-            for when, item in self._occurrences_on(day, ignore_reminder=True):
+            for when, item in self._occurrences_on(day, ignore_reminder=True, now=now):
                 end = when + timedelta(minutes=int(item.get("duration_minutes", 60) or 60))
                 if end <= now:
                     continue
@@ -1971,10 +1989,12 @@ class Skills:
                     out.append(cand)
         return out
 
-    def _occurrences_on(self, day: date, ignore_reminder: bool = False) -> list[tuple[datetime, dict]]:
+    def _occurrences_on(
+        self, day: date, ignore_reminder: bool = False, now: datetime | None = None
+    ) -> list[tuple[datetime, dict]]:
         """返回某天所有日程的 (开始时间, 条目) 列表。"""
         day_start = datetime.combine(day, datetime.min.time())
-        now = datetime.now()
+        now = now or datetime.now()
         out: list[tuple[datetime, dict]] = []
         for item in self.schedule.load():
             for cand in self._starts_from(item, day_start, limit=4):

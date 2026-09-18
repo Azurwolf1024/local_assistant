@@ -109,6 +109,68 @@ def test_no_crash_when_missing() -> None:
     check("Ollama 探测不抛异常", isinstance(vram, dict) and isinstance(seen, bool), True)
 
 
+def test_ollama_state() -> None:
+    print("\n[5] 从 Ollama 日志判断它用没用核显（日志会轮转，要按时间戳取最新）")
+    import tempfile as _tf
+
+    from voice_loop import accel
+
+    old = accel.OLLAMA_LOG
+    tmp = Path(_tf.mkdtemp(prefix="voiceloop_ollog_"))
+    try:
+        # 造三个文件：server.log（当前）、server-1.log、server-2.log
+        (tmp / "server.log").write_text(
+            'time=2026-09-18T23:55:21.660+08:00 level=INFO source=runner.go:405 '
+            'msg="dropping integrated GPU; to enable, set OLLAMA_IGPU_ENABLE=1" '
+            'id=0 library=Vulkan compute=0.0 name=Vulkan0 description="Intel(R) Arc(TM) 130T GPU (16GB)"\n'
+            'time=2026-09-18T23:55:21.660+08:00 level=INFO source=types.go:50 '
+            'msg="inference compute" id=cpu library=cpu compute="" name=cpu description=cpu\n'
+            "[GIN] 2026/09/18 - 23:57:31 | 200 |    0s | 127.0.0.1 | GET  \"/api/ps\"\n",
+            encoding="utf-8",
+        )
+        (tmp / "server-1.log").write_text(
+            'time=2026-09-18T23:30:00.000+08:00 level=INFO source=runner.go:405 '
+            'msg="dropping integrated GPU; to enable, set OLLAMA_IGPU_ENABLE=1" '
+            'library=Vulkan name=Vulkan0 description="Intel(R) Arc(TM) 130T GPU (16GB)"\n'
+            'time=2026-09-18T23:40:00.000+08:00 level=INFO source=types.go:32 '
+            'msg="inference compute" id=0 library=Vulkan compute=0.0 name=Vulkan0 '
+            'description="Intel(R) Arc(TM) 130T GPU (16GB)" type=iGPU total="18.0 GiB"\n',
+            encoding="utf-8",
+        )
+        accel.OLLAMA_LOG = tmp / "server.log"
+        st = accel.ollama_gpu_state()
+        check("认得出核显被丢掉了", st["dropped_igpu"], True)
+        check(
+            "丢弃那条更新时，旧日志里的设备名不算「在用核显」",
+            bool(st["device"]) and not st["dropped_igpu"],
+            False,
+        )
+
+        # 现在把「启用了核显」的更新日志追加进去（比丢弃那条更新）
+        with open(tmp / "server.log", "a", encoding="utf-8") as f:
+            f.write(
+                'time=2026-09-18T23:55:36.441+08:00 level=INFO source=types.go:32 '
+                'msg="inference compute" id=0 filter_id=0 library=Vulkan compute=0.0 '
+                'name=Vulkan0 description="Intel(R) Arc(TM) 130T GPU (16GB)" '
+                'libdirs=ollama,vulkan type=iGPU total="18.0 GiB" available="17.2 GiB"\n'
+            )
+        st = accel.ollama_gpu_state()
+        check("新增一条更晚的「启用了核显」后不再算丢弃", st["dropped_igpu"], False)
+        check("认得出设备名", "Arc" in st["device"], True)
+        check("认得出后端是 Vulkan", st["library"], "Vulkan")
+
+        # 只有旧文件里有记录（当前文件是空的）也要能读到
+        (tmp / "server.log").write_text("[GIN] 2026/09/18 - 23:59:00 | 200 | 0s | GET \"/\"\n",
+                                        encoding="utf-8")
+        st = accel.ollama_gpu_state()
+        check("当前日志没有记录时，会去轮转文件里找", "Arc" in st["device"], True)
+    finally:
+        accel.OLLAMA_LOG = old
+        import shutil
+
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main() -> int:
     print("=" * 66)
     print(" 加速设备选择测试")
@@ -117,6 +179,7 @@ def main() -> int:
     test_llm_options()
     test_report()
     test_no_crash_when_missing()
+    test_ollama_state()
     print("\n" + "=" * 66)
     if _failures:
         print(f" 失败 {len(_failures)} 项：{_failures}")
