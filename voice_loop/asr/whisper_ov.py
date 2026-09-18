@@ -44,7 +44,10 @@ class WhisperOpenVinoEngine:
         self.word_timestamps = word_timestamps
         self._processor = AutoProcessor.from_pretrained(str(model_dir))
         ov_config: dict = {"PERFORMANCE_HINT": "LATENCY"}
-        if num_threads:
+        # INFERENCE_NUM_THREADS 是 **CPU 专属**属性：一起塞给 GPU/NPU 会让 compile_model 直接抛
+        # （实测报 "Exception from src\inference\src\cpp\core.cpp:120"，然后整条 Whisper 路径
+        #  被降级到 CPU —— 核显明明能用却用不上）。所以只在 CPU 上设。
+        if num_threads and str(device).upper().startswith("CPU"):
             ov_config["INFERENCE_NUM_THREADS"] = str(num_threads)
         self._model = OVModelForSpeechSeq2Seq.from_pretrained(
             str(model_dir),

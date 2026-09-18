@@ -8,6 +8,7 @@ from collections.abc import Iterator
 
 import requests
 
+from .accel import llm_options
 from .settings import LlmConfig
 
 
@@ -77,7 +78,7 @@ class OllamaClient:
             "messages": [{"role": "user", "content": "hi"}],
             "stream": False,
             "keep_alive": self.cfg.keep_alive,
-            "options": {"num_predict": 1, "num_ctx": self.cfg.num_ctx},
+            "options": {"num_predict": 1, "num_ctx": self.cfg.num_ctx, **llm_options(self.cfg)},
         }
         r = requests.post(f"{self.base}/api/chat", json=payload, timeout=180)
         r.raise_for_status()
@@ -192,6 +193,7 @@ class OllamaClient:
                 "top_p": self.cfg.top_p,
                 "num_ctx": int(num_ctx or self.cfg.num_ctx),
                 "num_predict": self.cfg.num_predict,
+                **llm_options(self.cfg),
             },
         }
         if tools:

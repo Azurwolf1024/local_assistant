@@ -213,17 +213,26 @@ class AsrRouter:
             if not self._wh_enabled:
                 return None
             if self._wh is None and self._wh_error is None:
-                try:
-                    self._wh = WhisperOpenVinoEngine(
-                        model_dir=self.settings.resolve(self.cfg.whisper_model),
-                        device=self.cfg.whisper_device,
-                        language=self.cfg.language,
-                        num_threads=self.cfg.num_threads,
-                        word_timestamps=self.cfg.whisper_word_timestamps,
-                    )
-                    self._log("info", f"Whisper 就绪：{self.cfg.whisper_model} ({self.cfg.whisper_device})")
-                except Exception as exc:  # noqa: BLE001
-                    self._wh_error = f"{type(exc).__name__}: {exc}"
+                # 按「GPU 优先、CPU 兜底」的顺序试：设备选错、驱动不灵时不至于整条路没了
+                from ..accel import pick_whisper_devices
+
+                errors: list[str] = []
+                for device in pick_whisper_devices(self.cfg.whisper_device):
+                    try:
+                        self._wh = WhisperOpenVinoEngine(
+                            model_dir=self.settings.resolve(self.cfg.whisper_model),
+                            device=device,
+                            language=self.cfg.language,
+                            num_threads=self.cfg.num_threads,
+                            word_timestamps=self.cfg.whisper_word_timestamps,
+                        )
+                        self._log("info", f"Whisper 就绪：{self.cfg.whisper_model}（{device}）")
+                        break
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(f"{device}: {type(exc).__name__}: {exc}")
+                        self._log("warning", f"Whisper 在 {device} 上没起来，换下一个：{exc}")
+                if self._wh is None:
+                    self._wh_error = " | ".join(errors) or "没有可用设备"
                     self._log("warning", f"Whisper 不可用：{self._wh_error}")
             return self._wh
         raise ValueError(name)
