@@ -191,8 +191,12 @@ model = "qwen2.5vl:3b"
 default_source = "screen"
 camera_index = 0              # 第几个摄像头（0 = 默认）
 warmup_frames = 4             # 丢掉前几帧，等自动曝光稳定（不然画面偏黑）
-max_side = 1024               # 摄像头图片最长边（越小越快）
-screen_max_side = 1568        # 截图最长边（大一点屏幕上的字才认得清）
+# 图片尺寸 = 等多久。本机实测（i7 纯 CPU + qwen2.5vl:3b）：
+#   纯文本 1.8s / 长边 768 -> 32s / 1024 -> 33s / 1568 -> 61s
+# 所以默认 1024：屏幕上的 main.py、cmd_ask 这类名字还认得出来，再大就白等一倍时间。
+# 屏幕上的字如果认不清，再往上调到 1568（代价就是 60 秒）。
+max_side = 1024               # 摄像头图片最长边
+screen_max_side = 1024        # 截图最长边
 jpeg_quality = 82
 
 save_dir = "data/vision"      # 拍下来的图和截图存这儿（可回头核对模型到底看了什么）
