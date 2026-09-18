@@ -130,6 +130,23 @@ class SkillsConfig:
 
 
 @dataclass
+class BargeInConfig:
+    """语音打断：它还在说话时你一开口就停下来听你说。"""
+
+    enabled: bool = True
+    min_seconds: float = 0.25    # 连续说多久才算插话（太小了容易被噪音打断）
+    min_rms: float = 0.015       # 判定下限（幅度），压住底噪
+    margin: float = 1.6          # 比「漏出来的回声」响几倍才算插话（调大更稳、调小更灵敏）
+    leak_init: float = 0.15      # 回声泄漏系数初值（能量比，会自适应）
+    leak_min: float = 0.002
+    leak_max: float = 1.2
+    window_seconds: float = 0.30  # 能量滑窗，顺便吸收扬声器→麦克风的延迟
+    learn_seconds: float = 0.50   # 首次播放先学这么久的回声，再开始判断
+    keep_seconds: float = 1.0     # 打断前保留多久的音频（免得丢掉开口的第一个字）
+    collect_seconds: float = 6.0  # 打断后最多再收多久这句话
+
+
+@dataclass
 class SubtitleConfig:
     """屏幕底部居中的半透明字幕（关掉声音时靠它沟通）。"""
 
@@ -155,6 +172,7 @@ class Settings:
     wake: WakeConfig = field(default_factory=WakeConfig)
     skills: SkillsConfig = field(default_factory=SkillsConfig)
     subtitle: SubtitleConfig = field(default_factory=SubtitleConfig)
+    bargein: BargeInConfig = field(default_factory=BargeInConfig)
     path: Path = PROJECT_ROOT / "config.toml"
 
     # ---------------------------------------------------------------- paths
@@ -201,6 +219,7 @@ def load_settings(path: str | Path | None = None) -> Settings:
         wake=_build(WakeConfig, raw.get("wake", {}), "wake"),
         skills=_build(SkillsConfig, raw.get("skills", {}), "skills"),
         subtitle=_build(SubtitleConfig, raw.get("subtitle", {}), "subtitle"),
+        bargein=_build(BargeInConfig, raw.get("bargein", {}), "bargein"),
         tts=_build(TtsConfig, raw.get("tts", {}), "tts"),
         chat=_build(ChatConfig, raw.get("chat", {}), "chat"),
         path=cfg_path,
