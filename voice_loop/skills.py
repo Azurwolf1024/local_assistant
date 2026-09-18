@@ -41,6 +41,8 @@ from .vision import Vision, VisionError, norm_name
 WEEKDAY_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 WEEKDAY_FULL = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
 _WEEKDAY_CN = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6, "末": 5}
+# 「周五」这种没写「每」的星期（用来判断说的时间是不是已经过去了）
+_WEEKDAY_WORD = re.compile(r"(?:周|星期|礼拜)[一二三四五六日天末]")
 # 「每周三」「每个星期三」→ 固定课表，而不是一次性安排
 _WEEKLY = re.compile(r"每(?:个)?(?:周|星期|礼拜)\s*([一二三四五六日天])")
 
@@ -210,6 +212,15 @@ SCHEDULE_WORDS = ("课", "课程", "上课", "会议", "开会", "日程", "安�
 TRIGGER_ALARM = re.compile(r"(提醒|提行|提星|醒目|闹钟|闹中|叫醒|叫我|喊我|定时|喊一下)")
 TRIGGER_MEMO = re.compile(r"(记\s*[一以衣]?\s*[下住录哈吓夏]|记住|^记得|记录|备忘|备忘记)")
 TRIGGER_SCHEDULE = re.compile(r"(课|上课|会议|开会|例会|组会|日程|日成|行程|安排)")
+# 约会类：说「下周三下午三点半跟导师见面」时，句子里既没有「课/会议」，
+# 也没有「安排/记录」这种动词，以前会直接掉给大模型 ——
+# 大模型会回一句「已记录此安排」，实际上什么都没存（用户就是这么被坑的）。
+# 只要带明确时刻，这类说法也算新增日程。
+TRIGGER_APPOINT = re.compile(
+    r"(见面|碰面|碰头|约见|面谈|面试|答辩|汇报|演讲|聚餐|吃饭|喝咖啡|茶话会|"
+    r"拜访|走访|体检|复诊|看病|出差|讲座|研讨会|年会|沙龙|分享会|宣讲会|"
+    r"运动会|开学典礼|考试|测验|团建|接待|值班|报到|注册)"
+)
 
 # 「我的备忘有哪些 / 我现在有什么备忘录吗」这类是查询，不是添加。
 # 光靠「备忘」两个字判断会把查询误当成新增（之前就出过这个 bug：
@@ -250,6 +261,23 @@ def has_clock_expr(text: str) -> bool:
     return bool(CLOCK_EXPR.search(text or ""))
 
 
+# 只有时段没有钟点：「明天中午和导师吃饭」「晚上开会」
+_DAY_PERIOD = re.compile(
+    r"(半夜|凌晨|清晨|早晨|早上|上午|中午|正午|下午|傍晚|晚上|夜里|今早|明早|今晚|明晚)"
+)
+_PERIOD_HOUR = {
+    "半夜": 0, "凌晨": 5, "清晨": 7, "早晨": 8, "早上": 8, "今早": 8, "明早": 8,
+    "上午": 10, "中午": 12, "正午": 12, "下午": 15, "傍晚": 18,
+    "晚上": 20, "今晚": 20, "明晚": 20, "夜里": 21,
+}
+
+
+def _period_hour(text: str) -> int | None:
+    """「明天中午吃饭」这种只有时段的说法，给一个合理的钟点（中午->12 点）。"""
+    m = _DAY_PERIOD.search(text or "")
+    return _PERIOD_HOUR.get(m.group(1)) if m else None
+
+
 def _extract_alarm_what(text: str) -> str:
     """从「提醒我xxx」「闹钟定在…」里抽取出真正要提醒的内容。
 
@@ -287,6 +315,15 @@ def _clean_content(text: str) -> str:
     t = _TAIL_FILLER.sub("", t)
     t = re.sub(r"[，。、,.\s:：]+", "", t)
     return t.strip()
+
+
+_TITLE_NORM_DUP = None
+_NORM_STRIP = re.compile(r"[\s_\-—·．.，,。:：、'\"“”‘’()（）\[\]【】]+")
+
+
+def _norm_title(text: str) -> str:
+    """标题归一化：去掉空格标点、统一小写，用来判断「是不是同一条」。"""
+    return _NORM_STRIP.sub("", (text or "").strip().lower())
 
 
 def _extract_after(text: str, keywords: tuple[str, ...]) -> str:
@@ -470,6 +507,17 @@ class Skills:
         if (parse_repeat(text) or {}).get("repeat", "once") != "once":
             return None
         if len(parse_reminds(text) or []) > 1:
+            return None
+        # 「下周三下午三点半提醒我跟导师见面」这种**约会**也走日程，不走闹钟：
+        # 日程能按名字查（「这周有什么安排」能看见它）、能改能删、能设多个提前量，
+        # 闹钟只是一次性响一声，说完就找不着了。
+        # 判据是「约会词 + 明确时刻 + 明确日期」——「十分钟后提醒我跟导师打电话」
+        # 没有日期，仍然是闹钟。
+        if (
+            TRIGGER_APPOINT.search(text)
+            and has_clock_expr(text)
+            and parse_date_hint(text, now) is not None
+        ):
             return None
 
         # --- 新建 ---
@@ -922,12 +970,39 @@ class Skills:
         rule = parse_repeat(text)
         wd = int(rule["weekday"]) if rule and rule.get("weekday") is not None else _weekly_weekday(text)
         is_query = bool(self._SCHEDULE_ASK.search(text))
-        looks_add = (m is not None and TRIGGER_SCHEDULE.search(text)) or rule is not None
-        if not is_query and looks_add and (has_clock_expr(text) or rule is not None):
+        # 约会类（见面/面试/答辩…）带明确时刻时也算新增，否则只能掉给大模型。
+        # 只说了时段（「大后天中午吃饭」）也算——给它一个合理钟点，不会停到早上九点。
+        appoint = bool(TRIGGER_APPOINT.search(text)) and (
+            has_clock_expr(text) or _DAY_PERIOD.search(text) is not None
+        )
+        looks_add = (
+            (m is not None and TRIGGER_SCHEDULE.search(text))
+            or rule is not None
+            or appoint
+        )
+        if not is_query and looks_add and (
+            has_clock_expr(text) or rule is not None or appoint
+        ):
             first = parse_datetime(text, now)
             if first is None:
                 # 只说了周期没说时刻（「每天提醒我吃药」）→ 默认上午九点
                 first = datetime.combine(now.date(), datetime.min.time()).replace(hour=9, minute=0)
+            if appoint and not has_clock_expr(text):
+                # 「大后天中午和导师吃饭」：parse_datetime 会默默给 9 点，中午得纠正成 12 点
+                ph = _period_hour(text)
+                if ph is not None:
+                    first = first.replace(hour=ph, minute=0)
+            # 「周五上午十点答辩」在周五晚上说：这个时刻今天已经过了。
+            # 句子带星期（不管有没有「每」）就往后推一周（说的是下周五），
+            # 否则顺延一天并说明白——不然会默默存一条已经过去的日程（存进去再也不响）。
+            rolled = ""
+            if first < now:
+                if wd is not None or _WEEKDAY_WORD.search(text):
+                    first = first + timedelta(days=7)
+                    rolled = "这周那个时间已经过了，我按下一个算："
+                else:
+                    first = first + timedelta(days=1)
+                    rolled = "那个时间今天已经过了，"
             title, location = _split_title_location(text)
             if not _is_topic(title):
                 title = _clean_content(m.group("content")) if m else ""
@@ -954,6 +1029,12 @@ class Skills:
                 if repeat == "biweekly":
                     item["start"] = first.strftime("%Y-%m-%d %H:%M")   # 双周要有锚点才知道相位
                 self._finish_item(item, location, until, note)
+                dup = self._find_duplicate(item, now, first)
+                if dup is not None:
+                    return SkillResult(
+                        reply=f"这条日程已经有了：{self._repeat_text(dup)}{dup.get('title')}。",
+                        action="schedule_exist",
+                    )
                 self.schedule.append(item)
                 return SkillResult(
                     reply=(
@@ -984,6 +1065,15 @@ class Skills:
             self._finish_item(item, location, until, note)
             # 说的是「每月5号」时 first 可能只是「今天九点」，真正第一次要按规则算
             real_first = next(iter(self._starts_from(item, now)), first)
+            dup = self._find_duplicate(item, now, real_first)
+            if dup is not None:
+                return SkillResult(
+                    reply=(
+                        f"这条日程已经有了：{self._repeat_text(dup)}{dup.get('title')}，"
+                        f"{humanize(real_first, now)}。要改就说「把{dup.get('title')}挪到…」。"
+                    ),
+                    action="schedule_exist",
+                )
             self.schedule.append(item)
             head = (
                 f"已排入日程：{self._repeat_text(item)}"
@@ -992,7 +1082,7 @@ class Skills:
             )
             return SkillResult(
                 reply=(
-                    f"{head}，{title}{self._where_text(location)}。"
+                    f"{rolled}{head}，{title}{self._where_text(location)}。"
                     f"第一次是{humanize(real_first, now)}，{self._remind_text_of(leads)}"
                     f"{self._until_text(until)}"
                 ),
@@ -1012,6 +1102,39 @@ class Skills:
         return None
 
     # ------------------------------------------------------------ 日程改 / 删 / 跳过
+    def _find_duplicate(self, item: dict, now: datetime, first: datetime) -> dict | None:
+        """同名字 + 同一次时间就当成重复：语音里同一句话说两遍太常见了，
+        以前会存成两条，第二遍提醒又响一次。"""
+        want = _norm_title(str(item.get("title") or ""))
+        if not want:
+            return None
+        rep = self._repeat_of(item)
+        for it in self.schedule.load():
+            if _norm_title(str(it.get("title") or "")) != want:
+                continue
+            if self._repeat_of(it) != rep:
+                continue
+            if rep == "once":
+                if str(it.get("start") or "")[:16] == first.strftime("%Y-%m-%d %H:%M"):
+                    return it
+            elif rep in ("weekly", "biweekly"):
+                if (int(it.get("weekday", -1)) == int(item.get("weekday", -2))
+                        and it.get("time") == item.get("time")):
+                    return it
+            elif rep == "monthly":
+                if it.get("day") == item.get("day") and it.get("time") == item.get("time"):
+                    return it
+            elif rep == "yearly":
+                if (it.get("month") == item.get("month") and it.get("day") == item.get("day")
+                        and it.get("time") == item.get("time")):
+                    return it
+            elif rep == "interval":
+                if (it.get("time") == item.get("time")
+                        and it.get("every_days") == item.get("every_days")
+                        and it.get("every_minutes") == item.get("every_minutes")):
+                    return it
+        return None
+
     def _handle_schedule_change(self, text: str, now: datetime) -> SkillResult | None:
         """处理「改到…」「取消…那节课」「这周三不上了」「把所有会议删掉」。
 

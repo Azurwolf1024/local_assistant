@@ -418,6 +418,53 @@ def test_schedule_model() -> None:
     check("「这周」不列已经过去的（周五问，周三周四的课不该出现）",
           ("9月16日" not in r.reply and "AIAA3102" not in r.reply), True)
 
+    print("    · 约会也要进日程（以前只会掉给大模型，嘴上说「已记录」其实没存）")
+    # 背景：用户说「下周三下午3点半有跟导师见面」，技能没认出来 -> LLM 回「已记录此安排」，
+    # 日程里却是空的。根因是 _handle_schedule 只认 课/会议/安排 这类词。
+    skills.schedule.save([])
+    skills.alarms.save([])
+    for text, want_action in [
+        ("下周三下午三点半跟导师见面", "schedule_add"),
+        ("明天下午三点有个面试", "schedule_add"),
+        ("后天上午九点半体检", "schedule_add"),
+        ("大后天中午和导师吃饭", "schedule_add"),
+    ]:
+        got = getattr(skills.handle(text), "action", "")
+        check(f"约会 {text} -> 日程", got, want_action)
+    titles = [it.get("title") for it in skills.schedule.load()]
+    check("标题干净（时间词、废话都去掉了）",
+          titles, ["跟导师见面", "面试", "体检", "和导师吃饭"])
+    check("一次性约会是 meeting", [it.get("kind") for it in skills.schedule.load()][0], "meeting")
+    check("自动带上默认提前提醒",
+          skills.schedule.load()[0].get("remind_before"), [int(settings.skills.default_remind_before)])
+
+    r = skills.handle("下周三下午三点半跟导师见面")
+    print(f"        {r.reply}")
+    check("同一句话说两遍不会存两条", getattr(r, "action", ""), "schedule_exist")
+    check("库里还是 4 条", len(skills.schedule.load()), 4)
+
+    r = skills.handle("下周三下午三点半提醒我跟导师见面")
+    check("带「提醒我」的约会也走日程，不落在闹钟里", getattr(r, "action", ""), "schedule_exist")
+    check("闹钟里没有它", len(skills.alarms.load()), 0)
+    check("闹钟还是只管相对时间/起床这类",
+          getattr(skills.handle("十分钟后提醒我跟导师打电话"), "action", ""), "alarm_add")
+
+    check("问句不当成新增",
+          getattr(skills.handle("明天下午三点跟导师见面吗"), "action", "") != "schedule_add", True)
+
+    print("    · 说的时间已经过了：不能默默存一条再也不响的日程")
+    skills.schedule.save([])
+    fri = datetime(2026, 9, 18, 22, 0)               # 周五晚上
+    r = skills._handle_schedule("周五上午十点答辩", fri)     # noqa: SLF001
+    print(f"        {r.reply}")
+    check("带星期的往后推一周（周五 -> 下周五）",
+          skills.schedule.load()[0].get("start"), "2026-09-25 10:00")
+    check("并且说清楚是按下一个算的", "下一个" in r.reply, True)
+    skills.schedule.save([])
+    r = skills._handle_schedule("今晚八点和导师吃饭", fri)   # noqa: SLF001
+    check("不带星期的只顺延一天", skills.schedule.load()[0].get("start"), "2026-09-19 20:00")
+    check("也说了顺延", "已经过了" in r.reply, True)
+
     import shutil
 
     shutil.rmtree(tmp, ignore_errors=True)
