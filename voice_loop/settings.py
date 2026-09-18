@@ -130,6 +130,20 @@ class SkillsConfig:
 
 
 @dataclass
+class SubtitleConfig:
+    """屏幕底部居中的半透明字幕（关掉声音时靠它沟通）。"""
+
+    enabled: bool = True
+    width: int = 920            # 字幕条最大宽度（像素），屏幕太窄会自动缩
+    alpha: float = 0.86         # 不透明度，越小声越透
+    hold_seconds: float = 6.0   # 说完后多久自动隐藏
+    font_size: int = 20         # 正文字号
+    max_lines: int = 4          # 最多显示几行，超出只显示末尾（前面加「…」）
+    show_user_text: bool = True  # 要不要连「你说：…」一起显示（能看出有没有听错）
+    margin: int = 8             # 离任务栏上方多少像素
+
+
+@dataclass
 class Settings:
     app: AppConfig = field(default_factory=AppConfig)
     audio: AudioConfig = field(default_factory=AudioConfig)
@@ -140,6 +154,7 @@ class Settings:
     chat: ChatConfig = field(default_factory=ChatConfig)
     wake: WakeConfig = field(default_factory=WakeConfig)
     skills: SkillsConfig = field(default_factory=SkillsConfig)
+    subtitle: SubtitleConfig = field(default_factory=SubtitleConfig)
     path: Path = PROJECT_ROOT / "config.toml"
 
     # ---------------------------------------------------------------- paths
@@ -185,6 +200,7 @@ def load_settings(path: str | Path | None = None) -> Settings:
         llm=_build(LlmConfig, raw.get("llm", {}), "llm"),
         wake=_build(WakeConfig, raw.get("wake", {}), "wake"),
         skills=_build(SkillsConfig, raw.get("skills", {}), "skills"),
+        subtitle=_build(SubtitleConfig, raw.get("subtitle", {}), "subtitle"),
         tts=_build(TtsConfig, raw.get("tts", {}), "tts"),
         chat=_build(ChatConfig, raw.get("chat", {}), "chat"),
         path=cfg_path,

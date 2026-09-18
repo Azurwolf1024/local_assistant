@@ -217,6 +217,9 @@ def test_lifecycle() -> None:
 
     settings = load_settings()
     settings.wake.idle_action = "standby"
+    # 生命周期测试不需要往屏幕上弹东西
+    settings.subtitle.enabled = False
+    settings.skills.visual_alert = False
 
     loop = VoiceLoop(settings, enable_listening=False, lazy_whisper=True)
     try:

@@ -5,9 +5,10 @@
 
 实现要点
     - 只用标准库 tkinter，不引额外依赖
-    - Tk 必须在同一个线程里操作，所以起一个专用线程 + 队列
+    - 窗口挂在 :mod:`voice_loop.ui` 的共享 UI 线程上（一个进程只能有一个 Tk 解释器，
+      这里和字幕各起一个线程会直接抛 ``main thread is not in main loop``）
     - 窗口置顶但不抢焦点（不会打断你正在打的字）
-    - 点「知道了」或右上角 × 关闭；``timeout`` 秒后也会自动消失
+    - 点「知道了」或按 Esc 关闭；``timeout`` 秒后也会自动消失
     - 没有图形环境 / tkinter 不可用时静默降级，不影响语音主流程
 """
 
@@ -15,8 +16,9 @@ from __future__ import annotations
 
 import logging
 import queue
-import threading
 import time
+
+from . import ui
 
 
 class VisualNotifier:
@@ -31,92 +33,87 @@ class VisualNotifier:
         self.timeout = max(3.0, float(timeout))
         self.width = max(240, int(width))
         self.log = logger or logging.getLogger("voice_loop")
+
         self._queue: queue.Queue = queue.Queue()
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._failed = False
+        self._host: ui.UiHost | None = None
+        self._closing = False
+
+        # 以下都是 UI 线程里的状态
+        self._popups: list = []
+        self._last_render = 0.0
 
     # ------------------------------------------------------------------ 生命周期
     @property
     def running(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
+        return self._host is not None and not self._closing
+
+    @property
+    def failed(self) -> bool:
+        return self._host is None or self._host.failed
 
     def start(self) -> bool:
         if not self.enabled or self.running:
             return self.running
-        self._thread = threading.Thread(target=self._run, daemon=True, name="toast")
-        self._thread.start()
+        self._closing = False
+        h = ui.host(self.log)
+        if not h.start():
+            return False
+        self._host = h
+        h.add_tick(self._tick)
         return True
 
     def stop(self) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-            self._thread = None
+        self._closing = True
+        h, self._host = self._host, None
+        if h is not None:
+            # 先撤掉刷新回调，再让 UI 线程去销毁窗口，顺序不能反
+            h.remove_tick(self._tick)
+            h.post(self._close_all)
 
     def show(self, title: str, text: str) -> None:
         """非阻塞地弹一个提醒；开关关闭或不可用时直接忽略。"""
-        if not self.enabled or self._failed:
+        if not self.enabled or self._closing:
             return
-        if not self.running:
-            self.start()
+        if self._host is None and not self.start():
+            return
+        if self._host is None or self._host.failed:
+            return
         self._queue.put((str(title), str(text)))
 
-    # ------------------------------------------------------------------ 线程内
-    def _run(self) -> None:
-        try:
-            import tkinter as tk
-        except Exception as exc:  # noqa: BLE001
-            self._failed = True
-            self.log.warning(f"没有 tkinter（{exc}），可视提醒已关闭")
-            return
-
-        try:
-            root = tk.Tk()
-        except Exception as exc:  # noqa: BLE001
-            self._failed = True
-            self.log.warning(f"无法创建窗口（{exc}），可视提醒已关闭")
-            return
-
-        root.withdraw()
-        try:
-            root.attributes("-topmost", False)
-        except Exception:  # noqa: BLE001
-            pass
-
-        popups: list = []
-        while not self._stop.is_set():
+    # ------------------------------------------------------------------ UI 线程
+    def _close_all(self, _root) -> None:
+        for win in self._popups:
             try:
-                while True:
-                    title, text = self._queue.get_nowait()
-                    popups.append(self._popup(root, title, text))
-            except queue.Empty:
-                pass
-            # 丢掉已经被关掉 / 自动消失的
-            alive = []
-            for p in popups:
-                try:
-                    if p.winfo_exists():
-                        alive.append(p)
-                except Exception:  # noqa: BLE001
-                    pass
-            popups = alive
-            self._layout(root, popups)
-            try:
-                root.update()
-            except Exception:  # noqa: BLE001
-                break
-            time.sleep(0.05)
-
-        for p in popups:
-            try:
-                p.destroy()
+                win.destroy()
             except Exception:  # noqa: BLE001
                 pass
+        self._popups = []
+
+    def _tick(self, root) -> None:  # pragma: no cover - 需要图形环境
+        if self._closing:
+            return
+        now = time.monotonic()
+        if self._queue.empty() and now - self._last_render < 0.05:
+            return
+        self._last_render = now
+
         try:
-            root.destroy()
-        except Exception:  # noqa: BLE001
+            while True:
+                title, text = self._queue.get_nowait()
+                self._popups.append(self._popup(root, title, text))
+        except queue.Empty:
             pass
+
+        # 丢掉已经关掉 / 自动消失的
+        alive = []
+        for win in self._popups:
+            try:
+                if win.winfo_exists():
+                    alive.append(win)
+            except Exception:  # noqa: BLE001
+                pass
+        self._popups = alive
+        self._layout(root)
 
     # ------------------------------------------------------------------ 窗口
     def _popup(self, root, title: str, text: str):
@@ -159,15 +156,17 @@ class VisualNotifier:
         win.after(int(self.timeout * 1000), close)
         return win
 
-    def _layout(self, root, popups: list) -> None:
+    def _layout(self, root) -> None:
         """从屏幕右下角往上堆叠。"""
+        if not self._popups:
+            return
         try:
             sw = root.winfo_screenwidth()
             sh = root.winfo_screenheight()
         except Exception:  # noqa: BLE001
             return
         y_offset = 0
-        for win in reversed(popups):
+        for win in reversed(self._popups):
             try:
                 win.update_idletasks()
                 h = win.winfo_height()

@@ -25,9 +25,11 @@ from .llm import OllamaClient
 from .scheduler import ReminderScheduler
 from .settings import Settings
 from .skills import Skills
+from .subtitle import SubtitleOverlay
 from .text import SpeechChunker, is_meaningful, prepare_for_reading
 from .toast import VisualNotifier
 from .tts import create_tts
+from . import ui
 from .wake import WakeSession, WakeWordMatcher
 
 
@@ -120,6 +122,27 @@ class VoiceLoop:
             except Exception as exc:  # noqa: BLE001
                 self.log.warning(f"可视提醒初始化失败：{exc}")
                 self.toast = None
+
+        # 屏幕底部居中的半透明字幕：关掉声音（或戴着耳机走开了）也能跟着看
+        self.subtitle: SubtitleOverlay | None = None
+        sub_cfg = getattr(settings, "subtitle", None)
+        if sub_cfg is not None and sub_cfg.enabled:
+            try:
+                self.subtitle = SubtitleOverlay(
+                    enabled=True,
+                    width=int(sub_cfg.width),
+                    alpha=float(sub_cfg.alpha),
+                    hold_seconds=float(sub_cfg.hold_seconds),
+                    font_size=int(sub_cfg.font_size),
+                    max_lines=int(sub_cfg.max_lines),
+                    show_user_text=bool(sub_cfg.show_user_text),
+                    margin=int(sub_cfg.margin),
+                    logger=self.log,
+                )
+                self.subtitle.start()
+            except Exception as exc:  # noqa: BLE001
+                self.log.warning(f"字幕初始化失败：{exc}")
+                self.subtitle = None
 
         # 唤醒词
         self._wake_path = settings.resolve(settings.wake.file)
@@ -273,10 +296,18 @@ class VoiceLoop:
             for rate, pcm in self.tts.synth(chunk):
                 self.speaker.submit(pcm, rate)
 
-    def speak_text(self, text: str, wait: bool = True) -> float:
+    def speak_text(self, text: str, wait: bool = True, fresh: bool = False) -> float:
         """直接朗读一段文字（技能回答、提醒播报）。"""
         text = prepare_for_reading(text)
-        if not text or not self.tts_enabled:
+        if not text:
+            return 0.0
+        # 字幕先上屏：即使关掉了语音播报（tts_enabled=False）也要看得见回答
+        if self.subtitle is not None:
+            if fresh:
+                # 提醒 / 唤醒应答不属于某一轮对话，别把上一轮的「你说：…」留在屏幕上
+                self.subtitle.clear()
+            self.subtitle.update(text)
+        if not self.tts_enabled:
             return 0.0
         t0 = time.perf_counter()
         self._muted.set()
@@ -296,7 +327,7 @@ class VoiceLoop:
         if self.toast is not None:
             title = "日程提醒" if ("日程" in text or "课" in text or "会议" in text) else "提醒"
             self.toast.show(title, text)
-        self.speak_text(text)
+        self.speak_text(text, fresh=True)
         # 待唤醒状态下播报完就把 TTS 释放掉，别让它一直占内存
         if self.lazy and not self._active:
             unload = getattr(self.tts, "unload", None)
@@ -414,6 +445,12 @@ class VoiceLoop:
             stats.extra["asr_score"] = round(asr.score, 4)
         stats.asr_seconds = asr_seconds
 
+        # 字幕：先清掉上一轮的内容（否则流式 append 会越滚越长），
+        # 再把「你说：…」放上去——听错了一眼就能看出来
+        if self.subtitle is not None:
+            self.subtitle.clear()
+            self.subtitle.show_user(user_text)
+
         # ---------------------------------------------------------- 技能路径
         skill = self.skills.handle(user_text) if self.skills else None
         if skill is not None:
@@ -459,6 +496,8 @@ class VoiceLoop:
                     pieces.append(delta)
                     if on_delta is not None:
                         on_delta(delta)
+                    if self.subtitle is not None:
+                        self.subtitle.append(delta)
                     if self._interrupt.is_set():
                         break
                     for sentence in chunker.feed(delta):
@@ -767,7 +806,7 @@ class VoiceLoop:
                         ack = (self.wake.settings.ack or "").strip()
                         if ack:
                             print(f"助手：{ack}")
-                            self.speak_text(ack)
+                            self.speak_text(ack, fresh=True)
                 except KeyboardInterrupt:
                     raise
                 except Exception as exc:  # noqa: BLE001
@@ -864,6 +903,18 @@ class VoiceLoop:
             except Exception:  # noqa: BLE001
                 pass
             self.toast = None
+        if self.subtitle is not None:
+            try:
+                self.subtitle.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self.subtitle = None
+        # 字幕和提醒弹窗都挂在同一个 Tk 宿主上，收尾时一起关掉，
+        # 免得 Tcl 解释器在错误的线程里被回收（会打印 Tcl_AsyncDelete 之类的噪音）
+        try:
+            ui.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
         try:
             self.speaker.close()
         finally:
