@@ -330,11 +330,21 @@ class Skills:
         for store in (self.alarms, self.memos, self.schedule):
             store.ensure()
 
+        # 最近的对话（你说 + 助手答），用来解析「它 / 那个 / 刚才那条」指谁。
+        # 由 pipeline 每轮传进来；单独跑 skills 时就是空的。
+        self.dialog: list[str] = []
+
     # ======================================================================
     # 入口
     # ======================================================================
-    def handle(self, text: str) -> SkillResult | None:
-        """尝试用技能回答；返回 None 表示应该交给 LLM。"""
+    def handle(self, text: str, dialog: list[str] | None = None) -> SkillResult | None:
+        """尝试用技能回答；返回 None 表示应该交给 LLM。
+
+        ``dialog``：最近几轮「你说 / 助手答」的原文，指代解析（它、那个、刚才那条）
+        在上面找候选——技能本身不猜，找不到就问。
+        """
+        if dialog is not None:
+            self.dialog = [str(x) for x in dialog if str(x).strip()][-10:]
         if not self.enabled:
             return None
         raw = (text or "").strip()
@@ -605,6 +615,9 @@ class Skills:
     )
     # 「以后不上这门课了」= 删掉；只说「这周三不上了」= 只跳过这一次
     _SCHEDULE_FOREVER = re.compile(r"(?:以后|往后都|再也不|不再|一直|永久|全部|所有|这门课|这一门)")
+    # 批量说法里的「所有 / 全部」只是**范围**词，不能当成「以后都不上」。
+    # （_SCHEDULE_FOREVER 里含「所有」，那是给单条删用的；批量必须用这个。）
+    _FOREVER_WORDS = re.compile(r"(?:以后|往后|永远|再也不|不再|永久|彻底|从此)")
     # 带这些词的是问句，不要当成「取消」（「今天的课不上吗？」不能真去取消）
     _SCHEDULE_QUESTION = re.compile(r"(?:有什么|有哪些|有没有|列表|列出|查一下|查询|看看|看一下)|[吗呢？?]\s*$")
     _SCHEDULE_Q = re.compile(
@@ -612,6 +625,23 @@ class Skills:
         r"(?:课|课程|上课|会议|开会|日程|日成|安排|行程|例会|组会)"
     )
     _SCHEDULE_NEXT = re.compile(r"(下一个|下一节|接下来|最近的?)\s*(?:课|课程|会议|开会|日程|安排|例会|组会)")
+    # 指代词：出现这些词说明「哪一条」不在这一句里，要去看聊天记录
+    _REFER_WORDS = re.compile(
+        r"(?:它|他|她|这个|那个|这条|那条|这节|那节|这门|那门|刚才|刚刚|上面|前面|前面说|刚说|刚才说)"
+    )
+    # 批量说法：「所有课程」「全部会议」「所有日程」
+    _ALL_WORDS = re.compile(r"(?:所有|全部|一切|每个|各个|所有的|全部的)")
+    _SCOPE_COURSE = re.compile(r"(?:课程|课表|课)")
+    _SCOPE_MEETING = re.compile(r"(?:会议|开会|例会|组会)")
+    _SCOPE_TASK = re.compile(r"(?:任务|待办|要交的)")
+    _SCOPE_ANY = re.compile(r"(?:日程|安排|行程|事情)")
+    # 「有哪些课程」「一共有几门课」这种纯查询说法（没有「所有」也能问全体）
+    _SCOPE_ASK = re.compile(r"(?:有(?:哪些|什么|多少)|都有|一共|总共|总共|几门|几节|几个)")
+    # 句子里出现这些词就是在问某段时间，别按「全体」回答
+    _RANGE_WORD = re.compile(
+        r"(?:今天|明天|后天|大后天|这周|本周|下周|下下周|上周|周末|这个月|本月|下个月|上个月"
+        r"|今年|明年|未来|这几天|这两天|最近)"
+    )
     # 只说了时间段、没带「课/会议」这类词的问句：「下周呢」「这个月有什么」
     _RANGE_ASK = re.compile(
         r"(?:今天|今日|明天|后天|大后天|这周|本周|下周|下下周|这个月|本月|下个月|今年|明年"
@@ -722,6 +752,10 @@ class Skills:
         if self._SCHEDULE_NEXT.search(text):
             return self._next_item(now)
 
+        listed = self._list_scope(text, now)
+        if listed is not None:
+            return listed
+
         if self._SCHEDULE_Q.search(text) or self._RANGE_ASK.search(text):
             return self._day_items(text, now)
 
@@ -729,7 +763,7 @@ class Skills:
 
     # ------------------------------------------------------------ 日程改 / 删 / 跳过
     def _handle_schedule_change(self, text: str, now: datetime) -> SkillResult | None:
-        """处理「改到…」「取消…那节课」「这周三不上了」。
+        """处理「改到…」「取消…那节课」「这周三不上了」「把所有会议删掉」。
 
         返回 None = 这句话跟改/删无关，交给后面的新增与查询。
         """
@@ -744,7 +778,34 @@ class Skills:
             return SkillResult(
                 reply="日程里现在还是空的，没什么可以改的。", action="schedule_change"
             )
+
+        # --- 批量：所有课程 / 所有会议 / 所有日程 ---
+        pred, scope = self._scope_filter(text)
+        if pred is not None:
+            targets = [it for it in items if pred(it)]
+            if not targets:
+                return SkillResult(reply=f"日程里没有{scope}可以改。", action="schedule_change")
+            if edit:
+                return self._batch_edit(targets, scope, text, now)
+            return self._batch_drop(targets, scope, text, now)
+
         hits = self._match_schedule_items(text, items, now)
+        if not hits:
+            # 这一句里没有名字：看聊天记录（「把它改到明天」「取消刚才那个」）
+            refs = self._referenced_items(text, now)
+            if len(refs) == 1:
+                hits = [(4, refs[0])]
+            elif len(refs) > 1:
+                names = "、".join(f"「{it.get('title', '安排')}」" for it in refs[:4])
+                return SkillResult(
+                    reply=f"你说的「它」是指哪一条？（{names}）说个名字我就动手。",
+                    action="schedule_change",
+                )
+            elif self._REFER_WORDS.search(text):
+                return SkillResult(
+                    reply="我这边没有可以指代的日程——先说一句「今天有什么课」，或者把名字说清楚？",
+                    action="schedule_change_miss",
+                )
         if not hits:
             # 听着像在说日程，但库里找不到对应条目：说清楚比乱改好
             if drop and (TRIGGER_SCHEDULE.search(text) or _weekly_weekday(text) is not None):
@@ -960,16 +1021,182 @@ class Skills:
             return f"我会{parts[0]}提醒你。"
         return "我会" + "、".join(parts[:-1]) + "和" + parts[-1] + "提醒你。"
 
+    # ------------------------------------------------------------ 批量 / 指代
+    def _scope_filter(self, text: str, allow_partial: bool = False):
+        """「所有课程 / 全部会议 / 所有日程」→ (过滤函数, 说法)。
+
+        ``allow_partial``：只看「有哪些课程」这种**纯查询**说法（没有「所有」）。
+        """
+        t = text or ""
+        if not (self._ALL_WORDS.search(t) or (allow_partial and self._SCOPE_ASK.search(t))):
+            return None, ""
+        if self._SCOPE_COURSE.search(t):
+            return (
+                lambda it: str(it.get("kind")) == "course"
+                or self._repeat_of(it) in ("weekly", "biweekly"),
+                "课程",
+            )
+        if self._SCOPE_MEETING.search(t):
+            return (
+                lambda it: str(it.get("kind")) == "meeting" or "会" in str(it.get("title", "")),
+                "会议",
+            )
+        if self._SCOPE_TASK.search(t):
+            return lambda it: str(it.get("kind")) == "task", "任务"
+        if self._SCOPE_ANY.search(t):
+            return lambda it: True, "日程"
+        return None, ""
+
+    def _batch_drop(self, targets: list[dict], scope: str, text: str, now: datetime) -> SkillResult:
+        """批量取消：一次性的直接删；每周重复的要么「以后都不上」，要么逐条只跳过下一次。"""
+        weekly = [it for it in targets if self._repeat_of(it) in ("weekly", "biweekly")]
+        once = [it for it in targets if it not in weekly]
+        forever = bool(self._FOREVER_WORDS.search(text))
+
+        if weekly and not forever and not once and not self._RANGE_WORD.search(text):
+            # 「取消所有课程」到底是「以后都不上」还是「这周不上」——不猜，问一句
+            names = "、".join(str(it.get("title", "课")) for it in weekly[:4])
+            return SkillResult(
+                reply=(
+                    f"一共有{cn_quantity(len(weekly))}门课（{names}）。"
+                    f"是要以后都不上（彻底删掉），还是只取消这周这一次？"
+                    f"说「以后都不上」或者「这周不上」就行。"
+                ),
+                action="schedule_change",
+            )
+
+        if forever or once and not weekly:
+            keys = {_sched_key(it) for it in targets}
+            removed = self.schedule.remove_where(lambda it: _sched_key(it) in keys)
+            names = "、".join(str(it.get("title", "安排")) for it in removed[:6])
+            tail = "等" if len(removed) > 6 else ""
+            return SkillResult(
+                reply=f"已删除{cn_quantity(len(removed))}条{scope}：{names}{tail}。",
+                action="schedule_delete",
+            )
+
+        # 只跳过下一次
+        if not weekly:
+            return SkillResult(reply=f"{scope}里没有可以取消的。", action="schedule_change")
+        day = parse_date_hint(text, now)
+        done: list[str] = []
+        for it in weekly:
+            target_day = day if day is not None else self._skip_day("", it, now)
+            if target_day < now.date():
+                target_day = self._skip_day("", it, now)
+            skips = [str(d) for d in (it.get("skip") or []) if d]
+            if str(target_day) in skips:
+                continue
+            skips.append(str(target_day))
+            self._update_schedule_item(_sched_key(it), skip=skips)
+            done.append(str(it.get("title", "课")))
+        if not done:
+            return SkillResult(reply=f"{scope}这次本来就没安排。", action="schedule_skip")
+        return SkillResult(
+            reply=f"好，这次的{'、'.join(done)}都不提醒了，下次照常。", action="schedule_skip"
+        )
+
+    def _batch_edit(self, targets: list[dict], scope: str, text: str, now: datetime) -> SkillResult:
+        """批量改：只改这一句里说得清楚的那几项（时刻 / 星期 / 提前量 / 地点 / 备注 / 周期）。"""
+        when = parse_datetime(text, now)
+        leads = parse_reminds(text)
+        rule = parse_repeat(text)
+        wd = _weekly_weekday(text)
+        _, loc = _split_title_location(text)
+        note = self._note_of(text)
+        changed: list[str] = []
+        for it in targets:
+            fields: dict[str, Any] = {}
+            weekly = self._repeat_of(it) in ("weekly", "biweekly")
+            if wd is not None and weekly:
+                fields["weekday"] = wd
+                fields["skip"] = []          # 换了星期，之前跳过的那些天就不算数了
+            if when is not None:
+                if weekly:
+                    fields["time"] = f"{when.hour:02d}:{when.minute:02d}"
+                else:
+                    # 一次性/间隔的只换时刻，日期各自保留
+                    raw = it.get("start") or ""
+                    head = str(raw)[:10] if len(str(raw)) >= 10 else now.strftime("%Y-%m-%d")
+                    fields["start"] = f"{head} {when.hour:02d}:{when.minute:02d}"
+                    fields["time"] = f"{when.hour:02d}:{when.minute:02d}"
+            if rule is not None:
+                fields["repeat"] = rule["repeat"]
+                for key in ("weekday", "day", "month", "every_days", "every_minutes"):
+                    if rule.get(key) is not None:
+                        fields[key] = rule[key]
+            if leads is not None:
+                fields["remind_before"] = leads
+            if loc:
+                fields["location"] = loc
+            if note:
+                fields["note"] = note
+            if fields:
+                self._update_schedule_item(_sched_key(it), **fields)
+                changed.append(str(it.get("title", "安排")))
+        if not changed:
+            return SkillResult(
+                reply=f"要{scope}都改什么？可以说「都改到下午三点」或者「都提前半小时提醒」。",
+                action="schedule_edit",
+            )
+        names = "、".join(changed[:6])
+        return SkillResult(
+            reply=f"已改{cn_quantity(len(changed))}条{scope}：{names}{'等' if len(changed) > 6 else ''}。",
+            action="schedule_edit",
+        )
+
+    def _referenced_items(self, text: str, now: datetime) -> list[dict]:
+        """「它 / 那个 / 刚才那条」指谁：去最近的聊天记录里找日程名字。
+
+        技能不猜：记录里有几个候选就返回几个，由调用方决定是执行还是反问。
+        """
+        hay = "\n".join(self.dialog[-8:])
+        if not hay.strip():
+            return []
+        items = self.schedule.load()
+        hits = self._score_items(hay, items, now)
+        return [it for s, it in hits if s >= 2]     # 至少要有名字或时间对得上
+
+    def _list_scope(self, text: str, now: datetime) -> SkillResult | None:
+        """「有哪些课程 / 所有会议」——把所有定义列出来，而不是只看某一天。"""
+        pred, scope = self._scope_filter(text, allow_partial=True)
+        if pred is None:
+            return None
+        # 「每周五有什么课」「9月20日有哪些课」是在问某一天，别按全体列表回答
+        if (self._RANGE_WORD.search(text)
+                or _weekly_weekday(text) is not None
+                or parse_date_hint(text, now) is not None):
+            return None
+        targets = [it for it in self.schedule.load() if pred(it)]
+        if not targets:
+            return SkillResult(reply=f"日程里还没有{scope}。", action="schedule_list")
+        parts = []
+        for it in targets:
+            nxt = self.next_occurrence(it, now)
+            when = f"下一次{nxt.strftime('%m-%d %H:%M')}" if nxt else "已经过期"
+            title = str(it.get("title") or "安排")
+            parts.append(f"{title}（{when}）" if self._repeat_of(it) == "once"
+                         else f"{self._repeat_text(it)} {title}，{when}")
+        return SkillResult(
+            reply=f"一共{cn_quantity(len(targets))}条{scope}：" + "；".join(parts) + "。",
+            action="schedule_list",
+        )
+
     def _match_schedule_items(self, text: str, items: list[dict], now: datetime) -> list[tuple[int, dict]]:
-        """找出这句话指的是哪几条日程，返回 (得分, 条目) 按得分降序。
+        """这句话指的是哪几条日程。"""
+        return self._score_items(text, items, now)
+
+    def _score_items(self, hay: str, items: list[dict], now: datetime) -> list[tuple[int, dict]]:
+        """找出 ``hay`` 里提到了哪几条日程，返回 (得分, 条目) 按得分降序。
 
         名字最算数（4 分），其次是时间对得上（星期/几号/时刻）。
+        ``hay`` 既可以是当前这一句，也可以是最近几轮聊天记录（指代解析）。
         """
-        day = parse_date_hint(text, now)
-        clock = parse_clock(text)
+        day = parse_date_hint(hay, now)
+        clock = parse_clock(hay)
         hits: list[tuple[int, dict]] = []
         for it in items:
-            score = 2 * _title_hit(str(it.get("title", "")), text)
+            score = 2 * _title_hit(str(it.get("title", "")), hay)
             rep = self._repeat_of(it)
             same_clock = bool(clock) and str(it.get("time", "")) == f"{clock[0]:02d}:{clock[1]:02d}"
             if rep in ("weekly", "biweekly"):
