@@ -368,6 +368,56 @@ def test_schedule_model() -> None:
     check("十分钟后提醒我喝水 -> 还是闹钟",
           getattr(skills.handle("十分钟后提醒我喝水"), "action", ""), "alarm_add")
 
+    print("    · 一段时间要报一段时间（以前「下周」只报下周一）")
+    # 换一套干净的固定数据：周三 09:00 课、周四 14:00 组会、每月 30 号对账
+    skills.schedule.save(
+        [
+            {"title": "AIAA3102 机器学习", "repeat": "weekly", "weekday": 2, "time": "09:00",
+             "duration_minutes": 90, "location": "教学楼 A302", "remind_before": [15]},
+            {"title": "组会", "repeat": "weekly", "weekday": 3, "time": "14:00",
+             "duration_minutes": 60, "remind_before": [10]},
+            {"title": "月度对账", "repeat": "monthly", "day": 30, "time": "20:00",
+             "remind_before": [30]},
+        ]
+    )
+    fri = datetime(2026, 9, 18, 21, 0)          # 周五
+    for text, expect in [
+        ("今天有什么课", ("2026-09-18", "2026-09-18", "今天")),
+        ("明天有什么安排", ("2026-09-19", "2026-09-19", "明天")),
+        ("这周有什么安排", ("2026-09-14", "2026-09-20", "这周")),      # 周一到周日
+        ("下周有什么安排", ("2026-09-21", "2026-09-27", "下周")),
+        ("下下周有什么安排", ("2026-09-28", "2026-10-04", "下下周")),
+        ("这个周末有什么安排", ("2026-09-19", "2026-09-20", "这个周末")),
+        ("这个月有什么安排", ("2026-09-01", "2026-09-30", "这个月")),
+        ("下个月有什么安排", ("2026-10-01", "2026-10-31", "下个月")),
+        ("今年有什么安排", ("2026-01-01", "2026-12-31", "今年")),
+        ("明年有什么安排", ("2027-01-01", "2027-12-31", "明年")),
+        ("未来三天有什么安排", ("2026-09-18", "2026-09-20", "未来三天")),
+        ("未来一周有什么安排", ("2026-09-18", "2026-09-24", "未来一周")),
+        ("这几天有什么安排", ("2026-09-18", "2026-09-21", "这几天")),
+        ("有什么安排", ("2026-09-18", "2026-09-18", "今天")),          # 没说范围 = 今天
+    ]:
+        s, e, label = skills._range_of(text, fri)          # noqa: SLF001
+        check(f"范围 {text}",
+              (s.strftime("%Y-%m-%d"), e.strftime("%Y-%m-%d"), label), expect)
+
+    r = skills.handle("下周有什么安排")
+    print(f"        {r.reply}")
+    check("「下周」真的报一整周（含下周三、周四）",
+          ("下周（9月21日到9月27日）" in r.reply and "周三上午九点" in r.reply
+           and "周四下午两点" in r.reply), True)
+    r = skills.handle("下周呢")
+    check("「下周呢」也能当日程查询", getattr(r, "action", None), "schedule_query")
+    r = skills.handle("这个月有什么安排")
+    check("「这个月」报整月（含 9月30日 对账）",
+          ("这个月" in r.reply and "9月30日" in r.reply and "月度对账" in r.reply), True)
+    r = skills.handle("下个月有什么安排")
+    check("「下个月」报下个月", ("下个月" in r.reply and "10月" in r.reply), True)
+    r = skills.handle("这周有什么安排")
+    print(f"        {r.reply}")
+    check("「这周」不列已经过去的（周五问，周三周四的课不该出现）",
+          ("9月16日" not in r.reply and "AIAA3102" not in r.reply), True)
+
     import shutil
 
     shutil.rmtree(tmp, ignore_errors=True)
