@@ -221,6 +221,12 @@ TRIGGER_APPOINT = re.compile(
     r"拜访|走访|体检|复诊|看病|出差|讲座|研讨会|年会|沙龙|分享会|宣讲会|"
     r"运动会|开学典礼|考试|测验|团建|接待|值班|报到|注册)"
 )
+# 「我周三下午三点半要去见导师」「明天下午三点交材料」：带这种「去干什么」的动词，
+# 而且句子里有日期 + 时刻，就当成一条安排（只加了动词不行，还得有明确时间）
+PLAN_VERB = re.compile(
+    r"(?:要去|得去|去见|去找|去拿|去交|去办|去开|去听|去参加|"
+    r"去见|见|找|约|参加|出席|值班|接|送|交|提交|办理|面签)"
+)
 
 # 「我的备忘有哪些 / 我现在有什么备忘录吗」这类是查询，不是添加。
 # 光靠「备忘」两个字判断会把查询误当成新增（之前就出过这个 bug：
@@ -311,6 +317,19 @@ def _is_topic(text: str) -> bool:
 def _clean_content(text: str) -> str:
     t = _TIME_WORDS.sub("", text or "")
     t = re.sub(r"^[，。、,.\s:：]+", "", t)
+    t = _FILLER.sub("", t)
+    t = _TAIL_FILLER.sub("", t)
+    t = re.sub(r"[，。、,.\s:：]+", "", t)
+    return t.strip()
+
+
+def _clean_memo_content(text: str) -> str:
+    """备忘是**纯文本**，时间词要留着：
+
+    「记一下明天带伞」存成「带伞」就把最关键的信息丢了（备忘没有时间字段）。
+    闹钟/日程那边有时间字段，才需要 _clean_content 把时间词从内容里剥掉。
+    """
+    t = re.sub(r"^[，。、,.\s:：]+", "", text or "")
     t = _FILLER.sub("", t)
     t = _TAIL_FILLER.sub("", t)
     t = re.sub(r"[，。、,.\s:：]+", "", t)
@@ -630,25 +649,28 @@ class Skills:
 
         m = self._MEMO_ADD.search(text)
         if m:
-            content = _clean_content(m.group("content"))
-            if not content:
+            raw = m.group("content")
+            content = _clean_content(raw)              # 顺带存闹钟时当 what 用
+            memo_text = _clean_memo_content(raw)       # 备忘本身要留住时间词
+            if not memo_text and not content:
                 return None
-            self.memos.append({"content": content, "done": False})
+            self.memos.append({"content": memo_text or content, "done": False})
             # 「记一下明天要买牛奶」这类带时间的，顺带提醒一下
             when = parse_datetime(text, now)
             if when is not None and TRIGGER_ALARM.search(text):
                 self.alarms.append(
                     {
                         "when": when.strftime("%Y-%m-%d %H:%M:%S"),
-                        "what": content,
+                        "what": content or memo_text,
                         "fired": False,
                         "kind": "alarm",
                     }
                 )
                 return SkillResult(
-                    reply=f"已归档：{content}。{humanize(when, now)}我会提醒你。", action="memo_add_alarm"
+                    reply=f"已归档：{memo_text or content}。{humanize(when, now)}我会提醒你。",
+                    action="memo_add_alarm",
                 )
-            return SkillResult(reply=f"已归档：{content}。", action="memo_add")
+            return SkillResult(reply=f"已归档：{memo_text or content}。", action="memo_add")
 
         # 「提醒我买牛奶」这类没时间的 -> 存成备忘
         if TRIGGER_ALARM.search(text) and not has_clock_expr(text):
@@ -676,13 +698,21 @@ class Skills:
     _VISION_OBJECT = re.compile(
         r"(?:这个|那个|这一?张|那一?张|这幅|这里|这儿|画面|镜头|摄像头|相机|"
         r"照片|图片|截图|屏幕|显示器|桌面|窗口|界面|剪贴板|"
-        r"文件|文档|附件|报告|表格|日志|脚本|代码|内容|"
+        r"文件|文档|附件|报告|表格|日志|脚本|代码|内容|颜色|"
         r"上面|上头|里头|里面|手里|手上|桌上|窗外|镜头前)"
     )
-    # 在问「是什么」——但必须同时用手指着（这/那/它）或提到看得到的东西，
-    # 否则「明天是什么天气」也会被当成看图
+    # 在问「是什么」——必须同时指着看得到的东西，或就是【这是什么】这种短问句，
+    # 否则「导师见面那件事是什么时候」也会被当成看图（这个坑踩过）
     _VISION_WHAT = re.compile(r"(?:是什么|是啥|什么东西|写了什么|写的什么|有什么|讲了什么|什么颜色)")
-    _VISION_POINT = re.compile(r"[这那此它他她]")
+    _VISION_TINY = re.compile(
+        r"^[这那](?:个|张|幅|些|是|块|只|台|本)?\s*(?:是什么|是啥|什么东西|写的什么)"
+    )
+    # 「看看下周都有什么事」「看一下这周有什么安排」是**查询**，不是看图：
+    # 这些「什么 + 抽象名词」根本不是看得到的东西（这个坑评估里踩到了）
+    _VISION_NOT = re.compile(
+        r"(?:什么事|有什么安排|有什么日程|有什么活动|有什么计划|有什么任务|都有什么|"
+        r"有哪些安排|有哪些事|什么时候)"
+    )
     _V_SRC_LAST = re.compile(r"(?:刚才(?:那|的)?(?:张|幅)?图|上一张|刚才拍的|刚刚拍的|刚才看到的)")
     _V_SRC_CLIP = re.compile(r"(?:剪贴板|复制的东西|复制的那|刚复制的|我复制的)")
     _V_SRC_FILE = re.compile(
@@ -711,12 +741,14 @@ class Skills:
         last = bool(self._V_SRC_LAST.search(text))       # 刚才那张图
         obj = bool(self._VISION_OBJECT.search(text))     # 屏幕 / 文件 / 这个
         what = bool(self._VISION_WHAT.search(text))      # 是什么 / 写了什么
-        point = bool(self._VISION_POINT.search(text))    # 这 / 那 / 它：在指着东西说
+        tiny = bool(self._VISION_TINY.match(text))       # 「这是什么」这种短问句
+        if not (read or last) and self._VISION_NOT.search(text):
+            return None                     # 「看看这周有什么安排」是查询
         wanted = (
             read                                          # 「读一下会议纪要」
             or last                                       # 「刚才那张图」
             or (look and (obj or what))                   # 「看看我的屏幕」「看看这是什么」
-            or (what and (obj or point))                  # 「屏幕上写了什么」「它是什么颜色」
+            or (what and (obj or tiny))                   # 「屏幕上写了什么」「它是什么颜色」
         )
         if not wanted:
             return None
@@ -975,13 +1007,21 @@ class Skills:
         appoint = bool(TRIGGER_APPOINT.search(text)) and (
             has_clock_expr(text) or _DAY_PERIOD.search(text) is not None
         )
+        # 「我周三下午三点半要去见导师」：只是动词 + 时间，不是「安排/记录」这种命令式，
+        # 以前也认不出来（大模型选对了 add_schedule，技能层反而不认，就白搭了）
+        plan = (
+            bool(PLAN_VERB.search(text))
+            and has_clock_expr(text)
+            and parse_date_hint(text, now) is not None
+        )
         looks_add = (
             (m is not None and TRIGGER_SCHEDULE.search(text))
             or rule is not None
             or appoint
+            or plan
         )
         if not is_query and looks_add and (
-            has_clock_expr(text) or rule is not None or appoint
+            has_clock_expr(text) or rule is not None or appoint or plan
         ):
             first = parse_datetime(text, now)
             if first is None:
