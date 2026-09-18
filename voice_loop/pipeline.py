@@ -31,6 +31,14 @@ from .skills import Skills
 from .subtitle import SubtitleOverlay
 from .text import SpeechChunker, is_meaningful, prepare_for_reading
 from .toast import VisualNotifier
+from .tools import (
+    SUSPICIOUS_START,
+    TOOL_HINT,
+    ToolRegistry,
+    describe_calls,
+    looks_like_tool_text,
+    parse_tool_call_text,
+)
 from .tts import create_tts
 from . import ui
 from .wake import WakeSession, WakeWordMatcher
@@ -105,6 +113,10 @@ class VoiceLoop:
         self.tts = create_tts(settings, self.log, lazy=self.lazy)
         # 技能与提醒
         self.skills: Skills | None = Skills(settings, self.log) if enable_skills else None
+        # 工具层：技能没接住的话交给模型时，让它能自己查/记（见 voice_loop/tools.py）
+        self.tools: ToolRegistry | None = (
+            ToolRegistry(settings, self.skills, self.log) if self.skills else None
+        )
         self.scheduler: ReminderScheduler | None = (
             ReminderScheduler(self.skills, settings, self._on_reminder, self.log)
             if self.skills
@@ -648,6 +660,34 @@ class VoiceLoop:
         self._stream_answer(stats, user_text, on_delta=on_delta)
         return stats
 
+    def _tool_specs(self) -> list[dict] | None:
+        """这一轮要不要给模型工具（[llm] router = tools / chat）。"""
+        if self.tools is None:
+            return None
+        if str(self.settings.llm.router or "tools").lower() != "tools":
+            return None
+        return self.tools.specs()
+
+    def _run_tools(self, stats: TurnStats, calls: list[dict], t0: float) -> str:
+        """执行模型选中的工具，返回要念的话。
+
+        只跑一轮（不再把结果喂回去让它改写）：模型容易把「九月二十三日」改说成别的，
+        而工具产出的 reply 已经是可以直接念的一句话了。
+        """
+        assert self.tools is not None
+        results = self.tools.call_all(calls)
+        stats.extra["tool"] = describe_calls(calls)
+        stats.extra["tool_ok"] = all(r.ok for r in results)
+        stats.extra["tool_seconds"] = round(time.perf_counter() - t0, 3)
+        for r in results:
+            if not r.ok:
+                self.log.warning(f"[工具] 失败：{r.error or r.reply}")
+        reply = " ".join(r.reply for r in results if r.reply).strip()
+        if not reply:
+            reply = "这件事我没做成，你再说一遍？"
+        print(f"  [工具] {describe_calls(calls)} -> {reply[:60]}", flush=True)
+        return reply
+
     def _respond_vision(
         self, stats: TurnStats, skill, user_text: str, on_delta=None
     ) -> TurnStats:
@@ -733,6 +773,15 @@ class VoiceLoop:
         t0 = time.perf_counter()
         pieces: list[str] = []
         first_audio: float | None = None
+        calls: list[dict] = []
+        # 有些模型会把工具调用**写成一段 JSON 文字**（而不是真的调工具）。
+        # 这种文字绝对不能念出来：先攒着，看清了再决定是当工具调用还是当正常回答。
+        held: list[str] = []
+        holding = False
+        tool_text = False
+        # 看图那一轮不给工具（它有图要描述）
+        tools = self._tool_specs() if (not images and self.tools is not None) else None
+        prefix = [{"role": "system", "content": TOOL_HINT}] if tools else None
 
         def speak(sentence: str) -> None:
             nonlocal first_audio
@@ -747,9 +796,31 @@ class VoiceLoop:
 
         try:
             with self._speak_lock:
-                for delta in self.llm.chat_stream(
-                    prompt, images=images, model=model, num_ctx=num_ctx
+                for ev in self.llm.chat_events(
+                    prompt,
+                    images=images,
+                    model=model,
+                    num_ctx=num_ctx,
+                    tools=tools,
+                    prefix_messages=prefix,
                 ):
+                    if "tool_calls" in ev:
+                        calls.extend(ev["tool_calls"])
+                        continue
+                    if calls:
+                        continue          # 已经在调工具了，后面的解释性文字不念
+                    delta = ev["delta"]
+                    if holding or SUSPICIOUS_START.match(delta):
+                        # 可能是「把工具调用写成 JSON」：先攒着，一个字都不念
+                        holding = True
+                        held.append(delta)
+                        joined = "".join(held)
+                        tool_text = looks_like_tool_text(joined)
+                        if not tool_text and len(joined) > 8 and not SUSPICIOUS_START.match(joined):
+                            # 看清了：只是一段普通 JSON（例如用户要的示例）→ 放行
+                            holding = False
+                        if holding:
+                            continue
                     if stats.llm_first_token == 0.0:
                         stats.llm_first_token = time.perf_counter() - t0
                     pieces.append(delta)
@@ -768,10 +839,45 @@ class VoiceLoop:
                     if self._drain_playback(step=True):
                         break
 
-                if not self._interrupt.is_set():
+                if not self._interrupt.is_set() and not calls:
                     for sentence in chunker.flush():
                         speak(sentence)
                     self._drain_playback()
+
+            if not calls and held:
+                raw = "".join(held)
+                if tool_text:
+                    # 把「写成文字的 JSON」抢回来当工具调用（小模型常见毛病）
+                    recovered = parse_tool_call_text(raw, self.tools.names() if self.tools else None)
+                    self.log.warning(f"[工具] 模型把调用写成了文字，{'已抢回' if recovered else '抢不回来'}：{raw[:120]}")
+                    calls.extend(recovered)
+                else:
+                    # 只是普通 JSON 回答：补念出来
+                    pieces.extend(held)
+                    if on_delta is not None:
+                        on_delta(raw)
+                    if self.subtitle is not None:
+                        self.subtitle.append(raw)
+                    for sentence in chunker.feed(raw):
+                        speak(sentence)
+                    for sentence in chunker.flush():
+                        speak(sentence)
+                    self._drain_playback()
+
+            if calls and self.tools is not None:
+                # 模型只是「选了个工具」，真正干活的是确定性代码（见 voice_loop/tools.py）
+                if stats.llm_first_token == 0.0:
+                    stats.llm_first_token = time.perf_counter() - t0
+                reply = self._run_tools(stats, calls, t0)
+                if reply:
+                    pieces = [reply]
+                    if on_delta is not None:
+                        on_delta(reply)
+                    # 工具的话直接念：既省掉第二轮 LLM（本机约 4.6s），措辞也更可控
+                    if not self._interrupt.is_set():
+                        if first_audio is None:
+                            first_audio = time.perf_counter() - t0
+                        self.speak_text(reply)
         finally:
             self._barge_finish()
             if self._interrupt.is_set():

@@ -133,19 +133,58 @@ class OllamaClient:
         images: list[str] | None = None,
         model: str | None = None,
         num_ctx: int | None = None,
+        tools: list[dict] | None = None,
+        extra_messages: list[dict] | None = None,
     ) -> Iterator[str]:
-        """流式返回回答增量。
+        """流式返回回答增量（只出文字，工具调用事件被丢掉）。
 
-        ``images``：base64 图片（一张或多张）。带上图片时会用 ``model`` 指定的
-        视觉模型（默认还是 ``cfg.model``，调用方负责传对）。
+        要拿到 ``tool_calls`` 用 :meth:`chat_events`。
 
         注意：本方法不修改历史记录，调用方需在收尾时调用 :meth:`commit`，
         这样即使中途被打断也能如实记录对话。
         """
-        messages = self._build_messages(user_text, images)
+        for ev in self.chat_events(
+            user_text,
+            images=images,
+            model=model,
+            num_ctx=num_ctx,
+            tools=tools,
+            extra_messages=extra_messages,
+        ):
+            if "delta" in ev:
+                yield ev["delta"]
+
+    def chat_events(
+        self,
+        user_text: str = "",
+        images: list[str] | None = None,
+        model: str | None = None,
+        num_ctx: int | None = None,
+        tools: list[dict] | None = None,
+        extra_messages: list[dict] | None = None,
+        messages: list[dict] | None = None,
+        prefix_messages: list[dict] | None = None,
+    ) -> Iterator[dict]:
+        """流式返回事件：``{"delta": "文字"}`` 或 ``{"tool_calls": [...]}``。
+
+        为什么用事件而不是直接返回 tool_calls：Ollama 把工具调用放在**最后一个** chunk 里，
+        而文字是边生成边到的。用事件流就能做到「模型要直接回答 -> 边说边播；
+        模型要调工具 -> 一个字都没念，直接去执行」。
+
+        ``extra_messages``：接在历史之后、本次输入之前（例如把工具结果喂回去）。
+        """
+        if messages is not None:
+            msgs = [dict(m) for m in messages]
+        else:
+            msgs = self._build_messages(user_text, images)
+            if extra_messages:
+                msgs[-1:-1] = [dict(m) for m in extra_messages]
+        if prefix_messages:
+            # 放在最前面：例如「你可以调用工具」这类说明，跟用户的人设各自独立
+            msgs = [dict(m) for m in prefix_messages] + msgs
         payload = {
             "model": model or self.cfg.model,
-            "messages": messages,
+            "messages": msgs,
             "stream": True,
             "keep_alive": self.cfg.keep_alive,
             "options": {
@@ -155,7 +194,8 @@ class OllamaClient:
                 "num_predict": self.cfg.num_predict,
             },
         }
-        answer: list[str] = []
+        if tools:
+            payload["tools"] = tools
         try:
             with requests.post(
                 f"{self.base}/api/chat", json=payload, stream=True, timeout=(5, 300)
@@ -170,15 +210,38 @@ class OllamaClient:
                         continue
                     if chunk.get("error"):
                         raise OllamaError(str(chunk["error"]))
-                    piece = (chunk.get("message") or {}).get("content", "")
+                    message = chunk.get("message") or {}
+                    calls = message.get("tool_calls") or []
+                    if calls:
+                        yield {"tool_calls": calls}
+                    piece = message.get("content", "")
                     if piece:
-                        yield piece
+                        yield {"delta": piece}
                     if chunk.get("done"):
                         break
         except OllamaError:
             raise
         except Exception as exc:  # noqa: BLE001
             raise OllamaError(f"调用 Ollama 失败：{exc}") from exc
+
+    def chat_tools(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        model: str | None = None,
+        num_ctx: int | None = None,
+    ) -> tuple[str, list[dict]]:
+        """不走流式版：一次拿到「文字」和「工具调用」（评估脚本用，方便）。"""
+        content: list[str] = []
+        calls: list[dict] = []
+        for ev in self.chat_events(
+            model=model, num_ctx=num_ctx, tools=tools, messages=messages
+        ):
+            if "delta" in ev:
+                content.append(ev["delta"])
+            elif "tool_calls" in ev:
+                calls.extend(ev["tool_calls"])
+        return "".join(content).strip(), calls
 
     def commit(self, user_text: str, answer: str) -> None:
         """把这一轮写进对话历史。"""

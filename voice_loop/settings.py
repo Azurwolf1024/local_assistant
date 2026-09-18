@@ -67,6 +67,10 @@ class LlmConfig:
     keep_alive: str = "30m"
     history_turns: int = 6
     system_prompt: str = ""
+    # 技能没接住的话交给模型时，要不要给它工具（查日程/记备忘/排日程）。
+    # tools = 给（默认，实测闲聊不会多绕一圈，只有真调工具才多一轮）
+    # chat  = 不给，保持老的纯聊天行为
+    router: str = "tools"
 
 
 @dataclass
