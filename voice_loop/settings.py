@@ -67,6 +67,13 @@ class LlmConfig:
     keep_alive: str = "30m"
     history_turns: int = 6
     system_prompt: str = ""
+    # 加速相关（装了支持的运行时才有用，没装只是忽略）：
+    #   num_gpu    = -1 不传（默认）；>0 交给 Ollama 决定层数；99 = 尽量全放显存
+    #   num_thread = 0 不传；纯 CPU 时想指定线程数就填（比如 8）
+    #   num_batch  = 0 不传；预填慢的话可以调到 512
+    num_gpu: int = -1
+    num_thread: int = 0
+    num_batch: int = 0
     # 技能没接住的话交给模型时，要不要给它工具（查日程/记备忘/排日程）。
     # tools = 给（默认，实测闲聊不会多绕一圈，只有真调工具才多一轮）
     # chat  = 不给，保持老的纯聊天行为

@@ -47,7 +47,9 @@ sensevoice_use_itn = true     # 逆文本正则化：数字/日期更自然
 
 # Whisper large-v3-turbo（OpenVINO int8）
 whisper_model = "models/asr/whisper-large-v3-turbo-int8-ov"
-whisper_device = "CPU"        # CPU / GPU / AUTO
+# auto = 有 Intel 核显就用 GPU，否则 CPU（本机 Arc 130T：实测 3.79s -> 1.05s，3.6 倍）
+# 也可写 CPU / GPU / NPU，但 NPU 跑这个导出会**崩进程**，所以 auto 绝不选它
+whisper_device = "auto"
 whisper_min_duration = 6.0    # 音频超过该秒数时，hybrid 模式会追加 Whisper 校验
 whisper_word_timestamps = false
 
@@ -61,6 +63,14 @@ num_ctx = 4096
 num_predict = 512
 keep_alive = "30m"            # 让模型常驻显存/内存，首字延迟更低
 history_turns = 6             # 携带的历史轮数（user+assistant 各算一轮）
+# 加速相关（装了支持的运行时才有用，没装只忽略）：
+#   num_gpu    = -1 不传（默认）；>0 交给 Ollama 决定；99 = 尽量全放显存
+#   num_thread = 0 不传；纯 CPU 时想指定线程数就填（本机 14 核就试 6~10）
+#   num_batch  = 0 不传；预填慢可以调到 512
+# 本机现状：Ollama 是 100% CPU（Windows 上 Intel 核显要装 IPEX-LLM 版 ollama，见 README 第 12 节）
+num_gpu = -1
+num_thread = 0
+num_batch = 0
 # 技能层没接住的话交给模型时，给不给它工具（查日程 / 记备忘 / 排日程）。
 #   tools = 给（默认）：模型能查到**真实**日程，而不是凭想象编（以前它会编出一场会议）；
 #           实测闲聊不会多绕一圈，只有真要调工具时才多一轮（本机约 6s）。

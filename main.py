@@ -438,6 +438,84 @@ def cmd_see(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_gpu(settings: Settings, args: argparse.Namespace) -> int:
+    """看这台机器有哪些加速器、各阶段现在用的是哪个、以及要不要换。"""
+    from voice_loop.accel import detect, pick_whisper_devices, report
+
+    print("=" * 66)
+    print(" 加速设备")
+    print("=" * 66)
+    for line in report(settings, logging.getLogger("voice_loop")):
+        print("  " + line)
+
+    acc = detect(settings.llm)
+    print("\n  建议：")
+    dev = str(settings.asr.whisper_device)
+    if acc.has_intel_gpu and dev.strip().upper() != "GPU":
+        print("    · Whisper 可以改成 GPU：实测 CPU 3.79s → GPU 1.05s（同一段 9.6s 音频）")
+        print('      改 config.toml 里的 [asr] whisper_device = "GPU"（或保留 "auto"，它也会选 GPU）')
+    elif acc.has_intel_gpu:
+        print("    · Whisper 已经在用 GPU ✓")
+    if not acc.has_intel_gpu and not acc.has_cuda:
+        print("    · 没有独立/核显可用于推理：Whisper 只能 CPU（这就是当前最快的选择）")
+    if acc.ollama_seen and acc.ollama_vram and not any(acc.ollama_vram.values()):
+        print("    · Ollama 目前在 100% CPU。Windows 上想让它用 Intel Arc，"
+              "要换 IPEX-LLM 版 ollama（见 README 第 12 节）")
+    print("    · 纯 CPU 时还能调：[llm] num_thread（线程数）、num_batch（批大小）")
+
+    if not args.bench:
+        print("\n  （加 --bench 会真的跑一遍 Whisper CPU/GPU 对比，约 1 分钟）")
+        return 0
+
+    print("\n" + "=" * 66)
+    print(" Whisper 实测（同一段音频，各跑 3 次取热态）")
+    print("=" * 66)
+    require_models(settings, need_asr=True, need_tts=False)
+    import numpy as np
+
+    from voice_loop.asr.whisper_ov import WhisperOpenVinoEngine
+    from voice_loop.audio import load_wav
+
+    wav = settings.resolve("models/asr/sensevoice-small/zh.wav")
+    if not wav.exists():
+        wav = settings.sessions_dir / "prosody_new_整句合成.wav"
+    if not wav.exists():
+        print(f"  × 找不到测试音频（{wav}），先跑一次 main.py tts 生成一个")
+        return 2
+    audio, rate = load_wav(wav, 16000)
+    seconds = len(audio) / rate
+    print(f"  音频：{wav.name}（{seconds:.1f} 秒）\n")
+
+    from voice_loop.accel import detect as _detect
+
+    for device in (args.devices or pick_whisper_devices(settings.asr.whisper_device)):
+        if device not in _detect().openvino and device != "CPU":
+            print(f"  [{device}] 不可用，跳过")
+            continue
+        if str(device).upper() == "NPU":
+            print("  [NPU] 已跳过：这个 Whisper 导出在 NPU 上会把进程搞崩（实测过）")
+            continue
+        try:
+            t0 = time.perf_counter()
+            engine = WhisperOpenVinoEngine(
+                settings.resolve(settings.asr.whisper_model), device=device, language="zh"
+            )
+            load_s = time.perf_counter() - t0
+            times = []
+            for _ in range(3):
+                r = engine.transcribe(np.ascontiguousarray(audio))
+                times.append(r.latency)
+                text = r.text
+            warm = min(times[1:]) if len(times) > 1 else times[0]
+            print(f"  √ {device:3s} 加载 {load_s:5.1f}s  首次 {times[0]:5.2f}s  热态 {warm:5.2f}s"
+                  f"  RTF {warm / seconds:.3f}")
+            print(f"        「{text[:56]}」")
+            del engine
+        except Exception as exc:  # noqa: BLE001
+            print(f"  × {device:3s} 失败：{type(exc).__name__}: {exc}")
+    return 0
+
+
 def cmd_skills(settings: Settings, args: argparse.Namespace) -> int:
     """查看/测试生活技能（时间、闹钟、备忘、日程）。"""
     from voice_loop.skills import Skills
@@ -820,6 +898,17 @@ def cmd_selftest(settings: Settings, args: argparse.Namespace) -> int:
         ok = False
         print(f"  × {exc}")
 
+    print("\n[9] 加速设备")
+    try:
+        from voice_loop.accel import detect, report
+
+        for line in report(settings, logging.getLogger("voice_loop")):
+            print("  " + line)
+        if detect(settings.llm).has_intel_gpu:
+            print("  · 核显可用：想知道实际快多少，跑 python main.py gpu --bench")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ! 加速设备探测失败：{exc}")
+
     print("\n" + "=" * 66)
     print(" 结果：" + ("全部通过，可以运行 `python main.py listen` 了" if ok else "存在问题，请按上面的提示修复"))
     print("=" * 66)
@@ -904,6 +993,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("devices", help="列出音频设备")
     p.set_defaults(func=cmd_devices)
+
+    p = sub.add_parser("gpu", help="看加速器（Intel 核显 / NPU / CUDA）在用哪个，可实测")
+    p.add_argument("--bench", action="store_true", help="真的跑一遍 Whisper 设备对比（约 1 分钟）")
+    p.add_argument("--devices", nargs="*", default=None, help="只跑这几个设备，例如 --devices GPU CPU")
+    p.set_defaults(func=cmd_gpu)
 
     p = sub.add_parser("selftest", help="全链路自检")
     p.add_argument("--no-play", action="store_true")

@@ -186,6 +186,8 @@ python main.py see --fix --screen            # 只做本地部分（拍图/找�
 python main.py asr test.wav                  # 音频转文字
 python main.py tts "你好呀" -o a.wav          # 文本转语音
 python main.py devices                       # 查看音频设备
+python main.py gpu                           # 看加速器（核显/NPU/CUDA）在用哪个
+python main.py gpu --bench                   # 实测 Whisper CPU vs 核显
 ```
 
 `listen` 模式下：
@@ -387,6 +389,7 @@ python scripts/test_subtitle.py --check
 
 ```powershell
 python scripts/test_offline.py         # 几秒钟，不加载模型，测分块/时间/技能/唤醒
+python scripts/test_accel.py           # 加速设备选择（auto 绝不选 NPU / 回退顺序 / 报告编码）
 python scripts/test_tools.py           # 工具层（模型选工具、确定性代码干活），--live 会让真模型选一遍
 python scripts/test_vision.py          # 看图：找文件/确认流程/编码/路由（不用视觉模型）
 python scripts/eval_router.py --builtin  # 评估「模型选工具」准不准（也会跑闲聊，看会不会乱调）
@@ -744,31 +747,34 @@ python scripts/tts_probe.py "你好[[,]]世界"   # 看注入停顿的效果
 
 ---
 
-## 7. 实测性能（i7 / 纯 CPU）
+## 7. 实测性能（Core Ultra 5 225H + Arc 130T 核显）
 
 | 环节 | 实测 |
 | --- | --- |
 | 本地技能（几点了 / 定闹钟 / 查课表） | **0 s**（正则直接命中，不调模型） |
 | SenseVoiceSmall（5.6s 音频） | 0.08 s（RTF 0.014） |
-| Whisper turbo int8（5.6s 音频） | 2.8 ~ 3.4 s（RTF ≈ 0.5） |
+| Whisper turbo int8（5.6s 音频）**CPU** | 3.3 s（RTF 0.59） |
+| Whisper turbo int8（5.6s 音频）**Arc 核显** | **0.49 s（RTF 0.087，快 6.8 倍）** |
+| Whisper 首次在核显上编译图 | 约 10 s（只在第一次，之后有缓存） |
 | Piper 合成 | RTF 0.04~0.07，首块 0.12 s |
-| qwen2.5:7b 首字 | 0.1 ~ 0.5 s（预热后） |
+| qwen2.5:7b 首字 | 热态 2~4 s（冷启动加载 4.7 GB 要约 20 s） |
 | **端到端首音** | **0.7 ~ 2.1 s** |
-| 首次加载（编译 OpenVINO 图） | 约 40 s，之后有缓存会快很多 |
 
 优化建议，按收益排序：
 
-1. `keep_alive = "30m"` + 先跑一次 `selftest`，避免模型反复加载。
-2. `strategy = "sensevoice"`：中文短句场景直接砍掉 Whisper 的 1~3 秒。
-3. 想更快可以让 Whisper 走 openvino-genai（需要 stateful 导出）：
+1. **Whisper 走核显**（默认 `[asr] whisper_device = "auto"`，有 Intel 核显就会用上）：
+   实测 3.3 s → 0.49 s。想看自己这台快多少：`python main.py gpu --bench`。
+2. `keep_alive = "30m"` + 先跑一次 `selftest`，避免模型反复加载。
+3. `strategy = "sensevoice"`：中文短句场景直接砍掉 Whisper 的 1~3 秒。
+4. 想更快可以让 Whisper 走 openvino-genai（需要 stateful 导出）：
    ```powershell
    optimum-cli export openvino --trust-remote-code --model openai/whisper-large-v3-turbo `
        --weight-format int8 whisper-large-v3-turbo-int8-ov-stateful
    ```
    当前模型是 `--disable-stateful` 导出的，GenAI 的 `WhisperPipeline` 会报
    `beam_idx not found`，所以代码走的是 Optimum 路径（会自动识别并提示）。
-4. `ollama pull qwen2.5:7b-instruct-q4_K_M` 更快更省内存。
-5. `whisper_device = "GPU"`（Intel 核显）或给 Ollama 换上独显。
+5. 纯 CPU 跑模型时调 `[llm] num_thread`（线程数）/ `num_batch`（预填批大小）。
+6. `ollama pull qwen2.5:7b-instruct-q4_K_M` 更快更省内存。
 
 ---
 
@@ -937,4 +943,55 @@ Piper 的 `zh_CN-huayan-medium` 是官方唯一的中文女声。调 `noise_w_sc
 
 用到的模型各自遵守自己的协议：Whisper 与 SenseVoiceSmall 是 MIT，
 Piper 与它自带的中文声线是 MIT，Silero VAD 是 MIT，Qwen2.5 是 Apache-2.0。
+
+---
+
+## 12. GPU / 加速
+
+一条命令看清这台机器的现状和该改什么：
+
+```powershell
+python main.py gpu            # 有哪些加速器、每段现在用哪个
+python main.py gpu --bench    # 真的跑一遍 Whisper CPU/GPU 对比（约 1 分钟）
+```
+
+本机（Core Ultra 5 225H + **Intel Arc 130T 核显** + AI Boost NPU）实测：
+
+| 环节 | CPU | Arc 核显 | 说明 |
+| --- | --- | --- | --- |
+| Whisper turbo int8（5.6 s 音频） | 3.3 s | **0.49 s** | 快 6.8 倍；首次要编译图约 10 s |
+| SenseVoiceSmall | 0.08 s | — | sherpa-onnx 官方轮子只有 CPU，但已经够快 |
+| Piper TTS | RTF 0.04 | — | 瓶颈不在 TTS，加速收益很小 |
+| qwen2.5:7b / qwen2.5vl:3b | 首字 2~4 s / 看图 33 s | **用不上** | Windows 上 Ollama 对 Intel 核显只报 100% CPU |
+
+### 已经默认打开的
+
+- **`[asr] whisper_device = "auto"`**：OpenVINO 报出核显就用 GPU，编译失败自动回退 CPU。
+  hybrid 模式下超过 `whisper_min_duration`（默认 6 s）的音频会追加 Whisper 校验，
+  这一步就是省下来的地方。
+- 想强制：写 `"GPU"` / `"CPU"` / `"NPU"`。**别写 NPU** —— 这个 int8 导出在 NPU 上会让
+  进程直接崩（vpux-compiler 报 `Channels count ... != 128`），不是抛异常、没法回退。
+  `auto` 因此永远不会选它。
+
+### 想再快，三个方向
+
+1. **让 Ollama 用上核显**（收益最大：LLM 首字、看图 33 s 都在这条路上）。
+   Windows 上的官方 Ollama 不认 Intel 核显，要用 Intel 的 IPEX-LLM 版：
+   ```powershell
+   # 装完后是另一个 ollama.exe（自带 SYCL 后端），把它换到 PATH 前面
+   pip install --pre --upgrade ipex-llm[cpp]
+   ```
+   装好后 `ollama ps` 的 PROCESSOR 列会从 `100% CPU` 变成 `100% GPU`，
+   这时 `[llm] num_gpu` 才有意义（`99` = 尽量全放显存/共享内存）。
+   代价：模型要重新下一遍（IPEX-LLM 用自己的量化格式）。
+2. **纯 CPU 调参**：`[llm] num_thread = 6~10`（本机 14 核）、`num_batch = 512`，
+   以及把 `[llm] num_ctx` 从 4096 降到 2048（上下文越小预填越快）。
+3. **换更小的模型**：`qwen3.5:2b`（文本）、`qwen2.5vl:3b`（看图）已经是很小的一档；
+   只在文字问答的场景还可以砍掉视觉模型。
+
+### 不打算做的
+
+- **NPU 跑 Whisper**：会崩，已写进测试（`scripts/test_accel.py` 断言 auto 不选 NPU）。
+- **TTS 上 GPU**：Piper 是 RTF 0.04，加速收益远小于折腾成本；
+  `[tts] use_cuda` 只对装了 CUDA 版 onnxruntime 的机器有用，配错时 `main.py gpu` 会提醒你。
 
