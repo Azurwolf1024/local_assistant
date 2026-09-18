@@ -41,7 +41,7 @@ from .tools import (
 )
 from .tts import create_tts
 from . import ui
-from .wake import WakeSession, WakeWordMatcher
+from .wake import WakeSession, WakeWordMatcher, is_standby
 
 
 # 未唤醒状态下滤掉纯语气词，否则「嗯。」「哎。」会淹没日志里有用的行
@@ -390,12 +390,8 @@ class VoiceLoop:
         if self.toast is not None:
             title = "日程提醒" if ("日程" in text or "课" in text or "会议" in text) else "提醒"
             self.toast.show(title, text)
-        self.speak_text(text, fresh=True)
         # 待唤醒状态下播报完就把 TTS 释放掉，别让它一直占内存
-        if self.lazy and not self._active:
-            unload = getattr(self.tts, "unload", None)
-            if callable(unload):
-                unload()
+        self._speak_brief(text)
 
     # ======================================================================
     # 播放 + 语音打断
@@ -978,6 +974,27 @@ class VoiceLoop:
         t = text.strip().strip("。！!？?，,、 ")
         return any(p and p in t and len(t) <= len(p) + 4 for p in self.settings.chat.exit_phrases)
 
+    def _is_standby(self, text: str) -> bool:
+        """「没事了」这类收回唤醒的话（见 config.toml 的 [wake] standby_phrases）。"""
+        return is_standby(text, self.settings.wake.standby_phrases)
+
+    def _speak_brief(self, text: str) -> None:
+        """待唤醒状态下的一句话：说完就把 TTS 收回（别为了一句话常驻几百 MB）。"""
+        if not text:
+            return
+        self.speak_text(text, fresh=True)
+        if self.lazy and not self._active:
+            unload = getattr(self.tts, "unload", None)
+            if callable(unload):
+                unload()
+
+    def _standby_now(self, text: str) -> None:
+        """收回这次唤醒：关会话 + 说一句话；重型模型由主循环下一轮释放。"""
+        self.session.close()
+        reply = (self.settings.wake.standby_reply or "").strip()
+        print(f"\n你说：{text}\n助手：{reply or '（回待唤醒）'}\n", flush=True)
+        self._speak_brief(reply)
+
     def _report_wake_miss(self, text: str) -> None:
         """未唤醒时给一点有用的提示：听到什么 + 离唤醒词有多近。
 
@@ -987,6 +1004,10 @@ class VoiceLoop:
         """
         plain = (text or "").strip()
         key = _NOISE_STRIP.sub("", plain)
+        # 「没事了」这种是收回唤醒，不是喊错唤醒词，别刷一行提示
+        if self._is_standby(plain):
+            self.log.debug(f"[待命] 已忽略：{plain}")
+            return
         # 单个字的「嗯/哎/啊」以及「好的/谢谢」这类是环境杂音，写进日志只会淹没有用的行
         if not plain or not is_meaningful(text) or key in _FILLER_WORDS:
             self.log.debug(f"[未唤醒] {text}")
@@ -1040,6 +1061,12 @@ class VoiceLoop:
         if self._is_exit(text):
             print(f"\n你说：{text}\n助手：再见！\n")
             return True
+
+        # 「没事了」：收回这次唤醒，回待唤醒（不是退出服务，也不送 LLM）。
+        # 只在唤醒会话里算——普通对话（chat / 文本模式）没开过会话，那它就是普通一句话。
+        if self.session.active and self._is_standby(text):
+            self._standby_now(text)
+            return False
 
         tag = ""
         if result is not None:
@@ -1150,6 +1177,11 @@ class VoiceLoop:
             + ("（则释放模型回到待唤醒）" if self.lazy else "（则结束服务）")
             + "\n"
             + (
+                f"  收回  : 说「{self.settings.wake.standby_phrases[0]}」立刻回待唤醒，不用等超时\n"
+                if self.settings.wake.standby_phrases
+                else ""
+            )
+            + (
                 "  打断: 你直接开口就停下听你说"
                 if self.bargein is not None
                 else "  打断: 只能按回车（[bargein] enabled=false）"
@@ -1241,9 +1273,19 @@ class VoiceLoop:
                                 follow_result = (ftext, fresult, fseconds)
                                 request = ""
 
+                    # 「凯尔希，没事了」：只是想收回这次唤醒，
+                    # 别为了它把 Whisper / TTS / Ollama 全加载一遍再卸掉
+                    first = (
+                        follow_result[0]
+                        if follow_result is not None
+                        else (request if len(request) >= 2 else "")
+                    )
+                    if first and self._is_standby(first):
+                        self._standby_now(first)
+                        continue
+
                     # 唤醒后再加载重型模型（Whisper 与 LLM 在后台预热）
                     self._activate("唤醒" + mark)
-
                     if follow_result is not None:
                         ftext, fresult, fseconds = follow_result
                         self.session.open()

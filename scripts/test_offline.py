@@ -633,6 +633,43 @@ def test_wake() -> None:
 
 
 # --------------------------------------------------------------------------- #
+def test_standby() -> None:
+    print("\n[5b] 收回唤醒（「没事了」这类）")
+    from voice_loop.wake import is_standby
+
+    phrases = load_settings().wake.standby_phrases
+    print(f"    短语：{'、'.join(phrases)}")
+    cases = [
+        # 该收回的
+        ("没事了", True),
+        ("没事了。", True),
+        ("嗯，没事了", True),
+        ("那没事了", True),
+        ("没事了，谢谢", True),
+        ("没事", True),
+        ("没什么事了", True),
+        ("就这些", True),
+        ("先这样吧", True),
+        ("退下", True),
+        # 不该收回的
+        ("他没事了", False),        # 说的是别人
+        ("没事吧", False),          # 在问我有没有事
+        ("那件事没事了之后再聊", False),
+        ("不用了", False),          # 可能是回答「要改到下午三点吗」
+        ("好了", False),
+        ("算了", False),
+        ("今天天气怎么样", False),
+        ("凯尔希", False),
+        ("", False),
+    ]
+    for text, expect in cases:
+        check(f"{text or '（空）':20s} {'收回' if expect else '正常处理'}",
+              is_standby(text, phrases), expect)
+    check("短语清单为空时一律不收回", is_standby("没事了", []), False)
+    check("短语可以自己配", is_standby("收工了", ["收工了"]), True)
+
+
+# --------------------------------------------------------------------------- #
 def test_lifecycle() -> None:
     """验证「唤醒加载 / 空闲回收」状态机（不碰硬件，不加载模型）。"""
     print("\n[6] 唤醒服务生命周期")
@@ -654,6 +691,22 @@ def test_lifecycle() -> None:
         loop._deactivate()  # noqa: SLF001
         check("回待唤醒后释放", loop._active, False)  # noqa: SLF001
 
+        # 收回唤醒：说「没事了」应该立刻回待唤醒，而不是等 3 分钟超时
+        # （测里关掉播报，否则会真的从扬声器里说出一句）
+        loop.tts_enabled = False
+        loop._activate("收回测试")  # noqa: SLF001
+        loop.session.open()
+        check("收回前在会话里", loop.session.active, True)
+        check("「没事了」不退出进程（返回 False）", loop._process("没事了", None), False)  # noqa: SLF001
+        check("会话已关闭", loop.session.active, False)
+        check(
+            "主循环下一轮会回待唤醒",
+            loop._active and not loop.session.active,  # noqa: SLF001
+            True,
+        )
+        check("回待唤醒不退出进程（idle_action=standby）", loop._deactivate(), False)  # noqa: SLF001
+        loop.tts_enabled = True
+
         # idle_action = exit 时应该结束进程
         settings.wake.idle_action = "exit"
         loop._activate("测试")  # noqa: SLF001
@@ -674,6 +727,7 @@ def main() -> int:
     test_schedule_model()
     test_refer_and_batch()
     test_wake()
+    test_standby()
     test_lifecycle()
     print("\n" + "=" * 66)
     if _failures:

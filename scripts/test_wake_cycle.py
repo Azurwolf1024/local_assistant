@@ -13,6 +13,9 @@
 [2] 状态机：用真的 service() 循环 + 真的 ASR，喂合成出来的「凯尔希」音频，
     走一遍「唤醒 → 空闲回收 → 再次唤醒」，确认第二遍照样能唤醒、
     而且回收时 Whisper 确实被关掉了。
+
+[3] 收回唤醒：唤醒状态下说「没事了」，几秒内就要回待唤醒——
+    测试里把空闲超时拉到 60 秒，所以「几秒就回去了」只可能是被那句话赶回去的。
 """
 
 from __future__ import annotations
@@ -141,7 +144,7 @@ def test_state_machine(idle_seconds: float = 4.0) -> None:
     import json
 
     from voice_loop.pipeline import VoiceLoop
-    from voice_loop.wake import normalize
+    from voice_loop.wake import is_standby, normalize
 
     settings = load_settings()
     settings.subtitle.enabled = False
@@ -162,6 +165,7 @@ def test_state_machine(idle_seconds: float = 4.0) -> None:
 
     wake_audio = synth_wake("凯尔希")
     print(f"  合成唤醒词音频：{wake_audio.size / 16000:.2f}s")
+    standby_audio = synth_wake("没事了")
 
     # 合成音色每次都不一样，ASR 可能听成「开儿戏」之类。先让它真的识别一次，
     # 把「实际听到的说法」当成别名喂进去 —— 这样测的是状态机本身，
@@ -169,6 +173,20 @@ def test_state_machine(idle_seconds: float = 4.0) -> None:
     heard, _res, _sec = loop._transcribe(wake_audio)  # noqa: SLF001
     heard = heard.strip()
     check("合成音频能被 ASR 识别出内容", bool(heard), f"听到 {heard!r}")
+
+    # 收回短语同理：合成音色也会把「没事了」听岔，那是 ASR 的事（test_wake.py 的活），
+    # 这里把实际听到的说法临时算作收回短语，测的是状态机本身。
+    heard_standby, _res2, _sec2 = loop._transcribe(standby_audio)  # noqa: SLF001
+    heard_standby = heard_standby.strip()
+    print(f"  合成「没事了」被听成：{heard_standby!r}")
+    if not is_standby(heard_standby, settings.wake.standby_phrases):
+        settings.wake.standby_phrases = [*settings.wake.standby_phrases, heard_standby]
+        print("    （已把它临时加进收回短语）")
+    check(
+        "合成「没事了」会被当成收回短语",
+        is_standby(heard_standby, settings.wake.standby_phrases),
+        repr(heard_standby),
+    )
     tmp_wake = settings.sessions_dir / "_test_wake_cycle.json"
     tmp_wake.write_text(
         json.dumps(
@@ -200,6 +218,8 @@ def test_state_machine(idle_seconds: float = 4.0) -> None:
     # （塞进去会被当成用户说的话发给大模型，白白跑一次 LLM）。
     delivered = [0]
     allow_second = threading.Event()
+    want_standby = threading.Event()   # 测试准备好之后才递「没事了」
+    standby_sent = [0]      # 「没事了」只递一次
 
     def scripted_listen(quick: bool = False, timeout: float | None = None):
         if quick and not loop._active:  # noqa: SLF001
@@ -209,6 +229,16 @@ def test_state_machine(idle_seconds: float = 4.0) -> None:
             if delivered[0] == 1 and allow_second.is_set():
                 delivered[0] = 2
                 return wake_audio
+        # 活跃状态下递一句「没事了」（这时是等指令，不是等唤醒词）；
+        # 只在测试把空闲超时拉长之后才递，否则分不清「被赶回去」还是「超时回去」
+        if (
+            not quick
+            and loop._active  # noqa: SLF001
+            and want_standby.is_set()
+            and standby_sent[0] == 0
+        ):
+            standby_sent[0] = 1
+            return standby_audio
         # 模拟「这段没听到话」：睡一小会儿再返回，等价于真实的等待超时
         time.sleep(0.03)
         return None
@@ -225,11 +255,14 @@ def test_state_machine(idle_seconds: float = 4.0) -> None:
         check("第一次唤醒后进入活跃", loop._active, f"_active={loop._active}")  # noqa: SLF001
         check("唤醒后 Whisper 被打开", loop.asr.whisper_enabled)
 
-        # 等空闲超时：脚本一直在报「没听到」，session 到点就该回收
+        # 等空闲超时：脚本一直在报「没听到」，session 到点就该回收。
+        # 注意：_active 会先变 False，打印/卸模型在后面，所以三者都要等。
         print(f"  · 等 {idle_seconds + 3:.0f} 秒看它会不会回到待唤醒…")
-        deadline = time.time() + idle_seconds + 4.0
+        deadline = time.time() + idle_seconds + 8.0
         while time.time() < deadline and (
-            loop._active or loop.asr.whisper_enabled  # noqa: SLF001
+            loop._active  # noqa: SLF001
+            or loop.asr.whisper_enabled
+            or "[待唤醒] 已释放" not in buf.getvalue()
         ):
             time.sleep(0.1)
         check("空闲超时后回到待唤醒", not loop._active, f"_active={loop._active}")  # noqa: SLF001
@@ -258,6 +291,35 @@ def test_state_machine(idle_seconds: float = 4.0) -> None:
             "顺序正确：唤醒 → 回收 → 再次唤醒",
             0 <= first_wake < release_at < second_wake,
             f"位置 首次唤醒={first_wake} 回收={release_at} 再次唤醒={second_wake}",
+        )
+
+        # ---- 3) 收回唤醒：现在在活跃状态，说一句「没事了」 ----
+        # 把空闲超时拉到 60 秒并重开窗口：这样「几秒内就回待唤醒」
+        # 只可能是被「没事了」赶回去的，而不是超时兜的。
+        loop.session.timeout = 60.0  # noqa: SLF001
+        loop._idle_timeout = 60.0  # noqa: SLF001
+        loop.session.open()  # noqa: SLF001
+        released_before = buf.getvalue().count("[待唤醒] 已释放")
+        print("  · 现在（活跃状态下）说一句「没事了」…")
+        want_standby.set()
+        deadline = time.time() + 10.0
+        while time.time() < deadline and loop._active:  # noqa: SLF001
+            time.sleep(0.1)
+        while time.time() < deadline and "[待唤醒] 已释放" not in buf.getvalue():
+            time.sleep(0.1)
+        out_now = buf.getvalue()
+        check(
+            "★ 说「没事了」立刻回待唤醒（空闲超时可是 60 秒）",
+            not loop._active,  # noqa: SLF001
+            f"_active={loop._active}",  # noqa: SLF001
+        )
+        check("收回时没有退出服务", not loop._stop.is_set())  # noqa: SLF001
+        check("待唤醒时 Whisper 又被关掉", not loop.asr.whisper_enabled)
+        check(
+            "日志里有这次收回（应答 + 再次回收）",
+            settings.wake.standby_reply in out_now
+            and out_now.count("[待唤醒] 已释放") > released_before,
+            f"回收次数 {out_now.count('[待唤醒] 已释放')}",
         )
     finally:
         allow_second.set()

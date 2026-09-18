@@ -97,6 +97,39 @@ def _trim(text: str) -> str:
     return t.strip()
 
 
+# 「收回唤醒」的整句判断：只认这几个语气词，别的字一概不算
+_STANDBY_TAIL = frozenset({"了", "啦", "啊", "呀", "哈", "哦", "噢", "嗯", "谢谢", "多谢", "好了"})
+_STANDBY_HEAD = frozenset({"那", "哦", "噢", "嗯", "唔", "呃", "好", "好的", "行", "我", "就"})
+
+
+def _plain(text: str) -> str:
+    """去标点 + 剥两端口头禅，用于整句判断。"""
+    return _trim(normalize(text))
+
+
+def is_standby(text: str, phrases: list[str] | None, slack: int = 3) -> bool:
+    """这句话是不是「收回唤醒」（「没事了」这类）？
+
+    要求**整句**就是那句话，只允许前后多一个语气词（「那没事了」「没事了，谢谢」）。
+    故意不像 ``exit_phrases`` 那样「包含就算」：那样「他没事了」「没事吧」都会误判。
+    返回 True 时调用方应该关掉这次会话，回到待唤醒。
+    """
+    t = _plain(text)
+    if len(t) < 2:
+        return False
+    for raw in phrases or ():
+        p = _plain(str(raw))
+        if len(p) < 2 or not (len(p) <= len(t) <= len(p) + slack):
+            continue
+        if t == p:
+            return True
+        if t.startswith(p) and t[len(p) :] in _STANDBY_TAIL:
+            return True
+        if t.endswith(p) and t[: len(t) - len(p)] in _STANDBY_HEAD:
+            return True
+    return False
+
+
 @dataclass
 class WakeHit:
     word: str = ""                 # 命中的唤醒词
