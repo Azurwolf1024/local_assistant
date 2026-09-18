@@ -128,7 +128,7 @@ python main.py selftest               # 8 项检查，全过就能用了
 想让它能**看图**（摄像头 / 屏幕 / 文件），再补两件事：
 
 ```powershell
-ollama pull qwen2.5vl:7b          # 视觉模型（约 6 GB），纯文本模型看图只会编
+ollama pull qwen2.5vl:3b          # 视觉模型（约 3.2 GB），纯文本模型看图只会编
 pip install pypdf                 # 可选：读 PDF（Word 靠已装的 python-docx）
 ```
 
@@ -371,12 +371,13 @@ python scripts/clean_junk_data.py --apply    # 清理早期版本写坏的备忘
 先说前提：**看图要一个视觉模型**，文本模型收到图片只会编。装好后写进 `[vision] model`：
 
 ```powershell
-ollama pull qwen2.5vl:7b      # 约 6 GB；第一次看图要等它加载（10~20 秒），之后就快了
+ollama pull qwen2.5vl:3b      # 约 3.2 GB，CPU 上快很多（默认用这个）
+ollama pull qwen2.5vl:7b      # 约 6 GB，认得更准，但一张 1568 宽的截图要等十几秒
 ```
 
 | 你说 | 它看哪里 |
 | --- | --- |
-| 这是什么 / 看看这个 / 用摄像头看看 | 摄像头（`default_source` 可改成 `screen`） |
+| 这是什么 / 看看这个 / 用摄像头看看 | 默认来源（`default_source`，本机设的 `screen`）；说了「摄像头」就看摄像头 |
 | 看看我的屏幕上是什么 / 屏幕上写了什么 | 截屏（多显示器一起截） |
 | 看看我复制的东西 | 剪贴板里的图（复制的是文件会说一声，走文件那条路） |
 | 刚才那张图是什么 / 上一张 | **重看刚看过的那张**，不会重新拍 |
@@ -423,8 +424,8 @@ python main.py see --fix --screen              # 只做本地部分，不调模�
 | 配置 | 默认 | 作用 |
 | --- | --- | --- |
 | `enabled` | true | 总开关，关掉后看图相关的话全部交给 LLM |
-| `model` | `qwen2.5vl:7b` | 看图用的模型，必须自己 `ollama pull` |
-| `default_source` | `camera` | 只说「这是什么」时看哪里：`camera` / `screen` |
+| `model` | `qwen2.5vl:3b` | 看图用的模型，必须自己 `ollama pull` |
+| `default_source` | `screen` | 只说「这是什么」时看哪里：`screen` / `camera` |
 | `camera_index` | 0 | 第几个摄像头 |
 | `save_dir` / `keep_images` | `data/vision` / 40 | 图存哪、留多少张 |
 | `file_roots` | 桌面/下载/文档 | 找文件的范围（别的目录要说完整路径） |

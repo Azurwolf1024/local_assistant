@@ -98,6 +98,28 @@ def test_find_file() -> None:
     check("「笔记」把两个都列出来", len(names), 2)
     check("刚改过的排在旧的前面", names[0], "课程笔记.txt")
     check("query_name 会把废话去掉", vision.query_name("读一下那个课程笔记"), "课程笔记")
+
+    print("    · 只说「哪种文件」时按后缀找（真人说话经常不带名字）")
+    (root / "照片.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    (root / "表格数据.xlsx").write_text("x", encoding="utf-8")
+    (root / "笔记.json").write_text("{}", encoding="utf-8")
+    hits = vision.find_file("看看我的图片")
+    check("「图片」按图片后缀找", hits[0].name if hits else None, "照片.png")
+    hits = vision.find_file("念一下表格")
+    check("「表格」既按名字也按后缀", hits[0].name if hits else None, "表格数据.xlsx")
+    hits = vision.find_file("读一下那个 json 文件")
+    check("不带点号的后缀词也认（json）", hits[0].name if hits else None, "笔记.json")
+
+    print("    · 说「下载里的」就只在下载里找")
+    dl = tmp / "Downloads"
+    dl.mkdir(parents=True, exist_ok=True)
+    (dl / "轨迹数据.json").write_text("{}", encoding="utf-8")
+    settings.vision.file_roots = [str(root), str(dl)]
+    hits = vision.find_file("看看下载里的 json")
+    check("中文「下载」能对上英文 Downloads 目录",
+          str(dl) in str(hits[0].path) if hits else None, True)
+    check("这时不会把别的目录的文件也端出来",
+          all(str(dl) in str(h.path) for h in hits), True)
     import shutil
 
     shutil.rmtree(tmp, ignore_errors=True)
