@@ -612,6 +612,12 @@ class Skills:
         r"(?:课|课程|上课|会议|开会|日程|日成|安排|行程|例会|组会)"
     )
     _SCHEDULE_NEXT = re.compile(r"(下一个|下一节|接下来|最近的?)\s*(?:课|课程|会议|开会|日程|安排|例会|组会)")
+    # 只说了时间段、没带「课/会议」这类词的问句：「下周呢」「这个月有什么」
+    _RANGE_ASK = re.compile(
+        r"(?:今天|今日|明天|后天|大后天|这周|本周|下周|下下周|这个月|本月|下个月|今年|明年"
+        r"|未来|接下来|最近|这几天|这两天|这个?周末|下个?周末)"
+        r"[^，,。;；?？]{0,8}(?:有什么|有哪些|有没有|有课|安排|日程|行程|吗|呢|咋样|怎么样)"
+    )
     # 问句里也可能带「每周五下午两点」这种时刻，不能当成新增
     _SCHEDULE_ASK = re.compile(r"(有什么|有哪些|有没有|是什么|多少|查一下|查询|看看|看一下|列出|列表|吗|呢)")
     # 「帮我记录晚上7点半有跆拳道课」「明天下午三点安排组会」都应该当新增
@@ -716,7 +722,7 @@ class Skills:
         if self._SCHEDULE_NEXT.search(text):
             return self._next_item(now)
 
-        if self._SCHEDULE_Q.search(text):
+        if self._SCHEDULE_Q.search(text) or self._RANGE_ASK.search(text):
             return self._day_items(text, now)
 
         return None
@@ -1012,40 +1018,140 @@ class Skills:
                 return
 
     # ---------------------------------------------------------------- 日程查询
+    @staticmethod
+    def _day_label(day: date, now: datetime, with_date: bool = False) -> str:
+        delta = (day - now.date()).days
+        if delta == 0:
+            return "今天"
+        if delta == 1:
+            return "明天"
+        if delta == 2:
+            return "后天"
+        if delta == 3:
+            return "大后天"
+        if not with_date:
+            return WEEKDAY_NAMES[day.weekday()]
+        return f"{day.month}月{day.day}日{WEEKDAY_NAMES[day.weekday()]}"
+
+    def _range_of(self, text: str, now: datetime) -> tuple[date, date, str]:
+        """解析「问的是哪一段时间」，返回 (起, 止, 说法)，闭区间。
+
+        以前「下周」被算成「下周**一**那一天」，而「这个月 / 下个月 / 未来三天」
+        全都落到「今天」——问一段时间却只报一天。这里把所有范围都摊开：
+        日 / 周 / 周末 / 月 / 年 / 未来 N 天。
+        """
+        t = text or ""
+        today = now.date()
+
+        def week_of(offset: int) -> tuple[date, date]:
+            monday = today - timedelta(days=today.weekday()) + timedelta(weeks=offset)
+            return monday, monday + timedelta(days=6)
+
+        def month_of(offset: int) -> tuple[date, date]:
+            y = today.year + (today.month - 1 + offset) // 12
+            m = (today.month - 1 + offset) % 12 + 1
+            return date(y, m, 1), date(y, m, _days_in_month(y, m))
+
+        if "大后天" in t:
+            d = today + timedelta(days=3)
+            return d, d, "大后天"
+        if "后天" in t:
+            d = today + timedelta(days=2)
+            return d, d, "后天"
+        if "明天" in t or "明日" in t:
+            d = today + timedelta(days=1)
+            return d, d, "明天"
+        # 周末（周六+周日）
+        if re.search(r"(下下个?周末|下下周末)", t):
+            s = week_of(2)[0] + timedelta(days=5)
+            return s, s + timedelta(days=1), "下下个周末"
+        if re.search(r"(下个?周末|下周末)", t):
+            s = week_of(1)[0] + timedelta(days=5)
+            return s, s + timedelta(days=1), "下周末"
+        if re.search(r"(这个?周末|本周末)", t):
+            s = week_of(0)[0] + timedelta(days=5)
+            if s < today:               # 已经过了就顺延到下一个周末
+                s += timedelta(days=7)
+            return s, s + timedelta(days=1), "这个周末"
+        # 整周（周一起算）
+        if re.search(r"(下下个?周|下下星期|下下个星期)", t):
+            s, e = week_of(2)
+            return s, e, "下下周"
+        if re.search(r"(下周|下个星期|下星期|下个礼拜)", t):
+            s, e = week_of(1)
+            return s, e, "下周"
+        if re.search(r"(这周|本周|这个星期|这星期|本星期|这一周|整周|全周)", t):
+            s, e = week_of(0)
+            return s, e, "这周"
+        # 整月
+        if re.search(r"(下个月|下月)", t):
+            s, e = month_of(1)
+            return s, e, "下个月"
+        if re.search(r"(这个月|本月|当月)", t):
+            s, e = month_of(0)
+            return s, e, "这个月"
+        # 整年
+        if re.search(r"(明年|下一年)", t):
+            y = today.year + 1
+            return date(y, 1, 1), date(y, 12, 31), "明年"
+        if re.search(r"(今年|本年度)", t):
+            return date(today.year, 1, 1), date(today.year, 12, 31), "今年"
+        # 未来 N 天 / 未来一周 / 未来一个月
+        m = re.search(r"(?:未来|接下来|后面|最近)\s*(\d{1,2}|[一二三四五六七八九十两]+)\s*天", t)
+        if m:
+            n = max(1, int(cn2num(m.group(1)) or 1))
+            return today, today + timedelta(days=n - 1), f"未来{cn_number(n)}天"
+        if re.search(r"(?:未来|接下来|后面)\s*(?:一)?(?:周|星期|礼拜)", t):
+            return today, today + timedelta(days=6), "未来一周"
+        if re.search(r"(?:未来|接下来)\s*(?:一)?个?月", t):
+            return today, today + timedelta(days=29), "未来一个月"
+        if "这两天" in t:
+            return today, today + timedelta(days=1), "这两天"
+        if re.search(r"(这几天|最近几天)", t):
+            return today, today + timedelta(days=3), "这几天"
+        if re.search(r"(最近|接下来)", t):
+            return today, today + timedelta(days=6), "最近一周"
+        return today, today, "今天"
+
     def _day_items(self, text: str, now: datetime) -> SkillResult | None:
-        target = now.date()
-        if "后天" in text:
-            target = now.date() + timedelta(days=2)
-        elif "明天" in text:
-            target = now.date() + timedelta(days=1)
-        elif "下周" in text or "下个星期" in text:
-            target = now.date() + timedelta(days=7 - now.weekday())
-        elif re.search(r"(这周|本周|一星期|整周)", text):
-            return self._week_items(now)
+        start, end, label = self._range_of(text, now)
+        return self._range_items(start, end, label, now)
 
-        items = self._occurrences_on(target, ignore_reminder=True)
-        label = "今天" if target == now.date() else "明天" if target == now.date() + timedelta(days=1) else f"{target.month}月{target.day}日"
-        if not items:
-            return SkillResult(reply=f"{label}没有课程或会议安排。", action="schedule_query")
-        parts = []
-        for when, item in items:
-            where = f"，地点{item['location']}" if item.get("location") else ""
-            parts.append(f"{clock_text(when)}，{item.get('title', '安排')}{where}")
-        return SkillResult(reply=f"{label}有{cn_quantity(len(items))}项安排：" + "；".join(parts) + "。", action="schedule_query")
-
-    def _week_items(self, now: datetime) -> SkillResult:
-        lines = []
-        for offset in range(7):
-            day = now.date() + timedelta(days=offset)
+    def _range_items(self, start: date, end: date, label: str, now: datetime) -> SkillResult:
+        """把一段时间里的安排按天列出来（重复规则由 _occurrences_on 展开）。"""
+        # 问「这周 / 这个月」时只报还没过去的：周一说「这周安排」不想再听上周三的课
+        if start != end:
+            start = max(start, now.date())
+        found: list[tuple[date, str]] = []
+        total = 0
+        day = start
+        while day <= end:
             items = self._occurrences_on(day, ignore_reminder=True)
-            if not items:
-                continue
-            label = "今天" if offset == 0 else "明天" if offset == 1 else WEEKDAY_NAMES[day.weekday()]
-            detail = "、".join(f"{clock_text(w)}{i.get('title', '')}" for w, i in items)
-            lines.append(f"{label}{detail}")
-        if not lines:
-            return SkillResult(reply="这周没有课程或会议。", action="schedule_query")
-        return SkillResult(reply="这周安排：" + "；".join(lines) + "。", action="schedule_query")
+            if items:
+                total += len(items)
+                detail = "、".join(
+                    f"{clock_text(w)}{i.get('title', '安排')}"
+                    + (f"（地点{i['location']}）" if i.get("location") else "")
+                    for w, i in items
+                )
+                found.append((day, detail))
+            day += timedelta(days=1)
+
+        if not found:
+            return SkillResult(reply=f"{label}没有课程或会议安排。", action="schedule_query")
+        if start == end:
+            return SkillResult(
+                reply=f"{label}有{cn_quantity(total)}项安排：" + "；".join(d for _day, d in found) + "。",
+                action="schedule_query",
+            )
+        span = f"{label}（{start.month}月{start.day}日到{end.month}月{end.day}日）"
+        # 跨度大了就得把日期写出来，不然「周三」分不清是哪一周
+        with_date = (end - start).days > 31
+        detail = "；".join(f"{self._day_label(d, now, with_date)}{txt}" for d, txt in found)
+        return SkillResult(
+            reply=f"{span}有{cn_quantity(total)}项安排：{detail}。",
+            action="schedule_query",
+        )
 
     def _next_item(self, now: datetime) -> SkillResult:
         best: tuple[datetime, dict] | None = None
@@ -1305,7 +1411,8 @@ class Skills:
                 "我在。我能做这些：「现在几点」报时间；"
                 "「十分钟后提醒我喝水」「明天早上七点叫我起床」定提醒；"
                 "「记一下买牛奶」「我的备忘有哪些」管备忘；"
-                "「今天有什么课」「下一个会议是什么」查日程；"
+                "「今天有什么课」「这周有什么安排」「下周有什么安排」「这个月有什么安排」"
+                "「下一个会议是什么」查日程；"
                 "「每周三上午九点有 AIAA3102」排课、「每两周周三开组会」「每月5号交房租」"
                 "「每3天浇一次花」这种重复日程，说「提前一天和半小时提醒我」就能多提醒几次；"
                 "「把组会挪到周五上午十点」改日程、「下周三的课不上了」只取消那一次、"
