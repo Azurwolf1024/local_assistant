@@ -136,12 +136,12 @@ class BargeInConfig:
     enabled: bool = True
     min_seconds: float = 0.25    # 连续说多久才算插话（太小了容易被噪音打断）
     min_rms: float = 0.015       # 判定下限（幅度），压住底噪
-    margin: float = 1.6          # 比「漏出来的回声」响几倍才算插话（调大更稳、调小更灵敏）
-    leak_init: float = 0.15      # 回声泄漏系数初值（能量比，会自适应）
-    leak_min: float = 0.002
-    leak_max: float = 1.2
-    window_seconds: float = 0.30  # 能量滑窗，顺便吸收扬声器→麦克风的延迟
-    learn_seconds: float = 0.50   # 首次播放先学这么久的回声，再开始判断
+    margin: float = 1.6          # 比「麦克风里听到的回声」响几倍才算插话（调大更稳、调小更灵敏）
+    window_seconds: float = 0.30  # 麦克风能量滑窗
+    seed_seconds: float = 1.0     # 开头用多久校准回声基准（这段时间里不判断）
+    base_seconds: float = 6.0     # 回声基准的跟踪窗长度
+    base_percentile: float = 90.0  # 基准取低于门槛那些帧的哪个分位（要压过回声本身的高分位）
+    base_track: float = 0.3       # 基准每次跟随的比例（越小越稳）
     keep_seconds: float = 1.0     # 打断前保留多久的音频（免得丢掉开口的第一个字）
     collect_seconds: float = 6.0  # 打断后最多再收多久这句话
 

@@ -411,6 +411,8 @@ class Speaker:
         # 当前正在播的那一小段的 RMS（0~1）。语音打断要靠它区分
         # 「麦克风里是回声」还是「用户在插话」。
         self._level = 0.0
+        self._latency = 0.05          # 输出延迟估计，_ensure_stream 里更新
+        self._abort = threading.Event()
         self._thread = threading.Thread(target=self._worker, daemon=True, name="speaker")
         self._thread.start()
 
@@ -430,7 +432,11 @@ class Speaker:
 
     @property
     def current_level(self) -> float:
-        """正在播出去的内容的 RMS（0~1）；没在播就是 0。"""
+        """正在播出去的内容的 RMS（0~1）；没在播就是 0。
+
+        写入是按实时节奏推进的（见 :meth:`_write_blocks`），所以它和「此刻
+        扬声器里在响什么」基本对齐，靠这个当回声参考才靠谱。
+        """
         return self._level
 
     def join(self, timeout: float | None = None) -> bool:
@@ -444,6 +450,7 @@ class Speaker:
 
     def interrupt(self) -> None:
         """清空待播队列并立即停止当前播放。"""
+        self._abort.set()
         while True:
             try:
                 self._queue.get_nowait()
@@ -490,16 +497,32 @@ class Speaker:
         )
         self._stream.start()
         self._rate = rate
+        try:
+            lat = self._stream.latency
+            if isinstance(lat, (tuple, list)):
+                lat = lat[-1]
+            self._latency = min(0.5, max(0.0, float(lat)))
+        except Exception:  # noqa: BLE001
+            self._latency = 0.05
 
     def _write_blocks(self, pcm: np.ndarray, rate: int, block_seconds: float = 0.04) -> None:
-        """分小块写出去，顺便维护「此刻在播多大声」。
+        """分小块、按**实时节奏**写出去，顺便维护「此刻在播多大声」。
 
-        整块一次性 write 会阻塞到播完，中间拿不到电平；分成 40ms 的小块就
-        能随时告诉打断检测器「现在播到哪儿、多大声」。
+        为什么要按实时节奏：如果一次把整段都塞给驱动，PortAudio 会直接吞下，
+        几十毫秒后 `current_level` 就归零了，可缓冲区里的声音还在响。
+        语音打断拿这个电平当真声参考，于是会把「自己的回声」当成「你在说话」——
+        实测参考电平能低到真值的 1/50，于是自己把自己打断、还不断套娃。
+
+        按块写还有个好处：打断（interrupt/abort）能当场停下来，
+        而不用等当前那一大块播完。
         """
         stream = self._stream
         step = max(256, int(rate * block_seconds))
+        t0 = time.monotonic()
+        done = 0
         for i in range(0, len(pcm), step):
+            if self._abort.is_set():
+                break
             block = pcm[i : i + step]
             try:
                 self._level = float(
@@ -508,6 +531,10 @@ class Speaker:
             except Exception:  # noqa: BLE001
                 self._level = 0.0
             stream.write(block)
+            done += len(block)
+            delay = (t0 + done / rate - self._latency) - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
         self._level = 0.0
 
     def _worker(self) -> None:
@@ -517,6 +544,7 @@ class Speaker:
                 self._queue.task_done()
                 break
             pcm, rate = item
+            self._abort.clear()
             try:
                 self._ensure_stream(rate)
                 self._speaking.set()
