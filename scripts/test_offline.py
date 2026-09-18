@@ -278,6 +278,8 @@ def test_schedule_model() -> None:
     check("截止 12月底", parse_until("每周三有课，到12月底为止", datetime(2026, 9, 18)), datetime(2026, 12, 31).date())
 
     print("    · 新增各类日程")
+    # 固定「现在」，否则「明天上午八点」这类说法会跟着跑测试的日期漂
+    fixed = datetime(2026, 9, 18, 21, 0)        # 周五晚
     cases = [
         ("每周三上午九点有 AIAA3102 机器学习，地点教学楼 A302", "schedule_add_weekly"),
         ("每两周周三下午两点开组会", "schedule_add_weekly"),
@@ -288,7 +290,7 @@ def test_schedule_model() -> None:
         ("每天提醒我吃药，到12月底为止", "schedule_add"),
     ]
     for text, action in cases:
-        r = skills.handle(text)
+        r = skills.handle(text, now=fixed)
         check(f"新增 [{action}] {text[:16]}", getattr(r, "action", None), action)
         if r is not None:
             print(f"        {r.reply}")
@@ -316,7 +318,7 @@ def test_schedule_model() -> None:
     check("截止日期落盘", find("吃药").get("until"), "2026-12-31")
 
     print("    · 周期推进（next_occurrence）")
-    now = datetime(2026, 9, 18, 21, 0)          # 周五晚
+    now = fixed                                 # 周五晚
     marks = {"AIAA3102": "mach", "组会": "group", "房租": "rent",
              "开学": "school", "浇": "water"}
     steps = {}

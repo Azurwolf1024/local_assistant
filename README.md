@@ -951,8 +951,9 @@ Piper 与它自带的中文声线是 MIT，Silero VAD 是 MIT，Qwen2.5 是 Apac
 一条命令看清这台机器的现状和该改什么：
 
 ```powershell
-python main.py gpu            # 有哪些加速器、每段现在用哪个
-python main.py gpu --bench    # 真的跑一遍 Whisper CPU/GPU 对比（约 1 分钟）
+python main.py gpu                        # 有哪些加速器、每段现在用哪个
+python main.py gpu --bench                # 真的跑一遍 Whisper CPU/GPU 对比（约 1 分钟）
+python main.py gpu --enable-igpu          # 让 Ollama 用上核显（写环境变量 + 重启 Ollama）
 ```
 
 本机（Core Ultra 5 225H + **Intel Arc 130T 核显** + AI Boost NPU）实测：
@@ -962,7 +963,8 @@ python main.py gpu --bench    # 真的跑一遍 Whisper CPU/GPU 对比（约 1 �
 | Whisper turbo int8（5.6 s 音频） | 3.3 s | **0.49 s** | 快 6.8 倍；首次要编译图约 10 s |
 | SenseVoiceSmall | 0.08 s | — | sherpa-onnx 官方轮子只有 CPU，但已经够快 |
 | Piper TTS | RTF 0.04 | — | 瓶颈不在 TTS，加速收益很小 |
-| qwen2.5:7b / qwen2.5vl:3b | 首字 2~4 s / 看图 33 s | **用不上** | Windows 上 Ollama 对 Intel 核显只报 100% CPU |
+| qwen2.5:7b 文本首字 | 2.4 s | **1.16 s** | 冷启动加载模型 13.6 s，之后常驻 |
+| qwen2.5vl:3b 看图 | 33 s | **11.3 s** | 首次 20.1 s，之后稳定 |
 
 ### 已经默认打开的
 
@@ -973,21 +975,53 @@ python main.py gpu --bench    # 真的跑一遍 Whisper CPU/GPU 对比（约 1 �
   进程直接崩（vpux-compiler 报 `Channels count ... != 128`），不是抛异常、没法回退。
   `auto` 因此永远不会选它。
 
-### 想再快，三个方向
+### 让 Ollama 用上核显
 
-1. **让 Ollama 用上核显**（收益最大：LLM 首字、看图 33 s 都在这条路上）。
-   Windows 上的官方 Ollama 不认 Intel 核显，要用 Intel 的 IPEX-LLM 版：
-   ```powershell
-   # 装完后是另一个 ollama.exe（自带 SYCL 后端），把它换到 PATH 前面
-   pip install --pre --upgrade ipex-llm[cpp]
-   ```
-   装好后 `ollama ps` 的 PROCESSOR 列会从 `100% CPU` 变成 `100% GPU`，
-   这时 `[llm] num_gpu` 才有意义（`99` = 尽量全放显存/共享内存）。
-   代价：模型要重新下一遍（IPEX-LLM 用自己的量化格式）。
-2. **纯 CPU 调参**：`[llm] num_thread = 6~10`（本机 14 核）、`num_batch = 512`，
-   以及把 `[llm] num_ctx` 从 4096 降到 2048（上下文越小预填越快）。
-3. **换更小的模型**：`qwen3.5:2b`（文本）、`qwen2.5vl:3b`（看图）已经是很小的一档；
-   只在文字问答的场景还可以砍掉视觉模型。
+Windows 上的官方 Ollama 默认**主动把核显丢掉**，它的日志写得很清楚：
+
+```
+msg="dropping integrated GPU; to enable, set OLLAMA_IGPU_ENABLE=1"
+```
+
+所以不用装别的发行版，设一个环境变量就行。本项目把这个开关收进了一条命令：
+
+```powershell
+python main.py gpu --enable-igpu          # 写用户环境变量 OLLAMA_IGPU_ENABLE=1 并重启 Ollama
+python main.py gpu --enable-igpu --no-restart   # 只写变量，下次开机自己生效
+```
+
+手动等价的写法（在**新开的** PowerShell 里）：
+
+```powershell
+[Environment]::SetEnvironmentVariable("OLLAMA_IGPU_ENABLE", "1", "User")
+$env:OLLAMA_IGPU_ENABLE = "1"      # 这一句不能省，否则从当前窗口重启的 Ollama 读不到
+```
+
+生效后 `ollama ps` 的 PROCESSOR 列会从 `100% CPU` 变成 `100% GPU`，
+`python main.py gpu` 也会直接告诉你它选中了哪块设备（本机是
+`Intel(R) Arc(TM) 130T GPU (16GB)（Vulkan，核显）`）。
+
+几个坑：
+
+- **`OLLAMA_GPU_BACKEND=sycl` / `OLLAMA_NUM_GPU=99` 是没用的**。前者不在官方
+  Ollama 认识的环境变量表里（那套是 Intel 的 IPEX-LLM 分支在用），后者只是把模型
+  尽量多放显存、默认已经是这个行为。真正起作用的只有 `OLLAMA_IGPU_ENABLE`。
+- Intel 那个 `ipex-llm` 仓库**已于 2026-01-28 归档**，之前 README 里
+  “装 IPEX-LLM 版 Ollama” 的建议已过时，别照做了。
+- 设完用户环境变量后，从**已经开着的**窗口用 `Start-Process` 重启 Ollama 是没用的
+  （子进程继承的是旧环境）——`--enable-igpu` 会自己在启动进程里补上这份环境。
+- 核显和 CPU **共享同一块内存**（本机 31.5 GiB 里大约能借到 16~18 GiB）。
+  模型常驻会让系统可用内存变少，本项目默认 `[wake] unload_llm` 已在待机时把模型
+  卸掉；嫌内存紧张再加 `OLLAMA_MAX_LOADED_MODELS=1`。
+- Ollama 官方对**核显 + Vulkan** 的稳定性是留了余量的（不如独显稳）。如果偶尔出现
+  加载失败或结果异常，先 `python main.py gpu` 看一眼设备，再考虑退回 CPU。
+
+### 依然能再快一点
+
+- **纯 CPU 调参**：`[llm] num_thread = 6~10`（本机 14 核）、`num_batch = 512`，
+  以及把 `[llm] num_ctx` 从 4096 降到 2048（上下文越小预填越快）。
+- **换更小的模型**：`qwen3.5:2b`（文本）、`qwen2.5vl:3b`（看图）已经是很小的一档；
+  只在文字问答的场景还可以砍掉视觉模型。
 
 ### 不打算做的
 

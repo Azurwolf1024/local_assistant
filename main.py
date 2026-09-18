@@ -440,7 +440,28 @@ def cmd_see(settings: Settings, args: argparse.Namespace) -> int:
 
 def cmd_gpu(settings: Settings, args: argparse.Namespace) -> int:
     """看这台机器有哪些加速器、各阶段现在用的是哪个、以及要不要换。"""
-    from voice_loop.accel import detect, pick_whisper_devices, report
+    from voice_loop.accel import (
+        IGPU_ENV,
+        detect,
+        enable_igpu,
+        ollama_gpu_state,
+        pick_whisper_devices,
+        report,
+        restart_ollama,
+    )
+
+    if args.enable_igpu:
+        # Ollama 在 Windows 上默认**丢掉**核显，要 OLLAMA_IGPU_ENABLE=1（官方日志原话）
+        print("让 Ollama 用上核显：")
+        for line in enable_igpu():
+            print(f"  {line}")
+        if not args.no_restart:
+            for line in restart_ollama():
+                print(f"  {line}")
+        else:
+            print("  （--no-restart：请自己重启 Ollama 让变量生效）")
+        print("\n重启后验证：python main.py gpu   然后 ollama ps 里应看到 100% GPU")
+        return 0
 
     print("=" * 66)
     print(" 加速设备")
@@ -449,19 +470,23 @@ def cmd_gpu(settings: Settings, args: argparse.Namespace) -> int:
         print("  " + line)
 
     acc = detect(settings.llm)
+    state = ollama_gpu_state()
     print("\n  建议：")
     dev = str(settings.asr.whisper_device)
-    if acc.has_intel_gpu and dev.strip().upper() != "GPU":
-        print("    · Whisper 可以改成 GPU：实测 CPU 3.79s → GPU 1.05s（同一段 9.6s 音频）")
-        print('      改 config.toml 里的 [asr] whisper_device = "GPU"（或保留 "auto"，它也会选 GPU）')
+    plan = pick_whisper_devices(dev)
+    if acc.has_intel_gpu and plan and plan[0] != "GPU":
+        print("    · Whisper 可以改成 GPU：实测 CPU 3.31s → GPU 0.49s（同一段 5.6s 音频）")
+        print('      改 config.toml 里的 [asr] whisper_device = "GPU"（或写 "auto"，它也会选 GPU）')
     elif acc.has_intel_gpu:
-        print("    · Whisper 已经在用 GPU ✓")
+        print(f"    · Whisper 已经在用 GPU √（{dev} → {' → '.join(plan)}）")
     if not acc.has_intel_gpu and not acc.has_cuda:
-        print("    · 没有独立/核显可用于推理：Whisper 只能 CPU（这就是当前最快的选择）")
-    if acc.ollama_seen and acc.ollama_vram and not any(acc.ollama_vram.values()):
-        print("    · Ollama 目前在 100% CPU。Windows 上想让它用 Intel Arc，"
-              "要换 IPEX-LLM 版 ollama（见 README 第 12 节）")
-    print("    · 纯 CPU 时还能调：[llm] num_thread（线程数）、num_batch（批大小）")
+        print("    · 没有可用 GPU：Whisper 只能 CPU（这就是当前最快的选择）")
+    if state["dropped_igpu"] and "iGPU" not in state.get("device", ""):
+        print(f"    · Ollama 把核显丢掉了（它自己的日志写着要设 {IGPU_ENV}=1）")
+        print("      一条命令搞定：python main.py gpu --enable-igpu")
+        print("      实测收益：文本首字 2.4s→1.16s，看图 33s→11.3s")
+    if not (acc.has_intel_gpu and plan and plan[0] == "GPU"):
+        print("    · 纯 CPU 时还能调：[llm] num_thread（线程数）、num_batch（批大小）")
 
     if not args.bench:
         print("\n  （加 --bench 会真的跑一遍 Whisper CPU/GPU 对比，约 1 分钟）")
@@ -997,6 +1022,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("gpu", help="看加速器（Intel 核显 / NPU / CUDA）在用哪个，可实测")
     p.add_argument("--bench", action="store_true", help="真的跑一遍 Whisper 设备对比（约 1 分钟）")
     p.add_argument("--devices", nargs="*", default=None, help="只跑这几个设备，例如 --devices GPU CPU")
+    p.add_argument("--enable-igpu", action="store_true",
+                   help="让 Ollama 用上核显（写用户环境变量 OLLAMA_IGPU_ENABLE=1 并重启 Ollama）")
+    p.add_argument("--no-restart", action="store_true", help="配合 --enable-igpu：只写变量，不重启")
     p.set_defaults(func=cmd_gpu)
 
     p = sub.add_parser("selftest", help="全链路自检")
