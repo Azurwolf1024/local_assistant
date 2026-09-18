@@ -32,7 +32,7 @@ flowchart LR
     M -. 右下角弹窗 .-> N["可视提醒<br/>置顶小窗，点一下即关"]
 
     J -. 每句话都上屏 .-> O["底部字幕<br/>半透明、点得穿"]
-    L -. 你插话 .-> P["打断检测<br/>回声参考 + 滚动缓存"]
+    L -. 你插话 .-> P["打断检测<br/>回声基准 + 滚动缓存"]
     P -. 掐掉播放，把那句话交给下一轮 .-> B
 ```
 
@@ -86,7 +86,7 @@ flowchart LR
 │  ├─ skills.py                # 生活技能：时间 / 闹钟 / 备忘 / 日程
 │  ├─ scheduler.py             # 后台提醒调度器
 │  ├─ system_ops.py            # 系统操作：关/开显示器（只关屏，不休眠）
-│  ├─ bargein.py               # 语音打断：分别「自己的回声」和「你在插话」
+│  ├─ bargein.py               # 语音打断：分清「自己的回声」和「你在插话」
 │  ├─ subtitle.py              # 底部半透明字幕（帮手里说的话都显示出来）
 │  ├─ toast.py                 # 右下角可视提醒弹窗
 │  ├─ ui.py                    # Tk 窗口宿主（一个进程只能有一个 Tk 解释器）
@@ -101,7 +101,7 @@ flowchart LR
 │  ├─ download_models.py       # 一键下载模型
 │  ├─ test_offline.py          # 离线自测（分块/时间/技能/唤醒/生命周期）
 │  ├─ test_skills_route.py     # 技能路由 + 关屏 + 课表 + 提醒文案 + 重启不丢数据
-│  ├─ test_bargein.py          # ★ 打断：合成回声/插话对照 + 真机量回声（--live）
+│  ├─ test_bargein.py          # ★ 打断：合成对照 + 真机回声自测（--echo）/ 回环（--live）
 │  ├─ test_wake_cycle.py       # ★ 待机→唤醒→空闲回收→再次唤醒（含 Whisper 竞态）
 │  ├─ test_subtitle.py         # ★ 字幕：可见性 / 居中 / 点得穿 / 自动隐藏（--check）
 │  ├─ test_toast.py            # 看一眼右下角可视提醒长什么样
@@ -260,8 +260,8 @@ python scripts/test_bargein.py --live    # 真机回环：量回声 + 你自己�
 > 能稳定在 0.5 秒左右打断。
 
 **已知局限**：扬声器音量很大、你又离麦克风很近时，回声和你说话差不多响，
-物理上就分不开（开再大的 `margin` 也没用）。这种场合用耳机最省心：
-泄漏系数会自动降到接近 0，任何说话都能立刻打断。
+物理上就分不开（实测要盖过回声 4 倍能量才算稳）。这种场合用耳机最省心：
+基准会跟到底噪附近，任何说话都能立刻打断。
 另外，**刚开始用的第一句**要先攒够样本（大约前 0.3~0.5 秒）才能判断，
 这一句里插话可能不生效；那句太短没攒够的话，下一句会接着攒。
 
@@ -333,7 +333,7 @@ python scripts/test_subtitle.py --check
 ```powershell
 python scripts/test_offline.py         # 几秒钟，不加载模型，测分块/时间/技能/唤醒
 python scripts/test_skills_route.py    # 技能路由 + 关屏幕 + 课表 + 提醒文案 + 重启不丢数据
-python scripts/test_bargein.py         # 打断：合成回声/插话对照（--live 真机量回声）
+python scripts/test_bargein.py         # 打断：合成回声/插话对照（--echo 真机回声自测）
 python scripts/test_wake_cycle.py      # 待机 → 唤醒 → 空闲回收 → 再次唤醒
 python scripts/test_subtitle.py --check # 字幕：真的截屏量一遍可见性/居中/点穿/自动隐藏
 python scripts/test_toast.py           # 看一眼右下角可视提醒长什么样
