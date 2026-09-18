@@ -177,14 +177,18 @@ base_track = 0.3              # 基准跟随速度（越小越稳）
 # 戴耳机时基准会跟到底噪附近，任何说话都能立刻打断；外放时确实不如耳机灵敏。
 # 想验证这台机器会不会被自己的回声骗到：python scripts/test_bargein.py --echo
 
-# ── 看图（摄像头 / 屏幕 / 剪贴板 / 文件）────────────────────────────────────
+# ── 看图（摄像头 / 屏幕 / 剪贴板 / 文件）──────────────────────────────────
+# 注意：下面这些值才是真正生效的；settings.py 里的 dataclass 只是缺少配置项时的兜底。
 [vision]
 enabled = true
 # 看图要**视觉模型**：纯文本模型（qwen2.5 等）收到图片也只会瞎猜。
-# 先装一个： ollama pull qwen2.5vl:7b     （约 6 GB；显存/内存不够可换小一点的）
-model = "qwen2.5vl:7b"
+#   3b 约 3.2 GB，CPU 上快很多（推荐先用这个）
+#   7b 约 6 GB，认得更准，但 CPU 预填一张 1568 宽的截图要十几秒
+model = "qwen2.5vl:3b"
 
-default_source = "camera"     # 只说「这是什么」没提来源时看哪里：camera / screen
+# 只说「这是什么」没提来源时看哪里：screen / camera
+# （在电脑前用得多就 screen；拿着东西给镜头看就改回 camera）
+default_source = "screen"
 camera_index = 0              # 第几个摄像头（0 = 默认）
 warmup_frames = 4             # 丢掉前几帧，等自动曝光稳定（不然画面偏黑）
 max_side = 1024               # 摄像头图片最长边（越小越快）

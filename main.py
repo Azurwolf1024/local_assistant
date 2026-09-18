@@ -420,8 +420,6 @@ def cmd_see(settings: Settings, args: argparse.Namespace) -> int:
         stats = loop.respond(line, on_delta=lambda d: print(d, end="", flush=True))
         print()
         # 找文件要先确认：--yes 时自动回答「是」，把两轮串起来
-        if args.yes and not stats.answer:
-            print("（这次没看到东西，跳过确认）")
         if stats.extra.get("skill") == "vision_ask" and args.yes:
             print(f"\n你：是\n助手：", end="", flush=True)
             stats = loop.respond("是", on_delta=lambda d: print(d, end="", flush=True))

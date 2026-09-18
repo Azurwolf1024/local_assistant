@@ -40,13 +40,37 @@ class VisionError(RuntimeError):
 # --------------------------------------------------------------------------- #
 # 说话时会夹带的废话：留着会影响匹配（「读一下桌面上的报告」里真正有用的是「报告」）
 _FILE_STOP = re.compile(
-    r"(?:帮我|请|麻烦|你|我|把|给|这个|那个|一份|一个|一下|的|了|吧|吗|"
+    r"(?:帮我|请|麻烦|你|我|把|给|这个|那个|这份|那份|这本|那本|这篇|那篇|这封|那封|"
+    r"一份|一个|一下|的|了|吧|吗|"
     r"打开|看看|看一下|看下|看一眼|读一下|读读|读一读|念一下|念给我听|念|"
     r"文件|文档|附件|内容|里面的|里头|里头的|里面|里的|讲的|讲了什么|是什么|"
-    r"有没有|找一下|找一找|找找|搜索|搜一下)"
+    r"有没有|找一下|找一找|找找|搜索|搜一下|"
+    r"桌面上|桌面的|下载里|下载的|文档里|文档的|屏幕上|屏幕上的|桌面|下载|文档)"
 )
 _PATH_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\|/|~/|\.\.?/)")
+# 「论文.pdf」这种带点号的，以及「下载里的 json」这种只说后缀的
 _EXT_HINT = re.compile(r"\.([A-Za-z0-9]{1,6})\b")
+_EXT_WORD = re.compile(
+    r"\b(jpg|jpeg|png|bmp|webp|gif|tiff|txt|md|rst|log|csv|tsv|json|toml|ini|yaml|yml|"
+    r"xml|html|pdf|docx?|xlsx?|pptx?|py|js|ts|java|c|cpp|h|bat|ps1|sh)\b",
+    re.IGNORECASE,
+)
+# 中文说法 -> 可能的后缀（「桌面上的图片」"下载里的表格"）
+_CN_EXT: dict[str, tuple[str, ...]] = {
+    "图片": ("png", "jpg", "jpeg", "webp", "bmp", "gif"),
+    "图像": ("png", "jpg", "jpeg", "webp", "bmp"),
+    "照片": ("jpg", "jpeg", "png"),
+    "截图": ("png", "jpg", "jpeg"),
+    "表格": ("xlsx", "xls", "csv"),
+    "幻灯片": ("pptx", "ppt"),
+    "幻灯片": ("pptx", "ppt"),
+    "代码": ("py", "js", "ts", "c", "cpp", "h", "java"),
+    "word": ("docx", "doc"),
+    "excel": ("xlsx", "xls", "csv"),
+    "ppt": ("pptx", "ppt"),
+}
+# 两个汉字之间的空格去掉（「火龙果队 总结」这种），英文名里的空格保留
+_CJK_SPACE = re.compile(r"(?<=[\u4e00-\u9fff])[ \t]+(?=[\u4e00-\u9fff])")
 # 说「桌面上的 / 下载里的」时可以锁定根目录
 _ROOT_HINT = re.compile(r"(桌面|下载|文档|desktop|downloads?|documents?)", re.IGNORECASE)
 
@@ -309,24 +333,34 @@ class Vision:
             if p.exists() and p.is_file():
                 hits[str(p).lower()] = FileHit(p, 100.0, "完整路径")
             elif p.parent.is_dir():
-                for h in self._scan_name(p.parent, p.stem, depth=1, ext=p.suffix):
+                for h in self._scan_name(p.parent, p.stem, depth=1, exts=(p.suffix.lstrip("."),)):
                     hits.setdefault(str(h.path).lower(), h)
 
         # 2) 在根目录里按名字找
+        exts = self._exts_of(text)
         name = self._query_name(text)
-        if name:
+        if name and _norm(name) in exts:           # 只说「下载里的 json」：名字就是后缀
+            name = ""
+        if name or exts:
             roots = self.roots()
             hint = _ROOT_HINT.search(text)
             if hint:
-                picked = []
-                for r in roots:
-                    if hint.group(1).lower() in (r.name.lower(), str(r).lower()):
-                        picked.append(r)
+                # 「下载里的」要认出来：中文说法和英文目录名对不上，得先过一遍别名表
+                token = hint.group(1).lower()
+                aliases = [a.lower() for a in _HOME_ALIASES.get(token, (token,))]
+                picked = [
+                    r for r in roots
+                    if r.name.lower() in aliases or str(r).lower() in aliases
+                ]
                 roots = picked or roots
-            ext = _EXT_HINT.search(text)
             for root in roots:
-                for h in self._scan_name(root, name, ext=ext.group(0) if ext else ""):
+                for h in self._scan_name(root, name, exts=exts):
                     hits.setdefault(str(h.path).lower(), h)
+            if not hits and name and exts:
+                # 「文档里的幻灯片」这种：名字里没这两个字，但说了要哪种文件 -> 按后缀兜一遍
+                for root in roots:
+                    for h in self._scan_name(root, "", exts=exts):
+                        hits.setdefault(str(h.path).lower(), h)
 
         ordered = sorted(hits.values(), key=lambda h: h.score, reverse=True)
         return [h for h in ordered if h.score >= 45][:5]
@@ -335,6 +369,7 @@ class Vision:
         """从一句话里抠出「文件名叫什么」。"""
         name = _FILE_STOP.sub(" ", text or "")
         name = re.sub(r"[，,。；;！!？?、]+", " ", name)
+        name = _CJK_SPACE.sub("", name)
         name = re.sub(r"\s+", " ", name).strip()
         return name
 
@@ -342,13 +377,29 @@ class Vision:
         """给外部用：这句话里的文件名部分（可能为空）。"""
         return self._query_name(text)
 
-    def _scan_name(self, root: Path, name: str, depth: int | None = None, ext: str = "") -> list[FileHit]:
+    def _exts_of(self, text: str) -> tuple[str, ...]:
+        """这句话里点名要哪种文件：'.pdf' / 'json' / '图片' 都认。"""
+        t = text or ""
+        m = _EXT_HINT.search(t)
+        if m:
+            return (m.group(1).lower(),)
+        m = _EXT_WORD.search(t)
+        if m:
+            return (m.group(1).lower(),)
+        low = t.lower()
+        for word, exts in sorted(_CN_EXT.items(), key=lambda kv: -len(kv[0])):
+            if word in low:
+                return exts
+        return ()
+
+    def _scan_name(self, root: Path, name: str, depth: int | None = None,
+                   exts: tuple[str, ...] = ()) -> list[FileHit]:
         """在 root 里往下找文件名像 name 的文件。"""
         max_depth = int(depth if depth is not None else self.cfg.file_max_depth)
         budget = int(self.cfg.file_max_scan)
-        want_ext = ext.lower().lstrip(".")
+        want = tuple(e.lower().lstrip(".") for e in exts if e)
         q = _norm(name)
-        if not q and not want_ext:
+        if not q and not want:
             return []
         out: list[FileHit] = []
         root_depth = len(root.parts)
@@ -370,7 +421,7 @@ class Vision:
                     if fn.startswith("~$") or fn.startswith("."):
                         continue
                     p = here / fn
-                    score, why = self._score(p, q, want_ext)
+                    score, why = self._score(p, q, want)
                     if score > 0:
                         out.append(FileHit(p, score, why))
         except OSError:
@@ -378,10 +429,11 @@ class Vision:
         out.sort(key=lambda h: h.score, reverse=True)
         return out[:5]
 
-    def _score(self, path: Path, q: str, want_ext: str) -> tuple[float, str]:
+    def _score(self, path: Path, q: str, want_exts: tuple[str, ...]) -> tuple[float, str]:
         stem, full = _norm(path.stem), _norm(path.name)
+        suffix = path.suffix.lower().lstrip(".")
         if not q:
-            if want_ext and path.suffix.lower().lstrip(".") != want_ext:
+            if want_exts and suffix not in want_exts:
                 return 0.0, ""
             return 50.0 + self._recent(path), "按后缀找"
         if q == stem or q == full:
@@ -395,10 +447,10 @@ class Vision:
             score, why = ratio * 68.0, "名字有点像"
         if score < 45:
             return 0.0, ""
-        if want_ext:
-            if path.suffix.lower().lstrip(".") == want_ext:
+        if want_exts:
+            if suffix in want_exts:
                 score += 14.0
-                why += f"、后缀是 .{want_ext}"
+                why += f"、后缀是 .{suffix}"
             else:
                 score -= 22.0
         return score + self._recent(path), why
