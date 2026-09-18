@@ -142,6 +142,15 @@ class WakeConfig:
     min_silence_wake: float = 0.30   # 待唤醒状态下的静音判定
     fuzzy_ratio: float = 0.75        # 模糊匹配阈值
     followup_window: float = 2.0     # 只说唤醒词后，等下半句的时长（秒）；0=不等直接应答
+    # 「收回唤醒」：说了这些就立刻回待唤醒，不用干等 idle_timeout
+    standby_phrases: list[str] = field(
+        default_factory=lambda: [
+            "没事了", "没事", "没事儿了", "没什么事了", "没啥事了",
+            "没别的事了", "没别的事情了", "没别的了", "没其他事了", "没其它事了",
+            "就这些", "就这样", "先这样", "先这样吧", "退下", "退下吧", "你可以休息了",
+        ]
+    )
+    standby_reply: str = "好，随时叫我。"   # 收回时的应答，留空则只打印不播报
     # 后台运行相关
     pid_file: str = "sessions/listen.pid"
     stop_file: str = "sessions/listen.stop"
