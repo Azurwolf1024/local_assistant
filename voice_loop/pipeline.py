@@ -24,7 +24,7 @@ import numpy as np
 from .asr import AsrResult, AsrRouter
 from .audio import BaseSegmenter, MicReader, MicRecorder, Speaker, make_segmenter, save_wav
 from .bargein import BargeInDetector
-from .llm import OllamaClient
+from .llm import OllamaClient, OllamaError
 from .scheduler import ReminderScheduler
 from .settings import Settings
 from .skills import Skills
@@ -553,6 +553,16 @@ class VoiceLoop:
                     freed.append("TTS")
             if self.settings.wake.unload_llm and self.llm.release():
                 freed.append(f"Ollama/{self.settings.llm.model}")
+            # 视觉模型（qwen2.5vl 之类）一个就 6 GB 上下，看完图就该让它走
+            vmodel = str(self.settings.vision.model or "")
+            if (
+                self.settings.wake.unload_llm
+                and self.settings.vision.enabled
+                and vmodel
+                and vmodel != self.settings.llm.model
+                and self.llm.release(vmodel)
+            ):
+                freed.append(f"Ollama/{vmodel}")
         if freed:
             print(f"\n[待唤醒] 已释放：{'、'.join(freed)}", flush=True)
 
@@ -614,6 +624,8 @@ class VoiceLoop:
         skill = (
             self.skills.handle(user_text, dialog=list(self._dialog)) if self.skills else None
         )
+        if skill is not None and skill.action == "vision":
+            return self._respond_vision(stats, skill, user_text, on_delta)
         if skill is not None:
             # 上上轮可能被回车/语音打断过，不清掉的话这一句回答会一开始就被掐断
             self._interrupt.clear()
@@ -630,6 +642,86 @@ class VoiceLoop:
             return stats
 
         # ------------------------------------------------------------ LLM 路径
+        self._in_reply = True
+        self._muted.set()
+        self._mark_played()
+        self._stream_answer(stats, user_text, on_delta=on_delta)
+        return stats
+
+    def _respond_vision(
+        self, stats: TurnStats, skill, user_text: str, on_delta=None
+    ) -> TurnStats:
+        """看图这一轮：采集到的东西交给模型，再照常边生成边播。"""
+        data = dict(skill.data or {})
+        images = list(data.get("images") or [])
+        shot = str(data.get("shot") or "")
+        stats.extra["skill"] = "vision"
+        stats.extra["vision"] = str(data.get("what") or "")
+        if shot:
+            stats.extra["shot"] = shot
+            self.log.info(f"[看图] {data.get('what', '画面')}：{shot}")
+        if self.toast is not None and shot:
+            self.toast.show("看图", f"{data.get('what', '画面')}\n{shot}")
+
+        # 图片必须用视觉模型：纯文本模型看图只会编。先确认装没装，再出声。
+        model = None
+        if images:
+            try:
+                model = self.llm.resolve_model(str(self.settings.vision.model))
+            except OllamaError as exc:
+                hint = f"看图要视觉模型，本机还没有 {self.settings.vision.model}。先在终端跑 ollama pull {self.settings.vision.model}。"
+                self.log.warning(f"[看图] {exc}")
+                print(f"\n[看图] {exc}\n", flush=True)
+                stats.answer = hint
+                stats.extra["vision_error"] = str(exc)
+                self.speak_text(hint, fresh=True)
+                return stats
+
+        # 先答一句「我看一眼。」：拍图 + 编码 + 加载模型加起来好几秒，
+        # 一点声音都没有会让人以为它没听见
+        note = str(data.get("note") or "").strip()
+        if note:
+            self.speak_text(note)
+        if self.subtitle is not None:
+            self.subtitle.show_user(user_text)
+        self._interrupt.clear()
+        self._in_reply = True
+        self._muted.set()
+        self._mark_played()
+        try:
+            self._stream_answer(
+                stats,
+                str(data.get("prompt") or user_text),
+                images=images,
+                on_delta=on_delta,
+                model=model,
+                num_ctx=data.get("num_ctx"),
+                commit_text=user_text,
+            )
+        except OllamaError as exc:
+            hint = "看图这一步失败了，具体原因我打在终端里了。"
+            self.log.warning(f"[看图] {exc}")
+            print(f"\n[看图] {exc}\n", flush=True)
+            stats.answer = hint
+            stats.extra["vision_error"] = str(exc)
+            self.speak_text(hint, fresh=True)
+        return stats
+
+    def _stream_answer(
+        self,
+        stats: TurnStats,
+        prompt: str,
+        images: list[str] | None = None,
+        on_delta=None,
+        model: str | None = None,
+        num_ctx: int | None = None,
+        commit_text: str | None = None,
+    ) -> None:
+        """把 LLM 的回答边生成边播出（可带图片）。
+
+        ``commit_text``：写进对话历史的用户话（看图时用原始那句，
+        而不是塞了文件内容的那一大段 prompt）。
+        """
         tts_cfg = self.settings.tts
         chunker = SpeechChunker(
             max_chars=int(tts_cfg.max_chunk_chars),
@@ -638,9 +730,6 @@ class VoiceLoop:
             max_hold_seconds=float(tts_cfg.max_hold_seconds),
         )
         self._interrupt.clear()
-        self._in_reply = True
-        self._muted.set()
-        self._mark_played()
         t0 = time.perf_counter()
         pieces: list[str] = []
         first_audio: float | None = None
@@ -658,7 +747,9 @@ class VoiceLoop:
 
         try:
             with self._speak_lock:
-                for delta in self.llm.chat_stream(user_text):
+                for delta in self.llm.chat_stream(
+                    prompt, images=images, model=model, num_ctx=num_ctx
+                ):
                     if stats.llm_first_token == 0.0:
                         stats.llm_first_token = time.perf_counter() - t0
                     pieces.append(delta)
@@ -694,13 +785,12 @@ class VoiceLoop:
         answer = "".join(pieces).strip()
         stats.answer = answer
         self._note_spoken(answer)
-        self._note_dialog(user_text, answer)
+        self._note_dialog(commit_text or prompt, answer)
         stats.interrupted = self._interrupt.is_set()
         stats.first_audio = first_audio or 0.0
         stats.total_seconds = time.perf_counter() - t0
-        self.llm.commit(user_text, answer)
+        self.llm.commit(commit_text or prompt, answer)
         self._write_session(stats)
-        return stats
 
     # ======================================================================
     # 交互

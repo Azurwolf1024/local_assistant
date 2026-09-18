@@ -32,3 +32,6 @@ data/backup/
 !.vscode/settings.json
 !.vscode/launch.json
 !.vscode/tasks.json
+
+# 看图拍下来的画面（屏幕截图 / 摄像头照片都是隐私，绝不入库）
+data/vision/

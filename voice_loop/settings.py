@@ -70,6 +70,29 @@ class LlmConfig:
 
 
 @dataclass
+class VisionConfig:
+    """看图：摄像头 / 屏幕截图 / 剪贴板 / 指定文件。"""
+
+    enabled: bool = True
+    model: str = "qwen2.5vl:7b"      # 看图用的模型，需要 `ollama pull qwen2.5vl:7b`
+    default_source: str = "camera"   # 只说「这是什么」没提来源时看哪里：camera / screen
+    camera_index: int = 0
+    warmup_frames: int = 4           # 丢掉前几帧（自动曝光还没稳，画面偏黑/偏黄）
+    max_side: int = 1024             # 摄像头图片最长边（越小上传越快）
+    screen_max_side: int = 1568      # 截图最长边（大一点字才认得清）
+    jpeg_quality: int = 82
+    save_dir: str = "data/vision"    # 拍下来的图 / 截图存这里，方便回头核对模型看了什么
+    keep_images: int = 40            # 只保留最近这么多张，超了自动删最旧的
+    file_roots: list[str] = field(default_factory=lambda: ["桌面", "下载", "文档"])
+    file_max_depth: int = 4          # 在根目录里往下找几层
+    file_max_scan: int = 20000       # 最多扫多少个文件（防止在巨型目录里卡住）
+    file_max_chars: int = 1800       # 读文本文件时最多塞多少字（中文约 1 字 1 token）
+    file_num_ctx: int = 8192         # 读文件那一轮单独放大上下文
+    confirm_expire: float = 120.0    # 「是这个文件吗？」多久没回答就作废（秒）
+    say_first: str = "我看一眼。"     # 看图前先说的那句话（留空则不说）
+
+
+@dataclass
 class TtsConfig:
     backend: str = "piper"
     voice: str = "zh_CN-huayan-medium"
@@ -173,6 +196,7 @@ class Settings:
     skills: SkillsConfig = field(default_factory=SkillsConfig)
     subtitle: SubtitleConfig = field(default_factory=SubtitleConfig)
     bargein: BargeInConfig = field(default_factory=BargeInConfig)
+    vision: VisionConfig = field(default_factory=VisionConfig)
     path: Path = PROJECT_ROOT / "config.toml"
 
     # ---------------------------------------------------------------- paths
@@ -220,6 +244,7 @@ def load_settings(path: str | Path | None = None) -> Settings:
         skills=_build(SkillsConfig, raw.get("skills", {}), "skills"),
         subtitle=_build(SubtitleConfig, raw.get("subtitle", {}), "subtitle"),
         bargein=_build(BargeInConfig, raw.get("bargein", {}), "bargein"),
+        vision=_build(VisionConfig, raw.get("vision", {}), "vision"),
         tts=_build(TtsConfig, raw.get("tts", {}), "tts"),
         chat=_build(ChatConfig, raw.get("chat", {}), "chat"),
         path=cfg_path,
