@@ -1,5 +1,7 @@
 # 本地语音到语音助手（全离线）
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 **SenseVoiceSmall / Whisper-large-v3-turbo → Ollama qwen2.5:7b → Piper 中文女声**
 
 完全跑在本机的「说话 → 识别 → 思考 → 说话」闭环，不联网、不上传任何数据。
@@ -66,7 +68,7 @@ flowchart LR
 ## 2. 目录结构
 
 ```
-D:\local_AI\
+<项目目录>\
 ├─ main.py                     # 入口：listen / chat / text / ask / skills / asr / tts / selftest
 ├─ config.toml                 # 全部可调参数
 ├─ data/                       # ← 可以直接用编辑器改
@@ -79,6 +81,8 @@ D:\local_AI\
 │  ├─ wake.py                  # 唤醒词匹配（精确 + 别名 + 模糊）
 │  ├─ skills.py                # 生活技能：时间 / 闹钟 / 备忘 / 日程
 │  ├─ scheduler.py             # 后台提醒调度器
+│  ├─ system_ops.py            # 系统操作：关/开显示器（只关屏，不休眠）
+│  ├─ toast.py                 # 右下角可视提醒弹窗
 │  ├─ nlp_time.py              # 中文时间解析（明天早上七点 / 十分钟后 / 下周三）
 │  ├─ store.py                 # JSON 存储（保留注释、外部改动自动重载）
 │  ├─ text.py                  # LLM 输出清洗 + 流式分块 + 标点移植
@@ -89,12 +93,15 @@ D:\local_AI\
 ├─ scripts/
 │  ├─ download_models.py       # 一键下载模型
 │  ├─ test_offline.py          # 离线自测（分块/时间/技能/唤醒/生命周期）
+│  ├─ test_skills_route.py     # 技能路由 + 关屏 + 课表 + 提醒文案 + 重启不丢数据
+│  ├─ test_toast.py            # 看一眼右下角可视提醒长什么样
 │  ├─ test_dialog.py           # 对话链路自测（不用麦克风）
 │  ├─ test_wake.py             # ★ 唤醒词实测与调优（打印听到的内容 / 自动写 aliases）
 │  ├─ test_mic_loopback.py     # 麦克风回环诊断（放一段语音，看能不能听到 + 识别）
+│  ├─ clean_junk_data.py       # 清理早期版本写坏的备忘/闹钟
 │  ├─ say.py                   # 用扬声器念一句话（不想开口时测唤醒词用）
 │  └─ tts_probe.py             # TTS 调音工具（含语调对比）
-└─ models/                     # 模型权重
+└─ models/                     # 模型权重（不进 git，见 models/README.md）
 ```
 
 ---
@@ -102,9 +109,9 @@ D:\local_AI\
 ## 3. 安装
 
 ```powershell
-cd D:\local_AI
+cd <项目目录>
 pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
-python scripts/download_models.py     # Whisper 已存在，只补另外三个（约 300 MB）
+python scripts/download_models.py     # 补上 SenseVoice / Silero VAD / Piper 中文女声（约 300 MB）
 python main.py selftest               # 7 项检查，全过就能用了
 ```
 
@@ -485,11 +492,9 @@ Piper 的 `zh_CN-huayan-medium` 是官方唯一的中文女声。调 `noise_w_sc
 
 ## 9. 运行环境说明
 
-- 实际运行在**系统 Python 3.13.7**：
-  `C:\Users\philw\AppData\Local\Programs\Python\Python313\python.exe`
-- 工作区里的 `D:\local_AI\.conda` 是**空的 Python 3.14**（只有 pip）。
-  OpenVINO / sherpa-onnx / optimum-intel 目前没有 3.14 的轮子，所以没用它。
-  想用它请等生态跟上。
+- 实际运行在**系统 Python 3.13.7**（路径用 `where python` 或 `Get-Command python` 查，
+  形如 `C:\...\Python313\python.exe`）。3.13 是目前唯一能凑齐依赖的版本：
+  OpenVINO / sherpa-onnx / optimum-intel 都还没有更晚版本的轮子。
 - 安装时对系统 Python 3.13 做过这些改动（如影响其它项目可回滚）：
   `torch 2.13.0 → 2.14.0`、`numpy 2.5.3 → 2.4.6`、`requests 2.32.5 → 2.34.2`，
   并新增 `openvino`、`openvino-genai`、`sherpa-onnx`、`optimum-intel`、`transformers`、
@@ -503,6 +508,16 @@ Piper 的 `zh_CN-huayan-medium` 是官方唯一的中文女声。调 `noise_w_sc
 
 ## 10. 隐私说明
 
-麦克风音频、识别文本、模型推理全部在 `D:\local_AI` 本地完成（包括闹钟、备忘、日程，
+麦克风音频、识别文本、模型推理全部在项目目录本地完成（包括闹钟、备忘、日程，
 都只是本机 json 文件）。唯一的外部依赖是 `http://127.0.0.1:11434`（本机 Ollama）。
 断网可正常使用。
+
+---
+
+## 11. 协议
+
+[MIT](LICENSE) © 2026 Azurwolf1024
+
+用到的模型各自遵守自己的协议：Whisper 与 SenseVoiceSmall 是 MIT，
+Piper 与它自带的中文声线是 MIT，Silero VAD 是 MIT，Qwen2.5 是 Apache-2.0。
+
