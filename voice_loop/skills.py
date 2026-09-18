@@ -26,6 +26,7 @@ from .nlp_time import (
     humanize,
     humanize_delta,
     parse_clock,
+    parse_date_hint,
     parse_datetime,
     parse_duration,
 )
@@ -45,6 +46,57 @@ def _weekly_weekday(text: str) -> int | None:
     return _WEEKDAY_CN.get(m.group(1)) if m else None
 
 
+# 在日程列表里找你指的那一条。只把这些真正泛的工具词当停用词，
+# 「组会 / 例会」不算——它们通常就是条目的名字本身。
+_TITLE_STOPWORDS = {
+    "课", "课程", "上课", "会议", "开会", "日程", "安排", "行程",
+    "事情", "提醒", "活动", "一个", "一下",
+}
+
+# 双字匹配时容易撞车的泛词：光靠这些字对上不算「认出来了」
+_GENERIC_BIGRAMS = {
+    "今天", "明天", "后天", "早上", "上午", "中午", "下午", "晚上", "时候", "时间",
+    "什么", "怎么", "这个", "那个", "一下", "不是", "以后", "我要", "我们", "已经",
+    "取消", "删除", "删掉", "去掉", "改到", "改成", "换个", "挪到", "提前", "推迟",
+    "上课", "课程", "会议", "开会", "日程", "安排", "行程", "提醒", "取消", "的课",
+}
+
+
+def _title_tokens(title: str) -> list[str]:
+    if not title:
+        return []
+    toks = re.findall(r"[A-Za-z][A-Za-z0-9\-]{1,}|[\u4e00-\u9fff]{2,}", title)
+    return [t for t in toks if t not in _TITLE_STOPWORDS]
+
+
+def _title_hit(title: str, text: str) -> int:
+    """这句说的是不是这条日程：2 = 名字里的词直接出现，1 = 只沾到两个字，0 = 不像。
+
+    「开组会」对上「删掉组会」这种就得靠双字：名字本身很少被完整念一遍。
+    """
+    if not title:
+        return 0
+    if any(tok in text for tok in _title_tokens(title)):
+        return 2
+    for i in range(len(title) - 1):
+        bg = title[i : i + 2]
+        if bg in _GENERIC_BIGRAMS:
+            continue
+        if re.fullmatch(r"[\u4e00-\u9fff]{2}", bg) and bg in text:
+            return 1
+    return 0
+
+
+def _sched_key(item: dict) -> tuple:
+    """改/删时用它把条目定位回去（比对象身份靠谱，重载缓存也不会错）。"""
+    return (
+        str(item.get("title", "")),
+        str(item.get("repeat", "")),
+        str(item.get("weekday", item.get("start", ""))),
+        str(item.get("time", "")),
+    )
+
+
 # 新增日程时要把「帮我记录 / 安排 / 有」这类动词去掉，只留事情本身
 _SCHEDULE_VERBS = (
     "帮我", "麻烦你", "麻烦", "请", "到时候", "记得", "提醒我", "帮我记", "记录一下", "记录",
@@ -57,6 +109,8 @@ _LOCATION = re.compile(r"(?:地点|教室)\s*[:：]?\s*([^，,。;；]+)")
 def _strip_leading(text: str, words: tuple[str, ...]) -> str:
     """反复剥掉开头的口头语，直到没有可剥的为止。"""
     t = (text or "").strip(" \u3000，,。:：-—")
+    # 「开组会 / 开例会」的「开」不是名字的一部分（但「开学典礼」不能碰）
+    t = re.sub(r"^开(?=[会组例])", "", t)
     changed = True
     while changed and t:
         changed = False
@@ -104,7 +158,7 @@ _NUM = r"(?:\d{1,2}|[一二三四五六七八九十两]+)"
 _TIME_WORDS = re.compile(
     r"(?:大后天|后天|明天|明日|今天|今日|今早|明早|今晚|明晚|"
     r"凌晨|早上|早晨|清晨|上午|中午|正午|下午|傍晚|晚上|夜里|夜晚|半夜|"
-    r"下{0,2}个?(?:周|星期|礼拜)[一二三四五六日天]|"
+    r"(?:下{1,2}个?|上个?|这|本)?(?:周|星期|礼拜)[一二三四五六日天末]|"
     rf"{_NUM}\s*[点時时](?:半|{_NUM}\s*分)?|"
     r"\d{1,2}\s*[:：]\s*\d{1,2}|"
     rf"{_NUM}?个?半?(?:小时|钟头|分钟|分|秒)|"
@@ -514,6 +568,19 @@ class Skills:
     # ======================================================================
     # 课程 / 会议 / 日程
     # ======================================================================
+    # 「改 / 挪 / 删 / 取消」必须**先于**新增判断：以前「删掉每周三上午九点那节课」
+    # 因为句子里同时有「每周三 + 时刻」被当成新增，反手往课表里塞了一条
+    # 叫「删掉每…那节课」的垃圾条目。
+    _SCHEDULE_EDIT = re.compile(
+        r"(?:改到|改成|改为|改在|挪到|挪成|挪去|换到|调到|调成|提前到|推迟到|提前|推迟|往后推)"
+    )
+    _SCHEDULE_DROP = re.compile(
+        r"(?:取消|删掉|删除|去掉|清掉|不上|不去|不参加|不开了|上不了)"
+    )
+    # 「以后不上这门课了」= 删掉；只说「这周三不上了」= 只跳过这一次
+    _SCHEDULE_FOREVER = re.compile(r"(?:以后|往后都|再也不|不再|一直|永久|全部|所有|这门课|这一门)")
+    # 带这些词的是问句，不要当成「取消」（「今天的课不上吗？」不能真去取消）
+    _SCHEDULE_QUESTION = re.compile(r"(?:有什么|有哪些|有没有|列表|列出|查一下|查询|看看|看一下)|[吗呢？?]\s*$")
     _SCHEDULE_Q = re.compile(
         r"(?:今天|明天|后天|本周|这周|下周|下个星期|这个星期)?\s*(?:有什么|有哪些|有没有|安排|日程|行程|列表|看看|查一下)?\s*"
         r"(?:课|课程|上课|会议|开会|日程|日成|安排|行程|例会|组会)"
@@ -531,6 +598,11 @@ class Skills:
     )
 
     def _handle_schedule(self, text: str, now: datetime) -> SkillResult | None:
+        # 改 / 删 / 跳过 先判，别让它们掉进新增分支
+        change = self._handle_schedule_change(text, now)
+        if change is not None:
+            return change
+
         # 先判新增。「每周三上午九点有 AIAA3102」这种既没有「记录/安排」动词、
         # 也没有「课/会议」字眼，所以带「每周」+ 时刻的课表描述要单独放行，
         # 否则会被 _SCHEDULE_Q 之类的查询规则抢走。
@@ -603,6 +675,164 @@ class Skills:
 
         return None
 
+    # ------------------------------------------------------------ 日程改 / 删 / 跳过
+    def _handle_schedule_change(self, text: str, now: datetime) -> SkillResult | None:
+        """处理「改到…」「取消…那节课」「这周三不上了」。
+
+        返回 None = 这句话跟改/删无关，交给后面的新增与查询。
+        """
+        drop = self._SCHEDULE_DROP.search(text)
+        edit = self._SCHEDULE_EDIT.search(text)
+        if not drop and not edit:
+            return None
+        if self._SCHEDULE_QUESTION.search(text):
+            return None                     # 「今天的课不上吗？」是问句，别真去取消
+        items = self.schedule.load()
+        if not items:
+            return SkillResult(
+                reply="日程里现在还是空的，没什么可以改的。", action="schedule_change"
+            )
+        hits = self._match_schedule_items(text, items, now)
+        if not hits:
+            # 听着像在说日程，但库里找不到对应条目：说清楚比乱改好
+            if drop and (TRIGGER_SCHEDULE.search(text) or _weekly_weekday(text) is not None):
+                return SkillResult(
+                    reply="没找到你说的那条日程。先问一句「今天有什么课」，或者把名字说清楚一点？",
+                    action="schedule_change_miss",
+                )
+            return None
+
+        top = hits[0][0]
+        if drop and top < 2:
+            # 删除是不可逆的：名字没对上（只沾到两个字）就先问清楚，别猜
+            names = "、".join(f"「{it.get('title', '安排')}」" for _s, it in hits[:4])
+            return SkillResult(
+                reply=f"我不太确定你说的是哪一条（可能是{names}）。说清楚名字、或者带上星期几试试？",
+                action="schedule_change_unsure",
+            )
+
+        same = [it for s, it in hits if s == top]
+        if len(same) > 1:
+            names = "、".join(f"「{it.get('title', '安排')}」" for it in same[:4])
+            return SkillResult(
+                reply=f"有 {len(same)} 条都对得上（{names}），你说是哪一条？",
+                action="schedule_change",
+            )
+
+        item = same[0]
+        title = str(item.get("title") or "安排")
+        key = _sched_key(item)
+        weekly = str(item.get("repeat", "once")).lower() in ("weekly", "每周", "周")
+
+        # --- 删：以后都不上了 ---
+        if drop and not weekly:
+            self.schedule.remove_where(lambda it: _sched_key(it) == key)
+            return SkillResult(reply=f"已删除日程：{title}。", action="schedule_delete")
+        if drop and self._SCHEDULE_FOREVER.search(text):
+            self.schedule.remove_where(lambda it: _sched_key(it) == key)
+            return SkillResult(
+                reply=f"已删除日程：{title}，以后不会再提醒了。", action="schedule_delete"
+            )
+
+        # --- 跳过：只取消最近这一次，课表本身留着 ---
+        if drop and weekly:
+            day = self._skip_day(text, item, now)
+            if day < now.date():
+                # 「这周三」在周五说已经是过去了：不猜，问清楚（取消是不可逆的）
+                return SkillResult(
+                    reply=(
+                        f"{day.month}月{day.day}日（{WEEKDAY_NAMES[day.weekday()]}）已经过去了。"
+                        f"你是想取消下一次吗？说「下次的{title}不上了」就行。"
+                    ),
+                    action="schedule_change_miss",
+                )
+            skips = [str(d) for d in (item.get("skip") or []) if d]
+            if str(day) in skips:
+                return SkillResult(
+                    reply=f"{day.month}月{day.day}日的{title}本来就没安排。", action="schedule_skip"
+                )
+            skips.append(str(day))
+            self._update_schedule_item(key, skip=skips)
+            return SkillResult(
+                reply=f"好，{humanize(self._at(item, day), now)}的{title}不提醒了，下周照常。",
+                action="schedule_skip",
+            )
+
+        if drop:
+            self.schedule.remove_where(lambda it: _sched_key(it) == key)
+            return SkillResult(reply=f"已删除日程：{title}。", action="schedule_delete")
+
+        # --- 改：时间 / 星期 / 地点 ---
+        day = parse_date_hint(text, now)
+        fields: dict[str, Any] = {}
+        if weekly:
+            when = parse_datetime(text, now)
+            hh, mm = (when.hour, when.minute) if when is not None else self._parse_hhmm(item.get("time", "09:00"))
+            wd = day.weekday() if day is not None else int(item.get("weekday", 0) or 0)
+            fields.update(weekday=wd, time=f"{hh:02d}:{mm:02d}", skip=[])
+        else:
+            when = parse_datetime(text, now)
+            if when is None:
+                return SkillResult(
+                    reply=f"想把{title}改到什么时候？比如「挪到明天下午三点」。",
+                    action="schedule_edit",
+                )
+            fields["start"] = when.strftime("%Y-%m-%d %H:%M")
+        _, loc = _split_title_location(text)
+        if loc:
+            fields["location"] = loc
+        self._update_schedule_item(key, **fields)
+
+        where = f"，地点{loc}" if loc else ""
+        if weekly:
+            reply = (
+                f"已改：{title} 现在是每{WEEKDAY_NAMES[int(fields['weekday'])]} {fields['time']}{where}。"
+            )
+        else:
+            reply = f"已改：{title} 改到 {fields['start']}{where}。"
+        return SkillResult(reply=reply, action="schedule_edit")
+
+    def _match_schedule_items(self, text: str, items: list[dict], now: datetime) -> list[tuple[int, dict]]:
+        """找出这句话指的是哪几条日程，返回 (得分, 条目) 按得分降序。
+
+        名字最算数（4 分），其次是一周里的星期（2 分），最后是时刻（1 分）。
+        """
+        day = parse_date_hint(text, now)
+        clock = parse_clock(text)
+        hits: list[tuple[int, dict]] = []
+        for it in items:
+            score = 2 * _title_hit(str(it.get("title", "")), text)
+            weekly = str(it.get("repeat", "once")).lower() in ("weekly", "每周", "周")
+            if weekly:
+                if day is not None and int(it.get("weekday", -1)) == day.weekday():
+                    score += 2
+                if clock and str(it.get("time", "")) == f"{clock[0]:02d}:{clock[1]:02d}":
+                    score += 1
+            elif day is not None and str(it.get("start") or "")[:10] == day.isoformat():
+                score += 3
+            if score:
+                hits.append((score, it))
+        hits.sort(key=lambda x: x[0], reverse=True)
+        return hits
+
+    def _skip_day(self, text: str, item: dict, now: datetime) -> date:
+        """算出这次要跳过哪一天：句子里有日期就用它，否则用最近的那一次。"""
+        day = parse_date_hint(text, now)
+        if day is not None:
+            return day
+        nxt = self.next_occurrence(item, now - timedelta(seconds=1))
+        return nxt.date() if nxt is not None else now.date()
+
+    def _at(self, item: dict, day: date) -> datetime:
+        hh, mm = self._parse_hhmm(item.get("time", "09:00"))
+        return datetime.combine(day, datetime.min.time()).replace(hour=hh, minute=mm)
+
+    def _update_schedule_item(self, key: tuple, **fields: Any) -> None:
+        for i, it in enumerate(self.schedule.load(), start=1):
+            if _sched_key(it) == key:
+                self.schedule.update(i, **fields)
+                return
+
     # ---------------------------------------------------------------- 日程查询
     def _day_items(self, text: str, now: datetime) -> SkillResult | None:
         target = now.date()
@@ -665,6 +895,8 @@ class Skills:
         """返回某天所有日程的 (开始时间, 条目) 列表。"""
         out: list[tuple[datetime, dict]] = []
         for item in self.schedule.load():
+            if str(day) in [str(d) for d in (item.get("skip") or [])]:
+                continue                      # 这一天被单独取消了
             repeat = str(item.get("repeat", "once")).lower()
             if repeat in ("weekly", "每周", "周"):
                 if int(item.get("weekday", -1)) != day.weekday():
@@ -687,8 +919,9 @@ class Skills:
         return out
 
     def next_occurrence(self, item: dict, now: datetime) -> datetime | None:
-        """给调度器用：算出这个日程的下一次开始时间。"""
+        """给调度器用：算出这个日程的下一次开始时间（跳过被单独取消的那几天）。"""
         repeat = str(item.get("repeat", "once")).lower()
+        skipped = {str(d) for d in (item.get("skip") or [])}
         if repeat in ("weekly", "每周", "周"):
             weekday = int(item.get("weekday", -1))
             if not 0 <= weekday <= 6:
@@ -699,6 +932,11 @@ class Skills:
                 hour=hh, minute=mm
             )
             if candidate <= now:
+                candidate += timedelta(days=7)
+            # 连续几次都可能被跳过（比如连着取消两周）
+            for _ in range(8):
+                if str(candidate.date()) not in skipped:
+                    break
                 candidate += timedelta(days=7)
             return candidate
         raw = item.get("start") or item.get("when") or ""
@@ -766,6 +1004,10 @@ class Skills:
                 "「十分钟后提醒我喝水」「明天早上七点叫我起床」定提醒；"
                 "「记一下买牛奶」「我的备忘有哪些」管备忘；"
                 "「今天有什么课」「下一个会议是什么」查日程；"
+                "「每周三上午九点有 AIAA3102」排课、"
+                "「把组会挪到周五上午十点」改日程、"
+                "「下周三的课不上了」只取消那一次、"
+                "「以后不上这门课了」彻底删掉；"
                 "「关屏幕」把显示器关掉（只是关屏，不睡眠）。"
                 "其余的，直接问我就好。"
             ),

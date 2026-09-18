@@ -16,7 +16,14 @@ CN_DIGITS = {
     "零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
     "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
 }
-_WEEKDAY_CN = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
+_WEEKDAY_CN = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6, "末": 5}
+
+# 「这/本 = 本周」「下 = 下一周」「上 = 上一周」——相对**本周**（周一起算）偏移几周
+_WEEK_OFFSET = {
+    "这": 0, "这个": 0, "本": 0,
+    "下": 1, "下个": 1, "下下": 2,
+    "上": -1, "上个": -1, "上上": -2,
+}
 
 # 时段 -> 需要补的小时数（只在 hour < 12 时生效；0 表示不补）
 #   上午七点 -> 7      下午三点 -> 15     晚上八点 -> 20     凌晨两点 -> 2
@@ -162,16 +169,23 @@ def parse_date_hint(text: str, now: datetime) -> date | None:
     if "今天" in t or "今日" in t or "今晚" in t:
         return now.date()
 
-    m = re.search(r"(下{0,2})(?:个)?(?:周|星期|礼拜)\s*([一二三四五六日天末])", t)
+    m = re.search(
+        r"(下下|下个|下|上个|上上|上|这个|这|本)?\s*(?:周|星期|礼拜)\s*([一二三四五六日天末])", t
+    )
     if m:
-        prefix, day_char = m.group(1), m.group(2)
+        prefix, day_char = m.group(1) or "", m.group(2)
         target = _WEEKDAY_CN.get(day_char)
         if target is not None:
-            delta = (target - now.weekday()) % 7
-            if prefix:
-                delta += 7 * len(prefix)
-            elif delta == 0:
-                delta = 0
+            if prefix in _WEEK_OFFSET:
+                # 「这周三 / 本周三 / 上周三」都是相对**本周**（周一起算）算的，
+                # 所以可能落在过去（周五说「这周三」就是前天），这是有意的：
+                # 「取消这周三的课」必须指向真的那一天。
+                delta = target - now.weekday() + 7 * _WEEK_OFFSET[prefix]
+            else:
+                # 只说「周三」= 最近的将来那个周三。注意这里 **不能** 再 +7：
+                # (target - today) % 7 已经滚到下一周了，
+                # 以前再 +7 就把「下周三」多算了一周（周五说 → 9/30 而不是 9/23）。
+                delta = (target - now.weekday()) % 7
             return now.date() + timedelta(days=delta)
 
     m = re.search(r"(\d{1,2})\s*月\s*(\d{1,2})\s*[号日]", t)
