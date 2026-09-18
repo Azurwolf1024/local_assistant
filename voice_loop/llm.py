@@ -48,13 +48,32 @@ class OllamaClient:
             f"Ollama 中没有模型 {want}。请先执行：ollama pull {want}\n当前已有：{models}"
         )
 
-    def warmup(self) -> float:
+    def resolve_model(self, want: str) -> str:
+        """把配置里的模型名换成真正存在的那个（宽松匹配），不存在就报清楚怎么装。
+
+        看图专用：视觉模型一般另装一个（qwen2.5vl 等），
+        用纯文本模型看图只会得到一堆编造的内容，所以这里宁可报错。
+        """
+        want = (want or "").strip() or self.cfg.model
+        models = self.list_models()
+        if want in models:
+            return want
+        stem = want.split(":")[0]
+        matches = [m for m in models if m.split(":")[0] == stem]
+        if matches:
+            return matches[0]
+        raise OllamaError(
+            f"Ollama 里没有能看图的模型 {want}（纯文本模型看图只会编）。"
+            f"先在终端装一个：ollama pull {want}。当前已有：{models}"
+        )
+
+    def warmup(self, model: str | None = None) -> float:
         """预热：把模型加载进内存，避免第一次对话首字延迟过长。"""
         import time
 
         t0 = time.perf_counter()
         payload = {
-            "model": self.cfg.model,
+            "model": model or self.cfg.model,
             "messages": [{"role": "user", "content": "hi"}],
             "stream": False,
             "keep_alive": self.cfg.keep_alive,
@@ -64,28 +83,29 @@ class OllamaClient:
         r.raise_for_status()
         return time.perf_counter() - t0
 
-    def release(self) -> bool:
+    def release(self, model: str | None = None) -> bool:
         """让 Ollama 立刻卸载模型（keep_alive=0），一般能腾出 4~5 GB 内存。
 
-        回到待唤醒状态时调用，下次唤醒会上一次预热。
+        回到待唤醒状态时调用，下次唤醒会上一次预热。视觉模型（6 GB 上下）
+        尤其值得卸：看完图就让它走。
         """
         try:
             r = requests.post(
                 f"{self.base}/api/generate",
-                json={"model": self.cfg.model, "keep_alive": 0},
+                json={"model": model or self.cfg.model, "keep_alive": 0},
                 timeout=15,
             )
             return r.status_code == 200
         except Exception:  # noqa: BLE001
             return False
 
-    def is_loaded(self) -> bool | None:
+    def is_loaded(self, model: str | None = None) -> bool | None:
         """查询模型当前是否驻留在内存里（用于状态展示）。"""
         try:
             r = requests.get(f"{self.base}/api/ps", timeout=5)
             r.raise_for_status()
             names = [m.get("name", "") for m in r.json().get("models", [])]
-            return self.cfg.model in names
+            return (model or self.cfg.model) in names
         except Exception:  # noqa: BLE001
             return None
 
@@ -93,32 +113,45 @@ class OllamaClient:
     def reset(self) -> None:
         self._history.clear()
 
-    def _build_messages(self, user_text: str) -> list[dict]:
+    def _build_messages(self, user_text: str, images: list[str] | None = None) -> list[dict]:
         msgs: list[dict] = []
         if self.cfg.system_prompt.strip():
             msgs.append({"role": "system", "content": self.cfg.system_prompt.strip()})
         keep = max(0, int(self.cfg.history_turns)) * 2
         if keep:
             msgs.extend(self._history[-keep:])
-        msgs.append({"role": "user", "content": user_text})
+        last: dict = {"role": "user", "content": user_text}
+        if images:
+            # Ollama 的约定：images 是 base64 字符串数组（不带 data: 前缀）
+            last["images"] = list(images)
+        msgs.append(last)
         return msgs
 
-    def chat_stream(self, user_text: str) -> Iterator[str]:
+    def chat_stream(
+        self,
+        user_text: str,
+        images: list[str] | None = None,
+        model: str | None = None,
+        num_ctx: int | None = None,
+    ) -> Iterator[str]:
         """流式返回回答增量。
+
+        ``images``：base64 图片（一张或多张）。带上图片时会用 ``model`` 指定的
+        视觉模型（默认还是 ``cfg.model``，调用方负责传对）。
 
         注意：本方法不修改历史记录，调用方需在收尾时调用 :meth:`commit`，
         这样即使中途被打断也能如实记录对话。
         """
-        messages = self._build_messages(user_text)
+        messages = self._build_messages(user_text, images)
         payload = {
-            "model": self.cfg.model,
+            "model": model or self.cfg.model,
             "messages": messages,
             "stream": True,
             "keep_alive": self.cfg.keep_alive,
             "options": {
                 "temperature": self.cfg.temperature,
                 "top_p": self.cfg.top_p,
-                "num_ctx": self.cfg.num_ctx,
+                "num_ctx": int(num_ctx or self.cfg.num_ctx),
                 "num_predict": self.cfg.num_predict,
             },
         }

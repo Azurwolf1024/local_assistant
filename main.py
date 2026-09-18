@@ -367,6 +367,79 @@ def cmd_ask(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_see(settings: Settings, args: argparse.Namespace) -> int:
+    """看图：摄像头 / 屏幕 / 剪贴板 / 文件 —— 走完整链路（技能 → 视觉模型 → 语音）。
+
+    这就是语音那句「看看这是什么」的等价物，用来不开麦先验证一遍：
+    拍得到 / 找得到 / 模型答得出来。
+    """
+    require_models(settings, need_asr=False)
+    from voice_loop.vision import Vision, VisionError
+
+    if args.fix:
+        # 只做本地部分（拍图/截图/找文件/编码），不调模型
+        vision = Vision(settings.vision, settings.root, logging.getLogger("voice_loop"))
+        try:
+            if args.file:
+                hits = vision.find_file(args.file)
+                if not hits:
+                    print(f"没找到「{args.file}」。（只在 {'、'.join(p.name for p in vision.roots())} 里找）")
+                    return 1
+                for h in hits:
+                    print(f"  {h.score:5.1f}  {vision.describe(h)}   [{h.why}]")
+                text, kind = vision.read_file(hits[0].path)
+                print(f"\n 类型={kind}  长度={len(text)} 字")
+                print(" " + text[:300].replace("\n", "\n "))
+                return 0
+            shot = vision.screen() if args.screen else vision.camera()
+            b64 = vision.encode(shot.path)
+            print(f"{shot.what}：{shot.path}")
+            print(f"编码后 {len(b64) / 1024:.0f} KB（base64），模型用这张")
+            return 0
+        except VisionError as exc:
+            print(f"[失败] {exc}", file=sys.stderr)
+            return 2
+
+    loop = build_loop(settings, preload=False, enable_listening=False)
+    loop.tts_enabled = not args.no_tts
+    try:
+        if args.camera:
+            line = "用摄像头看看这是什么"
+        elif args.screen:
+            line = "看看我的屏幕上是什么"
+        elif args.clipboard:
+            line = "看看我剪贴板里的东西"
+        elif args.file:
+            line = f"读一下文件 {args.file}"
+        else:
+            line = args.text
+        if not line:
+            print("说点什么：main.py see \"看看这个\"，或者 --camera / --screen / --file", file=sys.stderr)
+            return 2
+        print(f"你：{line}\n助手：", end="", flush=True)
+        stats = loop.respond(line, on_delta=lambda d: print(d, end="", flush=True))
+        print()
+        # 找文件要先确认：--yes 时自动回答「是」，把两轮串起来
+        if args.yes and not stats.answer:
+            print("（这次没看到东西，跳过确认）")
+        if stats.extra.get("skill") == "vision_ask" and args.yes:
+            print(f"\n你：是\n助手：", end="", flush=True)
+            stats = loop.respond("是", on_delta=lambda d: print(d, end="", flush=True))
+            print()
+        if stats.extra.get("shot"):
+            print(f"[看的是 {stats.extra['shot']}]")
+        if stats.extra.get("skill"):
+            print(f"[本地技能 {stats.extra['skill']} / 播报 {stats.total_seconds:.2f}s]")
+        else:
+            print(f"[首字 {stats.llm_first_token:.2f}s / 总耗时 {stats.total_seconds:.2f}s]")
+    except Exception as exc:  # noqa: BLE001
+        print(f"\n[错误] {exc}", file=sys.stderr)
+        return 2
+    finally:
+        loop.close()
+    return 0
+
+
 def cmd_skills(settings: Settings, args: argparse.Namespace) -> int:
     """查看/测试生活技能（时间、闹钟、备忘、日程）。"""
     from voice_loop.skills import Skills
@@ -705,6 +778,50 @@ def cmd_selftest(settings: Settings, args: argparse.Namespace) -> int:
         ok = False
         print(f"  × {exc}")
 
+    # 8. 看图（本地部分：截图 / 找文件 / 编码 / 视觉模型是否装好）
+    print("\n[8] 看图（摄像头 / 屏幕 / 文件）")
+    try:
+        from voice_loop.vision import Vision, VisionError
+
+        if not settings.vision.enabled:
+            print("  ! [vision] enabled = false，看图功能已关闭")
+        else:
+            vision = Vision(settings.vision, settings.root, logging.getLogger("voice_loop"))
+            print(f"   看图模型: {settings.vision.model}")
+            try:
+                have = llm.list_models()
+                if any(m.split(":")[0] == settings.vision.model.split(":")[0] for m in have):
+                    print(f"  √ 视觉模型已安装（{settings.vision.model}）")
+                else:
+                    print(f"  ! 视觉模型没装：看图前先跑 ollama pull {settings.vision.model}")
+            except Exception as exc:  # noqa: BLE001
+                print(f"  ! 查不了模型列表：{exc}")
+
+            try:
+                shot = vision.screen()
+                b64 = vision.encode(shot.path)
+                print(f"  √ 截屏 + 编码：{shot.path.name}  base64 {len(b64) / 1024:.0f} KB")
+            except VisionError as exc:
+                print(f"  ! 截屏不可用：{exc}")
+
+            try:
+                vision.camera()
+                print("  √ 摄像头可用")
+            except VisionError as exc:
+                print(f"  ! 摄像头不可用：{exc}")
+            except Exception as exc:  # noqa: BLE001
+                print(f"  ! 摄像头异常：{exc}")
+
+            roots = "、".join(f"{p.name}({p})" for p in vision.roots()) or "（未配置）"
+            print(f"   找文件的根目录：{roots}")
+            for q in ("读一下里面的报告", "看看桌面上的数据文件"):
+                hits = vision.find_file(q) if vision.roots() else []
+                first = vision.describe(hits[0]) if hits else "（没找到）"
+                print(f"    · 「{q}」 -> {first}")
+    except Exception as exc:  # noqa: BLE001
+        ok = False
+        print(f"  × {exc}")
+
     print("\n" + "=" * 66)
     print(" 结果：" + ("全部通过，可以运行 `python main.py listen` 了" if ok else "存在问题，请按上面的提示修复"))
     print("=" * 66)
@@ -762,6 +879,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-tts", action="store_true", help="只输出文字不合成语音")
     p.add_argument("--llm", default=None)
     p.set_defaults(func=cmd_ask)
+
+    p = sub.add_parser("see", help="看图：摄像头 / 屏幕 / 剪贴板 / 文件")
+    p.add_argument("text", nargs="?", default=None, help="想让它看什么，例如「看看这是什么」")
+    p.add_argument("--camera", action="store_true", help="用摄像头拍一张")
+    p.add_argument("--screen", action="store_true", help="截屏")
+    p.add_argument("--clipboard", action="store_true", help="看剪贴板里的图")
+    p.add_argument("--file", default=None, help="读文件（支持模糊名字，会先确认）")
+    p.add_argument("--yes", action="store_true", help="需要确认时自动答「是」")
+    p.add_argument("--fix", action="store_true", help="只做本地部分（拍图/找文件/编码），不调模型")
+    p.add_argument("--no-tts", action="store_true", help="只输出文字不合成语音")
+    p.set_defaults(func=cmd_see)
 
     p = sub.add_parser("asr", help="音频文件转写")
     p.add_argument("audio", help="wav 文件路径")

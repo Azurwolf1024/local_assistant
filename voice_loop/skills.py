@@ -16,6 +16,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from .nlp_time import (
@@ -35,6 +36,7 @@ from .nlp_time import (
 )
 from .settings import Settings
 from .store import JsonStore
+from .vision import Vision, VisionError, norm_name
 
 WEEKDAY_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 WEEKDAY_FULL = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
@@ -334,6 +336,13 @@ class Skills:
         # 由 pipeline 每轮传进来；单独跑 skills 时就是空的。
         self.dialog: list[str] = []
 
+        # 看图（摄像头 / 屏幕 / 剪贴板 / 文件）
+        vcfg = settings.vision
+        self.vision_cfg = vcfg
+        self.vision = Vision(vcfg, settings.root, self.log) if vcfg.enabled else None
+        self._vision_pending: dict | None = None   # 「是这个文件吗？」等着回答
+        self._vision_shot: dict | None = None      # 最近一次「看了什么」
+
     # ======================================================================
     # 入口
     # ======================================================================
@@ -352,9 +361,11 @@ class Skills:
             return None
         now = datetime.now()
         for fn in (
+            self._handle_vision_reply,   # 先接「是 / 第一个」这种确认，别被别的技能抢走
             self._handle_help,
             self._handle_screen,
             self._handle_clock,
+            self._handle_vision,         # 看图（带时间词的会让给日程）
             self._handle_alarm,
             self._handle_schedule,
             self._handle_memo,
@@ -364,7 +375,8 @@ class Skills:
             except Exception as exc:  # noqa: BLE001
                 self.log.warning(f"技能 {fn.__name__} 出错：{exc}")
                 continue
-            if result:
+            # 看图这类结果不带 reply（要交给视觉模型出话），所以 data 也算命中
+            if result is not None and (result.reply or result.data):
                 result.action = result.action or fn.__name__.replace("_handle_", "")
                 self.log.info(f"[技能:{result.action}] {raw} -> {result.reply[:60]}")
                 return result
@@ -600,6 +612,244 @@ class Skills:
                     action="memo_add",
                 )
         return None
+
+    # ======================================================================
+    # 看图：摄像头 / 屏幕 / 剪贴板 / 文件
+    # ======================================================================
+    # 能看图的前提：句子里既要有「看」的动作，又要指向某个对象（这个/屏幕/文件…）。
+    # 只有「看看」不够，否则「看看新闻」会被当成拍照。
+    _VISION_ASK = re.compile(
+        r"(?:看看|看一下|看下|看一眼|瞅瞅|瞧瞧|拍一张|拍个照|拍照|打开看看|看一看)"
+    )
+    # 「读 / 念」这类几乎总是对着文件说的（「念一下会议纪要」），
+    # 所以不要求句子里出现「文件」两个字；但带时间词 + 日程词的会让给日程技能
+    _VISION_READ = re.compile(r"(?:读一下|读读|读一读|念一下|念一?遍|念给我|给我读|给我念)")
+    # 看得到的东西（屏幕 / 文件 / 这个 / 上面…）
+    _VISION_OBJECT = re.compile(
+        r"(?:这个|那个|这一?张|那一?张|这幅|这里|这儿|画面|镜头|摄像头|相机|"
+        r"照片|图片|截图|屏幕|显示器|桌面|窗口|界面|剪贴板|"
+        r"文件|文档|附件|报告|表格|日志|脚本|代码|内容|"
+        r"上面|上头|里头|里面|手里|手上|桌上|窗外|镜头前)"
+    )
+    # 在问「是什么」——但必须同时用手指着（这/那/它）或提到看得到的东西，
+    # 否则「明天是什么天气」也会被当成看图
+    _VISION_WHAT = re.compile(r"(?:是什么|是啥|什么东西|写了什么|写的什么|有什么|讲了什么|什么颜色)")
+    _VISION_POINT = re.compile(r"[这那此它他她]")
+    _V_SRC_LAST = re.compile(r"(?:刚才(?:那|的)?(?:张|幅)?图|上一张|刚才拍的|刚刚拍的|刚才看到的)")
+    _V_SRC_CLIP = re.compile(r"(?:剪贴板|复制的东西|复制的那|刚复制的|我复制的)")
+    _V_SRC_FILE = re.compile(
+        r"(?:\.(?:txt|md|py|json|csv|tsv|log|pdf|docx?|xlsx?|pptx?|ini|toml|ya?ml|xml|html|bat|ps1|sh|c|cpp|h|java|js|ts)\b"
+        r"|文件|文档|附件|pdf|PDF|word|excel|表格|脚本|源代码)"
+    )
+    _V_SRC_SCREEN = re.compile(r"(?:屏幕|显示器|桌面|窗口|界面|屏上|画面上)")
+    _V_SRC_CAMERA = re.compile(r"(?:摄像头|镜头|相机|摄像机|拍照|拍一张|拍个照|前面|手里|手上|桌上|窗外)")
+    _V_YES = re.compile(r"^(?:嗯+|哦+|是|是的|对|对的|对呀|好|好的|好啊|行|可以|要|读吧|看吧|打开吧|"
+                        r"ok|OK|Ok|okay|yes|yeah|yep)$")
+    _V_NO = re.compile(r"^(?:不是|不对|不用|不要|算了|取消|别了|不看|不读了|不看了|换个|no|nope)$")
+    _V_ORDINAL = re.compile(r"^(?:第\s*)?([一二三123])\s*(?:个|条|张|份|号)?$")
+    _V_PUNCT = re.compile(r"[\s，,。.！!？?、；;~〜]+")
+
+    def _handle_vision(self, text: str, now: datetime) -> SkillResult | None:
+        """「看看这是什么」「看看我的屏幕」「读一下那个报告」。
+
+        这里只负责**决定看什么**（拍图 / 截图 / 找到文件），真正的描述
+        交给 pipeline 调视觉模型——技能不猜内容。
+        """
+        cfg = self.vision_cfg
+        if not cfg.enabled or self.vision is None:
+            return None
+        look = bool(self._VISION_ASK.search(text))       # 看看 / 拍一张 / 打开看看
+        read = bool(self._VISION_READ.search(text))      # 读一下 / 念给我
+        last = bool(self._V_SRC_LAST.search(text))       # 刚才那张图
+        obj = bool(self._VISION_OBJECT.search(text))     # 屏幕 / 文件 / 这个
+        what = bool(self._VISION_WHAT.search(text))      # 是什么 / 写了什么
+        point = bool(self._VISION_POINT.search(text))    # 这 / 那 / 它：在指着东西说
+        wanted = (
+            read                                          # 「读一下会议纪要」
+            or last                                       # 「刚才那张图」
+            or (look and (obj or what))                   # 「看看我的屏幕」「看看这是什么」
+            or (what and (obj or point))                  # 「屏幕上写了什么」「它是什么颜色」
+        )
+        if not wanted:
+            return None
+        # 「看看今天的日程」「念一下明天的安排」是在问日程，不是在读文件：
+        # 带时间词 + 日程词的一律让给日程技能（它在后面）
+        if self._RANGE_WORD.search(text) and (
+            TRIGGER_SCHEDULE.search(text) or _weekly_weekday(text) is not None
+        ):
+            return None
+        source = self._vision_source(text, read=read)
+        try:
+            if source == "file":
+                return self._vision_ask_file(text)
+            if source == "last":
+                shot = self.vision.last
+                if shot is None:
+                    return SkillResult(
+                        reply="我还没看过什么东西。说「看看我的屏幕」或者「用摄像头看看」？",
+                        action="vision_miss",
+                    )
+                return self._vision_look(shot.path, shot.what, text)
+            if source == "screen":
+                shot = self.vision.screen()
+            elif source == "clipboard":
+                shot = self.vision.clipboard()
+            else:
+                shot = self.vision.camera()
+            return self._vision_look(shot.path, shot.what, text)
+        except VisionError as exc:
+            return SkillResult(reply=str(exc), action="vision_error")
+
+    def _vision_source(self, text: str, read: bool = False) -> str:
+        """这句话想在哪儿看：camera / screen / clipboard / file / last。"""
+        if self._V_SRC_LAST.search(text):
+            return "last"
+        if self._V_SRC_CLIP.search(text):
+            return "clipboard"
+        if self._V_SRC_FILE.search(text):
+            return "file"
+        if self._V_SRC_SCREEN.search(text):
+            return "screen"
+        if self._V_SRC_CAMERA.search(text):
+            return "camera"
+        if read:
+            return "file"                  # 「读一下会议纪要」= 去文件里找这个
+        # 没说来源（「这是什么」）→ 按配置来；拿不准就去问清楚反而更膈应人
+        default = str(self.vision_cfg.default_source or "camera").lower()
+        return default if default in ("camera", "screen") else "camera"
+
+    # ------------------------------------------------------------ 文件
+    def _vision_ask_file(self, text: str) -> SkillResult:
+        """文件先解析出**完整路径**再问一句，确认了才读。"""
+        assert self.vision is not None
+        hits = self.vision.find_file(text)
+        name = self.vision.query_name(text)
+        if not hits:
+            roots = "、".join(p.name for p in self.vision.roots()) or "（未配置）"
+            what = f"「{name}」" if name else "那个文件"
+            return SkillResult(
+                reply=f"没找到叫{what}的文件。我只在 {roots} 里找——说清楚文件名，或者把完整路径念给我？",
+                action="vision_miss",
+            )
+        self._vision_pending = {"hits": hits, "at": time.monotonic()}
+        best = hits[0]
+        if len(hits) > 1 and hits[1].score >= best.score - 12:
+            listing = "；".join(f"{i}) {self.vision.describe(h)}" for i, h in enumerate(hits[:3], 1))
+            return SkillResult(
+                reply=f"找到几个对得上的：{listing}。是哪个？说「第一个」或者直接把名字再说一遍。",
+                action="vision_ask",
+            )
+        return SkillResult(
+            reply=f"你是说 {self.vision.describe(best)}？说「是」我就打开看。",
+            action="vision_ask",
+        )
+
+    def _handle_vision_reply(self, text: str, now: datetime) -> SkillResult | None:
+        """接住「是这个文件吗？」的下一句：是 / 不是 / 第一个 / 再报个名字。"""
+        pend = self._vision_pending
+        if not pend:
+            return None
+        if time.monotonic() - float(pend.get("at", 0.0)) > float(self.vision_cfg.confirm_expire):
+            self._vision_pending = None
+            return None
+        raw = self._V_PUNCT.sub("", (text or "").strip())
+        if not raw or len(raw) > 16:
+            # 说的是别的新指令，这件事就算过去了
+            self._vision_pending = None
+            return None
+        hits = list(pend.get("hits") or [])
+        if self._V_YES.match(raw):
+            self._vision_pending = None
+            if not hits:
+                return None
+            return self._vision_open(hits[0].path, text)
+        if self._V_NO.match(raw):
+            self._vision_pending = None
+            return SkillResult(reply="好，那我不看了。", action="vision_cancel")
+        ordinal = self._V_ORDINAL.match(raw)
+        if ordinal:
+            idx = "一二三".find(ordinal.group(1))
+            if idx < 0:
+                idx = int(ordinal.group(1)) - 1
+            if 0 <= idx < len(hits):
+                self._vision_pending = None
+                return self._vision_open(hits[idx].path, text)
+        # 「打开那个报告」——名字要在候选里对得上，否则不猜
+        want = norm_name(raw)
+        for h in hits:
+            if want and want in norm_name(h.name):
+                self._vision_pending = None
+                return self._vision_open(h.path, text)
+        self._vision_pending = None
+        return None
+
+    # ------------------------------------------------------------ 交给模型
+    def _vision_open(self, path, user_text: str) -> SkillResult:
+        """用户确认过了：读文件 / 看图，包装成 pipeline 能直接送给模型的形式。"""
+        assert self.vision is not None
+        p = path if isinstance(path, Path) else Path(str(path))
+        try:
+            text, kind = self.vision.read_file(p)
+        except VisionError as exc:
+            return SkillResult(reply=str(exc), action="vision_error")
+        if kind == "image":
+            return self._vision_look(p, f"图片《{p.name}》", user_text)
+        if kind == "empty":
+            return SkillResult(reply=f"{p.name} 是个空文件，没什么可看的。", action="vision_empty")
+        return self._vision_text_result(p, text, user_text)
+
+    def _vision_look(self, path, what: str, user_text: str) -> SkillResult:
+        """看图：把图编码成 base64 交给视觉模型（pipeline 负责真的去调）。"""
+        assert self.vision is not None
+        suffix = str(path).lower().rsplit(".", 1)[-1]
+        if suffix in ("png", "jpg", "jpeg", "bmp", "webp", "gif", "tif", "tiff"):
+            try:
+                images = [self.vision.encode(path)]
+            except VisionError as exc:
+                return SkillResult(reply=str(exc), action="vision_error")
+            prompt = (
+                f"用户让你看{what}。用户说：「{user_text}」\n"
+                "请用中文口语回答，两到三句，不要用列表、不要 markdown。\n"
+                "如果用户没问具体问题，就说你看到了什么：有什么东西、上面有没有文字、大概什么颜色。\n"
+                "看不清楚就直说看不清，不要编。"
+            )
+            self._vision_shot = {"path": str(path), "what": what}
+            return SkillResult(
+                reply="",
+                action="vision",
+                data={"images": images, "prompt": prompt, "shot": str(path),
+                      "what": what, "note": str(self.vision_cfg.say_first or "")},
+            )
+        # 不是图片（PDF/Word/文本）→ 抽文本即可，用不着视觉模型
+        try:
+            text, _kind = self.vision.read_file(path)
+        except VisionError as exc:
+            return SkillResult(reply=str(exc), action="vision_error")
+        return self._vision_text_result(path, text, user_text)
+
+    def _vision_text_result(self, path, text: str, user_text: str) -> SkillResult:
+        """文本文件：把内容（截断）交给普通模型就行。"""
+        limit = max(200, int(self.vision_cfg.file_max_chars))
+        body = text[:limit]
+        more = "（内容太长，这里只是前面一部分）" if len(text) > limit else ""
+        lines = text.count("\n") + 1
+        prompt = (
+            f"用户让你看一个文件的全文：{getattr(path, 'name', path)}（约 {lines} 行）{more}\n"
+            "----- 文件内容开始 -----\n"
+            f"{body}\n"
+            "----- 文件内容结束 -----\n"
+            f"用户说：「{user_text}」\n"
+            "请用中文口语回答，两到三句，不要用列表、不要 markdown。\n"
+            "用户没问具体问题时，就说这个文件是做什么的。"
+        )
+        self._vision_shot = {"path": str(getattr(path, "name", path)), "what": "文件"}
+        return SkillResult(
+            reply="",
+            action="vision",
+            data={"images": [], "prompt": prompt, "shot": str(path), "what": "文件",
+                  "num_ctx": int(self.vision_cfg.file_num_ctx),
+                  "note": str(self.vision_cfg.say_first or "")},
+        )
 
     # ======================================================================
     # 课程 / 会议 / 日程
@@ -1648,6 +1898,7 @@ class Skills:
                 "拿不准就问你；"
                 "「有哪些课程」「所有会议」看全部的安排，「取消所有会议」"
                 "「所有课程提前半小时提醒」一次改一片；"
+                "「看看这是什么」「看看我的屏幕上是什么」「读一下那个报告」我还能看图看文件；"
                 "「关屏幕」把显示器关掉（只是关屏，不睡眠）。"
                 "其余的，直接问我就好。"
             ),

@@ -122,7 +122,14 @@ flowchart LR
 cd <项目目录>
 pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 python scripts/download_models.py     # 补上 SenseVoice / Silero VAD / Piper 中文女声（约 300 MB）
-python main.py selftest               # 7 项检查，全过就能用了
+python main.py selftest               # 8 项检查，全过就能用了
+```
+
+想让它能**看图**（摄像头 / 屏幕 / 文件），再补两件事：
+
+```powershell
+ollama pull qwen2.5vl:7b          # 视觉模型（约 6 GB），纯文本模型看图只会编
+pip install pypdf                 # 可选：读 PDF（Word 靠已装的 python-docx）
 ```
 
 ---
@@ -138,6 +145,10 @@ python main.py text          # 打字调试：完整技能 + LLM + 语音播报�
 python main.py skills        # 查看闹钟 / 备忘 / 日程
 python main.py skills "十分钟后提醒我喝水"   # 测试某句话会命中哪个技能
 python main.py ask "介绍一下杭州"            # 单次提问 + 播报
+python main.py see --screen                  # 看图：截屏让模型描述
+python main.py see --camera                  # 看图：拍一张
+python main.py see --file 报告.docx --yes    # 读文件（模糊名字，--yes 自动确认）
+python main.py see --fix --screen            # 只做本地部分（拍图/找文件/编码），不调模型
 python main.py asr test.wav                  # 音频转文字
 python main.py tts "你好呀" -o a.wav          # 文本转语音
 python main.py devices                       # 查看音频设备
@@ -202,6 +213,8 @@ Stop-Process -Id <PID> -Force
 | 只取消这一次 | 下周三的课不上了（课表留着，下周照常） |
 | 彻底删除 | 以后不上这门课了 / 删掉组会 |
 | 关/开显示器 | 关屏幕 / 黑屏 / 息屏（只是关屏，不是休眠；服务照常跑） |
+| 看图 | 看看这是什么 / 用摄像头看看 / 看看我的屏幕上是什么 / 刚才那张图是什么 |
+| 看文件 | 读一下那个报告 / 念一下会议纪要（先报完整路径，你说「是」才读） |
 
 技能命中就本地直接回答，零延迟也不会胡说；没命中才交给 Ollama。
 所有技能返回 `None` 时不会抢话，所以闲聊不受影响。
@@ -339,6 +352,7 @@ python scripts/test_subtitle.py --check
 
 ```powershell
 python scripts/test_offline.py         # 几秒钟，不加载模型，测分块/时间/技能/唤醒
+python scripts/test_vision.py          # 看图：找文件/确认流程/编码/路由（不用视觉模型）
 python scripts/test_skills_route.py    # 技能路由 + 关屏幕 + 课表 + 提醒文案 + 重启不丢数据
 python scripts/test_bargein.py         # 打断：合成回声/插话对照（--echo 真机回声自测）
 python scripts/test_wake_cycle.py      # 待机 → 唤醒 → 空闲回收 → 再次唤醒
@@ -351,6 +365,72 @@ python scripts/test_mic_loopback.py    # 扬声器放一句、麦克风收，诊
 python scripts/say.py "凯尔希，现在几点了"   # 不想开口时，让电脑替你喊唤醒词
 python scripts/clean_junk_data.py --apply    # 清理早期版本写坏的备忘/闹钟（先备份）
 ```
+
+### 看图（摄像头 / 屏幕 / 剪贴板 / 文件）
+
+先说前提：**看图要一个视觉模型**，文本模型收到图片只会编。装好后写进 `[vision] model`：
+
+```powershell
+ollama pull qwen2.5vl:7b      # 约 6 GB；第一次看图要等它加载（10~20 秒），之后就快了
+```
+
+| 你说 | 它看哪里 |
+| --- | --- |
+| 这是什么 / 看看这个 / 用摄像头看看 | 摄像头（`default_source` 可改成 `screen`） |
+| 看看我的屏幕上是什么 / 屏幕上写了什么 | 截屏（多显示器一起截） |
+| 看看我复制的东西 | 剪贴板里的图（复制的是文件会说一声，走文件那条路） |
+| 刚才那张图是什么 / 上一张 | **重看刚看过的那张**，不会重新拍 |
+| 读一下那个报告 / 念一下会议纪要 | 找一个文件来读（下面细说） |
+| 看看这个 C:\path\to\a.pdf | 指名道姓的路径也能读 |
+
+**找文件：模糊匹配 + 先问再读。** 只在 `file_roots`（默认 桌面 / 下载 / 文档）里按名字找，
+越近改过的越占优；找到之后**一定**先把完整路径、大小、修改时间念给你听：
+
+```
+你：读一下会议纪要
+它：你是说 C:\Users\philw\Desktop\会议纪要.txt（3 KB，20 分钟前改的）？说「是」我就打开看。
+你：是
+它：（读内容后回答）
+```
+
+- 同时有好几个对得上的 → 报前三个问你是哪个（说「第一个」或者说名字）
+- 说的名字对不上任何文件 → 直说没找到，并告诉你是在哪几个目录里找的
+- 「不是 / 算了」就作罢；120 秒不回答自动作废；下一句换别的话题也不会**误当成确认**
+- 文件类型：`.txt/.md/.py/.json/.csv/…` 直接抽文本（**不用视觉模型**）；
+  `.docx` 用 python-docx；`.pdf` 要 `pip install pypdf`；图片交给视觉模型
+- 超过 `file_max_chars`（默认 1800 字）只喂前面一部分，并在提示里说明「只是前面一部分」
+
+**拍下来的图会存下来**（`data/vision/`，默认只留最近 40 张）——模型说错了你能回头核对它到底看了什么。
+屏幕截图和照片都属于隐私内容，这个目录不进 git、也不要往外发；
+不想留就把 `[vision] enabled` 关掉，或者定期清空该目录。
+
+命令行等价物（不开麦也能验）：
+
+```powershell
+python main.py see --screen                   # 截屏让模型描述
+python main.py see --camera                   # 拍一张
+python main.py see "看看这个"                  # 走默认来源
+python main.py see --file 报告.docx --yes      # 读文件；--yes = 自动答「是」
+python main.py see --fix --screen              # 只做本地部分，不调模型（看拍到了什么）
+```
+
+> 截屏是 3120×2080（200% 缩放）这种大屏时，会被等比压到 `screen_max_side`（默认 1568）。
+> 屏幕上的小字如果认不清，把它调大到 2048 试试——代价是慢（图片越大，CPU 上预填越久）。
+> 摄像头默认压到 1024；帧率、曝光靠系统，`warmup_frames` 那几帧是用来等自动曝光稳定的。
+
+经常要动的几个开关（都在 `config.toml` 的 `[vision]`）：
+
+| 配置 | 默认 | 作用 |
+| --- | --- | --- |
+| `enabled` | true | 总开关，关掉后看图相关的话全部交给 LLM |
+| `model` | `qwen2.5vl:7b` | 看图用的模型，必须自己 `ollama pull` |
+| `default_source` | `camera` | 只说「这是什么」时看哪里：`camera` / `screen` |
+| `camera_index` | 0 | 第几个摄像头 |
+| `save_dir` / `keep_images` | `data/vision` / 40 | 图存哪、留多少张 |
+| `file_roots` | 桌面/下载/文档 | 找文件的范围（别的目录要说完整路径） |
+| `file_max_chars` | 1800 | 读文件时最多喂多少字 |
+| `confirm_expire` | 120 | 「是这个文件吗？」多久没回答作废（秒） |
+| `say_first` | `我看一眼。` | 看图前先说的一句话，`""` 则不出声 |
 
 ---
 
