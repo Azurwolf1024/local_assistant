@@ -237,8 +237,145 @@ def test_skills() -> None:
 
 
 # --------------------------------------------------------------------------- #
+def test_schedule_model() -> None:
+    """日程模型：多个提前提醒 / 循环周期 / 截止 / 结束后重排。"""
+    print("\n[4] 日程模型（多个提醒 + 循环周期）")
+    from datetime import timedelta
+
+    from voice_loop.nlp_time import parse_reminds, parse_repeat, parse_until
+    from voice_loop.skills import Skills
+
+    settings = load_settings()
+    tmp = Path(tempfile.mkdtemp(prefix="voiceloop_sched_"))
+    # ★ 三个文件都要指到临时目录，不然会写进真实 data/
+    settings.skills.data_dir = str(tmp)
+    settings.skills.alarm_file = str(tmp / "alarms.json")
+    settings.skills.memo_file = str(tmp / "memos.json")
+    settings.skills.schedule_file = str(tmp / "schedule.json")
+    skills = Skills(settings)
+    skills.schedule.save([])
+
+    print("    · 解析")
+    for text, expect in [
+        ("每周三上午九点有课", {"repeat": "weekly", "weekday": 2}),
+        ("每两周周三下午两点组会", {"repeat": "biweekly", "weekday": 2}),
+        ("每月5号交房租", {"repeat": "monthly", "day": 5}),
+        ("每年3月1日开学", {"repeat": "yearly", "month": 3, "day": 1}),
+        ("每3天浇一次花", {"repeat": "interval", "every_days": 3}),
+        ("每2小时起来活动", {"repeat": "interval", "every_minutes": 120}),
+        ("每天吃药", {"repeat": "interval", "every_days": 1}),
+        ("明天下午三点开会", None),
+    ]:
+        check(f"周期 {text}", parse_repeat(text), expect)
+    for text, expect in [
+        ("提前一天和半小时提醒我", [1440, 30]),
+        ("提前30分钟、10分钟和到点提醒我", [30, 10, 0]),
+        ("提前十分钟提醒我", [10]),
+        ("到点提醒我", [0]),
+        ("明天下午三点开会", None),
+    ]:
+        check(f"提前量 {text}", parse_reminds(text), expect)
+    check("截止 12月底", parse_until("每周三有课，到12月底为止", datetime(2026, 9, 18)), datetime(2026, 12, 31).date())
+
+    print("    · 新增各类日程")
+    cases = [
+        ("每周三上午九点有 AIAA3102 机器学习，地点教学楼 A302", "schedule_add_weekly"),
+        ("每两周周三下午两点开组会", "schedule_add_weekly"),
+        ("每月5号下午三点交房租", "schedule_add"),
+        ("每年3月1日上午九点开学典礼", "schedule_add"),
+        ("每3天浇一次花，第一次是明天上午八点", "schedule_add"),
+        ("明天下午三点安排项目评审会，提前30分钟、10分钟和到点提醒我", "schedule_add"),
+        ("每天提醒我吃药，到12月底为止", "schedule_add"),
+    ]
+    for text, action in cases:
+        r = skills.handle(text)
+        check(f"新增 [{action}] {text[:16]}", getattr(r, "action", None), action)
+        if r is not None:
+            print(f"        {r.reply}")
+
+    items = {i.get("title", ""): i for i in skills.schedule.load()}
+
+    def find(key: str) -> dict:
+        hit = next((it for t, it in items.items() if key in t), None)
+        assert hit is not None, f"没找到标题含「{key}」的日程：{list(items)}"
+        return hit
+
+    print(f"    落盘 {len(items)} 条：")
+    for title, it in items.items():
+        print(f"      {title}: repeat={it.get('repeat')} "
+              f"weekday={it.get('weekday')} day={it.get('day')} time={it.get('time')} "
+              f"leads={it.get('remind_before')} until={it.get('until')}")
+
+    check("多个提前量写进了数组", find("评审").get("remind_before"), [30, 10, 0])
+    check("每周课的提前量也支持多个", find("AIAA3102").get("remind_before"), [10])
+    check("每月存下了几号", find("房租").get("day"), 5)
+    check("每月标题不带「每月5号」", "每月" not in next(t for t in items if "房租" in t), True)
+    check("每年存下了月日",
+          (find("开学").get("month"), find("开学").get("day")), (3, 1))
+    check("间隔循环存的是间隔", find("吃药").get("every_days"), 1)
+    check("截止日期落盘", find("吃药").get("until"), "2026-12-31")
+
+    print("    · 周期推进（next_occurrence）")
+    now = datetime(2026, 9, 18, 21, 0)          # 周五晚
+    marks = {"AIAA3102": "mach", "组会": "group", "房租": "rent",
+             "开学": "school", "浇": "water"}
+    steps = {}
+    for key, name in marks.items():
+        it = find(key)
+        first = skills.next_occurrence(it, now)
+        second = skills.next_occurrence(it, first + timedelta(seconds=1)) if first else None
+        steps[name] = (first, second)
+        print(f"      {it.get('title')}: {first} -> {second}")
+    check("每周课下一次是下周三", steps["mach"][0].strftime("%m-%d %H:%M"), "09-23 09:00")
+    check("双周下一次隔两周", (steps["group"][1] - steps["group"][0]).days, 14)
+    check("每月下一次是下月同日",
+          (steps["rent"][0].strftime("%m-%d"), steps["rent"][1].strftime("%m-%d")),
+          ("10-05", "11-05"))
+    check("每年下一次是明年同日", steps["school"][0].strftime("%Y-%m-%d"), "2027-03-01")
+    check("每3天：第一次是明天上午八点", steps["water"][0].strftime("%m-%d %H:%M"), "09-19 08:00")
+    check("每3天：结束后再排下一次（间隔 3 天）",
+          (steps["water"][1] - steps["water"][0]).days, 3)
+
+    print("    · 每月 31 号碰上小月要回退到月末")
+    skills.schedule.append({"title": "月底对账", "repeat": "monthly", "day": 31,
+                            "time": "20:00", "start": "2026-09-30 20:00", "remind_before": [0]})
+    feb = skills.next_occurrence(
+        [i for i in skills.schedule.load() if i["title"] == "月底对账"][0], datetime(2027, 1, 31, 21, 0)
+    )
+    check("1/31 之后是 2/28", feb.strftime("%Y-%m-%d"), "2027-02-28")
+
+    print("    · 多个提前量各自只响一次")
+    ev = find("评审")
+    start = skills.next_occurrence(ev, datetime(2026, 9, 18, 21, 0))
+    fired = []
+    for mins in (31, 30, 11, 10, 0):
+        got = [t for _i, t in skills.due_schedule(start - timedelta(minutes=mins))]
+        fired.append((mins, len(got)))
+        print(f"      提前 {mins:>3} 分钟 -> {got}")
+    check("31 分钟时不该响", fired[0][1], 0)
+    check("30 分钟时响一次", fired[1][1], 1)
+    check("11 分钟时不该响", fired[2][1], 0)
+    check("10 分钟时响一次", fired[3][1], 1)
+    check("到点响一次", fired[4][1], 1)
+    check("再问一遍不会重复提醒（已记 _fired）",
+          len(skills.due_schedule(start - timedelta(minutes=30))), 0)
+    check("开始 6 分钟后不再补报",
+          len(skills.due_schedule(start + timedelta(minutes=6))), 0)
+
+    print("    · 循环重复/多个提前量的说法要交给日程，不是闹钟")
+    check("每周三提醒我上课 -> 日程",
+          getattr(skills.handle("每周三上午九点提醒我上课"), "action", "").startswith("schedule"), True)
+    check("十分钟后提醒我喝水 -> 还是闹钟",
+          getattr(skills.handle("十分钟后提醒我喝水"), "action", ""), "alarm_add")
+
+    import shutil
+
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
 def test_wake() -> None:
-    print("\n[4] 唤醒词匹配")
+    print("\n[5] 唤醒词匹配")
     settings = load_settings()
     path = settings.resolve(settings.wake.file)
     matcher = WakeWordMatcher(path)
@@ -273,7 +410,7 @@ def test_wake() -> None:
 # --------------------------------------------------------------------------- #
 def test_lifecycle() -> None:
     """验证「唤醒加载 / 空闲回收」状态机（不碰硬件，不加载模型）。"""
-    print("\n[5] 唤醒服务生命周期")
+    print("\n[6] 唤醒服务生命周期")
     from voice_loop.pipeline import VoiceLoop
 
     settings = load_settings()
@@ -309,6 +446,7 @@ def main() -> int:
     test_chunker()
     test_time()
     test_skills()
+    test_schedule_model()
     test_wake()
     test_lifecycle()
     print("\n" + "=" * 66)

@@ -262,6 +262,163 @@ def parse_datetime(text: str, now: datetime | None = None, roll_forward: bool = 
     return target
 
 
+# --------------------------------------------------------------------------- #
+# 重复周期 / 提前量
+# --------------------------------------------------------------------------- #
+_MONTHLY = re.compile(r"每(?:个)?月")
+_YEARLY = re.compile(r"每(?:个)?年")
+_EVERY_MINUTES = re.compile(r"每\s*(\d{1,3}|[一二三四五六七八九十两]+)\s*(?:个)?\s*(?:分钟|分)(?!钟)")
+_EVERY_HOURS = re.compile(r"每\s*(\d{1,3}|[一二三四五六七八九十两]+|半)\s*(?:个)?\s*(?:小时|钟头)")
+_EVERY_DAYS = re.compile(r"每\s*(\d{1,3}|[一二三四五六七八九十两]+)\s*天")
+_EVERY_WEEKS = re.compile(r"每\s*(\d{1,2}|[一二三四五六七八九十两]+)\s*(?:个)?\s*(?:周|星期|礼拜)")
+_DAILY = re.compile(r"每天|每晚|每早|每日")
+_HOURLY = re.compile(r"每小时|每个小时")
+_WEEKDAY_IN_TEXT = re.compile(r"(?:周|星期|礼拜)\s*([一二三四五六日天])")
+_MONTH_IN_TEXT = re.compile(r"(\d{1,2}|[一二三四五六七八九十]+)\s*月\s*(\d{1,2}|[一二三四五六七八九十]+)\s*[号日]")
+_DAY_IN_TEXT = re.compile(r"(\d{1,2}|[一二三四五六七八九十]+)\s*[号日]")
+
+
+def parse_repeat(text: str) -> dict | None:
+    """解析重复周期，返回可以直接并进日程条目的字段。
+
+    支持：每周三 / 每两周周三 / 每月5号 / 每年3月1日 / 每3天 / 每2小时 / 每天。
+    ``interval`` 的意思是「这次结束后再过 N 天/分钟」，不是固定日历周期。
+    """
+    t = text or ""
+    m = _YEARLY.search(t)
+    if m:
+        mm = _MONTH_IN_TEXT.search(t)
+        out = {"repeat": "yearly"}
+        if mm:
+            out["month"] = int(cn2num(mm.group(1)) or 0) or None
+            out["day"] = int(cn2num(mm.group(2)) or 0) or None
+            out = {k: v for k, v in out.items() if v}
+        return out
+    m = _MONTHLY.search(t)
+    if m:
+        dm = _DAY_IN_TEXT.search(t)
+        out = {"repeat": "monthly"}
+        if dm:
+            day = cn2num(dm.group(1))
+            if day:
+                out["day"] = int(day)
+        return out
+    m = _EVERY_MINUTES.search(t)
+    if m:
+        n = cn2num(m.group(1))
+        if n:
+            return {"repeat": "interval", "every_minutes": int(n)}
+    m = _EVERY_HOURS.search(t)
+    if m:
+        n = 0.5 if m.group(1) == "半" else cn2num(m.group(1))
+        if n:
+            return {"repeat": "interval", "every_minutes": int(round(float(n) * 60))}
+    m = _EVERY_DAYS.search(t)
+    if m:
+        n = cn2num(m.group(1))
+        if n:
+            return {"repeat": "interval", "every_days": int(n)}
+    m = _EVERY_WEEKS.search(t)
+    if m:
+        n = int(cn2num(m.group(1)) or 1)
+        out: dict = {}
+        if n == 1:
+            out["repeat"] = "weekly"
+        elif n == 2:
+            out["repeat"] = "biweekly"
+        else:
+            out["repeat"] = "interval"
+            out["every_days"] = n * 7
+        wd = _WEEKDAY_IN_TEXT.search(t)
+        if wd:
+            out["weekday"] = _WEEKDAY_CN[wd.group(1)]
+        return out
+    if _HOURLY.search(t):
+        return {"repeat": "interval", "every_minutes": 60}
+    if _DAILY.search(t):
+        return {"repeat": "interval", "every_days": 1}
+    wd = _WEEKDAY_IN_TEXT.search(t)
+    if wd and re.search(r"每(?:个)?(?:周|星期|礼拜)", t):
+        return {"repeat": "weekly", "weekday": _WEEKDAY_CN[wd.group(1)]}
+    return None
+
+
+_UNTIL = re.compile(r"(?:到|直到)\s*(.+?)\s*(?:为止|以前|之前)")
+_LEAD_UNITS = {"天": 1440, "日": 1440, "小时": 60, "钟头": 60, "分钟": 1, "分": 1, "刻": 15}
+_LEAD_TOKEN = re.compile(r"(\d{1,3}|[一二三四五六七八九十两]+|半)\s*(?:个)?\s*(天|日|小时|钟头|分钟|分|刻)")
+_LEAD_ON_TIME = re.compile(r"(到点|准时|正点|开始时|开始的时候)")
+
+
+def parse_reminds(text: str, *, maximum: int = 5) -> list[int] | None:
+    """解析「提前多久提醒」的多个提前量，返回分钟数组（0 = 到点）。
+
+    「提前一天和半小时提醒我」-> [1440, 30]
+    「提前30分钟、10分钟和到点提醒我」-> [30, 10, 0]
+    「到点提醒我」-> [0]
+    没说就返回 None（调用方用默认值）。
+    """
+    t = text or ""
+    has_lead = bool(re.search(r"(提前|预先|事先)", t))
+    if not has_lead:
+        return [0] if _LEAD_ON_TIME.search(t) else None
+    tail = re.split(r"(?:提前|预先|事先)", t, maxsplit=1)[-1]
+    # 到「提醒/叫我」为止，别把后面「还有课」那半句也算进来
+    tail = re.split(r"(?:提醒|叫我|喊我|通知|通知我)", tail)[0]
+    leads: list[int] = []
+    for m in _LEAD_TOKEN.finditer(tail):
+        raw = m.group(1)
+        n = 0.5 if raw == "半" else cn2num(raw)
+        if n is None:
+            continue
+        leads.append(int(round(float(n) * _LEAD_UNITS[m.group(2)])))
+    if _LEAD_ON_TIME.search(tail):
+        leads.append(0)
+    leads = sorted({v for v in leads if v >= 0}, reverse=True)
+    return leads[:maximum] or None
+
+
+def parse_until(text: str, now: datetime | None = None) -> date | None:
+    """「到 12 月底为止」这种循环截止日期。"""
+    t = text or ""
+    m = _UNTIL.search(t)
+    if not m:
+        return None
+    now = now or datetime.now()
+    frag = m.group(1).strip()
+
+    iso = re.search(r"(\d{4})\s*[-/]\s*(\d{1,2})\s*[-/]\s*(\d{1,2})", frag)
+    if iso:
+        try:
+            return date(int(iso.group(1)), int(iso.group(2)), int(iso.group(3)))
+        except ValueError:
+            return None
+
+    # 「年底 / 月末」这类模糊说法统一当成那一段的最后一天
+    if re.search(r"(年底|年末|今年底)", frag):
+        return date(now.year, 12, 31)
+    if re.search(r"(月底|月末|这个月底)", frag) and not re.search(r"\d|一二三四五六七八九十", frag):
+        return date(now.year, now.month, _days_in_month(now.year, now.month))
+    mo = re.search(r"(\d{1,2}|[一二三四五六七八九十]+)\s*月(?!\s*\d)", frag)
+    if mo:
+        month = int(cn2num(mo.group(1)) or 0)
+        if 1 <= month <= 12:
+            year = now.year + (1 if month < now.month else 0)
+            if re.search(r"(底|末)", frag):
+                return date(year, month, _days_in_month(year, month))
+            return date(year, month, _days_in_month(year, month))
+
+    day = parse_date_hint(frag, now)
+    if day is not None:
+        return day
+    return None
+
+
+def _days_in_month(year: int, month: int) -> int:
+    if month == 2:
+        return 29 if (year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)) else 28
+    return (31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)[month - 1]
+
+
 _CN_NUM = "零一二三四五六七八九"
 
 

@@ -31,6 +31,7 @@ import re
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -408,6 +409,26 @@ def cmd_skills(settings: Settings, args: argparse.Namespace) -> int:
         print("\n备忘：")
         for i, m in enumerate(memos[:10], 1):
             print(f"  {i}. {m.get('content')}")
+    sched = skills.schedule.load()
+    if sched:
+        print("\n日程（下一次 / 规则 / 提前提醒）：")
+        now = datetime.now()
+        for i, it in enumerate(sched, 1):
+            nxt = skills.next_occurrence(it, now)
+            leads = skills._leads_of(it)                       # noqa: SLF001
+            lead_text = "、".join(
+                "到点" if v <= 0 else (f"{v // 1440}天" if v % 1440 == 0 else f"{v // 60}小时" if v % 60 == 0 else f"{v}分钟")
+                for v in leads
+            )
+            where = f"  @{it['location']}" if it.get("location") else ""
+            note = f"  备注：{it['note']}" if it.get("note") else ""
+            link = f"  关联：{it.get('linked')}" if it.get("linked") else ""
+            skip = f"  跳过：{it['skip']}" if it.get("skip") else ""
+            print(
+                f"  {i}. {nxt.strftime('%m-%d %H:%M') if nxt else '（已结束）'}"
+                f"  {skills._repeat_text(it)}  {it.get('title')}{where}{note}{link}{skip}"
+                f"\n     提前提醒：{lead_text}"
+            )
     print("\n提示：直接编辑上面这些 json 文件即可增删；用 python main.py skills \"今天有什么课\" 可以测试识别。")
     return 0
 
