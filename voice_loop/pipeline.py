@@ -15,6 +15,7 @@ import re
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -177,6 +178,8 @@ class VoiceLoop:
         # 最近说过的话（用来识别「自己的声音被麦克风捡回来」）
         self._recent_spoken: list[tuple[float, str]] = []
         self._from_bargein = False
+        # 最近几轮对话原文（你说 / 助手答），供技能解析「它、那个、刚才那条」指谁
+        self._dialog: deque[str] = deque(maxlen=8)
 
         self._stop = threading.Event()
         self._interrupt = threading.Event()
@@ -607,12 +610,16 @@ class VoiceLoop:
             self.subtitle.show_user(user_text)
 
         # ---------------------------------------------------------- 技能路径
-        skill = self.skills.handle(user_text) if self.skills else None
+        # 带上最近几轮对话，技能才能把「它 / 那个 / 刚才那条」对上号
+        skill = (
+            self.skills.handle(user_text, dialog=list(self._dialog)) if self.skills else None
+        )
         if skill is not None:
             # 上上轮可能被回车/语音打断过，不清掉的话这一句回答会一开始就被掐断
             self._interrupt.clear()
             stats.extra["skill"] = skill.action
             stats.answer = skill.reply
+            self._note_dialog(user_text, skill.reply)
             if on_delta is not None:
                 on_delta(skill.reply)
             stats.total_seconds = self.speak_text(skill.reply)
@@ -687,6 +694,7 @@ class VoiceLoop:
         answer = "".join(pieces).strip()
         stats.answer = answer
         self._note_spoken(answer)
+        self._note_dialog(user_text, answer)
         stats.interrupted = self._interrupt.is_set()
         stats.first_audio = first_audio or 0.0
         stats.total_seconds = time.perf_counter() - t0
@@ -738,6 +746,16 @@ class VoiceLoop:
         self._recent_spoken.append((time.monotonic(), clean))
         if len(self._recent_spoken) > 6:
             self._recent_spoken.pop(0)
+
+    def _note_dialog(self, user_text: str, answer: str) -> None:
+        """记一轮对话，供技能做指代解析（「它」「那个」「刚才那条」）。
+
+        只留原文，不做摘要：技能自己会用名字/时间在里头找出候选，
+        找不准就反问，绝不猜。
+        """
+        for line in (f"你说：{user_text}", f"助手：{answer}"):
+            if line.strip() and len(line) > 3:
+                self._dialog.append(line)
 
     def _looks_like_own_voice(self, text: str, window: float = 30.0) -> bool:
         """这句话是不是「自己刚说的话被麦克风又捡回来了一遍」。

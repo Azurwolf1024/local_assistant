@@ -424,6 +424,132 @@ def test_schedule_model() -> None:
 
 
 # --------------------------------------------------------------------------- #
+def test_refer_and_batch() -> None:
+    """上下文指代（它 / 那个）与批量操作（所有课程 / 所有会议）。"""
+    print("\n[4b] 上下文指代 + 批量操作")
+    from voice_loop.skills import Skills
+
+    settings = load_settings()
+    tmp = Path(tempfile.mkdtemp(prefix="voiceloop_ref_"))
+    settings.skills.data_dir = str(tmp)
+    settings.skills.alarm_file = str(tmp / "alarms.json")
+    settings.skills.memo_file = str(tmp / "memos.json")
+    settings.skills.schedule_file = str(tmp / "schedule.json")
+    skills = Skills(settings)
+
+    base = [
+        {"title": "AIAA3102 机器学习", "kind": "course", "repeat": "weekly", "weekday": 2,
+         "time": "09:00", "duration_minutes": 90, "remind_before": [15]},
+        {"title": "数学分析", "kind": "course", "repeat": "weekly", "weekday": 0,
+         "time": "10:00", "remind_before": [10]},
+        {"title": "组会", "kind": "meeting", "repeat": "once", "start": "2026-09-19 14:00",
+         "time": "14:00", "remind_before": [30]},
+        {"title": "项目评审", "kind": "meeting", "repeat": "once", "start": "2026-09-22 10:00",
+         "time": "10:00"},
+        {"title": "交作业", "kind": "task", "repeat": "once", "start": "2026-09-25 22:00",
+         "time": "22:00"},
+    ]
+    skills.schedule.save([dict(it) for it in base])
+
+    print("    · 批量查询：把「所有」的定义列出来，而不是只看今天")
+    r = skills.handle("有哪些课程")
+    print(f"        {r.reply}")
+    check("「有哪些课程」列全部课程",
+          (getattr(r, "action", ""), "AIAA3102" in r.reply, "数学分析" in r.reply),
+          ("schedule_list", True, True))
+    check("课程列表里没有会议", "组会" in r.reply, False)
+    r = skills.handle("我的所有会议")
+    print(f"        {r.reply}")
+    check("「我的所有会议」列全部会议",
+          ("组会" in r.reply and "项目评审" in r.reply and "数学分析" not in r.reply), True)
+    check("「今天有什么课」还是只看今天，不是全量列表",
+          getattr(skills.handle("今天有什么课"), "action", None) != "schedule_list", True)
+    check("「每周五有什么课」也是问某一天", 
+          getattr(skills.handle("每周五有什么课"), "action", None) != "schedule_list", True)
+
+    print("    · 批量删除：一次性的直接删")
+    r = skills.handle("取消所有会议")
+    print(f"        {r.reply}")
+    left = [it.get("title") for it in skills.schedule.load()]
+    check("「取消所有会议」两条会议都没了",
+          (getattr(r, "action", ""), "组会" in left, "项目评审" in left),
+          ("schedule_delete", False, False))
+    check("课程和任务不受影响", sorted(left), ["AIAA3102 机器学习", "交作业", "数学分析"])
+
+    print("    · 每周循环的批量取消：说不清就反问，绝不乱删")
+    skills.schedule.save([dict(it) for it in base])
+    r = skills.handle("取消所有课程")
+    print(f"        {r.reply}")
+    check("「取消所有课程」会问「以后都不上」还是「这周不上」",
+          (getattr(r, "action", ""), "以后都不上" in r.reply), ("schedule_change", True))
+    check("反问的时候一条都没删", len(skills.schedule.load()), 5)
+
+    r = skills.handle("所有课程以后都不上了")
+    print(f"        {r.reply}")
+    check("说清楚「以后都不上」才删课程",
+          ([it.get("title") for it in skills.schedule.load()], getattr(r, "action", "")),
+          (["组会", "项目评审", "交作业"], "schedule_delete"))
+
+    print("    · 每周循环的批量跳过：只说这次不上")
+    skills.schedule.save([dict(it) for it in base])
+    r = skills.handle("所有课程这周不上")
+    print(f"        {r.reply}")
+    got = {it.get("title"): it.get("skip") for it in skills.schedule.load()
+           if it.get("kind") == "course"}
+    check("两门课都记了跳过，课表留着",
+          (getattr(r, "action", ""), all(v for v in got.values()), len(skills.schedule.load())),
+          ("schedule_skip", True, 5))
+
+    print("    · 批量改：一条指令改一片")
+    skills.schedule.save([dict(it) for it in base])
+    r = skills.handle("所有课程提前半小时提醒")
+    print(f"        {r.reply}")
+    leads = {it.get("title"): it.get("remind_before") for it in skills.schedule.load()}
+    check("两门课都改成提前30分钟",
+          (leads.get("AIAA3102 机器学习"), leads.get("数学分析")), ([30], [30]))
+    check("会议没被顺手改掉", leads.get("组会"), [30])
+
+    print("    · 指代：没有上下文就不猜")
+    skills.schedule.save([dict(it) for it in base])
+    r = skills.handle("取消它")
+    print(f"        {r.reply}")
+    check("空上下文里的「取消它」是反问", getattr(r, "action", ""), "schedule_change_miss")
+
+    print("    · 指代：从聊天记录里找候选")
+    r = skills.handle("取消它", dialog=["助手：下周三上午九点有 AIAA3102 机器学习。"])
+    print(f"        {r.reply}")
+    check("「取消它」对上了聊天记录里的那节课",
+          (getattr(r, "action", ""), "AIAA3102" in r.reply), ("schedule_skip", True))
+    check("指代命中的是那一门，不是别的",
+          any(it.get("title") == "AIAA3102 机器学习" and it.get("skip")
+              for it in skills.schedule.load()), True)
+
+    r = skills.handle("把它改到下午四点", dialog=["助手：明天下午两点有组会。"])
+    print(f"        {r.reply}")
+    check("「把它改到下午四点」改的是组会",
+          (getattr(r, "action", ""),
+           next((it.get("time") for it in skills.schedule.load() if it.get("title") == "组会"), None)),
+          ("schedule_edit", "16:00"))
+
+    r = skills.handle("把数学分析取消掉", dialog=["你说：数学分析这作业好难"])
+    check("用你说过的话也能指代（当前句里还有名字）",
+          getattr(r, "action", "").startswith("schedule_"), True)
+
+    print("    · 指代：候选不止一条就问")
+    r = skills.handle(
+        "取消它", dialog=["助手：今天有两项安排，数学分析 10:00，AIAA3102 机器学习 09:00。"]
+    )
+    print(f"        {r.reply}")
+    check("两条都对得上 → 反问是哪一条",
+          (getattr(r, "action", ""), "是指哪一条" in r.reply), ("schedule_change", True))
+    check("反问时不动数据", len(skills.schedule.load()), 5)
+
+    import shutil
+
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
 def test_wake() -> None:
     print("\n[5] 唤醒词匹配")
     settings = load_settings()
@@ -497,6 +623,7 @@ def main() -> int:
     test_time()
     test_skills()
     test_schedule_model()
+    test_refer_and_batch()
     test_wake()
     test_lifecycle()
     print("\n" + "=" * 66)
