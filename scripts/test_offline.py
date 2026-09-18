@@ -23,7 +23,7 @@ from voice_loop.nlp_time import (  # noqa: E402
     parse_duration,
 )
 from voice_loop.settings import load_settings  # noqa: E402
-from voice_loop.skills import Skills  # noqa: E402
+from voice_loop.skills import WEEKDAY_NAMES, Skills  # noqa: E402
 from voice_loop.text import SpeechChunker, prepare_for_reading, transplant_punctuation  # noqa: E402
 from voice_loop.wake import WakeWordMatcher  # noqa: E402
 
@@ -95,6 +95,25 @@ def test_time() -> None:
     check("中文数字", cn_number(153), "一百五十三")
     check("量词两", cn_quantity(2), "两")
 
+    # 星期说法：「这/本」是本周（可能已过）、「下」是下一周。
+    # 这里踩过坑：以前 (target-today)%7 之后再 +7，「下周三」会多算一周
+    # （周五说 → 9/30 而不是 9/23），已经写进提醒里过。
+    fri = datetime(2026, 9, 18, 18, 48)          # 周五
+    for text, expect in [
+        ("周三下午三点", "2026-09-23"),           # 最近的将来那个周三
+        ("这周三下午三点", "2026-09-16"),         # 本周三（已过）
+        ("本周三下午三点", "2026-09-16"),
+        ("下周三下午三点", "2026-09-23"),         # ★ 下一周的周三
+        ("下周一上午十点", "2026-09-21"),
+        ("上周三下午三点", "2026-09-09"),
+        ("下下周三上午九点", "2026-09-30"),
+        ("下周三上午九点有 AIAA3102 课", "2026-09-23"),
+    ]:
+        got = parse_datetime(text, fri)
+        check(f"周说法 {text}", got.strftime("%Y-%m-%d") if got else None, expect)
+    wed = datetime(2026, 9, 16, 10, 0)           # 周三当天
+    check("周三当天说周三=今天", parse_datetime("周三下午三点", wed).strftime("%Y-%m-%d"), "2026-09-16")
+
 
 # --------------------------------------------------------------------------- #
 def test_skills() -> None:
@@ -155,6 +174,48 @@ def test_skills() -> None:
     check("按序号取消单条", r.action, "alarm_cancel")
     r = skills.handle("清空所有提醒")
     check("清空全部", r.action, "alarm_clear")
+
+    # ---- 日程的改 / 删 / 只跳过这一次 ----
+    # 以前这三件事都做不了：「删掉每周三那节课」因为句子里有「每周三+时刻」
+    # 被当成新增，反而往课表里塞一条垃圾；「取消…那节课」掉进查询分支答非所问。
+    print("    · 日程改/删/跳过")
+    before = len(skills.schedule.load())
+    r = skills.handle("把组会挪到周五上午十点")
+    moved = [i for i in skills.schedule.load() if i["title"] == "组会"]
+    check(
+        "改：挪到周五十点",
+        (getattr(r, "action", None), bool(moved) and moved[0].get("weekday") == 4,
+         bool(moved) and moved[0].get("time") == "10:00"),
+        ("schedule_edit", True, True),
+    )
+    check("改：没多出一条来", len(skills.schedule.load()), before)
+
+    # 「周五的课不上了」= 只跳过这一次（用条目自己的星期说，免得依赖今天是星期几）
+    first = [i for i in skills.schedule.load() if i.get("repeat") == "weekly"][0]
+    wd_name = WEEKDAY_NAMES[int(first["weekday"])]
+    r = skills.handle(f"{first['title']} {wd_name}的课不上了")
+    skipped = [i for i in skills.schedule.load() if i.get("skip")]
+    check(
+        "跳过：只记一天",
+        (getattr(r, "action", None), len(skipped), len(skipped[0]["skip"]) if skipped else 0),
+        ("schedule_skip", 1, 1),
+    )
+    if skipped:
+        day = skipped[0]["skip"][0]
+        nxt = skills.next_occurrence(skipped[0], datetime(2026, 9, 17, 22, 30))
+        check("跳过：下次不算这一天", nxt.strftime("%Y-%m-%d") != day, True)
+        check("跳过：这一天已经过去就不算", datetime.strptime(day, "%Y-%m-%d").date() >= datetime.now().date(), True)
+    r2 = skills.handle(f"{first['title']} {wd_name}的课不上了")
+    check("跳过：重复说不叠加", len([i for i in skills.schedule.load() if i.get("skip")]), 1)
+    check("跳过：重复说会说明白", "本来就没安排" in (r2.reply or ""), True)
+
+    r = skills.handle("以后不上组会了")
+    check("删：彻底删除", (getattr(r, "action", None), len(skills.schedule.load())), ("schedule_delete", before - 1))
+
+    # 问句绝不能真的动手
+    keep = len(skills.schedule.load())
+    skills.handle("今天的课不上吗？")
+    check("问句不会误删", len(skills.schedule.load()), keep)
 
     # 到点检测
     due = skills.due_alarms(datetime.now())
