@@ -47,11 +47,14 @@ def main() -> int:
     ap.add_argument("--no-tts", action="store_true")
     ap.add_argument("--strategy", default=None)
     ap.add_argument("--real", action="store_true", help="使用真实的 data/ 目录（默认写临时目录）")
+    ap.add_argument("--subtitle", action="store_true", help="顺便把字幕也弹出来看看（默认关闭）")
     args = ap.parse_args()
 
     settings = load_settings()
     if args.strategy:
         settings.asr.strategy = args.strategy
+    # 自测默认不往屏幕上弹字幕，免得刷屏；想看得加 --subtitle
+    settings.subtitle.enabled = bool(args.subtitle)
 
     tmp_dir = None
     if not args.real:

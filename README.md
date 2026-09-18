@@ -30,6 +30,8 @@ flowchart LR
 
     M["调度器<br/>每 5s 轮询"] -. 到点播报 .-> J
     M -. 右下角弹窗 .-> N["可视提醒<br/>置顶小窗，点一下即关"]
+
+    J -. 每句话都上屏 .-> O["底部字幕<br/>半透明、点得穿"]
 ```
 
 ### 1.1 两级加载（`listen` 常驻服务）
@@ -82,7 +84,9 @@ flowchart LR
 │  ├─ skills.py                # 生活技能：时间 / 闹钟 / 备忘 / 日程
 │  ├─ scheduler.py             # 后台提醒调度器
 │  ├─ system_ops.py            # 系统操作：关/开显示器（只关屏，不休眠）
+│  ├─ subtitle.py              # 底部半透明字幕（帮手里说的话都显示出来）
 │  ├─ toast.py                 # 右下角可视提醒弹窗
+│  ├─ ui.py                    # Tk 窗口宿主（一个进程只能有一个 Tk 解释器）
 │  ├─ nlp_time.py              # 中文时间解析（明天早上七点 / 十分钟后 / 下周三）
 │  ├─ store.py                 # JSON 存储（保留注释、外部改动自动重载）
 │  ├─ text.py                  # LLM 输出清洗 + 流式分块 + 标点移植
@@ -94,6 +98,7 @@ flowchart LR
 │  ├─ download_models.py       # 一键下载模型
 │  ├─ test_offline.py          # 离线自测（分块/时间/技能/唤醒/生命周期）
 │  ├─ test_skills_route.py     # 技能路由 + 关屏 + 课表 + 提醒文案 + 重启不丢数据
+│  ├─ test_subtitle.py         # ★ 字幕：可见性 / 居中 / 点得穿 / 自动隐藏（--check）
 │  ├─ test_toast.py            # 看一眼右下角可视提醒长什么样
 │  ├─ test_dialog.py           # 对话链路自测（不用麦克风）
 │  ├─ test_wake.py             # ★ 唤醒词实测与调优（打印听到的内容 / 自动写 aliases）
@@ -142,6 +147,8 @@ python main.py devices                       # 查看音频设备
 - 后台运行时改 `data/wakewords.json` 也能生效（几秒内热加载）
 - 后台同时跑闹钟和会议提醒，到点会自己开口播报，**并在屏幕右下角弹一个可随时关掉的小窗**
   （扬声器没开、戴耳机走开了也不会错过；点「知道了」或按 Esc 立刻关）
+- 屏幕底部居中还有一条**半透明字幕**：助手说的每一句话都显示在上面，关掉声音也能沟通
+  （详见下面「屏幕字幕」一节）
 - 回答过程中**按回车**立刻打断（后台无终端时自动跳过）
 
 ### 关闭服务
@@ -187,6 +194,41 @@ Stop-Process -Id <PID> -Force
 技能命中就本地直接回答，零延迟也不会胡说；没命中才交给 Ollama。
 所有技能返回 `None` 时不会抢话，所以闲聊不受影响。
 
+### 屏幕字幕（不开声音也能沟通）
+
+屏幕底部（任务栏正上方）居中显示一条半透明字幕，助手说的每一句都上屏；
+上面一行暗蓝色的是「你说：…」，方便你一眼看出它有没有听错。
+
+```
+你说：现在几点了
+现在是上午十点四十三分。
+```
+
+- **半透明 + 置顶，但点得穿**：它永远不会挡住你下面的操作，也不会抢焦点
+  （用的是 ``WS_EX_TRANSPARENT``，配合已经存在的 ``WS_EX_LAYERED``）
+- 位置按 Windows 的「桌面工作区」算，自动避开任务栏；任务栏在左/右/上、
+  或者屏幕开了 DPI 缩放都能摆对
+- 说完了 `hold_seconds` 秒（默认 6）自动隐藏；LLM 流式输出是边生成边上屏的
+- 回答太长时最多显示 `max_lines` 行，超出的部分只留末尾并在开头标一个「…」
+
+调参在 `config.toml` 的 `[subtitle]`：
+
+| 项 | 说明 |
+| --- | --- |
+| `enabled` | 总开关 |
+| `width` | 字幕条最大宽度，屏幕比这窄会自动缩 |
+| `alpha` | 不透明度，0.2~1.0，越小越透 |
+| `hold_seconds` | 说完多久自动隐藏 |
+| `font_size` / `max_lines` | 字号 / 最多几行 |
+| `show_user_text` | 要不要连「你说：…」一起显示 |
+| `margin` | 离任务栏上方多少像素 |
+
+自检（会真的量屏幕：可见 / 居中 / 贴任务栏 / 点得穿 / 会自动消失）：
+
+```powershell
+python scripts/test_subtitle.py --check
+```
+
 ### 人格设定（明日方舟 · 凯尔希）
 
 `config.toml` 的 `[llm] system_prompt` 已经写成凯尔希：
@@ -220,6 +262,7 @@ Stop-Process -Id <PID> -Force
 ```powershell
 python scripts/test_offline.py         # 几秒钟，不加载模型，测分块/时间/技能/唤醒
 python scripts/test_skills_route.py    # 技能路由 + 关屏幕 + 课表 + 提醒文案 + 重启不丢数据
+python scripts/test_subtitle.py --check # 字幕：真的截屏量一遍可见性/居中/点穿/自动隐藏
 python scripts/test_toast.py           # 看一眼右下角可视提醒长什么样
 python scripts/test_dialog.py --no-tts # 13 轮对话，只看文本与耗时
 python scripts/test_wake.py --rounds 5 # ★ 拿真实嗓音试唤醒词，看被听成什么
@@ -475,6 +518,19 @@ CPU、服务、提醒调度器都照常跑，闹钟到点仍然会响。敲一�
 不会。闹钟 / 备忘 / 日程都在 `data/*.json` 里，重启只是重新读一遍文件：
 已响过的闹钟（`fired: true`）不会重复响，已经提醒过的日程当天也不会重复提醒，
 写入用的是「临时文件 + 替换」的原子写法，不会写到一半变成坏 JSON。
+
+**Q：字幕挡住东西 / 点不动下面的按钮**
+不会。字幕窗口带 `WS_EX_TRANSPARENT`，鼠标事件完全穿透，点它盖住的地方和没盖一样。
+不想要就设 `[subtitle] enabled = false`；只想让它低调一点就把 `alpha` 调到 0.5 左右。
+
+**Q：字幕位置偏了 / 跑到别的显示器上**
+位置是拿 `SPI_GETWORKAREA` 算的（会自动避开任务栏），不是拿屏幕高度减固定值。
+如果真的偏了，跑 `python scripts/test_subtitle.py --log` 看它算出来的坐标，
+再把 `[subtitle] margin` / `width` 调一下；多显示器下想换屏可以改
+`config.toml` 里对应设备的摆放，或先把主显示器设成目标屏。
+
+**Q：提醒弹窗和字幕能不能只要一个**
+能，互相独立：`[skills] visual_alert` 管右下角弹窗，`[subtitle] enabled` 管底部字幕。
 
 **Q：TTS 有爆音 / 太机器人**
 Piper 的 `zh_CN-huayan-medium` 是官方唯一的中文女声。调 `noise_w_scale` 到 0.9~1.0、
