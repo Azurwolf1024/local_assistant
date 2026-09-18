@@ -35,7 +35,15 @@ DEFAULT_CONFIG: dict = {
     "enabled": True,
     "words": ["凯尔希"],
     "aliases": {
-        "凯尔希": ["凯尔西", "凯尔茜", "凯尔惜", "凯尔锡", "凯尔溪", "凯尔熙", "凯尔兮", "凯儿希", "开尔希", "卡尔希"],
+        # 真人说话常被听成这些；后面几个「开儿戏 / 胎儿西 / 台儿西」是
+        # 用 TTS 合成的「凯尔希」（scripts/say.py 那种用法）被听成的样子。
+        "凯尔希": [
+            "凯尔西", "凯尔茜", "凯尔惜", "凯尔锡", "凯尔溪", "凯尔熙", "凯尔兮", "凯儿希",
+            "凯尔信", "凯尔心", "凯尔新", "凯尔辛", "凯尔席", "凯尔戏", "卡尔希", "卡尔西",
+            "开尔希", "开尔信", "开尔心", "开尔新", "开尔西", "开尔辛", "开尔戏", "开儿戏",
+            "太尔希", "太尔西", "太儿西", "台儿西", "泰尔希", "泰尔西", "泰儿西",
+            "海尔西", "胎儿西", "胎儿戏",
+        ],
     },
     "ack": "在的",
     "idle_timeout": 180,
@@ -44,16 +52,57 @@ DEFAULT_CONFIG: dict = {
 }
 
 
+def _scan(text: str) -> tuple[str, list[int]]:
+    """归一化，同时记下每个归一化字符在**原文**里的下标。
+
+    有了这个映射，才能在原文里精确地切掉唤醒词（否则下标对不上，
+    一旦原文里有标点/空格就会切错地方）。
+    """
+    out: list[str] = []
+    pos: list[int] = []
+    for i, ch in enumerate(text or ""):
+        if _PUNCT.fullmatch(ch):
+            continue
+        c = ch.lower()
+        if len(c) != 1:      # 少数语言里 lower() 会变长，只取首字符
+            c = c[0]
+        out.append(c)
+        pos.append(i)
+    return "".join(out), pos
+
+
 def normalize(text: str) -> str:
     """去掉空格、标点，统一小写，方便比对。"""
-    return _PUNCT.sub("", (text or "")).lower()
+    return _scan(text)[0]
+
+
+# 唤醒词前后常见的口头禅：「那个凯尔西」不应该把「那个」当成请求
+_EDGE_FILLER = (
+    "那个", "这个", "那", "这", "哎", "呃", "嗯", "啊", "喂", "嘿", "嗨", "诶", "哦", "呀",
+)
+_EDGE_PUNCT = " \u3000\t\r\n，。、；：！？,.!?;:…~—-·"
+
+
+def _trim(text: str) -> str:
+    """剥掉两端的标点和口头禅。"""
+    t = (text or "").strip(_EDGE_PUNCT)
+    changed = True
+    while changed and t:
+        changed = False
+        for w in _EDGE_FILLER:
+            if t.startswith(w):
+                t = t[len(w) :].strip(_EDGE_PUNCT)
+                changed = True
+                break
+    return t.strip()
 
 
 @dataclass
 class WakeHit:
-    word: str = ""          # 命中的唤醒词
-    remainder: str = ""     # 唤醒词之后的内容（同一句里直接说了请求时非空）
-    fuzzy: bool = False     # 是否是模糊匹配命中
+    word: str = ""                 # 命中的唤醒词
+    remainder: str = ""            # 唤醒词之后的内容（同一句里直接说了请求时非空）
+    fuzzy: bool = False            # 是否是模糊匹配命中
+    span: tuple[int, int] | None = None   # 命中区间在**原文**里的下标 [起, 止)
 
 
 @dataclass
@@ -153,55 +202,78 @@ class WakeWordMatcher:
         """判断这句话里有没有唤醒词。"""
         if not self.enabled:
             return None
-        norm = normalize(text)
+        norm, raw_pos = _scan(text)
         if not norm:
             return None
 
-        # 1) 精确 / 别名包含
+        def hit_of(word: str, a: int, b: int, fuzzy: bool) -> WakeHit:
+            span = (raw_pos[a], raw_pos[b] + 1)
+            return WakeHit(
+                word=word,
+                remainder=(text or "")[span[1] :].strip(),
+                fuzzy=fuzzy,
+                span=span,
+            )
+
+        # 1) 精确 / 别名包含（variants 已按长度倒序，长的优先）
         for word, variants in self._patterns:
             for variant in variants:
                 idx = norm.find(variant)
                 if idx >= 0:
-                    return WakeHit(word=word, remainder=text.strip(), fuzzy=False)
+                    return hit_of(word, idx, idx + len(variant) - 1, False)
 
-        # 2) 模糊匹配：滑窗逐段比对
+        # 2) 模糊匹配：滑窗逐段比对，取最像的那一段
         #    窗口最小长度取 主唤醒词长度-1（但不能少于 3），
         #    否则「凯尔希」这种 3 字词会被任意两字窗口误命中。
-        ratio = self._settings.fuzzy_ratio
-        for word, _ in self._patterns:
-            for variant in [normalize(word)]:
-                if not variant:
-                    continue
-                min_size = max(3, len(variant) - 1) if len(variant) >= 3 else len(variant)
-                for size in range(min_size, len(variant) + 2):
-                    if size > len(norm):
-                        break
-                    for i in range(0, len(norm) - size + 1):
-                        window = norm[i : i + size]
-                        if difflib.SequenceMatcher(None, window, variant).ratio() >= ratio:
-                            return WakeHit(word=word, remainder=text.strip(), fuzzy=True)
+        ratio, word, a, b = self._best_window(norm)
+        if ratio >= self._settings.fuzzy_ratio:
+            return hit_of(word, a, b, True)
         return None
 
+    def _best_window(self, norm: str) -> tuple[float, str, int, int]:
+        """在 norm 里找与唤醒词最像的窗口，返回 (相似度, 主唤醒词, 起, 止)。"""
+        best: tuple[float, str, int, int] = (0.0, "", 0, 0)
+        for word, _ in self._patterns:
+            variant = normalize(word)
+            if not variant:
+                continue
+            min_size = max(3, len(variant) - 1) if len(variant) >= 3 else len(variant)
+            for size in range(min_size, len(variant) + 2):
+                if size > len(norm):
+                    break
+                for i in range(0, len(norm) - size + 1):
+                    window = norm[i : i + size]
+                    r = difflib.SequenceMatcher(None, window, variant).ratio()
+                    if r > best[0]:
+                        best = (r, word, i, i + size - 1)
+        return best
+
+    def best_ratio(self, text: str) -> float:
+        """这句话与唤醒词最接近的相似度（0~1）。
+
+        和 :meth:`match` 用同一套滑窗，所以「相似度 ≥ fuzzy_ratio 却没命中」
+        这种情况不会出现，提示用户调阈值时不会自相矛盾。
+        """
+        norm = normalize(text)
+        return self._best_window(norm)[0] if norm else 0.0
+
     def strip_word(self, text: str, hit: WakeHit | None = None) -> str:
-        """去掉文本里的唤醒词，返回剩下的请求内容。"""
+        """去掉唤醒词，返回剩下的「请求内容」。
+
+        汉语的习惯是「名字 + 请求」（「凯尔希，现在几点了」），所以**后半句优先**；
+        只有后半句为空时才看前半句（「现在几点了凯尔希」这种倒装）。
+        两边都只是口头禅（「那个凯尔西」）就返回空，免得把「那个」当成请求丢给大模型。
+        """
         if hit is None:
             hit = self.match(text)
-        if hit is None:
-            return text.strip()
-        raw = text or ""
-        norm = normalize(raw)
-        for _, variants in self._patterns:
-            for variant in variants:
-                idx = norm.find(variant)
-                if idx < 0:
-                    continue
-                # norm 与 raw 的下标可能不同（标点/空格），用长度差粗略换算
-                approx = min(idx, len(raw))
-                for cut in range(approx, -1, -1):
-                    if normalize(raw[cut:]).startswith(variant):
-                        return raw[:cut].strip() or raw[cut + len(variant) :].strip()
-        # 模糊命中：无法精确定位，直接返回原文
-        return raw.strip()
+        raw = (text or "").strip()
+        if hit is None or hit.span is None:
+            return raw
+        start, end = hit.span
+        tail = _trim(raw[end:])
+        if tail:
+            return tail
+        return _trim(raw[:start])
 
 
 class WakeSession:

@@ -21,6 +21,7 @@ import numpy as np
 
 from .asr import AsrResult, AsrRouter
 from .audio import BaseSegmenter, MicReader, MicRecorder, Speaker, make_segmenter, save_wav
+from .bargein import BargeInDetector
 from .llm import OllamaClient
 from .scheduler import ReminderScheduler
 from .settings import Settings
@@ -100,7 +101,6 @@ class VoiceLoop:
         self.speaker = Speaker(settings)
         self.llm = OllamaClient(settings.llm)
         self.tts = create_tts(settings, self.log, lazy=self.lazy)
-
         # 技能与提醒
         self.skills: Skills | None = Skills(settings, self.log) if enable_skills else None
         self.scheduler: ReminderScheduler | None = (
@@ -161,11 +161,26 @@ class VoiceLoop:
 
         self.tts_enabled = True
 
+        # 语音打断：它还在说话时你一开口就停下来听你说
+        self.bargein: BargeInDetector | None = (
+            BargeInDetector(settings, self.log)
+            if (self.enable_listening and getattr(settings, "bargein", None) and settings.bargein.enabled)
+            else None
+        )
+        self._barge_seg: BaseSegmenter | None = None
+        self._barge_buf: list[np.ndarray] = []
+        self._barge_deadline = 0.0
+        self._barge_keep = 0
+        self._barge_triggered = False
+        self._barge_listening = False
+
         self._stop = threading.Event()
         self._interrupt = threading.Event()
         self._muted = threading.Event()      # 播放期间忽略麦克风，避免自我唤醒
+        self._needs_flush = False            # 播放过之后，下次监听前要清一次回声
         self._speak_lock = threading.Lock()  # 保证同一时刻只有一处发声
         self._in_reply = False
+        self._barge_audio: np.ndarray | None = None   # 被语音打断时收到的那句话
         self._watcher: threading.Thread | None = None
         self._turn = 0
         self._session_file = settings.sessions_dir / f"session-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
@@ -188,8 +203,14 @@ class VoiceLoop:
         return info
 
     def _flush_mic(self) -> None:
+        """丢掉驱动缓冲区里的陈旧音频（刚播完音、刚被唤醒时用）。"""
+        self._needs_flush = False
         if self.mic is not None:
             self.mic.flush()
+
+    def _mark_played(self) -> None:
+        """播放时麦克风也在采集，标记「下次监听前先清掉自己的回声」。"""
+        self._needs_flush = True
 
     # ======================================================================
     # 采集
@@ -213,6 +234,11 @@ class VoiceLoop:
         """
         if self.mic is None:
             raise RuntimeError("当前是纯文本模式，没有麦克风")
+        # 上一轮被打断时已经把他的话收下来了，直接交给上层处理，不然就白丢了
+        if self._barge_audio is not None:
+            audio, self._barge_audio = self._barge_audio, None
+            self.log.debug(f"使用打断时收到的语音：{audio.size} 采样")
+            return audio
         audio_cfg = self.settings.audio
         rate = int(audio_cfg.sample_rate)
         frame_size = int(audio_cfg.frame_size)
@@ -220,7 +246,12 @@ class VoiceLoop:
         wait = float(audio_cfg.listen_timeout if timeout is None else timeout)
 
         self.mic.open()
-        self.mic.flush()  # 丢掉播放期间积压的旧音频，避免自我唤醒
+        # 只有刚播过音才清缓冲。以前每次进入监听都无条件 flush：
+        # 待唤醒时每 5 秒就清一次，万一你正好在那一刻开口，
+        # 唤醒词的开头就被丢掉了（这是「待机久了唤醒变难」的一个原因）。
+        if self._needs_flush:
+            self.mic.flush()
+            self._needs_flush = False
         segmenter = self._segmenter_for(quick)
         segmenter.reset()
 
@@ -294,6 +325,8 @@ class VoiceLoop:
         )
         for chunk in chunker.feed(text) + chunker.flush():
             for rate, pcm in self.tts.synth(chunk):
+                if self._interrupt.is_set():
+                    return
                 self.speaker.submit(pcm, rate)
 
     def speak_text(self, text: str, wait: bool = True, fresh: bool = False) -> float:
@@ -309,13 +342,17 @@ class VoiceLoop:
             self.subtitle.update(text)
         if not self.tts_enabled:
             return 0.0
+        # 这是一句新的发言：先把上一轮遗留的打断标记清掉，
+        # 否则它会一开始就被自己掐断（提醒播报尤其明显）
+        self._interrupt.clear()
         t0 = time.perf_counter()
         self._muted.set()
+        self._mark_played()
         try:
             with self._speak_lock:
                 self._submit_chunks(text)
                 if wait:
-                    self.speaker.join()
+                    self._drain_playback()
         finally:
             self._muted.clear()
             self._flush_mic()
@@ -333,6 +370,91 @@ class VoiceLoop:
             unload = getattr(self.tts, "unload", None)
             if callable(unload):
                 unload()
+
+    # ======================================================================
+    # 播放 + 语音打断
+    # ======================================================================
+    def _drain_playback(self, step: bool = False) -> bool:
+        """等播放队列放完。
+
+        ``step=True`` 时只走一步（流式生成阶段用来顺手听一下有没有人插话），
+        返回「是否已经因为用户说话而打断」。
+
+        开打断时，这里会一边等一边读麦克风：一旦判断是用户在说话，
+        立刻掐掉播放、把已说出口的那句话收完，存进 ``_barge_audio``，
+        下一次 :meth:`listen_once` 会直接把它当成用户这一轮的输入。
+        """
+        bi = self.bargein
+        if bi is None:
+            if not step:
+                self.speaker.join()
+            return self._interrupt.is_set()
+
+        if not self._barge_listening:
+            bi.begin()
+            self._barge_listening = True
+            self._barge_triggered = False
+            self._barge_buf = []
+            self._barge_seg = None
+            audio_cfg = self.settings.audio
+            dt = float(audio_cfg.frame_size) / float(audio_cfg.sample_rate)
+            self._barge_keep = max(1, int(self.settings.bargein.keep_seconds / dt))
+            self._barge_deadline = 0.0
+
+        try:
+            while True:
+                playing = self.speaker.pending > 0 or self.speaker.speaking
+                if not self._barge_triggered:
+                    if not playing or self._interrupt.is_set():
+                        break
+                elif time.time() > self._barge_deadline:
+                    break
+
+                frame = self.mic.read()
+
+                if not self._barge_triggered:
+                    if bi.feed(frame, self.speaker.current_level):
+                        self._barge_triggered = True
+                        self._interrupt.set()
+                        self.speaker.interrupt()
+                        print("\n  [打断] 听到你说话了，先停下听你说", flush=True)
+                        self._barge_seg = self._segmenter_for(False)
+                        self._barge_seg.reset()
+                        self._barge_deadline = time.time() + float(
+                            self.settings.bargein.collect_seconds
+                        )
+                        # 把触发前攒着的音频补进断句器：不然你开口的第一个字会被切掉
+                        for old in self._barge_buf:
+                            done = self._barge_seg.accept(old)
+                            if done is not None:
+                                self._barge_audio = done
+                                return True
+                        self._barge_buf = []
+                    else:
+                        self._barge_buf.append(frame)
+                        if len(self._barge_buf) > self._barge_keep:
+                            self._barge_buf.pop(0)
+                else:
+                    done = self._barge_seg.accept(frame)
+                    if done is not None:
+                        self._barge_audio = done
+                        return True
+
+                if step:
+                    break
+        finally:
+            if not step:
+                bi.end()
+                self._barge_listening = False
+                self._barge_buf = []
+                if self._barge_triggered and self._barge_seg is not None:
+                    # 用户还没说完（或断句没等到）就超时了：把已经收到的先用上
+                    parts = self._barge_seg.flush()
+                    if parts and self._barge_audio is None:
+                        self._barge_audio = parts[0]
+                    self._barge_seg.reset()
+
+        return self._barge_triggered
 
     # ======================================================================
     # 两级加载：唤醒 → 加载重型模型；空闲超时 → 释放
@@ -365,8 +487,14 @@ class VoiceLoop:
             t0 = time.perf_counter()
             try:
                 if self.asr.load_whisper():
-                    self.asr.warmup()
-                    self.log.info(f"Whisper 已就绪（后台加载 {time.perf_counter() - t0:.1f}s）")
+                    if self._active:
+                        self.asr.warmup()
+                        self.log.info(
+                            f"Whisper 已就绪（后台加载 {time.perf_counter() - t0:.1f}s）"
+                        )
+                    else:
+                        # 加载过程中已经回到待唤醒，load_whisper 会自己收拾，这里不再预热
+                        self.log.info("Whisper 加载完成前已回到待唤醒，跳过预热")
             except Exception as exc:  # noqa: BLE001
                 self.log.warning(f"Whisper 后台加载失败：{exc}")
         try:
@@ -382,13 +510,17 @@ class VoiceLoop:
         if not self._active:
             return False
         self._active = False
+        self._needs_flush = True   # 刚才在说话，下一轮监听前得把积压的回声丢掉
         freed: list[str] = []
         if self.lazy:
             # 加锁：确保没有正在进行的播报被中途抽掉
             with self._speak_lock:
-                if self.asr is not None and self.asr.whisper_loaded:
-                    self.asr.set_whisper_enabled(False)
-                    freed.append("Whisper")
+                if self.asr is not None:
+                    # 无条件关（不是「已加载才关」）：后台预热线程可能正在加载 Whisper，
+                    # 那样 `whisper_loaded` 还是 False；不关的话它加载完就留在内存里，
+                    # 待唤醒状态会变成每句都跑几秒的 Whisper，再次唤醒又慢又不准。
+                    if self.asr.set_whisper_enabled(False):
+                        freed.append("Whisper")
                 unload = getattr(self.tts, "unload", None)
                 if callable(unload) and getattr(self.tts, "loaded", False):
                     unload()
@@ -454,12 +586,15 @@ class VoiceLoop:
         # ---------------------------------------------------------- 技能路径
         skill = self.skills.handle(user_text) if self.skills else None
         if skill is not None:
+            # 上上轮可能被回车/语音打断过，不清掉的话这一句回答会一开始就被掐断
+            self._interrupt.clear()
             stats.extra["skill"] = skill.action
             stats.answer = skill.reply
             if on_delta is not None:
                 on_delta(skill.reply)
             stats.total_seconds = self.speak_text(skill.reply)
             stats.first_audio = stats.total_seconds
+            stats.interrupted = self._interrupt.is_set()
             self.llm.commit(user_text, skill.reply)
             self._write_session(stats)
             return stats
@@ -475,6 +610,7 @@ class VoiceLoop:
         self._interrupt.clear()
         self._in_reply = True
         self._muted.set()
+        self._mark_played()
         t0 = time.perf_counter()
         pieces: list[str] = []
         first_audio: float | None = None
@@ -484,6 +620,8 @@ class VoiceLoop:
             if not self.tts_enabled:
                 return
             for rate, pcm in self.tts.synth(sentence):
+                if self._interrupt.is_set():
+                    return
                 if first_audio is None:
                     first_audio = time.perf_counter() - t0
                 self.speaker.submit(pcm, rate)
@@ -504,14 +642,19 @@ class VoiceLoop:
                         speak(sentence)
                         if self._interrupt.is_set():
                             break
-                    if self._interrupt.is_set():
+                    # 模型还在吐字、扬声器里也还在放：顺手听一下有没有人插话。
+                    # 不这样做的话，必须等整段生成完才轮到判断，长回答会变得很钝。
+                    if self._drain_playback(step=True):
                         break
 
                 if not self._interrupt.is_set():
                     for sentence in chunker.flush():
                         speak(sentence)
-                    self.speaker.join()
+                    self._drain_playback()
         finally:
+            if self._interrupt.is_set():
+                # 回车打断 / 语音打断都要把剩下没放完的清掉
+                self.speaker.interrupt()
             self._in_reply = False
             self._muted.clear()
             self._flush_mic()
@@ -565,6 +708,46 @@ class VoiceLoop:
     def _is_exit(self, text: str) -> bool:
         t = text.strip().strip("。！!？?，,、 ")
         return any(p and p in t and len(t) <= len(p) + 4 for p in self.settings.chat.exit_phrases)
+
+    def _report_wake_miss(self, text: str) -> None:
+        """未唤醒时给一点有用的提示：听到什么 + 离唤醒词有多近。
+
+        这是调唤醒词最直接的依据：相似度高说明只差一点，加进 aliases 或者把
+        fuzzy_ratio 降一点就行；相似度很低（像「胎儿戏」那样）降阈值没用，
+        只能把那句话填进 aliases。环境里有别人说话时，这些行也是判断依据。
+        """
+        plain = (text or "").strip()
+        key = _NOISE_STRIP.sub("", plain)
+        # 单个字的「嗯/哎/啊」以及「好的/谢谢」这类是环境杂音，写进日志只会淹没有用的行
+        if not plain or not is_meaningful(text) or key in _FILLER_WORDS:
+            self.log.debug(f"[未唤醒] {text}")
+            return
+
+        ratio = self.wake.best_ratio(plain)
+        close = ratio >= 0.6
+        # 短句最可能是喊唤醒词喊错了；长句只有「很像」时才值得刷屏
+        if not (2 <= len(key) <= 8 or close):
+            self.log.debug(f"[未唤醒] {text}")
+            return
+        if plain == self._last_miss:
+            self.log.debug(f"[未唤醒] {plain}")
+            return
+        self._last_miss = plain
+
+        words = self.wake.settings.words
+        target = words[0] if words else "唤醒词"
+        if close:
+            hint = (
+                f"和「{target}」相似度 {ratio:.2f}，就差一点：把它加进 "
+                f"{self._wake_path.name} 的 aliases，或者把 fuzzy_ratio 降到 "
+                f"{max(0.5, round(ratio - 0.05, 2))}"
+            )
+        else:
+            hint = (
+                f"和「{target}」相似度 {ratio:.2f}，降阈值没用，"
+                f"只能把它加进 {self._wake_path.name} 的 aliases"
+            )
+        print(f"[未唤醒] 听到：{plain}\n          {hint}", flush=True)
 
     def _transcribe(self, audio: np.ndarray) -> tuple[str, AsrResult, float]:
         rate = int(self.settings.audio.sample_rate)
@@ -686,8 +869,15 @@ class VoiceLoop:
             f"  空闲回收: {self._idle_desc()}"
             + ("（则释放模型回到待唤醒）" if self.lazy else "（则结束服务）")
             + "\n"
+            + (
+                "  打断: 你直接开口就停下听你说"
+                if self.bargein is not None
+                else "  打断: 只能按回车（[bargein] enabled=false）"
+            )
+            + "；按回车也能打断\n"
             + (f"  技能: {self.skills.stats()}\n" if self.skills else "")
-            + "  提示: Ctrl+C 退出；回答过程中按回车可打断\n"
+            + "  提示: Ctrl+C 退出"
+            + ("；字幕/提醒会显示在屏幕上\n" if self.subtitle is not None else "\n")
         )
 
         if not self.wake.enabled:
@@ -750,30 +940,12 @@ class VoiceLoop:
 
                     hit = self.wake.match(text)
                     if hit is None:
-                        # 短句很可能是用户在喊唤醒词但被识别错了，提示一下
-                        # （长句就不刷屏了，那是正常说话）
-                        plain = text.strip()
-                        key = _NOISE_STRIP.sub("", plain)
-                        # 单个字的「嗯/哎/啊」以及「好的/谢谢」这类是环境杂音，
-                        # 写进日志只会淹没真正有用的行
-                        short = (
-                            is_meaningful(text)
-                            and 2 <= len(key) <= 8
-                            and key not in _FILLER_WORDS
-                        )
-                        if short and plain != self._last_miss:
-                            self._last_miss = plain
-                            print(
-                                f"[未唤醒] 听到：{plain}    "
-                                f"若是唤醒词，请把它加进 {self._wake_path.name} 的 aliases",
-                                flush=True,
-                            )
-                        else:
-                            self.log.debug(f"[未唤醒] {text}")
+                        self._report_wake_miss(text)
                         continue
 
                     mark = "（模糊匹配）" if hit.fuzzy else ""
                     print(f"\n[已唤醒]{mark} {text}")
+                    self._last_miss = ""
                     self.session.open()
                     request = self.wake.strip_word(text, hit)
                     follow_result: tuple | None = None

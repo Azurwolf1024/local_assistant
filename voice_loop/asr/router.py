@@ -109,6 +109,7 @@ class AsrRouter:
         self._wh_error: str | None = None
         # Whisper 很重（约 1 GB + 首次编译 40s），允许待唤醒时先不加载
         self._wh_enabled = bool(whisper_enabled)
+        self._wh_loading = False
         self._wh_lock = threading.Lock()
         self._pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="asr")
         if preload:
@@ -124,27 +125,59 @@ class AsrRouter:
     def whisper_loaded(self) -> bool:
         return self._wh is not None
 
-    def set_whisper_enabled(self, enabled: bool) -> None:
-        """打开/关闭 Whisper。关闭时会立即卸载，释放内存。"""
+    def set_whisper_enabled(self, enabled: bool) -> bool:
+        """打开/关闭 Whisper。关闭时尽快卸载，释放内存。
+
+        返回是否真的已经卸掉。
+
+        这里**不能阻塞等加载完成**：首次加载要几十秒，而本方法会在回到待唤醒、
+        停机等路径上被调用，阻塞会把整个服务卡死。如果后台正在加载，就只是把
+        开关关掉，让加载线程加载完自己发现「已经不需要了」再卸载。
+        """
         self._wh_enabled = bool(enabled)
-        if not enabled:
-            self.unload_whisper()
+        if enabled:
+            return self._wh is None
+        return self.request_unload_whisper()
 
-    def load_whisper(self) -> bool:
-        """显式加载 Whisper（耗时长，建议在后台线程调用）。"""
-        with self._wh_lock:
-            if self._wh is not None:
-                return True
-            self._wh_enabled = True
-            self._wh_error = None
-            return self._engine("whisper") is not None
-
-    def unload_whisper(self) -> None:
-        with self._wh_lock:
+    def request_unload_whisper(self) -> bool:
+        """不阻塞地请求卸载 Whisper，返回是否真的卸掉了。"""
+        if self._wh is None:
+            return not self._wh_loading
+        if not self._wh_lock.acquire(blocking=False):
+            # 后台正在加载（或卸载），交给它收尾
+            return False
+        try:
             if self._wh is not None:
                 self._wh = None
                 self._wh_error = None
                 self._log("info", "Whisper 已卸载，内存已释放")
+            return True
+        finally:
+            self._wh_lock.release()
+
+    def load_whisper(self) -> bool:
+        """显式加载 Whisper（耗时长，建议在后台线程调用）。
+
+        注意：这里**不会**把 ``_wh_enabled`` 打开——开关由
+        :meth:`set_whisper_enabled` 控制。否则会出现在待唤醒状态下
+        被后台预热线程“顺手”打开，导致待唤醒时也在跑几秒一次的 Whisper。
+        """
+        with self._wh_lock:
+            if self._wh is not None:
+                return True
+            self._wh_loading = True
+            try:
+                self._wh_error = None
+                ok = self._engine("whisper") is not None
+            finally:
+                self._wh_loading = False
+            # 加载途中可能已经回到待唤醒（或用户把 Whisper 关了）：别白白占着内存
+            if self._wh is not None and not self._wh_enabled:
+                self._wh = None
+                self._wh_error = None
+                self._log("warning", "Whisper 加载完成时已回到待唤醒，立即卸载")
+                return False
+            return ok
 
     # ------------------------------------------------------------------ 加载
     def _wanted_engines(self) -> list[str]:
@@ -211,6 +244,9 @@ class AsrRouter:
         silence = np.zeros(int(16000 * seconds), dtype=np.float32)
         info: dict[str, float] = {}
         for name in self.available:
+            # 回到待唤醒后别再白跑一遍成本很高的编译
+            if name == "whisper" and not self._wh_enabled:
+                continue
             t0 = _time.perf_counter()
             try:
                 self._engine(name).transcribe(silence)

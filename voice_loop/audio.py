@@ -408,6 +408,9 @@ class Speaker:
         self._rate: int | None = None
         self._speaking = threading.Event()
         self._closing = False
+        # 当前正在播的那一小段的 RMS（0~1）。语音打断要靠它区分
+        # 「麦克风里是回声」还是「用户在插话」。
+        self._level = 0.0
         self._thread = threading.Thread(target=self._worker, daemon=True, name="speaker")
         self._thread.start()
 
@@ -424,6 +427,11 @@ class Speaker:
     @property
     def pending(self) -> int:
         return self._queue.unfinished_tasks
+
+    @property
+    def current_level(self) -> float:
+        """正在播出去的内容的 RMS（0~1）；没在播就是 0。"""
+        return self._level
 
     def join(self, timeout: float | None = None) -> bool:
         """等待队列播放完毕。"""
@@ -448,6 +456,7 @@ class Speaker:
                 stream.abort(ignore_errors=True)
             except Exception:
                 pass
+        self._level = 0.0
         self._speaking.clear()
 
     def close(self) -> None:
@@ -482,6 +491,25 @@ class Speaker:
         self._stream.start()
         self._rate = rate
 
+    def _write_blocks(self, pcm: np.ndarray, rate: int, block_seconds: float = 0.04) -> None:
+        """分小块写出去，顺便维护「此刻在播多大声」。
+
+        整块一次性 write 会阻塞到播完，中间拿不到电平；分成 40ms 的小块就
+        能随时告诉打断检测器「现在播到哪儿、多大声」。
+        """
+        stream = self._stream
+        step = max(256, int(rate * block_seconds))
+        for i in range(0, len(pcm), step):
+            block = pcm[i : i + step]
+            try:
+                self._level = float(
+                    np.sqrt(np.mean(np.square(block.astype(np.float32) / 32768.0)))
+                )
+            except Exception:  # noqa: BLE001
+                self._level = 0.0
+            stream.write(block)
+        self._level = 0.0
+
     def _worker(self) -> None:
         while True:
             item = self._queue.get()
@@ -492,11 +520,12 @@ class Speaker:
             try:
                 self._ensure_stream(rate)
                 self._speaking.set()
-                self._stream.write(pcm)
+                self._write_blocks(pcm, rate)
             except Exception as exc:  # noqa: BLE001
                 print(f"[audio] 播放失败：{exc}", file=sys.stderr)
                 self._close_stream()
             finally:
+                self._level = 0.0
                 self._speaking.clear()
                 self._queue.task_done()
         self._close_stream()

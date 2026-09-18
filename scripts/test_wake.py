@@ -52,16 +52,38 @@ def listen_utterance(mic, segmenter, seconds: float) -> np.ndarray | None:
 
 def append_alias(wake_file: Path, word: str, heard: str) -> str:
     """把实测到的说法写进 aliases，保留文件里其它字段与注释。"""
+    # 先归一化：识别结果常带标点（写成「海尔西。」这种别名又脏又容易误命中），
+    # 而匹配本身也是按归一化后的文本比的，所以存干净的形式即可。
+    clean = normalize(heard)
+    if not clean:
+        return "已跳过（空的）"
+    if not looks_like(clean, word):
+        return f"已跳过（{clean!r} 与「{word}」差太远，大概是环境杂音）"
     raw = json.loads(wake_file.read_text(encoding="utf-8") or "{}")
     aliases = raw.setdefault("aliases", {})
-    bucket = aliases.setdefault(word, [])
-    if heard in bucket:
+    bucket = [normalize(x) for x in aliases.get(word, []) or []]
+    if clean in bucket:
         return "已存在"
-    bucket.append(heard)
+    bucket.append(clean)
     # 顺手去重并保持可读
     aliases[word] = sorted(set(bucket), key=lambda x: (len(x), x))
     wake_file.write_text(json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return "已写入"
+
+
+def looks_like(heard: str, word: str) -> bool:
+    """挡一下明显不相干的识别结果，别把环境里听到的怪词当成别名存进去。
+
+    唤醒词一般三字上下，错听总是那么几种：首字不同（凯/开/海/太）、
+    末字相近（希/西/戏/信）。所以只要长度接近、且有一半以上的字相同就收。
+    """
+    target = normalize(word)
+    if not heard or not target:
+        return False
+    if abs(len(heard) - len(target)) > 1:
+        return False
+    same = sum(1 for ch in heard if ch in target)
+    return same >= max(1, len(target) // 2)
 
 
 def main() -> int:
