@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import re
@@ -173,6 +174,9 @@ class VoiceLoop:
         self._barge_keep = 0
         self._barge_triggered = False
         self._barge_listening = False
+        # 最近说过的话（用来识别「自己的声音被麦克风捡回来」）
+        self._recent_spoken: list[tuple[float, str]] = []
+        self._from_bargein = False
 
         self._stop = threading.Event()
         self._interrupt = threading.Event()
@@ -237,8 +241,13 @@ class VoiceLoop:
         # 上一轮被打断时已经把他的话收下来了，直接交给上层处理，不然就白丢了
         if self._barge_audio is not None:
             audio, self._barge_audio = self._barge_audio, None
+            self._from_bargein = True      # 标记来源：这句要靠「自识别护栏」把关
             self.log.debug(f"使用打断时收到的语音：{audio.size} 采样")
             return audio
+        # 正常录音的这一句不是打断来的：把标记清掉。不清的话，万一上一轮
+        # 打断来的音频没走到 _process（比如待机时被当成没喊唤醒词丢掉了），
+        # 这个标记会一直留着，把后面某句真话误判成自识别。
+        self._from_bargein = False
         audio_cfg = self.settings.audio
         rate = int(audio_cfg.sample_rate)
         frame_size = int(audio_cfg.frame_size)
@@ -345,6 +354,7 @@ class VoiceLoop:
         # 这是一句新的发言：先把上一轮遗留的打断标记清掉，
         # 否则它会一开始就被自己掐断（提醒播报尤其明显）
         self._interrupt.clear()
+        self._note_spoken(text)
         t0 = time.perf_counter()
         self._muted.set()
         self._mark_played()
@@ -354,6 +364,7 @@ class VoiceLoop:
                 if wait:
                     self._drain_playback()
         finally:
+            self._barge_finish()
             self._muted.clear()
             self._flush_mic()
         return time.perf_counter() - t0
@@ -442,19 +453,31 @@ class VoiceLoop:
 
                 if step:
                     break
-        finally:
-            if not step:
-                bi.end()
-                self._barge_listening = False
-                self._barge_buf = []
-                if self._barge_triggered and self._barge_seg is not None:
-                    # 用户还没说完（或断句没等到）就超时了：把已经收到的先用上
-                    parts = self._barge_seg.flush()
-                    if parts and self._barge_audio is None:
-                        self._barge_audio = parts[0]
-                    self._barge_seg.reset()
-
+        except Exception as exc:  # noqa: BLE001
+            # 打断检测出错不该影响正常说话，记一笔就好
+            self.log.warning(f"打断检测出错（已忽略）：{exc}")
         return self._barge_triggered
+
+    def _barge_finish(self) -> None:
+        """一轮发言结束：收拾打断检测的状态，并把回声校准结果定下来。
+
+        必须在一轮发言的所有出口都调到（包括被 step 模式打断提前退出的情况），
+        否则 `_barge_triggered` 会留到下一轮，下一轮一开口就被当成「已经打断」。
+        """
+        if self.bargein is None or not self._barge_listening:
+            return
+        self._barge_listening = False
+        self._barge_buf = []
+        if self._barge_triggered and self._barge_seg is not None:
+            # 用户还没说完（或断句没等到）就超时了：把已经收到的先用上
+            parts = self._barge_seg.flush()
+            if parts and self._barge_audio is None:
+                self._barge_audio = parts[0]
+            self._barge_seg.reset()
+        self._barge_seg = None
+        self._barge_triggered = False
+        self._barge_deadline = 0.0
+        self.bargein.end()
 
     # ======================================================================
     # 两级加载：唤醒 → 加载重型模型；空闲超时 → 释放
@@ -652,6 +675,7 @@ class VoiceLoop:
                         speak(sentence)
                     self._drain_playback()
         finally:
+            self._barge_finish()
             if self._interrupt.is_set():
                 # 回车打断 / 语音打断都要把剩下没放完的清掉
                 self.speaker.interrupt()
@@ -662,6 +686,7 @@ class VoiceLoop:
 
         answer = "".join(pieces).strip()
         stats.answer = answer
+        self._note_spoken(answer)
         stats.interrupted = self._interrupt.is_set()
         stats.first_audio = first_audio or 0.0
         stats.total_seconds = time.perf_counter() - t0
@@ -704,6 +729,36 @@ class VoiceLoop:
             self.wake.settings.idle_timeout or self.settings.wake.idle_timeout
         )
         self.session.timeout = self._idle_timeout
+
+    def _note_spoken(self, text: str) -> None:
+        """记下刚说出口的话，供自识别判断。"""
+        clean = _NOISE_STRIP.sub("", prepare_for_reading(text or ""))
+        if len(clean) < 2:
+            return
+        self._recent_spoken.append((time.monotonic(), clean))
+        if len(self._recent_spoken) > 6:
+            self._recent_spoken.pop(0)
+
+    def _looks_like_own_voice(self, text: str, window: float = 30.0) -> bool:
+        """这句话是不是「自己刚说的话被麦克风又捡回来了一遍」。
+
+        打断检测靠能量估计回声，总有估不准的时候（音量突变、有人动了音箱）。
+        这道护栏不看能量，而是看**内容**：如果打断收到的语音转出来就是自己刚才
+        说过的话，那它一定是自识别，直接忽略——否则会变成
+        「听见自己 → 回答 → 又听见自己」的嵌套。
+        """
+        clean = _NOISE_STRIP.sub("", text or "")
+        if len(clean) < 2:
+            return False
+        now = time.monotonic()
+        for when, spoken in self._recent_spoken:
+            if now - when > window:
+                continue
+            if clean in spoken:
+                return True
+            if len(clean) >= 4 and difflib.SequenceMatcher(None, clean, spoken).ratio() >= 0.8:
+                return True
+        return False
 
     def _is_exit(self, text: str) -> bool:
         t = text.strip().strip("。！!？?，,、 ")
@@ -757,6 +812,17 @@ class VoiceLoop:
 
     def _process(self, text: str, result: AsrResult | None, asr_seconds: float = 0.0) -> bool:
         """处理一句识别结果，返回 True 表示要退出。"""
+        # 自识别护栏：打断收到的语音如果就是自己刚说的话，直接丢掉，不要回答
+        from_barge = self._from_bargein
+        self._from_bargein = False
+        if from_barge and self._looks_like_own_voice(text):
+            print(
+                f"\n[自识别] 这句像是我自己刚说的（{text.strip()}），已忽略",
+                flush=True,
+            )
+            self.log.warning(f"忽略自识别：{text!r}")
+            return False
+
         if self._is_exit(text):
             print(f"\n你说：{text}\n助手：再见！\n")
             return True
