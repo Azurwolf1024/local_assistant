@@ -1,0 +1,36 @@
+{
+  "_说明": "课程表 / 会议日程。可以手工编辑，程序会自动重新加载。",
+  "_格式": {
+    "每周重复的课": {
+      "title": "课程名",
+      "kind": "course",
+      "repeat": "weekly",
+      "weekday": "0=周一, 1=周二, ... 6=周日",
+      "time": "HH:MM 开始时间",
+      "duration_minutes": "时长（分钟）",
+      "location": "地点（可省略）",
+      "remind_before": "提前几分钟语音提醒"
+    },
+    "一次性安排": {
+      "title": "会议名",
+      "kind": "meeting",
+      "repeat": "once",
+      "start": "YYYY-MM-DD HH:MM",
+      "location": "地点（可省略）",
+      "remind_before": "提前几分钟语音提醒"
+    }
+  },
+  "items": [
+    {
+      "title": "AIAA3102 机器学习",
+      "kind": "course",
+      "repeat": "weekly",
+      "weekday": 3,
+      "time": "09:00",
+      "duration_minutes": 90,
+      "location": "教学楼 A302",
+      "remind_before": 15,
+      "_note": "示例条目，确认格式后可直接删除"
+    }
+  ]
+}

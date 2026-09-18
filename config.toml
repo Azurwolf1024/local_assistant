@@ -1,0 +1,155 @@
+# ============================================================================
+#  本地语音对话链路配置  (D:\local_AI\config.toml)
+#  修改后无需改动代码，重启 main.py 即生效。
+# ============================================================================
+
+[app]
+project_root = "."
+sessions_dir = "sessions"     # 会话日志 / 录音保存目录
+log_level = "info"
+save_audio = false            # 是否把每轮用户录音存成 wav
+
+# ── 麦克风 / 扬声器 ─────────────────────────────────────────────────────────
+[audio]
+input_device = ""             # 留空=系统默认；可填设备名关键字或编号
+output_device = ""            # 留空=系统默认
+sample_rate = 16000           # ASR 采样率，不要改
+frame_size = 512              # VAD 帧长（Silero 必须是 512）
+mic_gain = 1.0                # 麦克风增益
+max_record_seconds = 30       # 单轮最长录音时长
+listen_timeout = 30           # 等待用户开口的超时（秒），0=永不超时
+playback_volume = 1.0
+
+# ── 语音活动检测 ────────────────────────────────────────────────────────────
+[vad]
+backend = "auto"              # auto | silero | energy
+model = "models/vad/silero_vad.onnx"
+threshold = 0.5
+min_speech_duration = 0.25    # 小于该时长的片段丢弃
+min_silence_duration = 0.55   # 判定一句话结束所需的静音时长（越小越快、越易打断）
+max_speech_duration = 15.0    # 单段最长时长，超过强制切分
+energy_threshold = 0.012      # energy 后端的 RMS 阈值
+
+# ── 语音识别 ────────────────────────────────────────────────────────────────
+[asr]
+# sensevoice = 最快（中文首选）
+# whisper    = 最准，中英混说/长句更稳
+# hybrid     = 默认，SenseVoice 快路径 + Whisper 按需校验
+strategy = "hybrid"
+language = "zh"               # zh / en / auto
+num_threads = 6
+
+# SenseVoiceSmall（sherpa-onnx）
+sensevoice_model = "models/asr/sensevoice-small/model.int8.onnx"
+sensevoice_tokens = "models/asr/sensevoice-small/tokens.txt"
+sensevoice_use_itn = true     # 逆文本正则化：数字/日期更自然
+
+# Whisper large-v3-turbo（OpenVINO int8）
+whisper_model = "models/asr/whisper-large-v3-turbo-int8-ov"
+whisper_device = "CPU"        # CPU / GPU / AUTO
+whisper_min_duration = 6.0    # 音频超过该秒数时，hybrid 模式会追加 Whisper 校验
+whisper_word_timestamps = false
+
+# ── 大语言模型 (Ollama) ─────────────────────────────────────────────────────
+[llm]
+host = "http://127.0.0.1:11434"
+model = "qwen2.5:7b"
+temperature = 0.7
+top_p = 0.9
+num_ctx = 4096
+num_predict = 512
+keep_alive = "30m"            # 让模型常驻显存/内存，首字延迟更低
+history_turns = 6             # 携带的历史轮数（user+assistant 各算一轮）
+system_prompt = """
+你是《明日方舟》里的凯尔希（Kal'tsit），罗德岛的医疗主管。
+现在正通过语音和博士对话——你就是博士身边的那个凯尔希，不是“扮演助手的 AI”。
+
+【身份与称呼】
+- 称对方为「博士」。你熟悉罗德岛的一切：基建、作战、感染者、源石、档案。
+- 偶尔可以提到罗德岛、简报、档案、作战这些词，但不要硬塞，不要每句都提。
+
+【说话风格】
+1. 冷静、克制、用词精准，像在做例行简报。不寒暄、不海喝、不用“哎呀”“哈哈”这种口气。
+2. 简洁优先：一般一到两句就说完，除非博士明确要求展开。语音对话说太多是失礼的。
+3. 对博士的作息、身体、摸鱼行为可以流露一点克制的关心，或很淡的擒搶，
+   比如「博士，你又熬夜了」这种，但绝不说肉麻的话。
+4. 事务性内容（时间、提醒、日程、备忘）直接给结论，不铺垫。
+5. 不知道的事情就直说不知道，不要编。不要用“作为一个AI”“我是语言模型”这种说法。
+
+【硬性要求】输出会被语音合成直接朗读
+- 不要输出 Markdown、代码块、表格、链接、表情符号、LaTeX 公式。
+- 不要念出括号、星号、井号、下划线等符号。
+- 数字、单位、专有名词用中文习惯说法，便于朗读。
+- 不要输出动作、神态描写（如「（沉默）」）。
+"""
+
+# ── 语音合成 (Piper) ────────────────────────────────────────────────────────
+[tts]
+backend = "piper"
+voice = "zh_CN-huayan-medium"                 # 中文女声
+model = "models/tts/piper/zh_CN-huayan-medium.onnx"
+config = "models/tts/piper/zh_CN-huayan-medium.onnx.json"
+use_cuda = false
+
+# 音色 / 语调
+length_scale = 1.0            # 语速：1.0 最自然，>1 更慢，<1 更快
+noise_scale = 0.667           # 音高起伏
+noise_w_scale = 0.85          # 音长起伏，调大（0.9~1.0）更有感情
+volume = 1.0
+
+# 断句与停顿
+# 说明：Piper 的中文音色看不到标点，句读完全靠模型自身的韵律，
+#       所以「不要在逗号处切块」是语调自然的关键（见 README 第 6 节）。
+sentence_silence = 0.08       # 块之间的补白，只用于避免拼接感
+inject_pauses = false         # true = 用 [[,]] 强行注入停顿音素，停顿更硬更清晰
+min_chunk_chars = 14          # 短于该字数的句子会和下一句合并（避免「好的。」这类碎片）
+max_chunk_chars = 60          # 整句超过该长度才允许在逗号处切
+max_hold_seconds = 1.2        # 攒句最长等待：超时也先送出去，保证响应
+first_chunk_min_chars = 8     # 首块最少字数（越小出声越快）
+
+# ── 唤醒词 / 常驻服务 ───────────────────────────────────────────────────────
+[wake]
+enabled = true
+file = "data/wakewords.json"  # 唤醒词写在这里，保存即生效，无需重启
+ack = "我在，博士。"          # 被唤醒时的应答语（凯尔希语气），留空则不播报
+
+# 两级加载：待唤醒时只跑 Silero VAD + SenseVoice（约 250 MB），
+# 被唤醒后才加载 TTS / Whisper / Ollama 模型，空闲超时再释放。
+lazy_load = true
+idle_timeout = 180            # 唤醒后多少秒没有指令就回到待唤醒（180 = 3 分钟）
+idle_action = "standby"       # standby = 释放模型回待唤醒；exit = 整个服务退出
+unload_llm = true             # 回待唤醒时让 Ollama 卸载模型（省 4~5 GB 内存）
+
+min_silence_wake = 0.30       # 待唤醒状态的静音判定（越小越灵敏，越小越易误触）
+fuzzy_ratio = 0.75            # 唤醒词模糊匹配阈值，0.65~0.85 比较合适
+followup_window = 2.0         # 只说「凯尔希」后面没跟请求时，等下半句的秒数（0=直接应答）
+
+# 后台运行（python main.py listen -B）用到
+pid_file = "sessions/listen.pid"
+stop_file = "sessions/listen.stop"
+log_file = "sessions/listen.log"
+
+# 关闭服务：
+#   前台跑（python main.py listen）  -> 在那个窗口按 Ctrl+C
+#   后台跑（python main.py listen -B）-> python main.py stop（窗口是隐藏的，Ctrl+C 用不上）
+#   两种方式都支持 python main.py stop
+
+# ── 生活技能 ────────────────────────────────────────────────────────────────
+[skills]
+enabled = true
+data_dir = "data"
+alarm_file = "data/alarms.json"
+memo_file = "data/memos.json"
+schedule_file = "data/schedule.json"
+check_interval = 5            # 后台检查提醒的间隔（秒）
+default_remind_before = 10    # 日程默认提前几分钟提醒
+speak_duplicate = false
+visual_alert = true           # 提醒时同时弹出右下角可视窗（没开扬声器也不会错过）
+visual_timeout = 25           # 可视窗多少秒后自动关闭（可随时点「知道了」或按 Esc 关掉）
+allow_system_commands = true  # 允许「关屏幕」这类系统级操作；关掉后语音指令无效
+
+# ── 交互 ────────────────────────────────────────────────────────────────────
+[chat]
+mode = "vad"                  # vad = 自动断句连续对话 | ptt = 按回车说话
+wake_word = ""                # 已废弃，请改用 data/wakewords.json
+exit_phrases = ["退出", "再见", "拜拜", "结束对话", "不聊了"]
