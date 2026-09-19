@@ -132,18 +132,28 @@ def parse_clock(text: str) -> tuple[int, int] | None:
     if tail.startswith("半"):
         minute = 30
     else:
-        m2 = re.match(r"\s*(\d{1,2}|[一二三四五六七八九十两]+)\s*分", tail)
+        # ★「分」是可选的★：以前要求必须带「分」，「8点45」被当成 8:00
+        # （整个分钟被吞了，实测用户说「8点45提醒我练琴」被排到了 08:00）。
+        # 但也不能看到任何数字就当分钟：「8点2个闹钟」里的 2 不是分钟，
+        # 所以只接受「两位以上」或者「前面有零」的写法（45 / 05 / 四十五）。
+        m2 = re.match(r"\s*(\d{1,2}|[一二三四五六七八九十两]+)\s*分?", tail)
         if m2:
-            v = cn2num(m2.group(1))
-            if v is not None:
+            raw_min = m2.group(1)
+            v = cn2num(raw_min)
+            two_digit = len(raw_min) >= 2 or raw_min.startswith("0")
+            has_fen = "分" in tail[: len(raw_min) + 2]
+            if v is not None and 0 <= v <= 59 and (two_digit or has_fen):
                 minute = v
     if not (0 <= hour <= 24 and 0 <= minute <= 59):
         return None
     return hour % 24 if hour == 24 else hour, minute
 
 
-def _apply_period(hour: int, text: str) -> int:
-    """根据「下午 / 晚上」等词把 12 小时制补成 24 小时制。"""
+def _apply_period(hour: int, text: str, minute: int = 0, now: datetime | None = None) -> int:
+    """根据「下午 / 晚上」等词把 12 小时制补成 24 小时制。
+
+    没有时段词时，再看**现在几点**（以前一律当上午，实测踩坑）：
+    """
     for word, offset in PERIOD_OFFSET.items():
         if word not in text:
             continue
@@ -154,6 +164,15 @@ def _apply_period(hour: int, text: str) -> int:
         if offset and hour < 12:
             return hour + offset
         return hour
+
+    # --- 没有时段词：按「现在」推断 ---
+    # 晚上 20:36 说「8点45」= 今晚 20:45（不是明天早上 8:45，已经过了还等到明天就说不过去）；
+    # 早上 8:30 说「8点」保持上午（不该跳成今晚 20:00）；
+    # 晚上说「7点」而 19:00 已过 → 保持上午 → 明天 07:00。
+    if now is None or hour >= 12 or now.hour < 12:
+        return hour
+    if (hour + 12, minute) > (now.hour, now.minute):
+        return hour + 12
     return hour
 
 
@@ -249,7 +268,7 @@ def parse_datetime(text: str, now: datetime | None = None, roll_forward: bool = 
         return datetime.combine(d, time(9, 0))
 
     hour, minute = clock
-    hour = _apply_period(hour, t)
+    hour = _apply_period(hour, t, minute, now)
 
     day = parse_date_hint(t, now)
     explicit_day = day is not None

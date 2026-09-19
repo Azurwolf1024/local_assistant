@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import tempfile
 from datetime import datetime
@@ -599,6 +600,117 @@ def test_refer_and_batch() -> None:
 
 
 # --------------------------------------------------------------------------- #
+def test_incident_0919() -> None:
+    """回归：2026-09-19 20:36 那次真实对话里的三个错（用当时的时间与数据复现）。
+
+    用户当时说的是（原文见 sessions/session-20260919-203401.jsonl）：
+        「8点45提醒我去练琴。」      -> 被记成「明天早上八点」（分钟被吞 + 时段判错）
+        「我说今天晚上8点45。」       -> 落到大模型手里，嘴上说改了，**库里没改**
+        「取消明天早上的安排。」      -> 把 9月23日的「跟导师见面」日程删了（不可逆）
+
+    这段测试就是盯住这三条，时间固定成当时那一刻，所以不会随跑测试的日子飘。
+    """
+    print("\n[4c] 回归：09-19 那次的三个错")
+    from datetime import datetime, timedelta
+
+    from voice_loop.nlp_time import humanize, parse_datetime
+    from voice_loop.skills import Skills
+
+    settings = load_settings()
+    tmp = Path(tempfile.mkdtemp(prefix="voiceloop_incident_"))
+    settings.skills.data_dir = str(tmp)
+    settings.skills.alarm_file = str(tmp / "alarms.json")
+    settings.skills.memo_file = str(tmp / "memos.json")
+    settings.skills.schedule_file = str(tmp / "schedule.json")
+
+    now = datetime(2026, 9, 19, 20, 36)          # 周六晚，就是当时那一刻
+
+    # ---- 1) 「8点45」不该被吞掉分钟，也不该被当成明天早上 ----
+    print("    · 时间解析")
+    for text, expect in [
+        ("8点45提醒我去练琴", datetime(2026, 9, 19, 20, 45)),   # 晚上说 = 今晚
+        ("8点开会", datetime(2026, 9, 20, 8, 0)),                # 已经过了 20:00 = 明早
+        ("晚上8点45提醒我", datetime(2026, 9, 19, 20, 45)),
+        ("8点45分提醒我", datetime(2026, 9, 19, 20, 45)),
+        ("7点叫我起床", datetime(2026, 9, 20, 7, 0)),
+        ("3点半提醒我", datetime(2026, 9, 20, 3, 30)),
+    ]:
+        got = parse_datetime(text, now)
+        check(f"{text:20s} -> {expect:%m-%d %H:%M}", got, expect)
+    # 早上说裸小时不该跳到晚上（反向保护）
+    check("早上 08:30 说「8点」仍是上午",
+          parse_datetime("8点开会", datetime(2026, 9, 19, 8, 30)),
+          datetime(2026, 9, 20, 8, 0))
+    check("晚上说「7点」= 明天早上（19:00 已过）",
+          humanize(parse_datetime("7点开会", now), now), "明天早上七点")
+
+    # ---- 2) 随即修正：改刚才那一条，而不是新建、也不是交给大模型嘴上改 ----
+    print("    · 随即修正（我说…）")
+    skills = Skills(settings)
+    skills.alarms.save([])
+    skills.schedule.save([])
+    r = skills.handle("8点45提醒我去练琴。", now=now)
+    check("先说一条闹钟", getattr(r, "action", None), "alarm_add")
+    check("时间是对的（今晚 20:45）", skills.alarms.load()[0]["when"], "2026-09-19 20:45:00")
+    r = skills.handle("我说今天晚上8点45。", now=now)
+    check("「我说…」被技能接住（不再落到大模型）", getattr(r, "action", None),
+          "alarm_reschedule")
+    check("只剩一条（没新建）", len(skills.alarms.load()), 1)
+    check("时间仍然是今晚 20:45", skills.alarms.load()[0]["when"], "2026-09-19 20:45:00")
+    # 只有时间、没有动词的一句，也当成修正在改
+    r = skills.handle("今晚9点", now=now)
+    check("「今晚9点」也当成修正", getattr(r, "action", None), "alarm_reschedule")
+    check("改成了 21:00", skills.alarms.load()[0]["when"], "2026-09-19 21:00:00")
+
+    # ---- 3) 「取消明天早上的安排」：该找闹钟，且绝不能误删日程 ----
+    print("    · 取消明天早上的安排")
+    skills.alarms.save([])
+    skills.schedule.save([
+        {"title": "跟导师见面", "kind": "meeting", "repeat": "once",
+         "start": "2026-09-23 15:30", "remind_before": [10]},
+    ])
+    skills._last_add = None                                          # noqa: SLF001
+    skills.handle("明天早上8点提醒我去练琴。", now=now)               # -> 09-20 08:00
+    r = skills.handle("取消明天早上的安排。", now=now)
+    check("取消的是那条闹钟", getattr(r, "action", None), "alarm_cancel")
+    check("闹钟没了", len(skills.alarms.load()), 0)
+    check("★日程没被动★", [i["title"] for i in skills.schedule.load()], ["跟导师见面"])
+
+    # 没有对应闹钟时：宁可说「没找到」，也不能删掉一条时间对不上的日程
+    skills.alarms.save([])
+    r = skills.handle("取消明天早上的安排。", now=now)
+    check("没找到就不删（回一句没找到）", getattr(r, "action", None),
+          "schedule_change_miss")
+    check("★日程仍然在★", [i["title"] for i in skills.schedule.load()], ["跟导师见面"])
+
+    # 就算「指代」到了它（上一轮助手念过「约导师见面」），时间对不上也得拦住
+    skills.dialog = ["今天有闹钟吗？", "待处理提醒三条。第一条，明天早上八点，练琴；"
+                                      "第三条，四天后下午三点半，约导师见面。"]
+    r = skills.handle("取消明天早上的安排。", now=now)
+    check("时间对不上的指代会被拦下", getattr(r, "action", None),
+          "schedule_change_unsure")
+    check("回复说清了它到底是哪天", "23" in (r.reply if r else ""), True)
+    check("★日程还是没被删★", [i["title"] for i in skills.schedule.load()], ["跟导师见面"])
+    skills.dialog = []
+
+    # 明确点名还是能删（守卫不能把正常用法也挡了）
+    r = skills.handle("删掉跟导师见面。", now=now)
+    check("点名说「删掉跟导师见面」照旧能删", getattr(r, "action", None), "schedule_delete")
+    check("删掉了", skills.schedule.load(), [])
+
+    # 时间对得上的显式删除也能删
+    skills.schedule.save([
+        {"title": "跟导师见面", "kind": "meeting", "repeat": "once",
+         "start": "2026-09-23 15:30", "remind_before": [10]},
+    ])
+    r = skills.handle("9月23日下午三点半的跟导师见面不去了。", now=now)
+    check("时间对得上就能删", getattr(r, "action", None), "schedule_delete")
+    check("确实删了", skills.schedule.load(), [])
+
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
 def test_wake() -> None:
     print("\n[5] 唤醒词匹配")
     settings = load_settings()
@@ -725,6 +837,7 @@ def main() -> int:
     test_time()
     test_skills()
     test_schedule_model()
+    test_incident_0919()
     test_refer_and_batch()
     test_wake()
     test_standby()

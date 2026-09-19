@@ -212,6 +212,13 @@ SCHEDULE_WORDS = ("课", "课程", "上课", "会议", "开会", "日程", "安�
 TRIGGER_ALARM = re.compile(r"(提醒|提行|提星|醒目|闹钟|闹中|叫醒|叫我|喊我|定时|喊一下)")
 TRIGGER_MEMO = re.compile(r"(记\s*[一以衣]?\s*[下住录哈吓夏]|记住|^记得|记录|备忘|备忘记)")
 TRIGGER_SCHEDULE = re.compile(r"(课|上课|会议|开会|例会|组会|日程|日成|行程|安排)")
+# ★明确日程名词★：只有这些才把「取消…」让给日程分支。
+# 「安排」不在这里 —— 它同时是用户说闹钟时的常用词。
+# 实测「取消明天早上的安排」就是因为句中有「安排」被整个绕过闹钟分支，
+# 转去删掉了四天后的「跟导师见面」（不可逆），而 08:00 那条闹钟还在。
+_SCHEDULE_NOUN = re.compile(
+    r"(?:课程|课|上课|会议|开会|例会|组会|日程|行程|讲座|答辩|面试|考试|出差|行程)"
+)
 # 约会类：说「下周三下午三点半跟导师见面」时，句子里既没有「课/会议」，
 # 也没有「安排/记录」这种动词，以前会直接掉给大模型 ——
 # 大模型会回一句「已记录此安排」，实际上什么都没存（用户就是这么被坑的）。
@@ -276,6 +283,26 @@ _PERIOD_HOUR = {
     "上午": 10, "中午": 12, "正午": 12, "下午": 15, "傍晚": 18,
     "晚上": 20, "今晚": 20, "明晚": 20, "夜里": 21,
 }
+# 只说了时段（「明天早上」）时用来收窄候选：(起始小时, 结束小时)，左闭右开
+_PERIOD_RANGE = {
+    "半夜": (0, 5), "凌晨": (0, 6), "清晨": (4, 9), "早晨": (4, 11), "早上": (4, 11),
+    "今早": (4, 11), "明早": (4, 11), "上午": (7, 12), "中午": (11, 14),
+    "正午": (11, 14), "下午": (12, 18), "傍晚": (16, 20), "晚上": (17, 24),
+    "今晚": (17, 24), "明晚": (17, 24), "夜里": (20, 24),
+}
+
+
+def _clock_with_period(text: str, now: datetime) -> tuple[int, int] | None:
+    """句中的钟点，并且把上午/下午/晚上算进去（「下午三点半」→ (15, 30)）。
+
+    光用 parse_clock 拿到的是 (3, 30)，跟 15:30 比就对不上：
+    删除守卫曾因此把「9月23日下午三点半的跟导师见面不去了」误拦成「时间对不上」。
+    """
+    clock = parse_clock(text)
+    if clock is None:
+        return None
+    dt = parse_datetime(text, now)
+    return (dt.hour, dt.minute) if dt is not None else clock
 
 
 def _period_hour(text: str) -> int | None:
@@ -391,6 +418,10 @@ class Skills:
         # 最近的对话（你说 + 助手答），用来解析「它 / 那个 / 刚才那条」指谁。
         # 由 pipeline 每轮传进来；单独跑 skills 时就是空的。
         self.dialog: list[str] = []
+        # 刚记下的那一条（闹钟/日程），用来处理「我说今天晚上8点45」这种**随即修正**。
+        # 实测：用户说完一句时间说错了，下一句「我说是今晚8点45」以前会被当成新请求
+        # 交给大模型，而大模型只会嘴上说「已更正」——**其实什么也没改**。
+        self._last_add: dict | None = None
 
         # 看图（摄像头 / 屏幕 / 剪贴板 / 文件）
         vcfg = settings.vision
@@ -425,6 +456,7 @@ class Skills:
             self._handle_screen,
             self._handle_clock,
             self._handle_vision,         # 看图（带时间词的会让给日程）
+            self._handle_correction,     # 「我说是今晚8点45」——改刚才那一条，别新建
             self._handle_alarm,
             self._handle_schedule,
             self._handle_memo,
@@ -484,8 +516,82 @@ class Skills:
         r"(?:提醒|闹钟|定时)"
     )
 
+    # 「取消明天早上的安排」这类：句子里有时间、没名字，也可能指的是**闹钟**。
+    # 实测踩坑：「取消明天早上的安排」被日程分支接住，从上一轮助手自己念过的话里
+    # 「指代」到了 9月23日的「跟导师见面」并把它删了——而用户指的是 08:00 的练琴闹钟。
+    _CANCEL_WORD = re.compile(r"取消|删掉|删除|去掉|不要了|别提醒|不用提醒|关掉|清掉")
+
+    def _cancel_by_time(self, text: str, now: datetime) -> SkillResult | None:
+        """按句中的时间来取消一条提醒（闹钟）。
+
+        只在「句子里有明确时间、且说的不是课/会议这类明确的日程名词」时生效；
+        找不到对应的就返回 None，让后面日程分支去处理。
+
+        ★为什么不再拿 TRIGGER_SCHEDULE 当闸门★：「安排」这个词既是日程词、
+        也是用户平时说闹钟的说法。实测用户说「取消明天早上的安排」时，
+        就因为句子里有「安排」被整个绕过闹钟分支、转去删日程，
+        结果把四天后的「跟导师见面」删了（不可逆），而那条 08:00 的闹钟还在。
+        现在只认「课/会议/组会…」这类**明确日程名词**，且句子里没提提醒/闹钟。
+        """
+        if not self._CANCEL_WORD.search(text):
+            return None
+        if _SCHEDULE_NOUN.search(text) and not TRIGGER_ALARM.search(text):
+            return None                      # 「取消明天早上的课」→ 那是日程的事
+        day = parse_date_hint(text, now)
+        clock = _clock_with_period(text, now)
+        if day is None and clock is None:
+            return None
+        hits: list[tuple[int, dict]] = []
+        for idx, item in enumerate(self.alarms.load(), start=1):
+            try:
+                when = datetime.fromisoformat(str(item.get("when")))
+            except (TypeError, ValueError):
+                continue
+            if day is not None and when.date() != day:
+                continue
+            if clock is not None and (when.hour, when.minute) != clock:
+                continue
+            hits.append((idx, item))
+        if not hits:
+            return None
+        # 只说了时段（「明天早上」）而当天有多条时，用时段再收一次
+        if len(hits) > 1:
+            period = _DAY_PERIOD.search(text)
+            window = _PERIOD_RANGE.get(period.group(1)) if period else None
+            if window:
+                narrowed = [
+                    (i, it) for i, it in hits
+                    if window[0] <= datetime.fromisoformat(str(it.get("when"))).hour < window[1]
+                ]
+                if narrowed:
+                    hits = narrowed
+        if not hits:
+            return None
+        if len(hits) > 1:
+            names = "、".join(
+                f"{humanize(datetime.fromisoformat(str(it.get('when'))), now)}"
+                f"{it.get('what', '')}" for _i, it in hits[:4]
+            )
+            return SkillResult(
+                reply=f"{cn_quantity(len(hits))}条提醒都对得上（{names}），你说是哪一条？",
+                action="alarm_cancel_unsure",
+            )
+        idx, item = hits[0]
+        when = datetime.fromisoformat(str(item.get("when")))
+        what = str(item.get("what") or "")
+        self.alarms.remove_at(idx)
+        return SkillResult(
+            reply=f"已取消{humanize(when, now)}的提醒：{what}。",
+            action="alarm_cancel",
+        )
+
     def _handle_alarm(self, text: str, now: datetime) -> SkillResult | None:
-        # --- 取消 ---
+        # --- 取消（按时间找，不要求说序号） ---
+        by_time = self._cancel_by_time(text, now)
+        if by_time is not None:
+            return by_time
+
+        # --- 取消（按序号 / 全部） ---
         m = self._ALARM_CANCEL.search(text)
         if m:
             idx_raw, all_raw = m.group("idx"), m.group("all")
@@ -573,6 +679,7 @@ class Skills:
                     "kind": "alarm",
                 }
             )
+            self._remember_add("alarm", idx=len(self.alarms.load()))
             return SkillResult(
                 reply=f"{prefix}闹钟已定：{when_text}，{humanize_delta(delta)}后。",
                 action="alarm_add",
@@ -588,6 +695,7 @@ class Skills:
                 "kind": "alarm",
             }
         )
+        self._remember_add("alarm", idx=len(self.alarms.load()))
         return SkillResult(
             reply=f"{prefix}已记录。{when_text}，也就是{humanize_delta(delta)}后，我会提醒你{what}。",
             action="alarm_add",
@@ -596,6 +704,105 @@ class Skills:
 
     def _looks_like_create(self, text: str) -> bool:
         return has_clock_expr(text)
+
+    # ======================================================================
+    # 随即修正：「我说是今晚8点45」「不对，是明天上午」——改刚才那一条
+    # ======================================================================
+    _CORRECT = re.compile(
+        r"我说|我是说|说的是|说错了|改了|不对|不是|应该是|指的是|搞错|错了|改成|换到|挪到"
+    )
+    # 允许出现在「纯时间」一句话里的字。除此之外任何一个字（提醒/开会/交房租/课…）
+    # 都会让它失去资格——这样「每月5号下午三点交房租」就不会把上一条改掉了
+    # （曾经用「长度 <= 14 且带钟点」当条件，结果这类短句被误当成修正在改）。
+    _TIME_ONLY_CHARS = set(
+        "0123456789"                    # 数字
+        "零一二三四五六七八九十百两"      # 汉字数字
+        "点时時刻分秒号日天"              # 时间单位
+        "早上下晚中夜晨凌半午"            # 时段
+        "今明后大周星期礼拜末这那个"      # 日期/星期
+        "的我是了不改成到应该对说"          # 修正措辞（「我说」「改成」「不对」）
+        "吧啊呢呀就才差过整"              # 语气/零碎
+    )
+
+    @classmethod
+    def _looks_time_only(cls, text: str, now: datetime) -> bool:
+        """整句只在说时间（可带「我说/不对/改成」这类词），没有别的内容。
+
+        这是「随即修正」的准入条件：修正只该给出一个新时间，不该顺便带来别的事。
+        """
+        t = re.sub(r"[\s，。、,.!！?？~]", "", text or "")
+        if not (2 <= len(t) <= 20):
+            return False
+        if any(ch not in cls._TIME_ONLY_CHARS for ch in t):
+            return False
+        if has_clock_expr(t):
+            return True
+        # 只说日期不说钟点的（「不是今天，是后天」），必须有修正措辞才认
+        return bool(cls._CORRECT.search(t)) and parse_date_hint(t, now) is not None
+
+    def _handle_correction(self, text: str, now: datetime) -> SkillResult | None:
+        """把「刚说的那条」改成新时间，而不是新建一条。
+
+        为什么需要它：实测用户说完「8点45提醒我练琴」发现被理解成明早八点，
+        紧接着说「我说今天晚上8点45」——这句话以前落到大模型手里，
+        大模型只会回一句「抱歉，刚才的时间换算有误，今晚八点四十五分……」，
+        **而库里什么也没改**（那个闹钟仍然是明天 08:00）。不可逆的错就这么留下了。
+
+        触发条件（两个都满足才动手，宁少改不多改）：
+            1. 整句只在说时间（见 _looks_time_only）——带别的内容就照常走新增/查询；
+            2. 上一轮确实刚记下一条（默认 3 分钟内）。
+        """
+        if self._last_add is None:
+            return None
+        age = time.monotonic() - float(self._last_add.get("at") or 0.0)
+        if age > 180:
+            return None
+        if not self._looks_time_only(text, now):
+            return None
+
+        when = parse_datetime(text, now)
+        if when is None:
+            return None
+        if when <= now:
+            when = when + timedelta(days=1)
+
+        kind = self._last_add.get("kind")
+        if kind == "alarm":
+            idx = int(self._last_add.get("idx") or 0)
+            items = self.alarms.load()
+            if not (1 <= idx <= len(items)):
+                return None
+            what = str(items[idx - 1].get("what") or DEFAULT_REMINDER_WHAT)
+            self.alarms.update(idx, when=when.strftime("%Y-%m-%d %H:%M:%S"), fired=False)
+            when_text = humanize(when, now)
+            self._last_add = {"kind": "alarm", "idx": idx, "at": time.monotonic()}
+            return SkillResult(
+                reply=f"改好了：{when_text}提醒你{what}。",
+                action="alarm_reschedule",
+                data={"when": when.isoformat(), "what": what},
+            )
+
+        if kind == "schedule":
+            key = tuple(self._last_add.get("key") or ())
+            items = self.schedule.load()
+            hit = next((it for it in items if _sched_key(it) == key), None)
+            if hit is None:
+                return None
+            title = str(hit.get("title") or "安排")
+            if self._repeat_of(hit) in ("weekly", "biweekly"):
+                self._update_schedule_item(key, time=when.strftime("%H:%M"))
+            else:
+                self._update_schedule_item(key, start=when.strftime("%Y-%m-%d %H:%M"))
+            self._last_add = {"kind": "schedule", "key": key, "at": time.monotonic()}
+            return SkillResult(
+                reply=f"改好了：{title}改到{humanize(when, now)}。",
+                action="schedule_reschedule",
+            )
+        return None
+
+    def _remember_add(self, kind: str, **info: Any) -> None:
+        """记下「刚刚新增的那一条」，供随即修正使用。"""
+        self._last_add = {"kind": kind, "at": time.monotonic(), **info}
 
     def _list_alarms(self, now: datetime) -> SkillResult:
         items = [it for it in self.alarms.load() if not it.get("fired")]
@@ -1092,6 +1299,7 @@ class Skills:
                         action="schedule_exist",
                     )
                 self.schedule.append(item)
+                self._remember_add("schedule", key=_sched_key(item))
                 return SkillResult(
                     reply=(
                         f"已排入课表：{self._repeat_text(item)}，{title}{self._where_text(location)}。"
@@ -1131,6 +1339,7 @@ class Skills:
                     action="schedule_exist",
                 )
             self.schedule.append(item)
+            self._remember_add("schedule", key=_sched_key(item))
             head = (
                 f"已排入日程：{self._repeat_text(item)}"
                 if repeat != "once"
@@ -1268,6 +1477,15 @@ class Skills:
         key = _sched_key(item)
         rep = self._repeat_of(item)
         weekly = rep in ("weekly", "biweekly")
+
+        # ★删之前必须核对时间★（这一步是拿真数据换来的）：
+        # 实测「取消明天早上的安排」被接成「删日程」，而且是从上一轮助手自己念过的
+        # 话里「指代」到了 9月23日的「跟导师见面」——把一条跟时间完全对不上的日程删了。
+        # 删除不可逆，句子里既然带了时间，对不上就一定要拦下来问清楚。
+        if drop:
+            mismatch = self._drop_time_mismatch(text, item, rep, now)
+            if mismatch:
+                return SkillResult(reply=mismatch, action="schedule_change_unsure")
 
         # --- 删：以后都不上了 ---
         if drop and not weekly:
@@ -1656,6 +1874,47 @@ class Skills:
                 hits.append((score, it))
         hits.sort(key=lambda x: x[0], reverse=True)
         return hits
+
+    def _drop_time_mismatch(self, text: str, item: dict, rep: str, now: datetime) -> str | None:
+        """要删的这条跟句子里说的时间对得上吗？对不上就返回「一句拒绝的话」。
+
+        只拦「句子里明确带了时间」的情况；没提时间的（「删掉组会」）照旧放行。
+        周期课按**星期几 + 时刻**比（“取消这周三的课”本来就允许跨到下一次），
+        一次性/间隔类按**日期 + 时刻**比。
+        """
+        day = parse_date_hint(text, now)
+        clock = _clock_with_period(text, now)
+        if day is None and clock is None:
+            return None
+        title = str(item.get("title") or "安排")
+        if rep in ("weekly", "biweekly"):
+            if day is not None and int(item.get("weekday", -1)) != day.weekday():
+                return (
+                    f"「{title}」是{self._repeat_text(item)}"
+                    f"，不是{self._day_label(day, now, True)}——要删它就说「删掉{title}」。"
+                )
+            if clock is not None and str(item.get("time", "")) != f"{clock[0]:02d}:{clock[1]:02d}":
+                return (
+                    f"「{title}」是{self._repeat_text(item)}开始的"
+                    f"，跟你说的时间对不上——要删它就说「删掉{title}」。"
+                )
+            return None
+        nxt = self.next_occurrence(item, now - timedelta(seconds=1))
+        if nxt is None:
+            return f"「{title}」算不出下一次时间，我不删——你说清楚名字再试。"
+        when_text = humanize(nxt, now)
+        if day is not None and nxt.date() != day:
+            return (
+                f"「{title}」是{nxt.month}月{nxt.day}日{clock_text(nxt)}，"
+                f"不是{self._day_label(day, now, True)}"
+                f"——要删它就说「删掉{title}」。"
+            )
+        if clock is not None and (nxt.hour, nxt.minute) != clock:
+            return (
+                f"「{title}」是{when_text}，跟你说的时间对不上"
+                f"——要删它就说「删掉{title}」。"
+            )
+        return None
 
     def _skip_day(self, text: str, item: dict, now: datetime) -> date:
         """算出这次要跳过哪一天：句子里有日期就用它，否则用最近的那一次。"""
