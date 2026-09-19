@@ -136,6 +136,7 @@ class WakeHit:
     remainder: str = ""            # 唤醒词之后的内容（同一句里直接说了请求时非空）
     fuzzy: bool = False            # 是否是模糊匹配命中
     span: tuple[int, int] | None = None   # 命中区间在**原文**里的下标 [起, 止)
+    character: str = ""            # ★是哪位角色被喊了★（多角色；空 = 没配角色或旧配置）
 
 
 @dataclass
@@ -202,12 +203,58 @@ class WakeWordMatcher:
             fuzzy_ratio=float(raw.get("fuzzy_ratio", DEFAULT_CONFIG["fuzzy_ratio"])),
         )
         self._patterns = []
-        for word in self._settings.words:
-            variants = [word] + list(self._settings.aliases.get(word, []))
-            norm_variants = sorted({normalize(v) for v in variants if normalize(v)}, key=len, reverse=True)
-            self._patterns.append((word, norm_variants))
+        self._build_patterns(self._settings.words, self._settings.aliases, "")
         self._mtime = mtime
         return self._settings
+
+    def _build_patterns(
+        self, words: list[str], aliases: dict[str, list[str]], character: str
+    ) -> None:
+        """把一批唤醒词**追加**进匹配表（``character`` 是这批属于哪位角色）。
+
+        ★注意是追加不是重置★：多角色时每个角色各调一次，重置的话
+        只有最后一个角色的唤醒词能命中（这个 bug 真踩过）。
+        需要重置的地方（:meth:`load` / :meth:`set_characters`）自己先清空。
+        """
+        for word in words:
+            variants = [word] + list(aliases.get(word, []))
+            norm_variants = sorted(
+                {normalize(v) for v in variants if normalize(v)}, key=len, reverse=True
+            )
+            self._patterns.append((word, norm_variants, character))
+
+    def set_characters(self, chars: list) -> None:
+        """★多角色★：用角色们的唤醒词重建匹配表（每个词带上它属于谁）。
+
+        ``chars`` 是 :class:`~voice_loop.persona.Character` 的列表。
+        调用后 ``match()`` 返回的 ``WakeHit.character`` 就是被喊的那位的 id，
+        上层据此切人设。传空列表就退回只看 wakewords.json。
+        """
+        enabled = [c for c in chars if getattr(c, "enabled", True)]
+        if not enabled:
+            self._patterns = []
+            self._char_words = []
+            self._build_patterns(self._settings.words, self._settings.aliases, "")
+            return
+        self._patterns = []
+        seen: set[str] = set()
+        self._char_words = []
+        for char in enabled:
+            words = [w for w in getattr(char, "wake_words", []) if w not in seen]
+            seen.update(words)
+            if not words:
+                continue
+            self._char_words.extend(words)
+            self._build_patterns(words, getattr(char, "aliases", {}) or {}, char.id)
+
+    def characters_loaded(self) -> bool:
+        """是否正在按角色文件匹配（而不是旧版的 wakewords.json）。"""
+        return any(c for _w, _v, c in self._patterns)
+
+    @property
+    def character_words(self) -> list[str]:
+        """当前所有主唤醒词（来自角色文件；拿去打印提示用）。"""
+        return list(getattr(self, "_char_words", [])) or list(self._settings.words)
 
     def maybe_reload(self) -> bool:
         """文件被改过就重新加载；返回「内容是否真的变了」。"""
@@ -239,34 +286,35 @@ class WakeWordMatcher:
         if not norm:
             return None
 
-        def hit_of(word: str, a: int, b: int, fuzzy: bool) -> WakeHit:
+        def hit_of(word: str, a: int, b: int, fuzzy: bool, character: str = "") -> WakeHit:
             span = (raw_pos[a], raw_pos[b] + 1)
             return WakeHit(
                 word=word,
                 remainder=(text or "")[span[1] :].strip(),
                 fuzzy=fuzzy,
                 span=span,
+                character=character,
             )
 
         # 1) 精确 / 别名包含（variants 已按长度倒序，长的优先）
-        for word, variants in self._patterns:
+        for word, variants, character in self._patterns:
             for variant in variants:
                 idx = norm.find(variant)
                 if idx >= 0:
-                    return hit_of(word, idx, idx + len(variant) - 1, False)
+                    return hit_of(word, idx, idx + len(variant) - 1, False, character)
 
         # 2) 模糊匹配：滑窗逐段比对，取最像的那一段
         #    窗口最小长度取 主唤醒词长度-1（但不能少于 3），
         #    否则「凯尔希」这种 3 字词会被任意两字窗口误命中。
-        ratio, word, a, b = self._best_window(norm)
+        ratio, word, a, b, character = self._best_window(norm)
         if ratio >= self._settings.fuzzy_ratio:
-            return hit_of(word, a, b, True)
+            return hit_of(word, a, b, True, character)
         return None
 
-    def _best_window(self, norm: str) -> tuple[float, str, int, int]:
-        """在 norm 里找与唤醒词最像的窗口，返回 (相似度, 主唤醒词, 起, 止)。"""
-        best: tuple[float, str, int, int] = (0.0, "", 0, 0)
-        for word, _ in self._patterns:
+    def _best_window(self, norm: str) -> tuple[float, str, int, int, str]:
+        """在 norm 里找与唤醒词最像的窗口，返回 (相似度, 主唤醒词, 起, 止, 角色)。"""
+        best: tuple[float, str, int, int, str] = (0.0, "", 0, 0, "")
+        for word, _variants, character in self._patterns:
             variant = normalize(word)
             if not variant:
                 continue
@@ -278,7 +326,7 @@ class WakeWordMatcher:
                     window = norm[i : i + size]
                     r = difflib.SequenceMatcher(None, window, variant).ratio()
                     if r > best[0]:
-                        best = (r, word, i, i + size - 1)
+                        best = (r, word, i, i + size - 1, character)
         return best
 
     def best_ratio(self, text: str) -> float:

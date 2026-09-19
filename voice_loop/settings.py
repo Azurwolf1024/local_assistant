@@ -202,6 +202,16 @@ class McpConfig:
 
 
 @dataclass
+class PersonaConfig:
+    """角色设定（名字/背景/称呼/示例台词…）。见 voice_loop/persona.py 第 14 节。"""
+
+    enabled: bool = True
+    file: str = "data/characters.json"      # 角色文件（可热加载）
+    default: str = ""                        # 没指定角色时用谁（id 或名字）；空 = 用文件里 default=true 的
+    extra_prompt: str = ""                   # 追加到任何角色后面的附加要求
+
+
+@dataclass
 class SkillsConfig:
     enabled: bool = True
     data_dir: str = "data"
@@ -256,6 +266,7 @@ class Settings:
     llm: LlmConfig = field(default_factory=LlmConfig)
     tts: TtsConfig = field(default_factory=TtsConfig)
     chat: ChatConfig = field(default_factory=ChatConfig)
+    persona: PersonaConfig = field(default_factory=PersonaConfig)
     wake: WakeConfig = field(default_factory=WakeConfig)
     skills: SkillsConfig = field(default_factory=SkillsConfig)
     subtitle: SubtitleConfig = field(default_factory=SubtitleConfig)
@@ -324,6 +335,7 @@ def load_settings(path: str | Path | None = None) -> Settings:
         vision=_build(VisionConfig, raw.get("vision", {}), "vision"),
         tts=_build(TtsConfig, raw.get("tts", {}), "tts"),
         chat=_build(ChatConfig, raw.get("chat", {}), "chat"),
+        persona=_build(PersonaConfig, raw.get("persona", {}), "persona"),
         mcp=_build_mcp(raw.get("mcp", {})),
         path=cfg_path,
     )

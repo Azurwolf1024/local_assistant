@@ -21,6 +21,11 @@ class OllamaClient:
         self.cfg = cfg
         self.base = cfg.host.rstrip("/")
         self._history: list[dict] = []
+        # ★运行时可换的两项★（多角色用）：None = 用 cfg 里的值。
+        # 单独存一份而不是直接改 cfg，是因为 settings.llm 是共享对象，
+        # 改它会牵连到评估脚本 / 自检里读同一份配置的地方。
+        self.system_prompt: str | None = None
+        self.temperature: float | None = None
 
     # ------------------------------------------------------------------ 基础
     def list_models(self) -> list[str]:
@@ -32,6 +37,12 @@ class OllamaClient:
                 f"无法连接 Ollama（{self.base}）。请确认已运行 `ollama serve`。原始错误：{exc}"
             ) from exc
         return [m.get("name", "") for m in r.json().get("models", [])]
+
+    def _system_prompt(self) -> str:
+        """当前生效的人设：运行时指的（角色）优先，否则用 config.toml 里那段。"""
+        if self.system_prompt is not None:
+            return self.system_prompt
+        return self.cfg.system_prompt
 
     def _think_param(self) -> bool | None:
         """把 ``[llm] think`` 翻成请求参数；None = 不传这个字段。
@@ -133,8 +144,9 @@ class OllamaClient:
 
     def _build_messages(self, user_text: str, images: list[str] | None = None) -> list[dict]:
         msgs: list[dict] = []
-        if self.cfg.system_prompt.strip():
-            msgs.append({"role": "system", "content": self.cfg.system_prompt.strip()})
+        prompt = self._system_prompt().strip()
+        if prompt:
+            msgs.append({"role": "system", "content": prompt})
         keep = max(0, int(self.cfg.history_turns)) * 2
         if keep:
             msgs.extend(self._history[-keep:])
@@ -206,7 +218,8 @@ class OllamaClient:
             "stream": True,
             "keep_alive": self.cfg.keep_alive,
             "options": {
-                "temperature": self.cfg.temperature,
+                "temperature": (self.temperature if self.temperature is not None
+                                else self.cfg.temperature),
                 "top_p": self.cfg.top_p,
                 "num_ctx": int(num_ctx or self.cfg.num_ctx),
                 "num_predict": self.cfg.num_predict,
