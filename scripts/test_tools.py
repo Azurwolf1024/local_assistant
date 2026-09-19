@@ -171,6 +171,14 @@ def test_reads() -> None:
     r = reg.call(tool_call("list_schedule", text="随便说点什么"))
     check("模型传了句废话也不会崩，退回今天", r.ok, True)
 
+    # ★别把时间段悄悄换成「今天」★：以前解析不出来就退到「今天」，
+    # 「下周三下午」会被答成「今天没有安排」，模型拿这句当依据去下结论（实测踩过）。
+    r = reg.call(tool_call("list_schedule", text="下周三下午"))
+    print(f"        {r.reply}")
+    check("「下周三下午」答的是下周三（不是今天）", "下周三" in r.reply, True)
+    r = reg.call(tool_call("list_schedule", text="这两周有安排吗"))
+    check("时间段解析不出来时，如实说没听懂而不是编今天", "今天" in r.reply, False)
+
     r = reg.call(tool_call("next_schedule"))
     print(f"        {r.reply}")
     check("下一项查得到", ("AIAA3102" in r.reply or "见面" in r.reply), True)

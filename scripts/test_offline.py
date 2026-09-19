@@ -400,9 +400,11 @@ def test_schedule_model() -> None:
         ("这几天有什么安排", ("2026-09-18", "2026-09-21", "这几天")),
         ("有什么安排", ("2026-09-18", "2026-09-18", "今天")),          # 没说范围 = 今天
     ]:
-        s, e, label = skills._range_of(text, fri)          # noqa: SLF001
+        s, e, label, ok = skills._range_of(text, fri)      # noqa: SLF001
         check(f"范围 {text}",
               (s.strftime("%Y-%m-%d"), e.strftime("%Y-%m-%d"), label), expect)
+        check(f"范围 {text} 的「听懂了」标记",
+              ok, text != "有什么安排")        # 没提时间的才会是 False
 
     r = skills.handle("下周有什么安排")
     print(f"        {r.reply}")
@@ -467,6 +469,33 @@ def test_schedule_model() -> None:
     r = skills._handle_schedule("今晚八点和导师吃饭", fri)   # noqa: SLF001
     check("不带星期的只顺延一天", skills.schedule.load()[0].get("start"), "2026-09-19 20:00")
     check("也说了顺延", "已经过了" in r.reply, True)
+
+    print("    · 问「哪一天/哪个时段」要答对应的那一天")
+    # 起因：工具层解析不出时间段时会**悄悄退到「今天」**，模型拿这句当依据去下结论
+    # （实测：问「我下周三下午有空吗」被答成「今天没有安排」）。这里盯两组：
+    #   ① 单个星期几 / 裸「周末」要能解析；② 只问一天时，句中的时段要算进去。
+    sat = datetime(2026, 9, 19, 10, 0)          # 周六上午
+    skills.schedule.save([{
+        "title": "组会", "kind": "meeting", "repeat": "weekly",
+        "weekday": 3, "time": "14:00", "remind_before": [10],
+    }])                                          # 每周四 14:00
+    cases = [
+        ("下周三有什么安排", "下周三", True),   # 下周三（9/23）没东西
+        ("下周四有什么安排", "组会", True),     # 下周四（9/24）有组会
+        ("下周四上午的课", "组会", False),      # 上午：14:00 的组会不算
+        ("下周四下午呢", "组会", True),         # 下午：算
+        ("周末有什么安排", "周末", True),       # 裸「周末」以前落到「今天」
+        ("这周三有什么安排", "下周三", True),   # 本周三已过 → 顺延，说法跟着改
+    ]
+    for text, needle, expect in cases:
+        r = skills._handle_schedule(text, sat)     # noqa: SLF001
+        reply = getattr(r, "reply", "") or ""
+        print(f"        {text} -> {reply}")
+        check(f"{text:12s} 回答里{'有' if expect else '没有'}「{needle}」",
+              needle in reply, expect)
+        check(f"{text:12s} 答的是那天（不是今天）", "今天" in reply, False)
+    check("提了时间就算「说了某段时间」", skills.mentions_time("下周三下午"), True)
+    check("没提时间就不算", skills.mentions_time("我的日程"), False)
 
     import shutil
 
