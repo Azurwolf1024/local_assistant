@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**SenseVoiceSmall / Whisper-large-v3-turbo → Ollama qwen2.5:7b → Piper 中文女声**
+**SenseVoiceSmall / Whisper-large-v3-turbo → Ollama qwen3.5:4b → Piper 中文女声**
 
 完全跑在本机的「说话 → 识别 → 思考 → 说话」闭环，不联网、不上传任何数据。
 支持唤醒词常驻待命、闹钟与会议提醒、备忘、日程查询，并且边说边播（首音 1~2 秒）。
@@ -22,7 +22,7 @@ flowchart LR
     E --> G{"生活技能命中?"}
     F --> G
     G -->|是| H["闹钟 / 备忘 / 日程 / 时间<br/>本地 JSON"]
-    G -->|否| I["Ollama qwen2.5:7b<br/>流式（带工具）"]
+    G -->|否| I["Ollama qwen3.5:4b<br/>流式（带工具 + 看图）"]
     I -->|直接回答| J["整句分块"]
     I -->|tool_call| Q["工具层<br/>复用同一套技能与守卫"]
     Q --> J
@@ -43,7 +43,7 @@ flowchart LR
 | 状态 | 加载了什么 | 内存 |
 | --- | --- | --- |
 | **待唤醒**（平时） | Silero VAD + SenseVoiceSmall | **约 0.9 GB** |
-| **已唤醒**（加载） | 前台加载 TTS，后台预热 Whisper 与 qwen2.5:7b | 约 2.5 GB + Ollama |
+| **已唤醒**（加载） | 前台加载 TTS，后台预热 Whisper 与 qwen3.5:4b | 约 2.5 GB + Ollama |
 | **空闲超时**（回收） | 卸载 Whisper / TTS，并让 Ollama 释放模型 | 回到 0.9 GB |
 
 ### 1.2 技能 / 工具 / 模型怎么分工
@@ -89,7 +89,7 @@ flowchart LR
   LLM 已就绪（预热 0.1s）
   Whisper 已卸载，内存已释放                 ← 3 分钟无指令
   TTS 已卸载
-[待唤醒] 已释放：Whisper、TTS、Ollama/qwen2.5:7b
+[待唤醒] 已释放：Whisper、TTS、Ollama/qwen3.5:4b
 ```
 
 关键设计：
@@ -140,6 +140,11 @@ flowchart LR
 │  ├─ test_subtitle.py         # ★ 字幕：可见性 / 居中 / 点得穿 / 自动隐藏（--check）
 │  ├─ test_toast.py            # 看一眼右下角可视提醒长什么样
 │  ├─ test_dialog.py           # 对话链路自测（不用麦克风）
+│  ├─ bench_llm.py             # ★ 换模型前的体检（延迟 / 是否思考 / 看图识字）
+│  ├─ eval_router.py           # ★ 模型选工具的准确率（--model 换模型对比）
+│  ├─ test_tools.py            # 工具层自测（--live 走真模型）
+│  ├─ test_vision.py           # 看图自测（编图 / 找文件 / 识别）
+│  ├─ test_accel.py            # 加速设备选择（核显 / NPU / 回退）
 │  ├─ test_wake.py             # ★ 唤醒词实测与调优（打印听到的内容 / 自动写 aliases）
 │  ├─ test_mic_loopback.py     # 麦克风回环诊断（放一段语音，看能不能听到 + 识别）
 │  ├─ clean_junk_data.py       # 清理早期版本写坏的备忘/闹钟
@@ -156,13 +161,13 @@ flowchart LR
 cd <项目目录>
 pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 python scripts/download_models.py     # 补上 SenseVoice / Silero VAD / Piper 中文女声（约 300 MB）
+ollama pull qwen3.5:4b                # 主模型：文本 + 看图 + 工具（3.4 GB）
 python main.py selftest               # 8 项检查，全过就能用了
 ```
 
-想让它能**看图**（摄像头 / 屏幕 / 文件），再补两件事：
+想让它能**读文件**（PDF），再补一行：
 
 ```powershell
-ollama pull qwen2.5vl:3b          # 视觉模型（约 3.2 GB），纯文本模型看图只会编
 pip install pypdf                 # 可选：读 PDF（Word 靠已装的 python-docx）
 ```
 
@@ -412,8 +417,8 @@ python scripts/clean_junk_data.py --apply    # 清理早期版本写坏的备忘
 先说前提：**看图要一个视觉模型**，文本模型收到图片只会编。装好后写进 `[vision] model`：
 
 ```powershell
-ollama pull qwen2.5vl:3b      # 约 3.2 GB，CPU 上快很多（默认用这个）
-ollama pull qwen2.5vl:7b      # 约 6 GB，认得更准，但一张 1568 宽的截图要等十几秒
+ollama pull qwen3.5:4b         # 3.4 GB，自带视觉 + 工具（文本也用它）
+# 想用专门的视觉模型也行：qwen2.5vl:3b（3.2 GB，快一点），moondream:1.8b（更快、认字差）
 ```
 
 | 你说 | 它看哪里 |
@@ -460,22 +465,20 @@ python main.py see --fix --screen              # 只做本地部分，不调模�
 > 屏幕上的小字如果认不清，把它调大到 1568——**代价是等一倍时间**（见下表）。
 > 摄像头默认压到 1024；帧率、曝光靠系统，`warmup_frames` 那几帧是用来等自动曝光稳定的。
 
-**看图要等多久（本机实测：i7 纯 CPU + qwen2.5vl:3b）**
+**看图要等多久（本机实测：Arc 核显 + qwen3.5:4b，2400×1120 的大屏截图）**
 
-| 情形 | 耗时 |
-| --- | --- |
-| 纯文本回答（对比用） | 1.8 s |
-| 带图，长边 768 | 32 s |
-| 带图，长边 1024（默认） | 33 s |
-| 带图，长边 1568 | 61 s |
+| 情形 | 耗时 | 认字 |
+| --- | --- | --- |
+| 长边 768 | 6.5 s | 5/5 |
+| 长边 1024（默认） | 7.3 s | 5/5 |
+| 长边 1568 | 12.6 s | 5/5 |
 
-也就是说：**CPU 上看一张图大概 30 秒起步**（固定开销主要是图像编码那一遭），
-图片越大越慢；纯文本对话不受影响。所以：
+也就是说：一张图 ≈ **7 秒**（固定开销主要是图像编码那一遭），图片越大越慢。所以：
 
 - 它会在拍图后**先说一句「我看一眼。」**，不至于让人以为没听见
 - 第一次看图还要额外等模型加载（3.2 GB 上内存），之后就快了
 - 回待唤醒时会**把视觉模型卸掉**（不白占几个 GB 内存）
-- 想快很多只能换更小的视觉模型或上显卡；`qwen2.5vl:3b` 已经是这个尺寸里较准的一档
+- 想更快就换更小的视觉模型（或把 `max_side` 降到 768，本机 7.3 s → 6.5 s）
 - 只是想知道「屏幕上开了什么窗口 / 这是什么东西」，可以考虑换更小的
   `moondream:1.8b`（更快、认字差）；改 `[vision] model` 就行
 
@@ -484,9 +487,9 @@ python main.py see --fix --screen              # 只做本地部分，不调模�
 | 配置 | 默认 | 作用 |
 | --- | --- | --- |
 | `enabled` | true | 总开关，关掉后看图相关的话全部交给 LLM |
-| `model` | `qwen2.5vl:3b` | 看图用的模型，必须自己 `ollama pull` |
+| `model` | `qwen3.5:4b` | 看图用的模型；默认跟 `[llm]` 同一个（它自带视觉）。换专门的 VL 模型也行 |
 | `default_source` | `screen` | 只说「这是什么」时看哪里：`screen` / `camera` |
-| `max_side` / `screen_max_side` | 1024 / 1024 | 图片最长边（直接决定等多久：1024→33 s，1568→61 s） |
+| `max_side` / `screen_max_side` | 1024 / 1024 | 图片最长边（直接决定等多久：1024→7.3 s，1568→12.6 s） |
 | `camera_index` | 0 | 第几个摄像头 |
 | `save_dir` / `keep_images` | `data/vision` / 40 | 图存哪、留多少张 |
 | `file_roots` | 桌面/下载/文档 | 找文件的范围（别的目录要说完整路径） |
@@ -793,7 +796,8 @@ python scripts/tts_probe.py "你好[[,]]世界"   # 看注入停顿的效果
 | Whisper turbo int8（5.6s 音频）**Arc 核显** | **0.49 s（RTF 0.087，快 6.8 倍）** |
 | Whisper 首次在核显上编译图 | 约 10 s（只在第一次，之后有缓存） |
 | Piper 合成 | RTF 0.04~0.07，首块 0.12 s |
-| qwen2.5:7b 首字 | 热态 2~4 s（冷启动加载 4.7 GB 要约 20 s） |
+| qwen3.5:4b 生成 | **17.6 tok/s**（qwen2.5:7b 是 12.3） |
+| qwen3.5:4b 热首字 | 0.5 s（冷启动加载 3.4 GB 约 4 s） |
 | **端到端首音** | **0.7 ~ 2.1 s** |
 
 优化建议，按收益排序：
@@ -810,7 +814,56 @@ python scripts/tts_probe.py "你好[[,]]世界"   # 看注入停顿的效果
    当前模型是 `--disable-stateful` 导出的，GenAI 的 `WhisperPipeline` 会报
    `beam_idx not found`，所以代码走的是 Optimum 路径（会自动识别并提示）。
 5. 纯 CPU 跑模型时调 `[llm] num_thread`（线程数）/ `num_batch`（预填批大小）。
-6. `ollama pull qwen2.5:7b-instruct-q4_K_M` 更快更省内存。
+6. 换更小/更快的模型：`python scripts/bench_llm.py <模型名>` 先体检一遍（见下节）。
+
+### 7.1 换模型怎么选（实测对比）
+
+一条命令就能给候选模型做体检（延迟 / 是否在思考 / 看图识字）：
+
+```powershell
+python scripts/bench_llm.py qwen3.5:4b qwen2.5:7b                 # 横向对比（会来回换模型）
+python scripts/bench_llm.py qwen3.5:4b --vision-sizes 768,1024,1568
+python scripts/eval_router.py --builtin --model qwen3.5:4b        # 选工具准不准
+python scripts/test_dialog.py --no-tts --model qwen3.5:4b "用一句话介绍杭州"   # 看回答质量
+```
+
+本机（Core Ultra 5 225H + Arc 130T 核显）实测：
+
+| | **qwen3.5:4b**（现在用） | qwen2.5:7b（老的） |
+| --- | --- | --- |
+| 体积 | **3.4 GB** | 4.7 GB（看图还要另装 3.2 GB 的 qwen2.5vl:3b） |
+| 生成速度 | **17.6 tok/s** | 12.3 tok/s |
+| 预填速度 | 284 tok/s | **345 tok/s** |
+| 冷启动首字 / 热首字 | 4.4 s / 0.5 s | **2.9 s** / 0.1 s |
+| 看图（1024 长边） | **自带**，7.3 s，5/5 关键词都认对 | 不支持；qwen2.5vl:3b 是 8.2 s，5/5 |
+| 工具选择 | 8/8（`test_tools --live`）、评估 18/23 条调工具、闲聊不乱调 | 7/8；评估 17/23 |
+| 回答风格 | 更像凯尔希、更简洁（「你」） | 偏通用，爱用「您」 |
+
+工具那一段值得多说一句：4b **不带思考时对「该不该调工具」略迟钝**
+（「我的备忘里有什么」竟然直接凭印象答、不查），所以我把 `voice_loop/tools.py` 里的
+`TOOL_HINT` 写成了**机械的关键词白名单**（出现 日程/提醒/备忘… 就先查一遍）。
+改完之后 8/8，而且指代类的（「那件事是什么时候」）也会先去查了。
+
+**为什么换**：一个模型同时管文本和看图（7.9 GB → 3.4 GB）、生成快 40%、
+中文和人设都更贴。代价是首字慢 0.4 s（两边都在 1 s 以内）、预填慢 18%。
+
+★**最大的坑：thinking**★。qwen3.5 默认**先默默想一两千字再开口**——同一次回答
+总耗时 15.8 s，关掉思考后 5.6 s，而这十几秒用户只能干等。所以配置里有：
+
+```toml
+[llm]
+think = "off"     # off = 发 think=false；on = 显式打开；auto = 不传，交给模型默认
+```
+
+换任何带 thinking 的新模型（qwen3*、qwen3.5* 这类），第一件事就是让 `bench_llm`
+看一眼汇总表里那一列「思考」，再决定 `think` 写什么。
+
+要更强的模型就直接换（两处改同一个名）：
+
+```powershell
+ollama pull qwen3.5:9b        # 6.6 GB，质量更好，但生成速度大概减半
+# config.toml: [llm] model 与 [vision] model 都改成 qwen3.5:9b
+```
 
 ---
 
@@ -897,10 +950,10 @@ CPU、服务、提醒调度器都照常跑，闹钟到点仍然会响。敲一�
 也可以说「开屏幕」。不想让语音控制这个，把 `[skills] allow_system_commands` 改成 `false`。
 
 **Q：为什么不干脆让大模型从头管到尾？**
-因为**算时间、做守卫这种事交给 7B 模型基本必错**，而它擅长的是「听懂你在说什么」。
-实测（本机 qwen2.5:7b）：
+因为**算时间、做守卫这种事交给小模型基本必错**，而它擅长的是「听懂你在说什么」。
+实测（qwen2.5:7b 与 qwen3.5:4b 都量过）：
 
-- 工具选择：8/8 都选对，闲聊也不会乱调（5/5）
+- 工具选择：基本都选对，闲聊也不会乱调（详见下面「换模型怎么选」）
 - 但它自己算日期：「下周三下午三点半」算成 `2026-10-04`（差两周），
   「每周四上午九点有课」把重复周期和地点都丢了
 - 所以工具只收**用户原话**，由 `nlp_time` 解析；实测同样的句子 100% 正确
@@ -978,7 +1031,7 @@ Piper 的 `zh_CN-huayan-medium` 是官方唯一的中文女声。调 `noise_w_sc
 [MIT](LICENSE) © 2026 Azurwolf1024
 
 用到的模型各自遵守自己的协议：Whisper 与 SenseVoiceSmall 是 MIT，
-Piper 与它自带的中文声线是 MIT，Silero VAD 是 MIT，Qwen2.5 是 Apache-2.0。
+Piper 与它自带的中文声线是 MIT，Silero VAD 是 MIT，Qwen3.5 是 Apache-2.0。
 
 ---
 
@@ -999,8 +1052,8 @@ python main.py gpu --enable-igpu          # 让 Ollama 用上核显（写环境�
 | Whisper turbo int8（5.6 s 音频） | 3.3 s | **0.49 s** | 快 6.8 倍；首次要编译图约 10 s |
 | SenseVoiceSmall | 0.08 s | — | sherpa-onnx 官方轮子只有 CPU，但已经够快 |
 | Piper TTS | RTF 0.04 | — | 瓶颈不在 TTS，加速收益很小 |
-| qwen2.5:7b 文本首字 | 2.4 s | **1.16 s** | 冷启动加载模型 13.6 s，之后常驻 |
-| qwen2.5vl:3b 看图 | 33 s | **11.3 s** | 首次 20.1 s，之后稳定 |
+| qwen3.5:4b 生成 | 12.3 tok/s（旧模型） | **17.6 tok/s** | 新模型在核显上更快；预填稍慢（284 vs 345 tok/s） |
+| qwen3.5:4b 看图（1024） | 14.6 s | **7.3 s** | 一个模型同时管文本和看图，省掉那 3.2 GB 的视觉模型 |
 
 ### 已经默认打开的
 
@@ -1056,8 +1109,8 @@ $env:OLLAMA_IGPU_ENABLE = "1"      # 这一句不能省，否则从当前窗口�
 
 - **纯 CPU 调参**：`[llm] num_thread = 6~10`（本机 14 核）、`num_batch = 512`，
   以及把 `[llm] num_ctx` 从 4096 降到 2048（上下文越小预填越快）。
-- **换更小的模型**：`qwen3.5:2b`（文本）、`qwen2.5vl:3b`（看图）已经是很小的一档；
-  只在文字问答的场景还可以砍掉视觉模型。
+- **换成更小的模型**：`qwen3.5:2b` 已经装在机器上（2.7 GB，更快但人设/工具会差些），
+  `qwen3.5:0.8b` 更小；换之前先 `python scripts/bench_llm.py qwen3.5:2b` 量一下。
 
 ### 不打算做的
 

@@ -216,6 +216,15 @@ def test_live() -> None:
 
     tmp = Path(tempfile.mkdtemp(prefix="voiceloop_tool_"))
     settings, _skills, reg = build(tmp)
+    wanted = None
+    for i, a in enumerate(sys.argv):
+        if a == "--model" and i + 1 < len(sys.argv):
+            wanted = sys.argv[i + 1]
+        elif a.startswith("--model="):
+            wanted = a.split("=", 1)[1]
+    if wanted:
+        settings.llm.model = wanted
+    print(f"    模型：{settings.llm.model}  think={settings.llm.think}")
     llm = OllamaClient(settings.llm)
     try:
         llm.ensure_model()

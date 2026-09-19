@@ -56,18 +56,28 @@ whisper_word_timestamps = false
 # ── 大语言模型 (Ollama) ─────────────────────────────────────────────────────
 [llm]
 host = "http://127.0.0.1:11434"
-model = "qwen2.5:7b"
+# qwen3.5 是多模态模型（自带 vision + tools），一个模型同时管文本和看图。
+# 实测（Arc 核显，见 README 第 7 节与 scripts/bench_llm.py）：
+#   3.4 GB / 生成 17.6 tok/s / 热首字 0.5s     ← 现在这个
+#   4.7 GB / 生成 12.3 tok/s / 热首字 0.1s     ← 老的 qwen2.5:7b（还要另装 3.2 GB 的视觉模型）
+# 想要更强：ollama pull qwen3.5:9b（6.6 GB，质量更好但慢一半左右）。
+model = "qwen3.5:4b"
 temperature = 0.7
 top_p = 0.9
 num_ctx = 4096
 num_predict = 512
 keep_alive = "30m"            # 让模型常驻显存/内存，首字延迟更低
 history_turns = 6             # 携带的历史轮数（user+assistant 各算一轮）
+# 思考模式（新一代模型带 thinking）：off / on / auto
+#   ★语音对话必须 off★：开着的话它会先默默想一两千字再开口，
+#   实测同一次回答总耗时 15.8s → 5.6s，而这十几秒用户只能干等。
+#   auto = 不传这个字段，交给模型自己的默认（qwen3.5 的默认是开）。
+think = "off"
 # 加速相关（装了支持的运行时才有用，没装只忽略）：
 #   num_gpu    = -1 不传（默认）；>0 交给 Ollama 决定；99 = 尽量全放显存
 #   num_thread = 0 不传；纯 CPU 时想指定线程数就填（本机 14 核就试 6~10）
 #   num_batch  = 0 不传；预填慢可以调到 512
-# 本机现状：Ollama 是 100% CPU（Windows 上 Intel 核显要装 IPEX-LLM 版 ollama，见 README 第 12 节）
+# 本机现状：Ollama 跑在 Intel 核显上（OLLAMA_IGPU_ENABLE=1，见 README 第 12 节）
 num_gpu = -1
 num_thread = 0
 num_batch = 0
@@ -208,19 +218,21 @@ base_track = 0.3              # 基准跟随速度（越小越稳）
 [vision]
 enabled = true
 # 看图要**视觉模型**：纯文本模型（qwen2.5 等）收到图片也只会瞎猜。
-#   3b 约 3.2 GB，CPU 上快很多（推荐先用这个）
-#   7b 约 6 GB，认得更准，但 CPU 预填一张 1568 宽的截图要十几秒
-model = "qwen2.5vl:3b"
+# 现在默认跟 [llm] 用同一个 qwen3.5:4b —— 它自带 vision，装一个顶两个
+# （老的组合是 qwen2.5:7b 4.7 GB + qwen2.5vl:3b 3.2 GB，一共 7.9 GB）。
+# 想换成专门的视觉模型也行，例如 moondream:1.8b（更快、认字差），
+# 或者 qwen2.5vl:7b（约 6 GB，认得更准但慢一倍）。
+model = "qwen3.5:4b"
 
 # 只说「这是什么」没提来源时看哪里：screen / camera
 # （在电脑前用得多就 screen；拿着东西给镜头看就改回 camera）
 default_source = "screen"
 camera_index = 0              # 第几个摄像头（0 = 默认）
 warmup_frames = 4             # 丢掉前几帧，等自动曝光稳定（不然画面偏黑）
-# 图片尺寸 = 等多久。本机实测（i7 纯 CPU + qwen2.5vl:3b）：
-#   纯文本 1.8s / 长边 768 -> 32s / 1024 -> 33s / 1568 -> 61s
-# 所以默认 1024：屏幕上的 main.py、cmd_ask 这类名字还认得出来，再大就白等一倍时间。
-# 屏幕上的字如果认不清，再往上调到 1568（代价就是 60 秒）。
+# 图片尺寸 = 等多久。本机实测（Arc 核显 + qwen3.5:4b，2400×1120 的大屏截图）：
+#   长边 768 -> 6.5s / 1024 -> 7.3s / 1568 -> 12.6s（三档都把图里的字认全了）
+# 所以默认 1024：屏幕上的 main.py、cmd_ask 这类名字认得出，再大就白等一倍时间。
+# 屏幕上的字如果认不清，再往上调到 1568（代价就是 12 秒）。
 max_side = 1024               # 摄像头图片最长边
 screen_max_side = 1024        # 截图最长边
 jpeg_quality = 82

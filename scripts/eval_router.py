@@ -49,6 +49,9 @@ BUILTIN = [
     "明天下午三点有个面试",
     "我周三下午三点半要去见导师",
     "导师见面那件事是什么时候",
+    "我跟导师见面是几点",
+    "上次说的那个会是什么时候",
+    "日程里有没有体检这一项",
     "帮我看看下周都有什么事",
     "我下周有空吗",
     "把后天下午两点的体检记上",
@@ -95,12 +98,15 @@ def main() -> int:
     ap.add_argument("--builtin", action="store_true", help="用内置样本")
     ap.add_argument("--text", default=None, help="只跑这一句")
     ap.add_argument("--limit", type=int, default=30, help="最多跑几条（默认 30）")
+    ap.add_argument("--model", default=None, help="临时换一个模型跑（默认用 config.toml 里的）")
     ap.add_argument("--dry", action="store_true", help="只列句子，不调模型")
     args = ap.parse_args()
 
     texts = load_utterances(args)
     print("=" * 72)
     print(f" 评估：模型选工具（共 {len(texts)} 句，工具在临时目录里执行，不碰真实数据）")
+    if args.model:
+        print(f" 模型：{args.model}（临时覆盖配置）")
     print("=" * 72)
     if args.dry:
         for t in texts:
@@ -112,6 +118,8 @@ def main() -> int:
     from voice_loop.tools import TOOL_HINT, ToolRegistry, describe_calls
 
     base = load_settings()
+    if args.model:
+        base.llm.model = args.model
     try:
         probe = OllamaClient(base.llm)
         probe.ensure_model()
@@ -122,6 +130,9 @@ def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="voiceloop_eval_"))
     log = logging.getLogger("voice_loop")
     rows: list[dict] = []
+    # ★别在循环里引用 args★：下面 `args = calls[0][...]["arguments"]` 会把 argparse 的
+    # args 遮蔽掉（踩过：AttributeError: 'dict' object has no attribute 'model'）
+    want_model = args.model
     try:
         for text in texts:
             # 每次换一套干净的技能数据，免得上一条的写入影响下一条
@@ -131,6 +142,8 @@ def main() -> int:
             st.skills.memo_file = str(tmp / "m.json")
             st.skills.schedule_file = str(tmp / "s.json")
             st.vision.save_dir = str(tmp / "vision")
+            if want_model:
+                st.llm.model = want_model
             skills = Skills(st, log)
             skills.schedule.save([])
             skills.alarms.save([])
