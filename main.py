@@ -680,6 +680,70 @@ def cmd_devices(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_mcp(settings: Settings, args: argparse.Namespace) -> int:
+    """自己的 MCP 工具层：看 / 调 / 挂起来给别人用。
+
+    三种用法：
+        python main.py mcp                         看工具清单（名字、来自哪个服务器、耗时）
+        python main.py mcp --call list_schedule --args '{"text": "下周"}'
+        python main.py mcp --serve skills           挂到 stdio，给 Copilot / Claude Code 用
+    """
+    if args.serve:
+        # 直接复用同一份实现，不另写一套：serve 模块就是 stdio 入口
+        from voice_loop.mcp.serve import main as serve_main
+
+        sys.argv = ["mcp-serve", args.serve]
+        return serve_main()
+
+    import json
+    import logging
+
+    from voice_loop.mcp import MCPHost
+
+    log = logging.getLogger("voice_loop")
+    skills = None
+    if settings.skills.enabled:
+        from voice_loop.skills import Skills
+
+        skills = Skills(settings, log)
+    host = MCPHost(
+        settings.mcp, log, deps={"settings": settings, "skills": skills, "logger": log}
+    )
+    try:
+        t0 = time.perf_counter()
+        specs = host.specs()
+        cost = time.perf_counter() - t0
+        print("=" * 72)
+        print(" 自己的 MCP 工具层")
+        print("=" * 72)
+        print(f"  状态：{host.status()}")
+        print(f"  启动耗时：{cost * 1000:.0f} ms（inproc；stdio 服务器会慢一些）")
+        if not specs:
+            print("\n  （一个工具都没有：检查 config.toml 的 [[mcp.servers]]）")
+            return 0
+        print(f"\n  模型能看到的 {len(specs)} 个工具：")
+        for info in host.describe():
+            desc = str(info["description"] or "").replace("\n", " ")
+            where = info["server"] + ("." + info["tool"] if info["namespaced"] else "")
+            print(f"    · {info['name']:24s} [{where}] {desc[:58]}")
+
+        if args.call:
+            raw = args.args or "{}"
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                print(f"\n[错误] --args 不是合法 JSON：{raw}")
+                return 2
+            print(f"\n  调用 {args.call} {payload}")
+            t0 = time.perf_counter()
+            ok, text = host.call(args.call, payload)
+            print(f"  {'√' if ok else '×'} {time.perf_counter() - t0:.2f}s  {text}")
+            return 0 if ok else 1
+        return 0
+    finally:
+        host.close()
+
+
 def cmd_selftest(settings: Settings, args: argparse.Namespace) -> int:
     """逐项检查依赖、模型、Ollama、TTS、ASR，并给出可执行的修复建议。"""
     ok = True
@@ -934,6 +998,43 @@ def cmd_selftest(settings: Settings, args: argparse.Namespace) -> int:
     except Exception as exc:  # noqa: BLE001
         print(f"  ! 加速设备探测失败：{exc}")
 
+    # 10. MCP 工具层（自己的协议层：能力域拆成服务器，宿主聚合与路由）
+    print("\n[10] MCP 工具层")
+    try:
+        from voice_loop.mcp import MCPHost
+        from voice_loop.skills import Skills
+
+        skills = Skills(settings, logging.getLogger("voice_loop")) if settings.skills.enabled else None
+        host = MCPHost(
+            settings.mcp,
+            logging.getLogger("voice_loop"),
+            deps={"settings": settings, "skills": skills,
+                  "logger": logging.getLogger("voice_loop")},
+        )
+        try:
+            t0 = time.perf_counter()
+            specs = host.specs()
+            cost = (time.perf_counter() - t0) * 1000
+            print(f"   状态：{host.status()}")
+            print(f"   启动：{cost:.0f} ms（inproc 很快；stdio 要拉起子进程）")
+            if not specs:
+                ok = False
+                print("  × 一个工具都没露出来：检查 config.toml 的 [[mcp.servers]]")
+            else:
+                for info in host.describe():
+                    where = info["server"] + ("." + info["tool"] if info["namespaced"] else "")
+                    print(f"    · {info['name']:22s} [{where}]")
+                # 只读那一个：确认协议层真的能把调用转到底下的技能
+                ok_call, text = host.call("list_memos", {})
+                print(f"  {'√' if ok_call else '×'} 经 MCP 调 list_memos：{text[:40]}")
+                if not ok_call:
+                    ok = False
+        finally:
+            host.close()
+    except Exception as exc:  # noqa: BLE001
+        ok = False
+        print(f"  × {exc}")
+
     print("\n" + "=" * 66)
     print(" 结果：" + ("全部通过，可以运行 `python main.py listen` 了" if ok else "存在问题，请按上面的提示修复"))
     print("=" * 66)
@@ -1030,6 +1131,13 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("selftest", help="全链路自检")
     p.add_argument("--no-play", action="store_true")
     p.set_defaults(func=cmd_selftest)
+
+    p = sub.add_parser("mcp", help="自己的 MCP 工具层：看 / 调 / 挂到 stdio 给别人用")
+    p.add_argument("--call", default=None, help="调一个工具，例如 --call list_schedule")
+    p.add_argument("--args", default=None, help="配合 --call：JSON 参数，例如 '{\"text\": \"下周\"}'")
+    p.add_argument("--serve", default=None, metavar="服务器",
+                   help="把某个服务器挂到 stdio（skills / vision…），给 Copilot / Claude Code 用")
+    p.set_defaults(func=cmd_mcp)
 
     return ap
 

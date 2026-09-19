@@ -25,6 +25,7 @@ from .asr import AsrResult, AsrRouter
 from .audio import BaseSegmenter, MicReader, MicRecorder, Speaker, make_segmenter, save_wav
 from .bargein import BargeInDetector
 from .llm import OllamaClient, OllamaError
+from .mcp import MCPHost
 from .scheduler import ReminderScheduler
 from .settings import Settings
 from .skills import Skills
@@ -113,9 +114,20 @@ class VoiceLoop:
         self.tts = create_tts(settings, self.log, lazy=self.lazy)
         # 技能与提醒
         self.skills: Skills | None = Skills(settings, self.log) if enable_skills else None
-        # 工具层：技能没接住的话交给模型时，让它能自己查/记（见 voice_loop/tools.py）
+        # 工具层（旧的进程内注册表）：MCP 宿主没就绪时当兼底，也还是不少单测的入口
         self.tools: ToolRegistry | None = (
             ToolRegistry(settings, self.skills, self.log) if self.skills else None
+        )
+        # ★自己搭的 MCP 架构★：能力域拆成服务器，宿主只负责聚合与路由
+        # （见 voice_loop/mcp/；工具清单与调用默认都走它）
+        self.mcp: MCPHost | None = (
+            MCPHost(
+                settings.mcp,
+                self.log,
+                deps={"settings": settings, "skills": self.skills, "logger": self.log},
+            )
+            if self.skills and getattr(settings, "mcp", None) is not None
+            else None
         )
         self.scheduler: ReminderScheduler | None = (
             ReminderScheduler(self.skills, settings, self._on_reminder, self.log)
@@ -659,12 +671,45 @@ class VoiceLoop:
         return stats
 
     def _tool_specs(self) -> list[dict] | None:
-        """这一轮要不要给模型工具（[llm] router = tools / chat）。"""
+        """这一轮要不要给模型工具（[llm] router = tools / chat）。
+
+        优先用 MCP 宿主（它可能聚合了好几个服务器）；宿主里一个工具都没有
+        （比如 [mcp] enabled = false）就退回旧的进程内注册表，
+        免得助手突然变成不会查日程、不会记事的。——前者是常态，后者是兼底。
+        """
         if self.tools is None:
             return None
         if str(self.settings.llm.router or "tools").lower() != "tools":
             return None
+        if self.mcp is not None and self.mcp.names():
+            return self.mcp.specs()
         return self.tools.specs()
+
+    def _tool_names(self) -> set[str] | None:
+        """模型当前能看到的所有工具名（把「写成文字的工具调用」抢回来时要用）。"""
+        if self.mcp is not None and self.mcp.names():
+            return self.mcp.names()
+        return self.tools.names() if self.tools else None
+
+    def _call_tool(self, call: dict) -> tuple[bool, str]:
+        """执行一次工具调用，返回 ``(ok, 要念的话)``。
+
+        路由：MCP 宿主里有这个名字就走宿主（可能被转到另一个服务器），
+        否则退回旧的进程内 ToolRegistry（兼底 / 外部配置把 MCP 关了）。
+        """
+        fn = call.get("function") or call
+        name = str(fn.get("name") or "")
+        if self.mcp is not None and self.mcp.handleable(name):
+            args = fn.get("arguments")
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args) if args.strip() else {}
+                except json.JSONDecodeError:
+                    args = {}
+            return self.mcp.call(name, dict(args or {}))
+        assert self.tools is not None
+        res = self.tools.call(call)
+        return res.ok, (res.reply or res.error or "")
 
     def _run_tools(self, stats: TurnStats, calls: list[dict], t0: float) -> str:
         """执行模型选中的工具，返回要念的话。
@@ -673,14 +718,17 @@ class VoiceLoop:
         而工具产出的 reply 已经是可以直接念的一句话了。
         """
         assert self.tools is not None
-        results = self.tools.call_all(calls)
+        out: list[tuple[bool, str]] = []
+        for call in calls:
+            ok, text = self._call_tool(call)
+            out.append((ok, text))
         stats.extra["tool"] = describe_calls(calls)
-        stats.extra["tool_ok"] = all(r.ok for r in results)
+        stats.extra["tool_ok"] = all(ok for ok, _ in out)
         stats.extra["tool_seconds"] = round(time.perf_counter() - t0, 3)
-        for r in results:
-            if not r.ok:
-                self.log.warning(f"[工具] 失败：{r.error or r.reply}")
-        reply = " ".join(r.reply for r in results if r.reply).strip()
+        for ok, text in out:
+            if not ok:
+                self.log.warning(f"[工具] 失败：{text or '（没有说明）'}")
+        reply = " ".join(text for _ok, text in out if text).strip()
         if not reply:
             reply = "这件事我没做成，你再说一遍？"
         print(f"  [工具] {describe_calls(calls)} -> {reply[:60]}", flush=True)
@@ -846,7 +894,7 @@ class VoiceLoop:
                 raw = "".join(held)
                 if tool_text:
                     # 把「写成文字的 JSON」抢回来当工具调用（小模型常见毛病）
-                    recovered = parse_tool_call_text(raw, self.tools.names() if self.tools else None)
+                    recovered = parse_tool_call_text(raw, self._tool_names())
                     self.log.warning(f"[工具] 模型把调用写成了文字，{'已抢回' if recovered else '抢不回来'}：{raw[:120]}")
                     calls.extend(recovered)
                 else:
@@ -1393,6 +1441,12 @@ class VoiceLoop:
         self._stop.set()
         if self.scheduler:
             self.scheduler.stop()
+        if self.mcp is not None:
+            # 关掉 MCP 服务器（stdio 的那些要收子进程，不然会留下孤儿）
+            try:
+                self.mcp.close()
+            except Exception as exc:  # noqa: BLE001
+                self.log.debug(f"关闭 MCP 出错（已忽略）：{exc}")
         if self.toast is not None:
             try:
                 self.toast.stop()
