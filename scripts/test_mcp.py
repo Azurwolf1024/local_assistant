@@ -238,7 +238,7 @@ def test_host(tmp: Path) -> None:
         check("外来/第二个服务器带 mcp__ 前缀", "mcp__ro__list_memos" in names)
         check("★白名单挡掉了写操作★", "mcp__ro__add_memo" not in names
               and "mcp__ro__add_alarm" not in names, str(sorted(names))[:90])
-        check("模型看到的工具数 = 7 + 2", len(host.specs()) == 9, f"{len(host.specs())} 个")
+        check("模型看到的工具数 = 11 + 2", len(host.specs()) == 13, f"{len(host.specs())} 个")
         check("specs 是 Ollama 形状", host.specs()[0]["type"] == "function"
               and "parameters" in host.specs()[0]["function"])
 
@@ -286,7 +286,7 @@ def test_pipeline(tmp: Path) -> None:
         specs = loop._tool_specs() or []  # noqa: SLF001
         names = {s["function"]["name"] for s in specs}
         check("工具清单来自宿主", {"list_schedule", "add_memo", "add_alarm"} <= names
-              and len(names) == 7, f"{len(names)} 个")
+              and len(names) == 11, f"{len(names)} 个")
         check("TOOL_HINT 会一起给（老行为没变）", bool(names))
 
         ok, text = loop._call_tool({"function": {"name": "add_memo",            # noqa: SLF001

@@ -707,6 +707,21 @@ def test_incident_0919() -> None:
     check("时间对得上就能删", getattr(r, "action", None), "schedule_delete")
     check("确实删了", skills.schedule.load(), [])
 
+    # ---- 4) 「取消…」没对上那条时，绝不能反而新建一条闹钟 ----
+    # （真机踩到：说「取消今晚十点的闹钟」时库里没有那条，代码一路走到新建分支，
+    #   结果多出一条 what=「取消」的闹钟——用户以为删了，反而多了一条）
+    print("    · 取消类说法不能掉进新建分支")
+    skills.alarms.save([])
+    skills._last_add = None                                          # noqa: SLF001
+    r = skills.handle("取消今晚十点的闹钟。", now=now)
+    check("回的是没找到", getattr(r, "action", None), "alarm_cancel_miss")
+    check("★没有凭空多出一条闹钟★", skills.alarms.load(), [])
+    r = skills.handle("提醒我明天早上七点练琴。", now=now)
+    check("正常新建仍然可以", getattr(r, "action", None), "alarm_add")
+    r = skills.handle("取消明天早上的练琴。", now=now)
+    check("对得上就能取消", getattr(r, "action", None), "alarm_cancel")
+    check("取消后空了", len(skills.alarms.load()), 0)
+
     shutil.rmtree(tmp, ignore_errors=True)
 
 

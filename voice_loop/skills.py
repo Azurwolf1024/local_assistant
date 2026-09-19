@@ -629,6 +629,19 @@ class Skills:
         if not has_hint:
             return None
 
+        # ★说「取消」却没对上任何一条：绝不能往下掉进「新建」★
+        # 实测踩到：说「取消今晚十点的闹钟」时库里没有那条，代码一路走到新建，
+        # 结果多出一条 what=「取消」的闹钟——用户以为删了，反而多了一条。
+        #
+        # 只截「确实在说提醒/闹钟」的那些（has_hint）；
+        # 「取消所有会议」「删掉跟导师见面」这类没有提醒词，照旧交给日程分支。
+        if self._CANCEL_WORD.search(text) and not _SCHEDULE_NOUN.search(text):
+            return SkillResult(
+                reply="我没找到要取消的那条提醒——你说个时间或者第几个，"
+                      "比如「取消明天早上的闹钟」。",
+                action="alarm_cancel_miss",
+            )
+
         # 「每周三…提前一天和半小时提醒我」「每2小时提醒我喝水」这种带重复周期、
         # 或者要好几次提前提醒的，属于日程（日程能存周期和多个提前量），
         # 闹钟只管一次性。
@@ -722,6 +735,7 @@ class Skills:
         "今明后大周星期礼拜末这那个"      # 日期/星期
         "的我是了不改成到应该对说"          # 修正措辞（「我说」「改成」「不对」）
         "吧啊呢呀就才差过整"              # 语气/零碎
+        ":："                            # 「8:45」这种写法
     )
 
     @classmethod
@@ -803,6 +817,40 @@ class Skills:
     def _remember_add(self, kind: str, **info: Any) -> None:
         """记下「刚刚新增的那一条」，供随即修正使用。"""
         self._last_add = {"kind": kind, "at": time.monotonic(), **info}
+
+    # ======================================================================
+    # 「这句话要不要先让确定性层看一眼」
+    # ======================================================================
+    # routes = model（默认）时，模型先选工具；它在某些说话方式上漏调工具时，
+    # 用这些词判断「这一句看起来要动手」——是的话就把模型的回答先攒住不念，
+    # 问过技能层再决定说哪句（见 pipeline.respond）。所以它是**兜底的触发条件**，
+    # 不是路由本身：多包含几个词只会多等一会儿，不会答错。
+    _ROUTE_WORDS = re.compile(
+        r"日程|安排|课程|课|会议|开会|例会|组会|行程|讲座|答辩|面试|体检"
+        r"|提醒|闹钟|叫我|喊我|备忘|记一下|记住|记下"
+        r"|几点|几号|星期几|周几|报时|什么日子"
+        r"|看看|看一下|瞧一眼|拍一张|拍个照|摄像头|屏幕上|屏幕里|剪贴板|桌面上的|文件"
+    )
+
+    def recent_add(self, seconds: float = 180.0) -> bool:
+        """刚记下一条吗？（「随即修正」类判断用）"""
+        if self._last_add is None:
+            return False
+        return time.monotonic() - float(self._last_add.get("at") or 0.0) <= seconds
+
+    def needs_attention(self, text: str) -> bool:
+        """这句话要不要「攒着等模型决定完、再让技能层兜一下」。
+
+        三种情况要：
+            1. 有等着你回答的事（「是这个文件吗？」）；
+            2. 刚记下一条（3 分钟内）——下一句很可能是「我说是今晚8点45」这种即时纠正；
+            3. 句子里有 :data:`_ROUTE_WORDS` 里的词。
+        """
+        if self._vision_pending:
+            return True
+        if self.recent_add():
+            return True
+        return bool(self._ROUTE_WORDS.search(text or ""))
 
     def _list_alarms(self, now: datetime) -> SkillResult:
         items = [it for it in self.alarms.load() if not it.get("fired")]

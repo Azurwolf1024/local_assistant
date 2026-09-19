@@ -357,10 +357,14 @@ def cmd_ask(settings: Settings, args: argparse.Namespace) -> int:
         print(f"你：{args.text}\n助手：", end="", flush=True)
         stats = loop.respond(args.text, on_delta=lambda d: print(d, end="", flush=True))
         print()
+        route = str(stats.extra.get("route") or "—")
         if stats.extra.get("skill"):
-            print(f"[本地技能 {stats.extra['skill']} / 播报 {stats.total_seconds:.2f}s]")
+            print(f"[本地技能 {stats.extra['skill']} / 路由 {route}"
+                  f" / 播报 {stats.total_seconds:.2f}s]")
         else:
-            print(f"[首字 {stats.llm_first_token:.2f}s / 首音 {stats.first_audio:.2f}s / 总耗时 {stats.total_seconds:.2f}s]")
+            tool = f" / 工具 {stats.extra['tool']}" if stats.extra.get("tool") else ""
+            print(f"[路由 {route}{tool} / 首字 {stats.llm_first_token:.2f}s"
+                  f" / 首音 {stats.first_audio:.2f}s / 总耗时 {stats.total_seconds:.2f}s]")
     except Exception as exc:  # noqa: BLE001
         print(f"\n[错误] {exc}", file=sys.stderr)
         return 2

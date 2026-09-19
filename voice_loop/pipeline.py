@@ -40,6 +40,8 @@ from .tools import (
     describe_calls,
     looks_like_tool_text,
     parse_tool_call_text,
+    repair_args,
+    reroute_correction,
 )
 from .tts import create_tts
 from . import ui
@@ -68,6 +70,20 @@ class TurnStats:
     answer: str = ""
     interrupted: bool = False
     extra: dict = field(default_factory=dict)
+
+
+@dataclass
+class DeferredAnswer:
+    """攒着没念的模型回答（等确定要不要让技能层兜底）。
+
+    为什么会有这么个东西：``route = model`` 时模型先选工具。它没调工具、
+    而这句话又明显要动手时，正确的答话应该来自确定性层（它才知道库里有什么），
+    所以这一段先不发声——问过技能层之后再决定念哪一句（见 :meth:`VoiceLoop._speak_deferred`）。
+    """
+
+    text: str = ""
+    t0: float = 0.0
+    first_token: float = 0.0
 
 
 class VoiceLoop:
@@ -713,7 +729,13 @@ class VoiceLoop:
         asr: AsrResult | None = None,
         asr_seconds: float = 0.0,
     ) -> TurnStats:
-        """先尝试本地技能，未命中再走 LLM；两种情况下都是边说边播。"""
+        """回答一句。走哪条路由看 ``[llm] route``：
+
+        - ``model``（默认）：**模型先选工具**（它能看到全部工具，自己决定调哪个、
+          要不要调），确定性代码只在工具里干活（算时间、写库、守卫）。
+          模型没调工具、而这句话又明显要动手时，才让技能层兜底。
+        - ``rules``：老顺序，先跑模式匹配，没接住才给模型。
+        """
         stats = TurnStats(turn=self._turn, user_text=user_text)
         if asr is not None:
             stats.asr_engine = asr.engine
@@ -729,33 +751,116 @@ class VoiceLoop:
             self.subtitle.clear()
             self.subtitle.show_user(user_text)
 
-        # ---------------------------------------------------------- 技能路径
-        # 带上最近几轮对话，技能才能把「它 / 那个 / 刚才那条」对上号
-        skill = (
-            self.skills.handle(user_text, dialog=list(self._dialog)) if self.skills else None
-        )
-        if skill is not None and skill.action == "vision":
-            return self._respond_vision(stats, skill, user_text, on_delta)
-        if skill is not None:
-            # 上上轮可能被回车/语音打断过，不清掉的话这一句回答会一开始就被掐断
-            self._interrupt.clear()
-            stats.extra["skill"] = skill.action
-            stats.answer = skill.reply
-            self._note_dialog(user_text, skill.reply)
-            if on_delta is not None:
-                on_delta(skill.reply)
-            stats.total_seconds = self.speak_text(skill.reply)
-            stats.first_audio = stats.total_seconds
-            stats.interrupted = self._interrupt.is_set()
-            self.llm.commit(user_text, skill.reply)
-            self._write_session(stats)
+        if self._route_mode() == "rules":
+            # -------------------------------------------------- 老顺序：技能先
+            skill = self.skills.handle(user_text, dialog=list(self._dialog))
+            if skill is not None and skill.action == "vision":
+                return self._respond_vision(stats, skill, user_text, on_delta)
+            if skill is not None:
+                stats.extra["route"] = "rules→skills"
+                return self._serve_skill(stats, skill, user_text, on_delta)
+            stats.extra["route"] = "rules→llm"
+            self._llm_turn(stats, user_text, on_delta)
             return stats
 
-        # ------------------------------------------------------------ LLM 路径
+        # ---------------------------------------------- 模型先路由（默认路径）
+        # 「这句话看起来要动手」时把模型的回答先攒住不念：万一它漏调工具，
+        # 这一句该由确定性层来答（它才知道库里有什么）。见 skills.needs_attention。
+        assert self.skills is not None
+        hold = self.skills.needs_attention(user_text)
+        stats.extra["route"] = "model"
+        stats.extra["hold"] = hold
+        deferred = self._llm_turn(stats, user_text, on_delta, hold_for_route=hold)
+        if deferred is None:
+            return stats
+
+        # 模型一个工具都没调（而且没念出任何字）：技能层兜底
+        skill = self.skills.handle(user_text, dialog=list(self._dialog))
+        if skill is not None and skill.action == "vision":
+            self.log.info(f"[路由] 模型没调工具，技能兜住看图：{user_text}")
+            return self._respond_vision(stats, skill, user_text, on_delta)
+        if skill is not None:
+            stats.extra["route"] = "model→skills"
+            self.log.info(f"[路由] 模型漏了，技能兜住：{user_text} -> {skill.action}")
+            print(f"      [路由] 模型没调工具，本地技能兜住（{skill.action}）", flush=True)
+            return self._serve_skill(stats, skill, user_text, on_delta)
+        self.log.info(f"[路由] 模型没调工具，技能也没接住：{user_text}")
+        return self._speak_deferred(stats, deferred, on_delta)
+
+    def _route_mode(self) -> str:
+        """这一轮按哪种顺序：``model`` = 模型先选工具，``rules`` = 模式匹配先。
+
+        没工具（``router = chat`` / 技能关掉）时只能走 rules——模型手上什么都没有，
+        先跑技能至少还能查日程。
+        """
+        if self.skills is None or self.tools is None:
+            return "rules"
+        if str(self.settings.llm.router or "tools").lower() != "tools":
+            return "rules"
+        mode = str(getattr(self.settings.llm, "route", "model") or "model").strip().lower()
+        return "model" if mode in ("model", "llm", "model_first", "auto") else "rules"
+
+    def _llm_turn(
+        self, stats: TurnStats, user_text: str, on_delta=None, hold_for_route: bool = False
+    ) -> DeferredAnswer | None:
+        """交给模型这一轮（带工具）。返回值非空表示「攒着一句话没念，等你决定」。"""
         self._in_reply = True
         self._muted.set()
         self._mark_played()
-        self._stream_answer(stats, user_text, on_delta=on_delta)
+        try:
+            return self._stream_answer(
+                stats, user_text, on_delta=on_delta, hold_for_route=hold_for_route
+            )
+        finally:
+            self._in_reply = False
+            self._muted.clear()
+
+    def _serve_skill(
+        self, stats: TurnStats, skill, user_text: str, on_delta=None
+    ) -> TurnStats:
+        """确定性技能的回答：直接念，不经过模型。"""
+        # 上上轮可能被回车/语音打断过，不清掉的话这一句回答会一开始就被掐断
+        self._interrupt.clear()
+        stats.extra["skill"] = skill.action
+        stats.answer = skill.reply
+        self._note_dialog(user_text, skill.reply)
+        if on_delta is not None:
+            on_delta(skill.reply)
+        stats.total_seconds = self.speak_text(skill.reply)
+        stats.first_audio = stats.total_seconds
+        stats.interrupted = self._interrupt.is_set()
+        self.llm.commit(user_text, skill.reply)
+        self._write_session(stats)
+        return stats
+
+    def _speak_deferred(
+        self, stats: TurnStats, deferred: "DeferredAnswer", on_delta=None
+    ) -> TurnStats:
+        """把攒住的模型回答补念出来（模型没调工具、技能也没兜住）。
+
+        ★代价★：这一句没法边生成边播（文字是攒着等决定的），所以首音 = 首字。
+        换来的是「模型漏了路由时不会说出错误答案」。只有看起来要动手的句子才走这里。
+        """
+        text = deferred.text.strip() or "……我没想好说什么。"
+        stats.extra["deferred"] = True
+        self._interrupt.clear()
+        self._in_reply = True
+        self._muted.set()
+        self._mark_played()
+        stats.answer = text
+        stats.llm_first_token = deferred.first_token
+        stats.first_audio = deferred.first_token
+        self._note_spoken(text)
+        self._note_dialog(stats.user_text, text)
+        if on_delta is not None:
+            on_delta(text)
+        self.speak_text(text)
+        stats.total_seconds = time.perf_counter() - deferred.t0
+        stats.interrupted = self._interrupt.is_set()
+        self.llm.commit(stats.user_text, text)
+        self._write_session(stats)
+        self._in_reply = False
+        self._muted.clear()
         return stats
 
     def _tool_specs(self) -> list[dict] | None:
@@ -804,13 +909,26 @@ class VoiceLoop:
 
         只跑一轮（不再把结果喂回去让它改写）：模型容易把「九月二十三日」改说成别的，
         而工具产出的 reply 已经是可以直接念的一句话了。
+
+        每个调用先过一遍 :func:`repair_args`（模型改写原话时换回原话）与
+        :func:`reroute_correction`（「刚记下一条 + 这一句只是时间」→ 改上一条，不新建）。
         """
         assert self.tools is not None
         out: list[tuple[bool, str]] = []
+        fixed: list[dict] = []
         for call in calls:
+            new_call = repair_args(call, stats.user_text)
+            if new_call is not call:
+                self.log.info(f"[工具] 模型改写了原话，已换回：{describe_calls([call])}")
+            # 「刚记下一条 + 这句只是时间」= 在改上一条，不是新建（实测模型会选 add_*）
+            routed = reroute_correction(new_call, stats.user_text, self.skills)
+            if routed is not new_call:
+                self.log.info(f"[工具] 这一句是在改上一条，已改走 fix_last：{stats.user_text}")
+            fixed.append(routed)
+        for call in fixed:
             ok, text = self._call_tool(call)
             out.append((ok, text))
-        stats.extra["tool"] = describe_calls(calls)
+        stats.extra["tool"] = describe_calls(fixed)
         stats.extra["tool_ok"] = all(ok for ok, _ in out)
         stats.extra["tool_seconds"] = round(time.perf_counter() - t0, 3)
         for ok, text in out:
@@ -890,11 +1008,14 @@ class VoiceLoop:
         model: str | None = None,
         num_ctx: int | None = None,
         commit_text: str | None = None,
-    ) -> None:
+        hold_for_route: bool = False,
+    ) -> DeferredAnswer | None:
         """把 LLM 的回答边生成边播出（可带图片）。
 
         ``commit_text``：写进对话历史的用户话（看图时用原始那句，
         而不是塞了文件内容的那一大段 prompt）。
+        ``hold_for_route``：把模型的文字先攒着不念，返回 :class:`DeferredAnswer`
+        交给调用方决定（模型没调工具时，可能该由技能层来答）。
         """
         tts_cfg = self.settings.tts
         chunker = SpeechChunker(
@@ -910,12 +1031,16 @@ class VoiceLoop:
         calls: list[dict] = []
         # 有些模型会把工具调用**写成一段 JSON 文字**（而不是真的调工具）。
         # 这种文字绝对不能念出来：先攒着，看清了再决定是当工具调用还是当正常回答。
+        # hold_for_route 时从一开始就攒着（等路由定下来才念，见 respond 的 route=model）。
         held: list[str] = []
-        holding = False
+        holding = bool(hold_for_route)
         tool_text = False
         # 看图那一轮不给工具（它有图要描述）
         tools = self._tool_specs() if (not images and self.tools is not None) else None
-        prefix = [{"role": "system", "content": TOOL_HINT}] if tools else None
+        # ★TOOL_HINT 要紧贴用户那一句★（而不是放在人设前面）。
+        # 实测：放在最前面时 qwen3.5:4b 会当没看见，直接凭记忆答「下周有什么安排」；
+        # 挪到用户话前面（extra_messages 插在最后一条之前）就稳定调工具了。
+        hint = [{"role": "system", "content": TOOL_HINT}] if tools else None
 
         def speak(sentence: str) -> None:
             nonlocal first_audio
@@ -936,7 +1061,7 @@ class VoiceLoop:
                     model=model,
                     num_ctx=num_ctx,
                     tools=tools,
-                    prefix_messages=prefix,
+                    extra_messages=hint,
                 ):
                     if "tool_calls" in ev:
                         calls.extend(ev["tool_calls"])
@@ -950,10 +1075,18 @@ class VoiceLoop:
                         held.append(delta)
                         joined = "".join(held)
                         tool_text = looks_like_tool_text(joined)
-                        if not tool_text and len(joined) > 8 and not SUSPICIOUS_START.match(joined):
+                        if (
+                            not hold_for_route
+                            and not tool_text
+                            and len(joined) > 8
+                            and not SUSPICIOUS_START.match(joined)
+                        ):
                             # 看清了：只是一段普通 JSON（例如用户要的示例）→ 放行
                             holding = False
                         if holding:
+                            # 攒着不念，但回车打断还是要能生效（否则这一段话就只能干等）
+                            if self._interrupt.is_set():
+                                break
                             continue
                     if stats.llm_first_token == 0.0:
                         stats.llm_first_token = time.perf_counter() - t0
@@ -977,6 +1110,12 @@ class VoiceLoop:
                     for sentence in chunker.flush():
                         speak(sentence)
                     self._drain_playback()
+
+            if not calls and hold_for_route and not self._interrupt.is_set():
+                # 模型一个字都没念、也没调工具：交给 respond() 问过技能层再决定
+                return DeferredAnswer(
+                    text="".join(held), t0=t0, first_token=stats.llm_first_token
+                )
 
             if not calls and held:
                 raw = "".join(held)
@@ -1225,11 +1364,17 @@ class VoiceLoop:
             asr=result,
             asr_seconds=asr_seconds,
         )
+        route = str(stats.extra.get("route") or "")
         if stats.extra.get("skill"):
-            print(f"\n      [本地技能 {stats.extra['skill']} / 播报 {stats.total_seconds:.2f}s]")
+            print(
+                f"\n      [本地技能 {stats.extra['skill']} / 路由 {route or '—'}"
+                f" / 播报 {stats.total_seconds:.2f}s]"
+            )
         else:
             print(
-                f"\n      [首字 {stats.llm_first_token:.2f}s / 首音 {stats.first_audio:.2f}s"
+                f"\n      [路由 {route or '—'}"
+                f"{' 工具=' + str(stats.extra.get('tool')) if stats.extra.get('tool') else ''}"
+                f" / 首字 {stats.llm_first_token:.2f}s / 首音 {stats.first_audio:.2f}s"
                 f" / 总耗时 {stats.total_seconds:.2f}s]"
             )
         if stats.answer == "" and not stats.interrupted:

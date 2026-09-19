@@ -21,24 +21,35 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from .nlp_time import parse_datetime
 from .settings import Settings
-from .skills import TRIGGER_MEMO_ADD, SkillResult, Skills
+from .skills import (
+    TRIGGER_ALARM,
+    TRIGGER_MEMO_ADD,
+    TRIGGER_SCHEDULE,
+    SkillResult,
+    Skills,
+)
 
 # 给模型的额外说明（跟人设 system_prompt 分开放，人设仍然由用户自己改）
 # 写法上刻意「机械」：第 1 条给的是关键词白名单，而不是「相关就问」这种要靠理解的
 # 说法——实测（qwen3.5:4b）靠理解的做法会漏调（「我的备忘里有什么」它直接凭印象答了）。
 TOOL_HINT = (
     "你可以调用工具。规则：\n"
-    "1. 句子里只要出现这些词——日程、安排、课程、课、会议、开会、提醒、闹钟、备忘——"
-    "就先调对应的工具查一遍，再开口。不要凭记忆或习惯回答：你的记忆里没有他的日程。\n"
+    "1. 句子里只要出现这些词——日程、安排、课程、课、会议、开会、提醒、闹钟、备忘、几点——"
+    "就先调对应的工具，再开口。不要凭记忆或习惯回答：你的记忆里没有他的日程。\n"
     "2. 用户用「那件事」「那个会」「我跟导师见面」这种**指代**或模糊说法，"
     "只要沾得上安排/提醒/备忘，也先调工具查一遍：宁可查到空（然后如实说没有），"
     "也不要凭印象说「没这回事」——你并不知道他记过什么。\n"
     "3. 用户要**记东西或排日程**时，把他的话**原样**放进 text 参数，"
     "不要自己换算日期、不要改写时间说法（「下周三下午三点半」就照抄）。\n"
-    "4. 上面这些词都没出现、也不涉及安排/提醒/备忘时，直接回答，不要调工具。\n"
-    "5. 工具返回的 reply 就是最终答复，不要改数字和时间的说法。\n"
-    "6. 要调工具就**直接用工具接口**，不要用文字写出 {'name': ..., 'arguments': ...} 这种 JSON。"
+    "4. 要**改 / 挪 / 取消 / 删掉**什么，也走工具（change_schedule / cancel_alarm），"
+    "text 同样是原话——你不需要知道库里现在有什么，也不需要算时间。\n"
+    "5. 上面这些词都没出现、也不涉及安排/提醒/备忘时，直接回答，不要调工具。"
+    "闲聊、问知识、让你写代码、问你的看法（「你觉得我中午吃什么好」「要不要继续写」）"
+    "都属于这种——不要拿这些去查日程。\n"
+    "6. 工具返回的 reply 就是最终答复，不要改数字和时间的说法。\n"
+    "7. 要调工具就**直接用工具接口**，不要用文字写出 {'name': ..., 'arguments': ...} 这种 JSON。"
 )
 
 # 模型（尤其是小模型）偶尔不调工具，而是把调用**写成一段 JSON 文字**。
@@ -51,6 +62,108 @@ SUSPICIOUS_START = re.compile(r'^\s*[{[]\s*"')
 def looks_like_tool_text(text: str) -> bool:
     """这段文字像不像「把工具调用当文字写出来」。"""
     return bool(_TOOL_TEXT_HINT.search(text or ""))
+
+
+# 拿 text 去**算时间**的工具：这些的参数必须跟原话一致，不能是模型改写过的版本
+_TIME_SENSITIVE_TOOLS = {
+    "add_alarm",
+    "add_schedule",
+    "change_schedule",
+    "cancel_alarm",
+    "fix_last",
+}
+
+# 这些工具**一律用用户原话**，不看模型给的 text。
+# 为什么：修正句（「我说是今晚十点」）**全部内容就是一个时间**，
+# 实测模型会把「十点」改写成「8点45」（凭空换了个时间），而原话本身短且准。
+_ALWAYS_ORIGINAL_TOOLS = {"fix_last"}
+
+
+def reroute_correction(call: dict, user_text: str, skills: Skills | None) -> dict:
+    """「刚记下一条 + 这句话只是时间」→ 拉回 fix_last（它在改上一条，不是新建）。
+
+    ★为什么要用代码管这件事★（实测）：说完「提醒我明天早上七点练琴」，
+    紧接着说「我说是今晚十点」——模型选了 `add_alarm`（还自己编了句
+    「今晚十点提醒我练琴」），结果库里两条闹钟，用户以为改了。
+    工具描述写了「别新建」也不能保证，所以这里机械地掰回来：
+
+        ＊技能层刚记下一条（3 分钟内）；
+        ＊这句话是**纯时间**（「我说是今晚十点」这种，没说别的事）。
+
+    两条都满足时，新建一定不是他想要的。只要带一点别的东西（「九点提醒我写作业」）
+    就不会命中，照旧新建。
+    """
+    if not isinstance(call, dict) or not user_text or skills is None:
+        return call
+    fn = call.get("function") or call
+    name = str(fn.get("name") or "")
+    if name not in _CORRECTION_PRONE_TOOLS:
+        return call
+    now = datetime.now()
+    if skills.recent_add() and skills._looks_time_only(user_text, now):  # noqa: SLF001
+        return {"function": {"name": "fix_last", "arguments": {"text": user_text.strip()}}}
+    return call
+
+
+def _has_action_word(text: str) -> bool:
+    """这句里有没有「提醒 / 叫我 / 记一下 / 安排」这类**动宾词**。
+
+    为什么要看它：模型改写时会把动词吞掉（「提醒我明天早上七点练琴」→
+    「明天早上七点练琴」），时间还在，但技能层认不出这是要新建提醒。
+    """
+    t = text or ""
+    return bool(
+        TRIGGER_ALARM.search(t)
+        or TRIGGER_SCHEDULE.search(t)
+        or TRIGGER_MEMO_ADD.search(t)
+    )
+
+
+# 「刚记下一条 + 只说时间」时要改掉新建念头的工具
+_CORRECTION_PRONE_TOOLS = {"add_alarm", "add_schedule", "add_memo"}
+
+
+def repair_args(call: dict, user_text: str) -> dict:
+    """把「被模型改写坏了」的参数换回用户原话（机械校验，不靠模型自觉）。
+
+    为什么要它（实测数据）：qwen3.5:4b 在 23 次调用里有 6 次**改写了原话**，两种都见过：
+        - 把时间说法丢掉：「下周三下午三点半跟导师见面」→「跟导师见面」；
+        - 把动词丢掉：「提醒我明天早上七点练琴」→「明天早上七点练琴」
+          （后者技能层认不得，回了一句「这个提醒我没定上」）。
+
+    两条机械规则，任一命中就用原话：
+        ＊原话里带着能解析出的时间、模型那段没有 → 用原话；
+        ＊原话里有「提醒/叫我/记一下/安排」这类动宾词、模型那段没有 → 用原话。
+
+    查询类（list_*）不修：模型自己缩小范围（「帮我看看下周都有什么」→「下周」）是合理的。
+    """
+    if not isinstance(call, dict) or not user_text:
+        return call
+    fn = call.get("function") or call
+    name = str(fn.get("name") or "")
+    if name not in _TIME_SENSITIVE_TOOLS:
+        return call
+    args = fn.get("arguments")
+    if isinstance(args, str):
+        try:
+            args = json.loads(args) if args.strip() else {}
+        except json.JSONDecodeError:
+            args = {}
+    args = dict(args or {})
+    original = user_text.strip()
+    text = str(args.get("text") or "").strip()
+    if not original or text == original:
+        return call
+    if name in _ALWAYS_ORIGINAL_TOOLS:
+        args["text"] = original
+        return {"function": {"name": name, "arguments": args}}
+    if parse_datetime(original) is not None and parse_datetime(text) is None:
+        args["text"] = original
+        return {"function": {"name": name, "arguments": args}}
+    if _has_action_word(original) and not _has_action_word(text):
+        args["text"] = original
+        return {"function": {"name": name, "arguments": args}}
+    return call
 
 
 def parse_tool_call_text(text: str, allowed: set[str] | None = None) -> list[dict]:
@@ -217,6 +330,50 @@ class ToolRegistry:
                     "parameters": text_only,
                 },
             },
+            {
+                "type": "function",
+                "function": {
+                    "name": "cancel_alarm",
+                    "description": (
+                        "取消一条**提醒 / 闹钟**：「取消明天早上的闹钟」「把七点的提醒取消了」"
+                        "「不用提醒我了」。注意：用户说的「安排」可能指闹钟也可能指日程，"
+                        "但他只要提到闹钟/提醒/叫我，就用这个（不要去改日程）。"
+                    ),
+                    "parameters": text_only,
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "change_schedule",
+                    "description": (
+                        "改 / 挪 / 删 / 跳过 已经记下的日程课表：「把组会挪到周五上午十点」"
+                        "「AIAA3102 改成下午三点」「下周三的课不上了」「删掉体检」"
+                        "「所有课程提前半小时提醒」。不确定时它会自己反问，text 给原话就行。"
+                    ),
+                    "parameters": text_only,
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "now",
+                    "description": "现在几点 / 今天几号 / 今天星期几。",
+                    "parameters": text_only,
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "fix_last",
+                    "description": (
+                        "用户纠正**刚刚**记下的那一条的时间：「我说今天晚上8点45」「不对，"
+                        "是明天早上」。刚记完一条、他紧接着只说了个新时间时，**用它**，"
+                        "不要再新建一条（那样会响两次）。text 给原话。"
+                    ),
+                    "parameters": text_only,
+                },
+            },
         ]
 
     def names(self) -> set[str]:
@@ -247,6 +404,10 @@ class ToolRegistry:
             "add_schedule": self._add_schedule,
             "add_memo": self._add_memo,
             "add_alarm": self._add_alarm,
+            "cancel_alarm": self._cancel_alarm,
+            "change_schedule": self._change_schedule,
+            "now": self._now,
+            "fix_last": self._fix_last,
         }.get(name)
         if handler is None:
             self.errors += 1
@@ -365,6 +526,75 @@ class ToolRegistry:
             return ToolResult(False, action="memo_list", reply="备忘里现在是空的。")
         return ToolResult(True, action=result.action, reply=result.reply, data=result.data)
 
+    # ------------------------------------------------- 改 / 取消 / 报时 / 纠正
+    def _cancel_alarm(self, args: dict) -> ToolResult:
+        """取消一条提醒。
+
+        ★两道闸门，都是为了「不会因为模型说反了而多出一条」★：
+            1. 句子里没「取消类」的词，直接回「没找到」——**不调**任何添加逻辑；
+            2. 结果必须是取消类动作（alarm_cancel / alarm_clear），
+               不是的话就算回复能看也不当成功。
+        （配套的硬保证在 skills._handle_alarm：带取消词却没对上时，
+         它会在新建分支之前就返回，绝不会惄惄加一条。）
+        """
+        text = self._text_arg(args)
+        if not self.skills._CANCEL_WORD.search(text):  # noqa: SLF001
+            return ToolResult(
+                False,
+                action="alarm_cancel_miss",
+                error="这不是取消提醒的说法",
+                reply="这句听着不像取消提醒——要取消就说「取消明天早上的闹钟」。",
+            )
+        now = datetime.now()
+        result = self.skills._cancel_by_time(text, now)  # noqa: SLF001
+        if result is None:
+            result = self.skills._handle_alarm(text, now)  # noqa: SLF001
+        action = str(getattr(result, "action", "") or "")
+        if result is None or action not in ("alarm_cancel", "alarm_clear"):
+            return ToolResult(
+                False,
+                action=action or "alarm_cancel_miss",
+                error="没找到要取消的那条提醒",
+                reply=(result.reply if result is not None else "")
+                or "我没找到要取消的那条提醒——说个时间试试。",
+            )
+        return ToolResult(True, action=result.action, reply=result.reply, data=result.data)
+
+    def _change_schedule(self, args: dict) -> ToolResult:
+        """改 / 挪 / 删 / 跳过日程（守卫、反问都在 _handle_schedule_change 里）。"""
+        text = self._text_arg(args)
+        result = self.skills._handle_schedule_change(text, datetime.now())  # noqa: SLF001
+        if result is None:
+            return ToolResult(
+                False,
+                action="schedule_change_miss",
+                error="技能层没认出来",
+                reply="我没找到要改的那一条，你说个名字？比如「把组会挪到周五上午十点」。",
+            )
+        return ToolResult(bool(result.reply), action=result.action, reply=result.reply, data=result.data)
+
+    def _now(self, args: dict) -> ToolResult:
+        text = str(args.get("text") or "").strip() or "现在几点"
+        result = self.skills._handle_clock(text, datetime.now())  # noqa: SLF001
+        if result is None:
+            return ToolResult(
+                False, action="clock_miss", error="这不是问时间的说法", reply="（没听懂问的是几点）"
+            )
+        return ToolResult(True, action=result.action, reply=result.reply, data=result.data)
+
+    def _fix_last(self, args: dict) -> ToolResult:
+        """「我说是今晚8点45」——改刚记下的那一条（而不是新建一条）。"""
+        text = self._text_arg(args)
+        result = self.skills._handle_correction(text, datetime.now())  # noqa: SLF001
+        if result is None:
+            return ToolResult(
+                False,
+                action="fix_last_miss",
+                error="没有可改的那一条（刚记下的那条太久了，或者这句不像在改时间）",
+                reply="我不确定你是要改哪一条，再说一遍要改成什么？",
+            )
+        return ToolResult(True, action=result.action, reply=result.reply, data=result.data)
+
 
 def describe_calls(calls: list[dict]) -> str:
     """日志/评估用：把 tool_calls 变成一行字。"""
@@ -383,4 +613,6 @@ __all__ = [
     "describe_calls",
     "looks_like_tool_text",
     "parse_tool_call_text",
+    "repair_args",
+    "reroute_correction",
 ]
