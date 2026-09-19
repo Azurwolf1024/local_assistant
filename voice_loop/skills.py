@@ -1247,6 +1247,11 @@ class Skills:
         r"|未来|接下来|最近|这几天|这两天|这个?周末|下个?周末)"
         r"[^，,。;；?？]{0,8}(?:有什么|有哪些|有没有|有课|安排|日程|行程|吗|呢|咋样|怎么样)"
     )
+    # 「提了时间但可能解析不出来」的补充词（只用于「如实说没听懂」的判断，
+    # 不影响任何路由，所以宁宽勿窄）
+    _MENTION_TIME_EXTRA = re.compile(
+        r"这两天|两周|几个?星期|几天|几年|未来|接下来|以后|之后|下下|月份?"
+    )
     # 这些是问别的事，不是问日程（「今天天气怎么样」的「怎么样」会撞上 _RANGE_ASK）
     _NOT_SCHEDULE_Q = re.compile(r"(天气|气温|温度|下雨|下雪|雨|雪|新闻|股票|汇率|价格|几点开会?)")
     # 问句里也可能带「每周五下午两点」这种时刻，不能当成新增
@@ -1998,12 +2003,15 @@ class Skills:
             return WEEKDAY_NAMES[day.weekday()]
         return f"{day.month}月{day.day}日{WEEKDAY_NAMES[day.weekday()]}"
 
-    def _range_of(self, text: str, now: datetime) -> tuple[date, date, str]:
-        """解析「问的是哪一段时间」，返回 (起, 止, 说法)，闭区间。
+    def _range_of(self, text: str, now: datetime) -> tuple[date, date, str, bool]:
+        """解析「问的是哪一段时间」，返回 (起, 止, 说法, 听懂了没)，闭区间。
 
         以前「下周」被算成「下周**一**那一天」，而「这个月 / 下个月 / 未来三天」
         全都落到「今天」——问一段时间却只报一天。这里把所有范围都摊开：
         日 / 周 / 周末 / 月 / 年 / 未来 N 天。
+
+        末尾那个 bool 是为「没听懂」准备的：以前解析不出来就**静静地**退到「今天」，
+        工具层拿这个答案去回答「下周三下午」就成了谎话（模型直接拿它下结论）。
         """
         t = text or ""
         today = now.date()
@@ -2019,71 +2027,144 @@ class Skills:
 
         if "大后天" in t:
             d = today + timedelta(days=3)
-            return d, d, "大后天"
+            return d, d, "大后天", True
         if "后天" in t:
             d = today + timedelta(days=2)
-            return d, d, "后天"
+            return d, d, "后天", True
         if "明天" in t or "明日" in t:
             d = today + timedelta(days=1)
-            return d, d, "明天"
+            return d, d, "明天", True
+        # ★「今天」要显式认出来★：以前它靠「都没命中 → 默认今天」兜着，
+        # 而默认那条现在标成「没听懂」，会把「今天有什么课」当成听不懂的时间段。
+        if re.search(r"(今天|今日)", t):
+            return today, today, "今天", True
         # 周末（周六+周日）
         if re.search(r"(下下个?周末|下下周末)", t):
             s = week_of(2)[0] + timedelta(days=5)
-            return s, s + timedelta(days=1), "下下个周末"
+            return s, s + timedelta(days=1), "下下个周末", True
         if re.search(r"(下个?周末|下周末)", t):
             s = week_of(1)[0] + timedelta(days=5)
-            return s, s + timedelta(days=1), "下周末"
+            return s, s + timedelta(days=1), "下周末", True
         if re.search(r"(这个?周末|本周末)", t):
             s = week_of(0)[0] + timedelta(days=5)
             if s < today:               # 已经过了就顺延到下一个周末
                 s += timedelta(days=7)
-            return s, s + timedelta(days=1), "这个周末"
+            return s, s + timedelta(days=1), "这个周末", True
+        # ★裸「周末」★：以前落到「今天」（问周末却报今天）
+        if "周末" in t:
+            s = week_of(0)[0] + timedelta(days=5)
+            if s < today:
+                s += timedelta(days=7)
+            return s, s + timedelta(days=1), "这个周末", True
+        # ★单个星期几（「周三 / 下周三 / 这周三」）→ 那一天，不是整周★
+        # 必须放在「整周」前面：「下周三」里也含「下周」，先匹整周就会
+        # 把「下周三下午有没有空」答成整周。没写限定时往后找最近的那一天。
+        m = re.search(r"(下下|下|这|本)?\s*(?:周|星期|礼拜)\s*([一二三四五六日天])", t)
+        if m:
+            idx = _WEEKDAY_CN.get(m.group(2))
+            if idx is not None:
+                word = m.group(1) or ""
+                monday = today - timedelta(days=today.weekday())
+                if word == "下下":
+                    d = monday + timedelta(weeks=2, days=idx)
+                elif word == "下":
+                    d = monday + timedelta(weeks=1, days=idx)
+                else:
+                    d = monday + timedelta(days=idx)
+                    if d < today:           # 本周（或今天）已经过了 → 顺延到下一次
+                        d += timedelta(days=7)
+                # ★说法按解析出来的那天重新生成★：「这周三」已经过了会被顺延到
+                # 下周，叫「这周三（9月23日）」就自相矛盾了。
+                weeks_ahead = (d - monday).days // 7
+                word = {0: "这", 1: "下"}.get(weeks_ahead, "下下")
+                return d, d, f"{word}周{m.group(2)}（{d.month}月{d.day}日）", True
         # 整周（周一起算）
         if re.search(r"(下下个?周|下下星期|下下个星期)", t):
             s, e = week_of(2)
-            return s, e, "下下周"
+            return s, e, "下下周", True
         if re.search(r"(下周|下个星期|下星期|下个礼拜)", t):
             s, e = week_of(1)
-            return s, e, "下周"
+            return s, e, "下周", True
         if re.search(r"(这周|本周|这个星期|这星期|本星期|这一周|整周|全周)", t):
             s, e = week_of(0)
-            return s, e, "这周"
+            return s, e, "这周", True
         # 整月
         if re.search(r"(下个月|下月)", t):
             s, e = month_of(1)
-            return s, e, "下个月"
+            return s, e, "下个月", True
         if re.search(r"(这个月|本月|当月)", t):
             s, e = month_of(0)
-            return s, e, "这个月"
+            return s, e, "这个月", True
         # 整年
         if re.search(r"(明年|下一年)", t):
             y = today.year + 1
-            return date(y, 1, 1), date(y, 12, 31), "明年"
+            return date(y, 1, 1), date(y, 12, 31), "明年", True
         if re.search(r"(今年|本年度)", t):
-            return date(today.year, 1, 1), date(today.year, 12, 31), "今年"
+            return date(today.year, 1, 1), date(today.year, 12, 31), "今年", True
         # 未来 N 天 / 未来一周 / 未来一个月
         m = re.search(r"(?:未来|接下来|后面|最近)\s*(\d{1,2}|[一二三四五六七八九十两]+)\s*天", t)
         if m:
             n = max(1, int(cn2num(m.group(1)) or 1))
-            return today, today + timedelta(days=n - 1), f"未来{cn_number(n)}天"
+            return today, today + timedelta(days=n - 1), f"未来{cn_number(n)}天", True
         if re.search(r"(?:未来|接下来|后面)\s*(?:一)?(?:周|星期|礼拜)", t):
-            return today, today + timedelta(days=6), "未来一周"
+            return today, today + timedelta(days=6), "未来一周", True
         if re.search(r"(?:未来|接下来)\s*(?:一)?个?月", t):
-            return today, today + timedelta(days=29), "未来一个月"
+            return today, today + timedelta(days=29), "未来一个月", True
         if "这两天" in t:
-            return today, today + timedelta(days=1), "这两天"
+            return today, today + timedelta(days=1), "这两天", True
         if re.search(r"(这几天|最近几天)", t):
-            return today, today + timedelta(days=3), "这几天"
+            return today, today + timedelta(days=3), "这几天", True
         if re.search(r"(最近|接下来)", t):
-            return today, today + timedelta(days=6), "最近一周"
-        return today, today, "今天"
+            return today, today + timedelta(days=6), "最近一周", True
+        return today, today, "今天", False          # 没听懂：只说「今天」但标清楚
+
+    def range_understood(self, text: str, now: datetime) -> bool:
+        """这句话里的时间段真的解析出来了吗（工具层用来决定「如实说没听懂」）。"""
+        return self._range_of(text, now)[3]
 
     def _day_items(self, text: str, now: datetime) -> SkillResult | None:
-        start, end, label = self._range_of(text, now)
-        return self._range_items(start, end, label, now)
+        start, end, label, ok = self._range_of(text, now)
+        # ★没听懂时间段就别拿「今天」顶替★：问「这两周有安排吗」答「今天没有安排」
+        # 是假话，而工具层会把这句话当成事实去下结论（实测：模型据此说「下周三下午有空」）。
+        # 提了时间又没解析出来 → 交白卷，让工具层/上层去反问。
+        if not ok and self.mentions_time(text):
+            return None
+        # 只问一天时，句中的时段也要算进去：「下周三下午有没有空」
+        # 不能把上午的课也算成「有安排」。
+        period = None
+        if start == end:
+            hit = _DAY_PERIOD.search(text or "")
+            window = _PERIOD_RANGE.get(hit.group(1)) if hit else None
+            if window:
+                period = window
+                base, _sep, tail = label.partition("（")
+                label = f"{base}{hit.group(1)}（{tail}" if tail else f"{base}{hit.group(1)}"
+        return self._range_items(start, end, label, now, period=period)
 
-    def _range_items(self, start: date, end: date, label: str, now: datetime) -> SkillResult:
-        """把一段时间里的安排按天列出来（重复规则由 _occurrences_on 展开）。"""
+    def mentions_time(self, text: str) -> bool:
+        """这句里有没有「时间说法」。
+
+        用来区分「换个说法再问」和「他确实问了某段时间」：
+        工具层解析不出时间段时，提了时间的要如实说没听懂，
+        没提时间的（「我的日程」）才能退到「今天有什么」。
+        """
+        t = text or ""
+        return bool(
+            self._RANGE_WORD.search(t)
+            or _DAY_PERIOD.search(t)
+            or _WEEKDAY_WORD.search(t)
+            or self._MENTION_TIME_EXTRA.search(t)
+            or parse_datetime(t) is not None
+        )
+
+    def _range_items(
+        self, start: date, end: date, label: str, now: datetime,
+        period: tuple[int, int] | None = None,
+    ) -> SkillResult:
+        """把一段时间里的安排按天列出来（重复规则由 _occurrences_on 展开）。
+
+        ``period``：只看这个时段（左闭右开小时区间），用于「下周三下午」这类问法。
+        """
         # 问「这周 / 这个月」时只报还没过去的：周一说「这周安排」不想再听上周三的课
         if start != end:
             start = max(start, now.date())
@@ -2092,6 +2173,8 @@ class Skills:
         day = start
         while day <= end:
             items = self._occurrences_on(day, ignore_reminder=True, now=now)
+            if period is not None:
+                items = [(w, i) for w, i in items if period[0] <= w.hour < period[1]]
             if items:
                 total += len(items)
                 detail = "、".join(

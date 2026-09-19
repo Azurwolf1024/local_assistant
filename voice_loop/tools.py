@@ -448,12 +448,30 @@ class ToolRegistry:
         result = self._via(text, self.skills._handle_schedule)  # noqa: SLF001
         if result.ok:
             return result
+        # ★说了时间段的，先按时间答★（问的是「下周三下午有没有空」，不是「哪一条」）
+        if self.skills.mentions_time(text):  # noqa: SLF001
+            now = datetime.now()
+            if self.skills.range_understood(text, now):  # noqa: SLF001
+                when = self.skills._day_items(text, now)  # noqa: SLF001
+                if when is not None and when.reply.strip():
+                    return ToolResult(
+                        True, action=when.action, reply=when.reply, data=when.data
+                    )
+            # ★别悄悄把时间段换成「今天」★：以前只要解析不出来就退到「今天」，
+            # 于是「下周三下午」被答成「今天没有课程或会议安排」——模型拿这句当依据，
+            # 直接下了结论（实测它就这么回了「下周三下午有空」）。如实说没听懂才对。
+            return ToolResult(
+                False,
+                action="schedule_miss",
+                error="这段时间没解析出来",
+                reply="这个时间段我没听懂——换个说法？比如「下周三有什么安排」「这周呢」。",
+            )
         # 模型常常把整句原话递过来（「导师见面那件事是什么时候」），
         # 时间范围解析不了 —— 那就按名字去库里找那一条。
         named = self._find_named(text)
         if named is not None:
             return named
-        # 还是不行就退一步：给今天有什么，总比回一句「没听懂」有用
+        # 连时间都没提（「我的日程」）：给今天有什么，总比回一句「没听懂」有用
         return self._via("今天有什么安排", self.skills._handle_schedule)  # noqa: SLF001
 
     def _find_named(self, text: str) -> ToolResult | None:
