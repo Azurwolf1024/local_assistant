@@ -166,6 +166,42 @@ class WakeConfig:
 
 
 @dataclass
+class McpServerConfig:
+    """一个 MCP 服务器（一个能力域）。"""
+
+    name: str = ""
+    enabled: bool = True
+    transport: str = "inproc"        # inproc = 同进程（自家服务器，快）| stdio = 起子进程
+    module: str = ""                 # inproc：模块路径，里面要有 build_server()
+    command: list[str] = field(default_factory=list)   # stdio：启动命令
+    cwd: str = ""                    # stdio：工作目录
+    env: dict[str, str] = field(default_factory=dict)  # stdio：额外的环境变量
+    tools: list[str] = field(default_factory=list)     # ★白名单★，空 = 全部（不推荐）
+    namespace: bool = True           # 工具名要不要加 mcp__<服务器>__ 前缀
+    timeout: float = 15.0            # 单次调用超时（秒）
+
+
+@dataclass
+class McpConfig:
+    """自己的 MCP 架构（见 voice_loop/mcp/）。"""
+
+    enabled: bool = True
+    servers: list[McpServerConfig] = field(
+        default_factory=lambda: [
+            # 助手的核心能力：日程/备忘/提醒。
+            # ★namespace=False★：工具名保持 list_schedule / add_memo 原样，
+            # 模型已经认得这 8 个名字（实测 qwen3.5:4b 在这 8 个上 8/8）。
+            McpServerConfig(
+                name="skills",
+                transport="inproc",
+                module="voice_loop.mcp.servers.skills",
+                namespace=False,
+            )
+        ]
+    )
+
+
+@dataclass
 class SkillsConfig:
     enabled: bool = True
     data_dir: str = "data"
@@ -225,6 +261,7 @@ class Settings:
     subtitle: SubtitleConfig = field(default_factory=SubtitleConfig)
     bargein: BargeInConfig = field(default_factory=BargeInConfig)
     vision: VisionConfig = field(default_factory=VisionConfig)
+    mcp: McpConfig = field(default_factory=McpConfig)
     path: Path = PROJECT_ROOT / "config.toml"
 
     # ---------------------------------------------------------------- paths
@@ -255,6 +292,18 @@ def _build(cls: type, data: dict[str, Any], section: str) -> Any:
     return cls(**kwargs)
 
 
+def _build_mcp(data: dict[str, Any]) -> McpConfig:
+    """[mcp] 段要单独填：里面是「表数组」（[[mcp.servers]]），_build 处理不了。"""
+    servers = [
+        _build(McpServerConfig, raw, "mcp.servers")
+        for raw in (data.get("servers") or [])
+        if isinstance(raw, dict)
+    ]
+    cfg = _build(McpConfig, {k: v for k, v in data.items() if k != "servers"}, "mcp")
+    cfg.servers = servers
+    return cfg
+
+
 def load_settings(path: str | Path | None = None) -> Settings:
     cfg_path = Path(path) if path else (PROJECT_ROOT / "config.toml")
     if not cfg_path.exists():
@@ -275,5 +324,6 @@ def load_settings(path: str | Path | None = None) -> Settings:
         vision=_build(VisionConfig, raw.get("vision", {}), "vision"),
         tts=_build(TtsConfig, raw.get("tts", {}), "tts"),
         chat=_build(ChatConfig, raw.get("chat", {}), "chat"),
+        mcp=_build_mcp(raw.get("mcp", {})),
         path=cfg_path,
     )

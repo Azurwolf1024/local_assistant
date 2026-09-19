@@ -55,10 +55,13 @@ flowchart LR
            ├ 命中 → 直接执行、直接播报          ← 实测占真实对话的 62%
            └ 没接住 ──▶ ② 模型（带工具，流式）
                           ├ 直接回答    → 闲聊/百科，和以前一样快（中位 2~4 s）
-                          └ tool_call   → ③ 工具层：复用同一套技能与守卫
-                                            （算日期、去重、反问确认都在那边）
+                          └ tool_call   → ③ MCP 工具层（宿主 → 服务器）
+                                            （算日期、去重、反问确认都在服务器后面）
                                            → 工具产出的话直接播报（不再多跑一轮模型）
 ```
+
+③ 那一层是**按 MCP 协议自己搭的**（见第 13 节）：能力域拆成服务器，
+宿主只负责「工具名 → 谁提供」，所以以后加能力域不用改 pipeline。
 
 为什么不让模型从头管到尾（实测数据，`sessions/*.jsonl` 里 101 轮真实对话）：
 
@@ -71,6 +74,7 @@ flowchart LR
 | 所以工具收什么参数 | **用户原话**（`text`）。解析交给 `nlp_time`——实测 100% 正确、还带上了原本丢掉的重复与地点 |
 | 带工具会不会拖慢闲聊 | 不会：闲聊仍是**一次调用**（模型可以直接答，不必先路由），中位 2~4 s |
 | 完整 llm→工具→llm 一轮 | 10.6 s（路由 6.0 + 复述 4.6）；所以我们**跳过复述**，直接念工具产出的话 |
+| 工具怎么接进来 | 走自己搭的 MCP 协议层（第 13 节）：inproc 服务器握手 5 ms，工具清单与调用都由宿主路由 |
 
 想关掉工具、回到纯聊天：`[llm] router = "chat"`。
 想先量一遍“模型会选哪个工具”：`python scripts/eval_router.py --builtin`。
@@ -118,6 +122,14 @@ flowchart LR
 │  ├─ pipeline.py              # 会话编排（唤醒服务、连续对话、打断、提醒播报）
 │  ├─ wake.py                  # 唤醒词匹配（精确 + 别名 + 模糊）、「没事了」收回唤醒
 │  ├─ skills.py                # 生活技能：时间 / 闹钟 / 备忘 / 日程
+│  ├─ tools.py                 # 工具层：技能包成模型能调的工具（现在是 MCP 的一个服务器）
+│  ├─ mcp/                     # ★ 自己搭的 MCP 架构（协议 / 服务器 / 客户端 / 宿主）
+│  │  ├─ protocol.py           #   JSON-RPC 2.0 + MCP 消息形状
+│  │  ├─ server.py             #   一个能力域 = 一个服务器（可 inproc 也可 stdio）
+│  │  ├─ client.py             #   两种传输走同一套消息
+│  │  ├─ host.py               #   聚合工具清单 + 白名单 + 路由 + 崩了重启
+│  │  ├─ serve.py              #   python -m voice_loop.mcp.serve <服务器>
+│  │  └─ servers/skills.py     #   技能服务器（见第 13 节）
 │  ├─ scheduler.py             # 后台提醒调度器
 │  ├─ system_ops.py            # 系统操作：关/开显示器（只关屏，不休眠）
 │  ├─ bargein.py               # 语音打断：分清「自己的回声」和「你在插话」
@@ -143,6 +155,7 @@ flowchart LR
 │  ├─ bench_llm.py             # ★ 换模型前的体检（延迟 / 是否思考 / 看图识字）
 │  ├─ eval_router.py           # ★ 模型选工具的准确率（--model 换模型对比）
 │  ├─ test_tools.py            # 工具层自测（--live 走真模型）
+│  ├─ test_mcp.py              # ★ MCP：协议 / 真管道 stdio / 白名单 / 路由 / 接进 pipeline
 │  ├─ test_vision.py           # 看图自测（编图 / 找文件 / 识别）
 │  ├─ test_accel.py            # 加速设备选择（核显 / NPU / 回退）
 │  ├─ test_wake.py             # ★ 唤醒词实测与调优（打印听到的内容 / 自动写 aliases）
@@ -162,7 +175,7 @@ cd <项目目录>
 pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 python scripts/download_models.py     # 补上 SenseVoice / Silero VAD / Piper 中文女声（约 300 MB）
 ollama pull qwen3.5:4b                # 主模型：文本 + 看图 + 工具（3.4 GB）
-python main.py selftest               # 8 项检查，全过就能用了
+python main.py selftest               # 10 项检查，全过就能用了
 ```
 
 想让它能**读文件**（PDF），再补一行：
@@ -193,6 +206,7 @@ python main.py tts "你好呀" -o a.wav          # 文本转语音
 python main.py devices                       # 查看音频设备
 python main.py gpu                           # 看加速器（核显/NPU/CUDA）在用哪个
 python main.py gpu --bench                   # 实测 Whisper CPU vs 核显
+python main.py mcp                           # 看工具层：有哪些工具、来自哪个 MCP 服务器（第 13 节）
 ```
 
 `listen` 模式下：
@@ -1141,3 +1155,122 @@ $env:OLLAMA_IGPU_ENABLE = "1"      # 这一句不能省，否则从当前窗口�
 - **TTS 上 GPU**：Piper 是 RTF 0.04，加速收益远小于折腾成本；
   `[tts] use_cuda` 只对装了 CUDA 版 onnxruntime 的机器有用，配错时 `main.py gpu` 会提醒你。
 
+## 13. MCP：自己搭的工具协议层
+
+这个项目的工具不再是一坨写死在 pipeline 里的函数，而是**按 MCP 协议**拆成服务器、
+由宿主聚合（`voice_loop/mcp/`）。目标是拿那套 agent（Claude Code / Copilot）的架构，
+但**不引任何新依赖**：协议层自己实现，只有 stdio 的 JSON-RPC。
+
+```
+pipeline（会话编排）
+  └─ MCPHost         ← 只认「工具名 → 谁提供」这一件事
+       ├─ MCPClient ─ InProcessTransport ─┐
+       ├─ MCPClient ─ StdioTransport ─┐   │
+       └─ …                           │   │
+                                      ↓   ↓
+                            MCPServer（自家能力域）
+                              skills / vision / system…
+```
+
+| 文件 | 干什么 |
+| --- | --- |
+| `mcp/protocol.py` | JSON-RPC 2.0 + MCP 消息形状、编解码（换行分帧）、形状校验 |
+| `mcp/server.py` | 一个能力域 = 一个服务器；`initialize` / `tools/list` / `tools/call` / `ping` |
+| `mcp/client.py` | 两种传输走**同一套消息**：inproc（不起进程，5 ms 握手）/ stdio（起子进程） |
+| `mcp/host.py` | 聚合工具清单、白名单、路由、服务器崩了自动重启 |
+| `mcp/servers/skills.py` | 第一个服务器：把现成的 `ToolRegistry`（日程/备忘/提醒）挂到协议后面 |
+
+第一条命令：
+
+```powershell
+python main.py mcp                                     # 现在有哪些工具、来自哪个服务器
+python main.py mcp --call list_schedule --args "{\"text\": \"下周\"}"
+python main.py mcp --serve skills                       # 挂到 stdio，给别人当 MCP 服务器用
+```
+
+### 为什么值得这么拆
+
+1. **加能力域不用动 pipeline**：写一个 `mcp/servers/xxx.py`，在 `config.toml` 的
+   `[[mcp.servers]]` 里登记一行就完事。以前加一类工具要改 `tools.py` 的 spec 表、
+   handler 表、pipeline 的分发，三处。
+2. **同一份 handler，两条路都能用**：`python -m voice_loop.mcp.serve skills` 就是把
+   助手自己的日程/备忘能力交给 Copilot / Claude Code 用（见下面配置）。
+   反过来接别人的服务器（`mcp-server-git` 之类）也是同一个宿主。
+3. **崩了不连坐**：每个服务器一个连接，`stdio` 模式下还是独立进程；
+   某一台挂了只让这一路失败，宿主会顺手把它拉起来。
+4. **能单测**：协议层、服务器、宿主都能脱离模型测（`scripts/test_mcp.py`）。
+
+### 接进别的 agent（把助手当 MCP 服务器）
+
+```powershell
+# Claude Code
+claude mcp add voice-assistant -- python -m voice_loop.mcp.serve skills
+```
+
+```jsonc
+// VS Code / Copilot：.vscode/mcp.json
+{
+  "servers": {
+    "voice-assistant": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["-m", "voice_loop.mcp.serve", "skills"],
+      "cwd": "D:/local_AI",
+      "env": { "PYTHONIOENCODING": "utf-8", "VOICE_LOOP_DATA_DIR": "D:/local_AI/data" }
+    }
+  }
+}
+```
+
+配好之后，在 Copilot 里说「查一下我的日程」它就会调这个服务器的 `list_schedule`，
+拿到的和语音助手是**同一份数据**。
+
+> `VOICE_LOOP_DATA_DIR` 只在 stdio 模式下生效（独立进程读的是真实 `config.toml`），
+> 用来把数据目录指走（测试、或想同时跑两个实例）。
+
+### 两条必须守的规矩
+
+1. **★工具清单要短★**。实测本地 4b 在 8 个工具上 8/8，9b 反而 5/8；接一堆服务器
+   把几十个工具摊在模型面前，它就开始乱选甚至不选。所以 `[[mcp.servers]]` 支持
+   `tools = [...]` 白名单：**没进白名单的工具根本不出现在模型面前**（比调用时再拒绝安全得多）。
+   接外来服务器时请默认只放只读工具。
+2. **★stdout 是协议通道★**。服务器里任何 `print()` 都会把对端的解析搞坏，
+   日志一律走 `stderr`（`server.log_stderr()`），Python 子进程建议带
+   `PYTHONIOENCODING=utf-8`（否则中文可能走 cp936）。
+
+### 加一个新的能力域（三步）
+
+```python
+# voice_loop/mcp/servers/louder.py
+from ..server import MCPServer
+from ...system_ops import set_volume          # 假设有这么一个函数
+
+def build_server(settings=None, skills=None, logger=None, **_) -> MCPServer:
+    srv = MCPServer("louder", instructions="音量控制")
+    srv.add_tool("get_volume", "当前音量",
+                 {"type": "object", "properties": {}},
+                 lambda a: f"当前音量 {get_volume()}%")
+    srv.add_tool("set_volume", "调整音量（0~100）",
+                 {"type": "object",
+                  "properties": {"percent": {"type": "integer"}}, "required": ["percent"]},
+                 lambda a: f"音量已调到 {set_volume(int(a['percent']))}%")
+    return srv
+```
+
+```toml
+# config.toml
+[[mcp.servers]]
+name = "louder"
+transport = "inproc"                    # 自家代码：进程内，零启动开销
+module = "voice_loop.mcp.servers.louder"
+tools = ["get_volume", "set_volume"]    # 白名单（想全开就留空，但不推荐）
+```
+
+想隔离到子进程就把 `transport` 换成 `stdio` + `command = ["python", "-m", "voice_loop.mcp.serve", "louder"]`，
+**handler 一行都不用改**。
+
+### 命名规则
+
+- 自家的能力域 `namespace = false`：名字保持 `list_schedule` / `add_memo` 原样
+  （模型已经认得这 8 个，TOOL_HINT 和评估脚本也照旧）。
+- 其它服务器自动加前缀 `mcp__<服务器>__<工具>`（跟 Claude Code 一致），防止撞名。

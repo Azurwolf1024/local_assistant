@@ -250,6 +250,42 @@ confirm_expire = 120          # 「是这个文件吗？」多少秒没回答就
 
 say_first = "我看一眼。"       # 看图前先说的那句话（留空则不说）
 
+# ── MCP：自己搭的工具协议层（见 voice_loop/mcp/）────────────────────────────
+# 把能力域拆成独立的 MCP 服务器：宿主（MCPHost）聚合工具清单，再把调用路由回去。
+# 同一个服务器既能被助手进程内用（inproc，零进程开销），
+# 也能挂到 stdio 给别的 agent（Copilot / Claude Code）当 MCP 服务器用：
+#     python -m voice_loop.mcp.serve skills
+#     python main.py mcp                 # 看当前有哪些工具、来自哪个服务器
+#     python main.py mcp --call list_schedule --args "{\"text\": \"下周\"}"
+[mcp]
+enabled = true
+
+# 助手自己的核心能力：日程 / 备忘 / 提醒 / 时间（背后还是那套有守卫的 Skills）
+[[mcp.servers]]
+name = "skills"
+transport = "inproc"
+module = "voice_loop.mcp.servers.skills"
+namespace = false              # 工具名保持 list_schedule / add_memo 原样：模型已经认得这 8 个
+timeout = 15
+
+# 想更隔离就把它挪到子进程（每次调用多几毫秒，但服务器崩了不影响助手）：
+# [[mcp.servers]]
+# name = "skills"
+# transport = "stdio"
+# command = ["python", "-m", "voice_loop.mcp.serve", "skills"]
+# cwd = "."
+# env = { PYTHONIOENCODING = "utf-8" }   # 中文走 utf-8，别走 cp936
+# namespace = false
+
+# 接外来的服务器时：名字会自动带 mcp__<服务器>__ 前缀（跟 Claude Code 一致），
+# ★一定要写 tools 白名单★——工具一多，本地小模型就选不准了（实测 8 个是甜点）。
+# [[mcp.servers]]
+# name = "git"
+# transport = "stdio"
+# command = ["python", "-m", "mcp_server_git", "--repository", "D:/local_AI"]
+# tools = ["git_status", "git_log", "git_diff"]     # 留空 = 全部工具都暴露（不推荐）
+# timeout = 20
+
 # ── 交互 ────────────────────────────────────────────────────────────────────
 [chat]
 mode = "vad"                  # vad = 自动断句连续对话 | ptt = 按回车说话
