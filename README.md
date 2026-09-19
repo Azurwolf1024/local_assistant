@@ -122,6 +122,7 @@ flowchart LR
 │  ├─ pipeline.py              # 会话编排（唤醒服务、连续对话、打断、提醒播报）
 │  ├─ wake.py                  # 唤醒词匹配（精确 + 别名 + 模糊）、「没事了」收回唤醒
 │  ├─ skills.py                # 生活技能：时间 / 闹钟 / 备忘 / 日程
+│  ├─ persona.py               # ★角色设定：名字/背景/称呼/风格/示例台词 → system prompt
 │  ├─ tools.py                 # 工具层：技能包成模型能调的工具（现在是 MCP 的一个服务器）
 │  ├─ mcp/                     # ★ 自己搭的 MCP 架构（协议 / 服务器 / 客户端 / 宿主）
 │  │  ├─ protocol.py           #   JSON-RPC 2.0 + MCP 消息形状
@@ -156,6 +157,7 @@ flowchart LR
 │  ├─ eval_router.py           # ★ 模型选工具的准确率（--model 换模型对比）
 │  ├─ test_tools.py            # 工具层自测（--live 走真模型）
 │  ├─ test_mcp.py              # ★ MCP：协议 / 真管道 stdio / 白名单 / 路由 / 接进 pipeline
+│  ├─ test_persona.py          # ★ 角色：结构化人设 / 多角色唤醒归属 / 切换 / 热重载
 │  ├─ test_vision.py           # 看图自测（编图 / 找文件 / 识别）
 │  ├─ test_accel.py            # 加速设备选择（核显 / NPU / 回退）
 │  ├─ test_wake.py             # ★ 唤醒词实测与调优（打印听到的内容 / 自动写 aliases）
@@ -207,11 +209,13 @@ python main.py devices                       # 查看音频设备
 python main.py gpu                           # 看加速器（核显/NPU/CUDA）在用哪个
 python main.py gpu --bench                   # 实测 Whisper CPU vs 核显
 python main.py mcp                           # 看工具层：有哪些工具、来自哪个 MCP 服务器（第 13 节）
+python main.py persona                       # 看角色设定：名字、称呼、各自的唤醒词（第 14 节）
 ```
 
 `listen` 模式下：
 
 - 平时只等唤醒词（默认「凯尔希」），内存只占约 0.9 GB
+- **多角色**：每个角色带自己的唤醒词，喊谁就切到谁（人设 + 应答语，可选声线）——第 14 节
 - 被唤醒才加载 TTS / Whisper / LLM，**3 分钟没指令自动释放回到待唤醒**
 - 唤醒后连续对话不用反复喊（每次说话都会续上 3 分钟）
 - **喊醒了又不想问了，说「没事了」立刻回待唤醒**，不用干等 3 分钟超时（详见下面「收回唤醒」一节）
@@ -1274,3 +1278,75 @@ tools = ["get_volume", "set_volume"]    # 白名单（想全开就留空，但�
 - 自家的能力域 `namespace = false`：名字保持 `list_schedule` / `add_memo` 原样
   （模型已经认得这 8 个，TOOL_HINT 和评估脚本也照旧）。
 - 其它服务器自动加前缀 `mcp__<服务器>__<工具>`（跟 Claude Code 一致），防止撞名。
+
+---
+
+## 14. 角色设定（多角色 + 不同唤醒词）
+
+人设不再是 `config.toml` 里那一大段 `system_prompt`，而是**结构化的角色文件**：
+`data/characters.json`。每个角色一段，写名字、背景、对「我」的称呼、说话风格、示例台词，
+系统提示词由程序按这些字段拼出来（`voice_loop/persona.py`）——**你填字段，不写提示词工程**。
+
+```powershell
+python main.py persona                      # 现在有哪些角色、各自的唤醒词
+python main.py persona --show 阿米娅          # 看这一个角色的所有字段
+python main.py persona --show 阿米娅 --prompt # 看她拼出来的 system prompt（想调措辞时看这个）
+python main.py persona --voices             # 每个角色的声线装没装
+python main.py --character amiya text       # 临时用某个角色（chat / listen / text / ask 都支持）
+```
+
+### 一个角色长什么样
+
+```jsonc
+{
+  "id": "kaltsit",                 // 内部标识（日志、--character 用它）
+  "name": "凯尔希",                 // ★名字★
+  "title": "罗德岛医疗主管",         // 身份，一句话
+  "background": "罗德岛的医疗主管……", // ★背景★：世界观 + 性格由来 + 和「我」的关系
+  "user_title": "博士",             // ★对「我」的称呼★（提示词里统一用它）
+  "wake_words": ["凯尔希"],         // ★唤醒词★：喊谁切谁
+  "aliases": { "凯尔希": ["老猫", "开尔希"] },   // 常被听错的写法
+  "ack": "我在，博士。",             // 被唤醒时的应答（留空则不出声）
+  "style": ["冷静、克制", "事务性内容直接给结论"],  // ★说话风格★，每条一句
+  "rules": ["不知道就直说不知道"],                  // 硬性要求
+  "avoid": ["不要用「作为一个AI」"],                // 明确不要出现什么
+  "lines": [                        // ★示例台词★（场景 → 台词）
+    { "scene": "被唤醒", "text": "我在，博士。" }
+  ],
+  "voice": "",                      // 可选：这个角色用自己的 piper 声线
+  "temperature": 0.0,               // 可选：覆盖全局温度（0 = 用全局）
+  "default": true,                  // 没指定角色时用谁
+  "enabled": true,                  // false 则不参与唤醒（设定还留着）
+  "notes": "给自己看的备注，不进提示词"
+}
+```
+
+### 多角色怎么工作
+
+1. **喊谁切谁**：唤醒词写在各角色的 `wake_words` 里，`WakeWordMatcher` 命中时
+   会告诉上层「是哪位」，服务就切人设（顺带换应答语；角色写了 `voice` 就一起换声线）。
+   默认文件里已经放了两个：喊「凯尔希」是凯尔希，喊「阿米娅」是阿米娅，喊回去就切回来。
+2. **切换会清对话历史**：新角色不继承上一位的口气（否则她会学着凯尔希的简报腔说话）。
+3. **热加载**：改完 `data/characters.json` 保存即生效（几秒内重新读取，不用重启）；
+   加角色、改人设、补别名都算。
+4. **别名跟着角色走**：`aliases` 挂在各角色的主唤醒词下——不同角色相互独立，
+   凯尔希的「老猫」不会把阿米娅叫醒。
+5. **兜底**：角色文件里一个可用角色都没有时会退回 `[llm] system_prompt` 那段
+   （`[persona] enabled = false` 也一样），所以删了文件也不会变成没有性格的机器。
+   没有角色时，唤醒词退回 `data/wakewords.json` 的 `words`/`aliases`。
+
+### 写设定时踩过的坑（实测）
+
+| 现象 | 原因 | 怎么办 |
+| --- | --- | --- |
+| 机器人复读同一句话 | 示例台词里写了「你常问的问题 + 它的完整答案」，场景和用户原话一模一样，小模型就当成查表 | **别把常问问题的完整答案写进 `lines`**；写口吻、称呼习惯、不易撞车的情景 |
+| 用第三人称描述自己（「罗德岛的医疗主管凯尔希正在……」） | 只给 `background` 时，模型把它当百科条目念 | 提示词里已硬性要求「用第一人称、不要自我介绍」；`background` 也尽量用「你/我」写 |
+| 提示词越长越容易走形 | 字段堆太多 | 优先写好 `background` + 3~5 条 `style` + 2~3 条 `lines`，`avoid` 只留真正在意的 |
+
+> `data/characters.json` 里的字段说明（`_字段说明`）就在文件开头，改的时候不用翻文档。
+
+### 想让角色声音也不一样
+
+Piper 的每个声线是一个 onnx 文件。在角色里写 `"voice": "zh_CN-huayan-medium"` 之外的名字，
+把那两个文件（`.onnx` + `.onnx.json`）放进 `models/tts/piper/` 即可；
+**没装的时候只警告、继续用全局声线**（不会把嘴弄哑）。用 `python main.py persona --voices` 看缺哪个。

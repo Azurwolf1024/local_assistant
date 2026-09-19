@@ -49,11 +49,15 @@ def main() -> int:
     ap.add_argument("--real", action="store_true", help="使用真实的 data/ 目录（默认写临时目录）")
     ap.add_argument("--subtitle", action="store_true", help="顺便把字幕也弹出来看看（默认关闭）")
     ap.add_argument("--model", default=None, help="临时换一个模型跑（默认用 config.toml 里的）")
+    ap.add_argument("--character", default=None,
+                    help="用哪个角色（id 或名字，见 python main.py persona）")
     args = ap.parse_args()
 
     settings = load_settings()
     if args.model:
         settings.llm.model = args.model
+    if args.character:
+        settings.persona.default = args.character
     if args.strategy:
         settings.asr.strategy = args.strategy
     # 自测默认不往屏幕上弹字幕，免得刷屏；想看得加 --subtitle
@@ -77,6 +81,9 @@ def main() -> int:
     print("=" * 70)
     print(f" 对话链路自测（{len(prompts)} 轮，{'含语音播报' if loop.tts_enabled else '仅文本'}）")
     print(f" 模型：{settings.llm.model}    think={settings.llm.think}")
+    if loop.character is not None:
+        print(f" 角色：{loop.character.label}   喊「{'/'.join(loop.character.wake_words)}」唤醒"
+              f"   对「我」的称呼：{loop.character.user_title}")
     print(f" 数据目录：{'临时 ' + str(tmp_dir) if tmp_dir else settings.skills.data_dir}")
     print("=" * 70)
 

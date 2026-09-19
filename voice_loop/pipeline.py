@@ -26,6 +26,7 @@ from .audio import BaseSegmenter, MicReader, MicRecorder, Speaker, make_segmente
 from .bargein import BargeInDetector
 from .llm import OllamaClient, OllamaError
 from .mcp import MCPHost
+from .persona import Character, CharacterRegistry, render_system_prompt
 from .scheduler import ReminderScheduler
 from .settings import Settings
 from .skills import Skills
@@ -174,6 +175,21 @@ class VoiceLoop:
         self._wake_path = settings.resolve(settings.wake.file)
         WakeWordMatcher.write_default(self._wake_path)
         self.wake = WakeWordMatcher(self._wake_path)
+        # ★角色设定★：人设与唤醒词都来自 data/characters.json（见 voice_loop/persona.py）
+        self.persona: CharacterRegistry | None = None
+        self.character: Character | None = None
+        if getattr(settings, "persona", None) is not None and settings.persona.enabled:
+            try:
+                self.persona = CharacterRegistry(settings.resolve(settings.persona.file))
+                self.wake.set_characters(self.persona.all(only_enabled=True))
+                self._apply_character(
+                    self.persona.get(settings.persona.default) or self.persona.default(),
+                    reason="启动",
+                )
+            except Exception as exc:  # noqa: BLE001 - 角色文件坏了也要能说话
+                self.log.warning(f"角色设定加载失败（改用 config.toml 的 system_prompt）：{exc}")
+                self.persona = None
+                self.character = None
         self._idle_timeout = float(
             self.wake.settings.idle_timeout or settings.wake.idle_timeout
         )
@@ -596,13 +612,85 @@ class VoiceLoop:
             self._stop.set()
             return True
         words = self.wake.settings.words
-        print(f"\n[待唤醒] 请说「{words[0] if words else ''}」…\n", flush=True)
+        print(f"\n[待唤醒] 请说「{self._wake_hint()}」…\n", flush=True)
         return False
 
     def _idle_desc(self) -> str:
         if self._idle_timeout >= 120:
             return f"空闲 {self._idle_timeout / 60:.0f} 分钟"
         return f"空闲 {self._idle_timeout:.0f} 秒"
+
+    # ======================================================================
+    # 角色（人设 + 唤醒词归属）：见 voice_loop/persona.py
+    # ======================================================================
+    def _apply_character(self, char: Character | None, reason: str = "") -> None:
+        """把角色装上：人设（system prompt）、应答语、声线、温度。
+
+        ``char=None`` 表示回退到 config.toml 里那段 system_prompt（老行为）。
+        """
+        self.character = char
+        if char is None:
+            self.llm.system_prompt = None
+            self.llm.temperature = None
+            return
+        extra = str(getattr(self.settings.persona, "extra_prompt", "") or "")
+        self.llm.system_prompt = render_system_prompt(char, extra)
+        self.llm.temperature = float(char.temperature) if char.temperature else None
+        # 唤醒应答语跟着角色走（wakewords.json 里的 ack 只在没有角色时生效）
+        if char.ack:
+            self.wake.settings.ack = char.ack
+        self._apply_voice(char, reason)
+        self.log.info(f"[角色] 生效：{char.label}（{reason or '设定'}）")
+
+    def _apply_voice(self, char: Character, reason: str = "") -> None:
+        """角色自带声线时换声线。
+
+        Piper 的声线是绑在 onnx 模型上的，换就必须卸载重载（下次说话时自然加载）。
+        声线文件不存在就只警告、继续用当前的——**绝不能因为换声线把嘴弄哑了**。
+        """
+        want = (char.voice or "").strip()
+        tts_cfg = self.settings.tts
+        current = str(getattr(tts_cfg, "voice", "") or "")
+        if not want or want == current:
+            return
+        model = self.settings.resolve(f"models/tts/piper/{want}.onnx")
+        if not model.exists():
+            self.log.warning(f"角色 {char.name} 想用声线 {want}，但没装（继续用 {current}）")
+            print(
+                f"[角色] 「{want}」声线没装，继续用 {current}"
+                f"（想用就把 {want}.onnx 与 .onnx.json 放进 models/tts/piper/）",
+                flush=True,
+            )
+            return
+        tts_cfg.voice = want
+        tts_cfg.model = f"models/tts/piper/{want}.onnx"
+        tts_cfg.config = f"models/tts/piper/{want}.onnx.json"
+        unload = getattr(self.tts, "unload", None)
+        if callable(unload):
+            unload()
+        self.log.info(f"[角色] 声线：{current} → {want}（{reason or '切换'}）")
+
+    def _switch_character(self, cid: str) -> Character | None:
+        """唤醒词点了谁的名就切到谁（人设 + 应答语 + 声线）。"""
+        if self.persona is None or not cid:
+            return None
+        char = self.persona.get(cid)
+        if char is None:
+            return None
+        if self.character is not None and char.id == self.character.id:
+            return char
+        old = self.character.name if self.character else "（无角色）"
+        self._apply_character(char, reason="切换")
+        # 换人不继承上一位的口气：清掉对话历史，否则她会学着上一个人的语气说话
+        self.llm.reset()
+        words = "、".join(char.wake_words) or char.name
+        print(f"\n[角色] {old} → {char.label}（喊「{words}」切过来，喊别人的名字就切走）", flush=True)
+        return char
+
+    def _wake_hint(self) -> str:
+        """提示该喊什么：多角色时把所有角色的主唤醒词列出来。"""
+        words = [w for w in (self.wake.character_words or self.wake.settings.words) if w]
+        return "」或「".join(words[:3]) if words else "唤醒词"
 
     def _check_stop_file(self) -> bool:
         """后台运行时用停止文件优雅退出（比 taskkill 干净）。"""
@@ -971,7 +1059,11 @@ class VoiceLoop:
         self._watcher.start()
 
     def use_wake_file(self, path: str | Path) -> None:
-        """切换唤醒词文件（供 listen --wake-file 使用）。"""
+        """切换唤醒词文件（供 listen --wake-file 使用）。
+
+        这是「用这个文件里的唤醒词」的意思，所以**故意不再叠加角色文件的唤醒词**：
+        测试和调唤醒词时要的是这个文件说了算。
+        """
         self._wake_path = Path(path)
         self.wake.path = self._wake_path
         self.wake.load(force=True)
@@ -1223,7 +1315,10 @@ class VoiceLoop:
             f"  LLM : {self.settings.llm.model} @ {self.settings.llm.host}\n"
             f"  TTS : piper / {self.settings.tts.voice}\n"
             f"  唤醒词: {words}    (可直接编辑 {self._wake_path}，保存即生效)\n"
-            f"  空闲回收: {self._idle_desc()}"
+            + (
+                f"  角色  : {self.persona.stats()}\n" if self.persona is not None else ""
+            )
+            + f"  空闲回收: {self._idle_desc()}"
             + ("（则释放模型回到待唤醒）" if self.lazy else "（则结束服务）")
             + "\n"
             + (
@@ -1255,7 +1350,7 @@ class VoiceLoop:
         if not self.lazy:
             # 不分级时模型已经加载好了，直接算活跃
             self._active = True
-        print(f"\n[待唤醒] 请说「{wall[0] if wall else '凯尔希'}」…\n")
+        print(f"\n[待唤醒] 请说「{self._wake_hint()}」…\n")
 
         try:
             while not self._stop.is_set():
@@ -1268,6 +1363,12 @@ class VoiceLoop:
                         )
                         self.session.timeout = self._idle_timeout
                         print(f"[唤醒词已更新] {'、'.join(self.wake.settings.words)}\n")
+                    # 角色文件改了（改了人设/加了角色/补了别名）→ 重新装上
+                    if self.persona is not None and self.persona.maybe_reload():
+                        self.wake.set_characters(self.persona.all(only_enabled=True))
+                        keep = self.persona.get(self.character.id) if self.character else None
+                        self._apply_character(keep or self.persona.default(), reason="热重载")
+                        print(f"[角色设定已更新] {self.persona.stats()}\n")
                     # 空闲超时 -> 收回资源
                     if self._active and not self.session.active:
                         if self._deactivate():
@@ -1306,6 +1407,8 @@ class VoiceLoop:
                         continue
 
                     mark = "（模糊匹配）" if hit.fuzzy else ""
+                    # ★多角色★：谁的名字被喊了就用谁的人设（必要时连声线一起换）
+                    self._switch_character(hit.character)
                     print(f"\n[已唤醒]{mark} {text}")
                     self._last_miss = ""
                     self.session.open()

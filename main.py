@@ -88,6 +88,8 @@ def apply_overrides(settings: Settings, args: argparse.Namespace) -> Settings:
         settings.asr.whisper_device = args.device
     if getattr(args, "llm", None):
         settings.llm.model = args.llm
+    if getattr(args, "character", None):
+        settings.persona.default = args.character
     if getattr(args, "log_level", None):
         settings.app.log_level = args.log_level
     return settings
@@ -680,6 +682,92 @@ def cmd_devices(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_persona(settings: Settings, args: argparse.Namespace) -> int:
+    """看 / 查角色设定（名字、背景、对「我」的称呼、示例台词）。
+
+    用法：
+        python main.py persona                    列出所有角色（含各自的唤醒词）
+        python main.py persona --show 阿米娅        看这一个角色的字段
+        python main.py persona --show 阿米娅 --prompt   看她拼出来的 system prompt
+        python main.py persona --voices            看每个角色的声线装没装
+    """
+    from voice_loop.persona import CharacterRegistry, render_system_prompt
+
+    path = settings.resolve(settings.persona.file)
+    reg = CharacterRegistry(path)
+    extra = str(settings.persona.extra_prompt or "")
+
+    print("=" * 72)
+    print(f" 角色设定：{path}")
+    print("=" * 72)
+    if not reg.characters:
+        print("  （文件里一个角色都没有；删掉这个文件会用默认模板重建）")
+        return 0
+
+    if args.voices:
+        tts_dir = settings.resolve("models/tts/piper")
+        have = sorted(p.stem for p in tts_dir.glob("*.onnx")) if tts_dir.exists() else []
+        print(f"  已装的 piper 声线：{'、'.join(have) or '（一个都没有）'}")
+        print(f"  全局默认（[tts] voice）：{settings.tts.voice}")
+        for char in reg.all():
+            want = char.voice or ""
+            mark = "✓" if (want in have or not want) else "×"
+            print(f"   {mark} {char.name:8s} voice={want or '（用全局）'}")
+        return 0
+
+    if args.show:
+        char = reg.get(args.show)
+        if char is None:
+            print(f"  [错误] 没有这个角色：{args.show}")
+            print(f"  有的：{'、'.join(c.name for c in reg.all())}")
+            return 2
+        if args.prompt:
+            print(render_system_prompt(char, extra))
+            return 0
+        print(f"  id          : {char.id}")
+        print(f"  名字        : {char.name}")
+        print(f"  身份        : {char.title or '（空）'}")
+        print(f"  对「我」称呼 : {char.user_title}")
+        print(f"  唤醒词      : {'、'.join(char.wake_words) or '（没写，只能在会话里用）'}")
+        print(f"  应答语      : {char.ack or '（不出声）'}")
+        print(f"  声线/温度   : {char.voice or '（用全局）'} / {char.temperature or '（用全局）'}")
+        print(f"  默认角色    : {'是' if char.default else '否'}   启用：{'是' if char.enabled else '否'}")
+        print(f"  背景        : {char.background or '（空）'}")
+        print(f"  别名        : {sum(len(v) for v in char.aliases.values())} 条")
+        for label, items in (("说话风格", char.style), ("必须做到", char.rules),
+                             ("不要出现", char.avoid)):
+            print(f"  {label}    :")
+            for it in items or ["（空）"]:
+                print(f"      · {it}")
+        print("  示例台词    :")
+        for line in char.lines or [{"scene": "（空）", "text": ""}]:
+            print(f"      · {line['scene']} → {line['text']}")
+        if char.notes:
+            print(f"  备注        : {char.notes}")
+        print("\n  想看拼出来的 system prompt："
+              f"python main.py persona --show {char.id} --prompt")
+        return 0
+
+    print(f"  {reg.stats()}")
+    default = reg.default()
+    for char in reg.all():
+        flags = []
+        if default is not None and char.id == default.id:
+            flags.append("默认")
+        if not char.enabled:
+            flags.append("已停用")
+        mark = f"  [{('、'.join(flags))}]" if flags else ""
+        words = "、".join(char.wake_words) or "（无唤醒词）"
+        print(f"\n  · {char.label}{mark}")
+        print(f"      对「我」的称呼：{char.user_title}   应答：{char.ack or '（不出声）'}")
+        print(f"      唤醒词：{words}")
+        print(f"      别名：{sum(len(v) for v in char.aliases.values())} 条    "
+              f"风格 {len(char.style)} 条 / 示例 {len(char.lines)} 条")
+    print("\n  提示：唤醒词写在各角色的 wake_words 里，喊谁就切谁；"
+          "改完保存即生效，不用重启。")
+    return 0
+
+
 def cmd_mcp(settings: Settings, args: argparse.Namespace) -> int:
     """自己的 MCP 工具层：看 / 调 / 挂起来给别人用。
 
@@ -1054,6 +1142,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("-c", "--config", default=None, help="配置文件路径（默认 config.toml）")
     ap.add_argument("--log-level", choices=["debug", "info", "warning"], default=None)
     ap.add_argument("--log-file", default=None, help="把日志与输出同时写进文件（后台运行需要）")
+    ap.add_argument("--character", default=None,
+                    help="临时指定角色（id 或名字，见 python main.py persona）")
     sub = ap.add_subparsers(dest="command")
 
     p = sub.add_parser("chat", help="语音对话")
@@ -1061,6 +1151,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--strategy", choices=["sensevoice", "whisper", "hybrid"], default=None)
     p.add_argument("--device", default=None, help="Whisper 设备：CPU / GPU / AUTO")
     p.add_argument("--llm", default=None, help="覆盖 Ollama 模型名")
+    p.add_argument("--character", default=None, help="用哪个角色（默认用角色文件里的默认角色）")
     p.set_defaults(func=cmd_chat)
 
     p = sub.add_parser("listen", help="唤醒词服务（后台跑闹钟/日程提醒）")
@@ -1071,6 +1162,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--strategy", choices=["sensevoice", "whisper", "hybrid"], default=None)
     p.add_argument("--device", default=None)
     p.add_argument("--llm", default=None)
+    p.add_argument("--character", default=None, help="默认角色（唤醒词喊了别人仍然会切过去）")
     p.set_defaults(func=cmd_listen)
 
     p = sub.add_parser("stop", help="停止后台运行的唤醒服务")
@@ -1080,6 +1172,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-tts", action="store_true", help="只输出文字")
     p.add_argument("--strategy", choices=["sensevoice", "whisper", "hybrid"], default=None)
     p.add_argument("--llm", default=None)
+    p.add_argument("--character", default=None, help="用哪个角色")
     p.set_defaults(func=cmd_text)
 
     p = sub.add_parser("skills", help="查看/测试生活技能（时间、闹钟、备忘、日程）")
@@ -1091,6 +1184,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("text", help="要提问的内容")
     p.add_argument("--no-tts", action="store_true", help="只输出文字不合成语音")
     p.add_argument("--llm", default=None)
+    p.add_argument("--character", default=None, help="用哪个角色")
     p.set_defaults(func=cmd_ask)
 
     p = sub.add_parser("see", help="看图：摄像头 / 屏幕 / 剪贴板 / 文件")
@@ -1131,6 +1225,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("selftest", help="全链路自检")
     p.add_argument("--no-play", action="store_true")
     p.set_defaults(func=cmd_selftest)
+
+    p = sub.add_parser("persona", help="看角色设定（名字/背景/称呼/示例台词）")
+    p.add_argument("--show", default=None, help="看某一个角色（id 或名字）")
+    p.add_argument("--prompt", action="store_true", help="配合 --show：打印拼出来的 system prompt")
+    p.add_argument("--voices", action="store_true", help="看每个角色的声线装没装")
+    p.set_defaults(func=cmd_persona)
 
     p = sub.add_parser("mcp", help="自己的 MCP 工具层：看 / 调 / 挂到 stdio 给别人用")
     p.add_argument("--call", default=None, help="调一个工具，例如 --call list_schedule")
