@@ -33,6 +33,20 @@ class OllamaClient:
             ) from exc
         return [m.get("name", "") for m in r.json().get("models", [])]
 
+    def _think_param(self) -> bool | None:
+        """把 ``[llm] think`` 翻成请求参数；None = 不传这个字段。
+
+        为什么要它：qwen3.5 这类带 thinking 的模型**默认会先想一两千字再开口**，
+        实测同一次回答 16.8s → 7.2s（关掉思考后），而语音对话里这几秒用户只能干等。
+        不支持的模型（qwen2.5 等）收到这个字段不会报错，实测会被忽略。
+        """
+        mode = str(getattr(self.cfg, "think", "off") or "off").strip().lower()
+        if mode in ("off", "false", "0", "no"):
+            return False
+        if mode in ("on", "true", "1", "yes"):
+            return True
+        return None
+
     def ensure_model(self) -> None:
         models = self.list_models()
         want = self.cfg.model
@@ -52,8 +66,8 @@ class OllamaClient:
     def resolve_model(self, want: str) -> str:
         """把配置里的模型名换成真正存在的那个（宽松匹配），不存在就报清楚怎么装。
 
-        看图专用：视觉模型一般另装一个（qwen2.5vl 等），
-        用纯文本模型看图只会得到一堆编造的内容，所以这里宁可报错。
+        看图专用：视觉模型可以是另一个（qwen2.5vl 等），也可以是自带视觉的
+        qwen3.5:4b；用纯文本模型看图只会得到一堆编造的内容，所以这里宁可报错。
         """
         want = (want or "").strip() or self.cfg.model
         models = self.list_models()
@@ -80,6 +94,9 @@ class OllamaClient:
             "keep_alive": self.cfg.keep_alive,
             "options": {"num_predict": 1, "num_ctx": self.cfg.num_ctx, **llm_options(self.cfg)},
         }
+        think = self._think_param()
+        if think is not None:
+            payload["think"] = think        # 预热也别让它先思考，否则白烧 token
         r = requests.post(f"{self.base}/api/chat", json=payload, timeout=180)
         r.raise_for_status()
         return time.perf_counter() - t0
@@ -198,6 +215,9 @@ class OllamaClient:
         }
         if tools:
             payload["tools"] = tools
+        think = self._think_param()
+        if think is not None:
+            payload["think"] = think
         try:
             with requests.post(
                 f"{self.base}/api/chat", json=payload, stream=True, timeout=(5, 300)

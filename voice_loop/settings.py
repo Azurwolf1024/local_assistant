@@ -59,7 +59,9 @@ class AsrConfig:
 @dataclass
 class LlmConfig:
     host: str = "http://127.0.0.1:11434"
-    model: str = "qwen2.5:7b"
+    # qwen3.5 是多模态（自带视觉 + tools），一个模型同时干文本和看图：
+    # 比 qwen2.5:7b + qwen2.5vl:3b 少 4.5 GB，生成还快 40%（见 README 第 7 节）
+    model: str = "qwen3.5:4b"
     temperature: float = 0.7
     top_p: float = 0.9
     num_ctx: int = 4096
@@ -78,6 +80,12 @@ class LlmConfig:
     # tools = 给（默认，实测闲聊不会多绕一圈，只有真调工具才多一轮）
     # chat  = 不给，保持老的纯聊天行为
     router: str = "tools"
+    # 思考模式（新一代模型带 thinking）：off / on / auto
+    #   off  = 不发 think 字段（语音对话必须关：开着会先默默想一两千字，
+    #          实测同一次回答总耗时 16.8s → 7.2s，而这十几秒用户只能干等）
+    #   on   = 显式打开（已确认模型支持时）
+    #   auto = 完全不发这个字段，交给 Ollama / 模型自己的默认
+    think: str = "off"
 
 
 @dataclass
@@ -85,7 +93,7 @@ class VisionConfig:
     """看图：摄像头 / 屏幕截图 / 剪贴板 / 指定文件。"""
 
     enabled: bool = True
-    model: str = "qwen2.5vl:7b"      # 看图用的模型，需要 `ollama pull qwen2.5vl:7b`
+    model: str = "qwen3.5:4b"       # 看图用的模型；qwen3.5 自带视觉，所以跟 [llm] 同一个
     default_source: str = "camera"   # 只说「这是什么」没提来源时看哪里：camera / screen
     camera_index: int = 0
     warmup_frames: int = 4           # 丢掉前几帧（自动曝光还没稳，画面偏黑/偏黄）

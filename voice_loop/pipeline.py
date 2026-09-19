@@ -561,7 +561,9 @@ class VoiceLoop:
                     freed.append("TTS")
             if self.settings.wake.unload_llm and self.llm.release():
                 freed.append(f"Ollama/{self.settings.llm.model}")
-            # 视觉模型（qwen2.5vl 之类）一个就 6 GB 上下，看完图就该让它走
+            # 视觉模型：现在默认跟 [llm] 同一个（qwen3.5:4b 自带视觉）；
+            # 如果配成单独的 VL 模型（好几 GB），看完图就该让它走。
+            # 名字相同时 release() 会被下面的去重跳过，不会白调一次。
             vmodel = str(self.settings.vision.model or "")
             if (
                 self.settings.wake.unload_llm
