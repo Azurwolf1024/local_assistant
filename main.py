@@ -687,25 +687,39 @@ def cmd_devices(settings: Settings, args: argparse.Namespace) -> int:
 
 
 def cmd_persona(settings: Settings, args: argparse.Namespace) -> int:
-    """看 / 查角色设定（名字、背景、对「我」的称呼、示例台词）。
+    """看 / 查角色设定（索引 + 独立人格文件）。
 
     用法：
-        python main.py persona                    列出所有角色（含各自的唤醒词）
+        python main.py persona                    列出所有**已挂上**的角色（含唤醒词与文件）
         python main.py persona --show 阿米娅        看这一个角色的字段
         python main.py persona --show 阿米娅 --prompt   看她拼出来的 system prompt
         python main.py persona --voices            看每个角色的声线装没装
+        python main.py persona --split             把旧版内联的角色拆成独立人格文件
     """
-    from voice_loop.persona import CharacterRegistry, render_system_prompt
+    from voice_loop.persona import PERSONA_DIR, CharacterRegistry, render_system_prompt
 
     path = settings.resolve(settings.persona.file)
     reg = CharacterRegistry(path)
     extra = str(settings.persona.extra_prompt or "")
 
+    if args.split:
+        created = reg.split_inline()
+        if not created:
+            print(f"  {path} 里没有需要拆的角色（已经是「索引 + 人格文件」了）")
+            return 0
+        print(f"  已拆出 {len(created)} 个人格文件：")
+        for f in created:
+            print(f"    · {f}")
+        print(f"  索引已改成指向它们：{path}")
+        print(f"  想再挂一个：把人设放进 {path.parent / PERSONA_DIR}，"
+              "再在索引的 characters 里加一行")
+        return 0
+
     print("=" * 72)
-    print(f" 角色设定：{path}")
+    print(f" 角色索引：{path}")
     print("=" * 72)
     if not reg.characters:
-        print("  （文件里一个角色都没有；删掉这个文件会用默认模板重建）")
+        print("  （索引里没有可用角色；删掉索引文件会用默认模板重建）")
         return 0
 
     if args.voices:
@@ -730,6 +744,7 @@ def cmd_persona(settings: Settings, args: argparse.Namespace) -> int:
             return 0
         print(f"  id          : {char.id}")
         print(f"  名字        : {char.name}")
+        print(f"  人格文件    : {reg.files.get(char.id) or '（写在索引里）'}")
         print(f"  身份        : {char.title or '（空）'}")
         print(f"  对「我」称呼 : {char.user_title}")
         print(f"  唤醒词      : {'、'.join(char.wake_words) or '（没写，只能在会话里用）'}")
@@ -767,6 +782,15 @@ def cmd_persona(settings: Settings, args: argparse.Namespace) -> int:
         print(f"      唤醒词：{words}")
         print(f"      别名：{sum(len(v) for v in char.aliases.values())} 条    "
               f"风格 {len(char.style)} 条 / 示例 {len(char.lines)} 条")
+        f = reg.files.get(char.id)
+        print(f"      人格文件：{f if f else '（写在索引里，建议 --split 拆出去）'}")
+    if reg.orphans:
+        print(f"\n  库里还有 {len(reg.orphans)} 个人格文件没挂上（不会被唤醒）：")
+        for f in reg.orphans:
+            print(f"      · {f}")
+        print(f"  想让她上线：在 {path.name} 的 characters 里加一行"
+              f"（{{\"id\": \"{reg.orphans[0].stem}\", \"file\": \"{PERSONA_DIR}/"
+              f"{reg.orphans[0].name}\"}}）")
     print("\n  提示：唤醒词写在各角色的 wake_words 里，喊谁就切谁；"
           "改完保存即生效，不用重启。")
     return 0
@@ -1234,6 +1258,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--show", default=None, help="看某一个角色（id 或名字）")
     p.add_argument("--prompt", action="store_true", help="配合 --show：打印拼出来的 system prompt")
     p.add_argument("--voices", action="store_true", help="看每个角色的声线装没装")
+    p.add_argument("--split", action="store_true",
+                   help="把索引里内联的角色拆成独立人格文件（旧版文件迁移用）")
     p.set_defaults(func=cmd_persona)
 
     p = sub.add_parser("mcp", help="自己的 MCP 工具层：看 / 调 / 挂到 stdio 给别人用")

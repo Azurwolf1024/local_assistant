@@ -270,6 +270,105 @@ def test_default_file() -> None:
         check("模板里默认角色只有一个", sum(1 for c in reg.all() if c.default) == 1)
 
 
+def test_split_layout() -> None:
+    """索引 + 独立人格文件：挂谁算谁、没挂的不会被唤醒、改文件即时生效。"""
+    print("\n[6] 索引 + 独立人格文件（一个角色一个文件）")
+    from voice_loop.persona import DEFAULT_INDEX, PERSONA_DIR
+
+    with tempfile.TemporaryDirectory(prefix="voiceloop_split_") as d:
+        base = Path(d)
+        personas = base / PERSONA_DIR
+        personas.mkdir(parents=True)
+        # 库里的三个人格：a、b 挂上，c 放着不挂
+        (personas / "a.json").write_text(json.dumps({
+            "id": "a", "name": "甲", "wake_words": ["甲甲"], "ack": "第一版应答",
+            "user_title": "您", "background": "甲。",
+        }, ensure_ascii=False), encoding="utf-8")
+        (personas / "b.json").write_text(json.dumps({
+            "id": "b", "name": "乙", "wake_words": ["乙乙"], "background": "乙。",
+        }, ensure_ascii=False), encoding="utf-8")
+        (personas / "c.json").write_text(json.dumps({
+            "id": "c", "name": "丙", "wake_words": ["丙丙"], "background": "丙。",
+        }, ensure_ascii=False), encoding="utf-8")
+        index = base / "characters.json"
+        index.write_text(json.dumps({
+            "default": "b",
+            "characters": [
+                {"id": "a", "file": f"{PERSONA_DIR}/a.json"},
+                f"{PERSONA_DIR}/b.json",                      # 简写：只给路径
+            ],
+        }, ensure_ascii=False), encoding="utf-8")
+
+        reg = CharacterRegistry(index)
+        ids = [c.id for c in reg.all()]
+        check("只加载索引里挂上的两个", ids == ["a", "b"], str(ids))
+        check("id 可以省略（用文件名）", (reg.get("b") or Character("", "")).id == "b")
+        check("记下了各自的文件", sorted(reg.files) == ["a", "b"], str(sorted(reg.files)))
+        check("没挂上的记成「库里另有」", [p.name for p in reg.orphans] == ["c.json"],
+              str([p.name for p in reg.orphans]))
+        check("stats 里说清谁没挂上", "c" in reg.stats(), reg.stats())
+        check("索引里的 default 生效", (reg.default() or Character("", "")).id == "b")
+        check("没挂上的不会被唤醒",
+              set(reg.wake_map()) == {"甲甲", "乙乙"}, str(sorted(reg.wake_map())))
+
+        # 人格文件改了 → 热重载（索引没动）
+        time.sleep(0.02)
+        (personas / "a.json").write_text(json.dumps({
+            "id": "a", "name": "甲", "wake_words": ["甲甲"], "ack": "第二版应答",
+            "user_title": "您", "background": "甲。",
+        }, ensure_ascii=False), encoding="utf-8")
+        check("人格文件改动会被发现", reg.maybe_reload())
+        check("改动即时生效（应答语变了）", (reg.get("a") or Character("", "")).ack == "第二版应答",
+              (reg.get("a") or Character("", "")).ack)
+
+        # 索引里停用某位：人格文件不动
+        time.sleep(0.02)
+        data = json.loads(index.read_text(encoding="utf-8"))
+        data["characters"][0]["enabled"] = False
+        index.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        reg.maybe_reload()
+        stopped = reg.get("a")
+        check("索引里 enabled=false 能停用（人格文件没动）",
+              stopped is not None and not stopped.enabled and "甲甲" not in reg.wake_map(),
+              f"enabled={stopped.enabled if stopped else None}")
+
+        # 少了人格文件 / 文件坏了：只跳这一个，别把整件事弄垮
+        (personas / "broken.json").write_text("{ 这不是 json", encoding="utf-8")
+        data["characters"] = [
+            {"id": "a", "file": f"{PERSONA_DIR}/a.json"},
+            {"id": "gone", "file": f"{PERSONA_DIR}/missing.json"},
+            {"id": "broken", "file": f"{PERSONA_DIR}/broken.json"},
+        ]
+        index.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        reg.reload()
+        left = [c.id for c in reg.all()]
+        check("坏掉的/找不到的只跳过自己", left == ["a"], str(left))
+        check("警告里说明白是哪个文件", any("missing.json" in w for w in reg.warnings),
+              " / ".join(reg.warnings))
+
+        # split_inline：旧版（角色写死在索引里）能一键拆出去
+        legacy = base / "legacy.json"
+        legacy.write_text(json.dumps({
+            "characters": [{"id": "old", "name": "老", "wake_words": ["老老"],
+                            "background": "老。", "default": True}],
+        }, ensure_ascii=False), encoding="utf-8")
+        reg2 = CharacterRegistry(legacy)
+        old = reg2.get("old")
+        check("旧版内联写法还能读（会给个迁移提示）",
+              old is not None and old.name == "老" and any("--split" in w for w in reg2.warnings))
+        created = reg2.split_inline()
+        check("split 拆出人格文件", [p.name for p in created] == ["old.json"],
+              str([p.name for p in created]))
+        check("拆完还能读到同样的人", (reg2.get("old") or Character("", "")).name == "老")
+        check("拆完索引指向文件", str(reg2.files.get("old", "")).endswith("old.json"),
+              str(reg2.files.get("old")))
+        again = reg2.split_inline()
+        check("再拆一次不会重复写", again == [], str([p.name for p in again]))
+        check("默认索引模板自带两个人格引用",
+              [e["id"] for e in DEFAULT_INDEX["characters"]] == ["kaltsit", "amiya"],
+              str([e["id"] for e in DEFAULT_INDEX["characters"]]))
+
+
 def main() -> int:
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -286,6 +385,7 @@ def main() -> int:
         test_wake_attribution(tmp)
         test_pipeline(tmp)
         test_default_file()
+        test_split_layout()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

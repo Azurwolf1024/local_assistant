@@ -160,7 +160,9 @@ flowchart LR
 ├─ main.py                     # 入口：listen / chat / text / ask / skills / asr / tts / selftest
 ├─ config.toml                 # 全部可调参数
 ├─ data/                       # ← 可以直接用编辑器改
-│  ├─ wakewords.json           #   唤醒词
+│  ├─ characters.json          #   ★角色索引★：挂上谁（= 谁可被唤醒）+ 默认角色
+│  ├─ personas/                #   ★独立人格文件★：一个角色一个 json（没挂上的不会被唤醒）
+│  ├─ wakewords.json           #   唤醒词调参（唤醒词本身在人格文件里）
 │  ├─ alarms.json              #   闹钟 / 定时提醒
 │  ├─ memos.json               #   备忘
 │  └─ schedule.json            #   课程表 / 会议
@@ -1368,23 +1370,53 @@ tools = ["get_volume", "set_volume"]    # 白名单（想全开就留空，但�
 
 ## 14. 角色设定（多角色 + 不同唤醒词）
 
-人设不再是 `config.toml` 里那一大段 `system_prompt`，而是**结构化的角色文件**：
-`data/characters.json`。每个角色一段，写名字、背景、对「我」的称呼、说话风格、示例台词，
-系统提示词由程序按这些字段拼出来（`voice_loop/persona.py`）——**你填字段，不写提示词工程**。
+人设不再是 `config.toml` 里那一大段 `system_prompt`，而是**索引 + 独立人格文件**两层：
+
+```
+data/characters.json          ← 索引：只写「加载哪些人格」+ 默认是谁（= 谁可被唤醒）
+data/personas/kaltsit.json    ← 一个人格一个文件（名字/背景/称呼/风格/示例台词/唤醒词…）
+data/personas/amiya.json
+data/personas/别人.json        ← 放着不挂：不会被加载，也不会被唤醒
+```
+
+**为什么要拆**：以前所有角色挤在一个文件里，想试第三个角色的设定就得先写进去 ——
+而写进去就等于「挂上了」（会被唤醒词命中、会切人设）。现在**设一个角色 ≠ 挂上她**：
+人格文件随手写，索引里加一行才上线；临时停用也只改索引一行，人格文件不动。
+系统提示词仍由程序按字段拼（`voice_loop/persona.py`）——**你填字段，不写提示词工程**。
 
 ```powershell
-python main.py persona                      # 现在有哪些角色、各自的唤醒词
+python main.py persona                      # 现在挂着谁（含唤醒词、人格文件路径）
 python main.py persona --show 阿米娅          # 看这一个角色的所有字段
 python main.py persona --show 阿米娅 --prompt # 看她拼出来的 system prompt（想调措辞时看这个）
 python main.py persona --voices             # 每个角色的声线装没装
+python main.py persona --split              # 旧版（角色全写在一个文件里）→ 一键拆成独立文件
 python main.py --character amiya text       # 临时用某个角色（chat / listen / text / ask 都支持）
 ```
 
-### 一个角色长什么样
+### 索引长什么样
 
 ```jsonc
+// data/characters.json
 {
-  "id": "kaltsit",                 // 内部标识（日志、--character 用它）
+  "default": "kaltsit",                 // 没指定角色时用谁（也可以写在各人格文件里，索引优先）
+  "characters": [
+    { "id": "kaltsit", "file": "personas/kaltsit.json" },   // 挂上 = 可以被「凯尔希」唤醒
+    { "id": "amiya",   "file": "personas/amiya.json", "enabled": false },  // 临时停用
+    "personas/lucy.json"                // 简写：只给路径也行
+  ]
+}
+```
+
+`file` 相对索引所在目录（也可以写绝对路径）；`id` 可省略（默认用文件名）。
+`personas/` 里**没被索引引用**的文件会出现在 `python main.py persona` 的
+「库里另有 … 没挂上」那一行——想让她上线，加一行就行。
+
+### 一个人格文件长什么样
+
+```jsonc
+// data/personas/kaltsit.json
+{
+  "id": "kaltsit",                 // 可省略（用文件名）
   "name": "凯尔希",                 // ★名字★
   "title": "罗德岛医疗主管",         // 身份，一句话
   "background": "罗德岛的医疗主管……", // ★背景★：世界观 + 性格由来 + 和「我」的关系
@@ -1400,25 +1432,24 @@ python main.py --character amiya text       # 临时用某个角色（chat / lis
   ],
   "voice": "",                      // 可选：这个角色用自己的 piper 声线
   "temperature": 0.0,               // 可选：覆盖全局温度（0 = 用全局）
-  "default": true,                  // 没指定角色时用谁
-  "enabled": true,                  // false 则不参与唤醒（设定还留着）
+  "enabled": true,                  // 可选：false 则不参与唤醒（索引里写也一样）
   "notes": "给自己看的备注，不进提示词"
 }
 ```
 
 ### 多角色怎么工作
 
-1. **喊谁切谁**：唤醒词写在各角色的 `wake_words` 里，`WakeWordMatcher` 命中时
-   会告诉上层「是哪位」，服务就切人设（顺带换应答语；角色写了 `voice` 就一起换声线）。
-   默认文件里已经放了两个：喊「凯尔希」是凯尔希，喊「阿米娅」是阿米娅，喊回去就切回来。
+1. **喊谁切谁**：唤醒词写在各人格文件的 `wake_words` 里，`WakeWordMatcher` 命中时
+   会告诉上层「是哪位」，服务就切人设（顺带换应答语；写了 `voice` 就一起换声线）。
+   默认挂着两个：喊「凯尔希」是凯尔希，喊「阿米娅」是阿米娅，喊回去就切回来。
 2. **切换会清对话历史**：新角色不继承上一位的口气（否则她会学着凯尔希的简报腔说话）。
-3. **热加载**：改完 `data/characters.json` 保存即生效（几秒内重新读取，不用重启）；
-   加角色、改人设、补别名都算。
+3. **热加载**：索引**和人格文件**的改动都会被监听到（几秒内生效，不用重启）；
+   改人设、补别名、加角色、临时停用都算。
 4. **别名跟着角色走**：`aliases` 挂在各角色的主唤醒词下——不同角色相互独立，
    凯尔希的「老猫」不会把阿米娅叫醒。
-5. **兜底**：角色文件里一个可用角色都没有时会退回 `[llm] system_prompt` 那段
-   （`[persona] enabled = false` 也一样），所以删了文件也不会变成没有性格的机器。
-   没有角色时，唤醒词退回 `data/wakewords.json` 的 `words`/`aliases`。
+5. **容错**：某个人格文件找不到或写坏了，只跳过她一个（日志会说是哪个文件），
+   其余角色照常；索引里一个可用角色都没有时才退回 `[llm] system_prompt` 那段
+   （`[persona] enabled = false` 也一样）。没有角色时，唤醒词退回 `data/wakewords.json`。
 
 ### 写设定时踩过的坑（实测）
 
@@ -1428,7 +1459,8 @@ python main.py --character amiya text       # 临时用某个角色（chat / lis
 | 用第三人称描述自己（「罗德岛的医疗主管凯尔希正在……」） | 只给 `background` 时，模型把它当百科条目念 | 提示词里已硬性要求「用第一人称、不要自我介绍」；`background` 也尽量用「你/我」写 |
 | 提示词越长越容易走形 | 字段堆太多 | 优先写好 `background` + 3~5 条 `style` + 2~3 条 `lines`，`avoid` 只留真正在意的 |
 
-> `data/characters.json` 里的字段说明（`_字段说明`）就在文件开头，改的时候不用翻文档。
+> 索引文件开头的 `_字段说明` 就写着每个键的意思，改的时候不用翻文档。
+> 旧版（两个角色都写在 `characters.json` 里）用 `python main.py persona --split` 一键拆开。
 
 ### 想让角色声音也不一样
 

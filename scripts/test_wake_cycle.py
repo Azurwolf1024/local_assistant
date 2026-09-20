@@ -302,7 +302,10 @@ def test_state_machine(idle_seconds: float = 4.0) -> None:
         released_before = buf.getvalue().count("[待唤醒] 已释放")
         print("  · 现在（活跃状态下）说一句「没事了」…")
         want_standby.set()
-        deadline = time.time() + 10.0
+        # 窗口给到 20 秒：这一步要跑真 ASR + 卸载模型，机器同时在跑别的测试时
+        # 10 秒会不够（偶发失败过两次）；而这里的空闲超时是 60 秒，
+        # 20 秒内回到待唤醒仍然只可能是被「没事了」赶回去的。
+        deadline = time.time() + 20.0
         while time.time() < deadline and loop._active:  # noqa: SLF001
             time.sleep(0.1)
         while time.time() < deadline and "[待唤醒] 已释放" not in buf.getvalue():
