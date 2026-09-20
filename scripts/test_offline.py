@@ -406,17 +406,19 @@ def test_schedule_model() -> None:
         check(f"范围 {text} 的「听懂了」标记",
               ok, text != "有什么安排")        # 没提时间的才会是 False
 
-    r = skills.handle("下周有什么安排")
+    # ★必须固定「现在」★：下面报的是「周三/周四」这种相对说法，
+    # 用真实时间的话——今天正好是周三的时候它就变成「今天」了（过一天就挂，踩过）。
+    r = skills.handle("下周有什么安排", now=fri)
     print(f"        {r.reply}")
     check("「下周」真的报一整周（含下周三、周四）",
           ("下周（9月21日到9月27日）" in r.reply and "周三上午九点" in r.reply
            and "周四下午两点" in r.reply), True)
-    r = skills.handle("下周呢")
+    r = skills.handle("下周呢", now=fri)
     check("「下周呢」也能当日程查询", getattr(r, "action", None), "schedule_query")
-    r = skills.handle("这个月有什么安排")
+    r = skills.handle("这个月有什么安排", now=fri)
     check("「这个月」报整月（含 9月30日 对账）",
           ("这个月" in r.reply and "9月30日" in r.reply and "月度对账" in r.reply), True)
-    r = skills.handle("下个月有什么安排")
+    r = skills.handle("下个月有什么安排", now=fri)
     check("「下个月」报下个月", ("下个月" in r.reply and "10月" in r.reply), True)
     r = skills.handle("这周有什么安排")
     print(f"        {r.reply}")
@@ -470,6 +472,54 @@ def test_schedule_model() -> None:
     check("不带星期的只顺延一天", skills.schedule.load()[0].get("start"), "2026-09-19 20:00")
     check("也说了顺延", "已经过了" in r.reply, True)
 
+    print("    · 活动类也要能排进日程")
+    # 起因（2026-09-20 真实对话）：用户连说四遍
+    #   「9月23号下午3点到4点半，有一场造物社的活动。」
+    #   「下周三下午3点招物社的活动。」「下周三下午3点社团活动。」
+    #   「下周三下午3点，我有社团活动，到时候记得提醒我。」
+    # 一条日程都没排上（技能层不认这类说法），只建了个闹钟。
+    # 判据：句子里有「活动/比赛/班会…」这类事件名词 + 日期 + 时刻。
+    skills.schedule.save([])
+    skills.alarms.save([])
+    sun = datetime(2026, 9, 20, 17, 30)          # 周日傍晚
+    for text, title, start, mins in [
+        ("9月23号下午3点到4点半，有一场造物社的活动。", "造物社的活动", "2026-09-23 15:00", 90),
+        ("下周三下午3点招物社的活动。", "招物社的活动", "2026-09-23 15:00", 0),
+        ("下周三下午3点社团活动。", "社团活动", "2026-09-23 15:00", 0),
+        ("下周三下午三点到四点半社团活动。", "社团活动", "2026-09-23 15:00", 90),
+        ("10月1号上午9点到11点有比赛", "比赛", "2026-10-01 09:00", 120),
+    ]:
+        skills.schedule.save([])
+        r = skills.handle(text, now=sun)
+        print(f"        {text} -> {getattr(r, 'action', None)}")
+        item = (skills.schedule.load() or [{}])[0]
+        check(f"活动类能排上 [{title}]", item.get("title"), title)
+        check(f"活动类起始时间 [{title}]", item.get("start"), start)
+        if mins:
+            check(f"「…到…」记成时长 [{title}]", item.get("duration_minutes"), mins)
+    # 有日期没钟点：不许瞎猜时间，但要问得更准（而不是泛泛地「说清楚点」）
+    skills.schedule.save([])
+    r = skills.handle("9月23号社团活动", now=sun)
+    check("有日期没钟点 → 不瞎排", getattr(r, "action", None), None)
+    check("没有多出一条", skills.schedule.load(), [])
+
+    print("    · 活动类不归闹钟管（否则日程里什么都没有）")
+    skills.schedule.save([])
+    skills.alarms.save([])
+    r = skills.handle("下周三下午3点，我有社团活动，到时候记得提醒我。", now=sun)
+    check("带「提醒我」也走日程", getattr(r, "action", None), "schedule_add")
+    check("没往闹钟里塞", len(skills.alarms.load()), 0)
+    check("标题干净（不留「到时候记得提醒我」）",
+          (skills.schedule.load() or [{}])[0].get("title"), "社团活动")
+
+    print("    · 日程是空的时候也要能新增（「提前」别把它当成改）")
+    # 「提前半小时提醒我」里的「提前」会撞上「改」的判据，空日程时以前会回
+    # 「没什么可以改的」——明明是要新增却排不上（2026-09-20 在全新数据目录里必现）。
+    skills.schedule.save([])
+    r = skills.handle("明天下午三点安排项目评审会，提前30分钟提醒我", now=sun)
+    check("空日程 + 带「提前」的新增 → 照排", getattr(r, "action", None), "schedule_add")
+    check("标题是会议名", (skills.schedule.load() or [{}])[0].get("title"), "项目评审会")
+
     print("    · 问「哪一天/哪个时段」要答对应的那一天")
     # 起因：工具层解析不出时间段时会**悄悄退到「今天」**，模型拿这句当依据去下结论
     # （实测：问「我下周三下午有空吗」被答成「今天没有安排」）。这里盯两组：
@@ -508,6 +558,9 @@ def test_refer_and_batch() -> None:
     print("\n[4b] 上下文指代 + 批量操作")
     from voice_loop.skills import Skills
 
+    # ★固定「现在」★：指代打分里的「明天/周三」是相对时间，
+    # 用真实时间的话候选会随跑测试的日期变（踩过：某天起「改的是组会」变成反问）。
+    now = datetime(2026, 9, 18, 21, 0)          # 周五晚
     settings = load_settings()
     tmp = Path(tempfile.mkdtemp(prefix="voiceloop_ref_"))
     settings.skills.data_dir = str(tmp)
@@ -531,23 +584,25 @@ def test_refer_and_batch() -> None:
     skills.schedule.save([dict(it) for it in base])
 
     print("    · 批量查询：把「所有」的定义列出来，而不是只看今天")
-    r = skills.handle("有哪些课程")
+    r = skills.handle("有哪些课程", now=now)
     print(f"        {r.reply}")
     check("「有哪些课程」列全部课程",
           (getattr(r, "action", ""), "AIAA3102" in r.reply, "数学分析" in r.reply),
           ("schedule_list", True, True))
     check("课程列表里没有会议", "组会" in r.reply, False)
-    r = skills.handle("我的所有会议")
+    r = skills.handle("我的所有会议", now=now)
     print(f"        {r.reply}")
     check("「我的所有会议」列全部会议",
           ("组会" in r.reply and "项目评审" in r.reply and "数学分析" not in r.reply), True)
     check("「今天有什么课」还是只看今天，不是全量列表",
-          getattr(skills.handle("今天有什么课"), "action", None) != "schedule_list", True)
-    check("「每周五有什么课」也是问某一天", 
-          getattr(skills.handle("每周五有什么课"), "action", None) != "schedule_list", True)
+          getattr(skills.handle("今天有什么课", now=now), "action", None) != "schedule_list",
+          True)
+    check("「每周五有什么课」也是问某一天",
+          getattr(skills.handle("每周五有什么课", now=now), "action", None) != "schedule_list",
+          True)
 
     print("    · 批量删除：一次性的直接删")
-    r = skills.handle("取消所有会议")
+    r = skills.handle("取消所有会议", now=now)
     print(f"        {r.reply}")
     left = [it.get("title") for it in skills.schedule.load()]
     check("「取消所有会议」两条会议都没了",
@@ -557,13 +612,13 @@ def test_refer_and_batch() -> None:
 
     print("    · 每周循环的批量取消：说不清就反问，绝不乱删")
     skills.schedule.save([dict(it) for it in base])
-    r = skills.handle("取消所有课程")
+    r = skills.handle("取消所有课程", now=now)
     print(f"        {r.reply}")
     check("「取消所有课程」会问「以后都不上」还是「这周不上」",
           (getattr(r, "action", ""), "以后都不上" in r.reply), ("schedule_change", True))
     check("反问的时候一条都没删", len(skills.schedule.load()), 5)
 
-    r = skills.handle("所有课程以后都不上了")
+    r = skills.handle("所有课程以后都不上了", now=now)
     print(f"        {r.reply}")
     check("说清楚「以后都不上」才删课程",
           ([it.get("title") for it in skills.schedule.load()], getattr(r, "action", "")),
@@ -571,7 +626,7 @@ def test_refer_and_batch() -> None:
 
     print("    · 每周循环的批量跳过：只说这次不上")
     skills.schedule.save([dict(it) for it in base])
-    r = skills.handle("所有课程这周不上")
+    r = skills.handle("所有课程这周不上", now=now)
     print(f"        {r.reply}")
     got = {it.get("title"): it.get("skip") for it in skills.schedule.load()
            if it.get("kind") == "course"}
@@ -581,7 +636,7 @@ def test_refer_and_batch() -> None:
 
     print("    · 批量改：一条指令改一片")
     skills.schedule.save([dict(it) for it in base])
-    r = skills.handle("所有课程提前半小时提醒")
+    r = skills.handle("所有课程提前半小时提醒", now=now)
     print(f"        {r.reply}")
     leads = {it.get("title"): it.get("remind_before") for it in skills.schedule.load()}
     check("两门课都改成提前30分钟",
@@ -590,12 +645,12 @@ def test_refer_and_batch() -> None:
 
     print("    · 指代：没有上下文就不猜")
     skills.schedule.save([dict(it) for it in base])
-    r = skills.handle("取消它")
+    r = skills.handle("取消它", now=now)
     print(f"        {r.reply}")
     check("空上下文里的「取消它」是反问", getattr(r, "action", ""), "schedule_change_miss")
 
     print("    · 指代：从聊天记录里找候选")
-    r = skills.handle("取消它", dialog=["助手：下周三上午九点有 AIAA3102 机器学习。"])
+    r = skills.handle("取消它", dialog=["助手：下周三上午九点有 AIAA3102 机器学习。"], now=now)
     print(f"        {r.reply}")
     check("「取消它」对上了聊天记录里的那节课",
           (getattr(r, "action", ""), "AIAA3102" in r.reply), ("schedule_skip", True))
@@ -603,14 +658,14 @@ def test_refer_and_batch() -> None:
           any(it.get("title") == "AIAA3102 机器学习" and it.get("skip")
               for it in skills.schedule.load()), True)
 
-    r = skills.handle("把它改到下午四点", dialog=["助手：明天下午两点有组会。"])
+    r = skills.handle("把它改到下午四点", dialog=["助手：明天下午两点有组会。"], now=now)
     print(f"        {r.reply}")
     check("「把它改到下午四点」改的是组会",
           (getattr(r, "action", ""),
            next((it.get("time") for it in skills.schedule.load() if it.get("title") == "组会"), None)),
           ("schedule_edit", "16:00"))
 
-    r = skills.handle("把数学分析取消掉", dialog=["你说：数学分析这作业好难"])
+    r = skills.handle("把数学分析取消掉", dialog=["你说：数学分析这作业好难"], now=now)
     check("用你说过的话也能指代（当前句里还有名字）",
           getattr(r, "action", "").startswith("schedule_"), True)
 

@@ -365,6 +365,38 @@ def test_reroute_correction() -> None:
 
 
 # --------------------------------------------------------------------------- #
+def test_no_double_reminder() -> None:
+    """同一句话既排了日程、又定了闹钟 → 闹钟是重复的，不该定。
+
+    实测（2026-09-20）：「下周三下午3点，我有社团活动，到时候记得提醒我。」
+    模型同时调 add_schedule 与 add_alarm，text 一模一样——日程本身带提前提醒，
+    再来个闹钟就是同一件事响两次。
+    """
+    print("\n[7] 同一句话不重复提醒（日程 + 闹钟）")
+    with tempfile.TemporaryDirectory(prefix="route_dedup_") as td:
+        tmp = Path(td)
+        text = "下周三下午3点，我有社团活动，到时候记得提醒我。"
+        loop = make_loop(tmp)
+        loop.llm = FakeLLM("tool", [call("add_schedule", text=text),
+                                    call("add_alarm", text=text)])
+        stats = loop.respond(text)
+        check("日程排上了", len(loop.skills.schedule.load()), 1)
+        check("★没有多定一个重复的闹钟★", loop.skills.alarms.load(), [])
+        check("念的是日程那句", "排入日程" in stats.answer, True)
+        loop.close()
+
+        # 日程没排成时，闹钟照旧要定（不能因为「可能重复」就把事丢了）
+        text2 = "明天早上七点叫我起床"
+        loop = make_loop(tmp)
+        loop.llm = FakeLLM("tool", [call("add_schedule", text=text2),
+                                    call("add_alarm", text=text2)])
+        stats = loop.respond(text2)
+        check("日程那条排不上（本来就不是日程）", loop.skills.schedule.load(), [])
+        check("闹钟仍然定了", len(loop.skills.alarms.load()), 1)
+        loop.close()
+
+
+# --------------------------------------------------------------------------- #
 def main() -> int:
     print("=" * 66)
     print(" 路由自测（假模型脚本化，不联网、不加载模型、不碰真实数据）")
@@ -375,6 +407,7 @@ def main() -> int:
     test_new_tools()
     test_repair_args()
     test_reroute_correction()
+    test_no_double_reminder()
     print("\n" + "=" * 66)
     if _bad:
         print(f" 失败 {len(_bad)} 项（共 {_ok + len(_bad)}）：")

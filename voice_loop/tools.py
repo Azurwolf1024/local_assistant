@@ -24,11 +24,15 @@ from typing import Any
 from .nlp_time import parse_datetime
 from .settings import Settings
 from .skills import (
+    ACTIVITY_NOUN,
     TRIGGER_ALARM,
+    TRIGGER_APPOINT,
     TRIGGER_MEMO_ADD,
     TRIGGER_SCHEDULE,
     SkillResult,
     Skills,
+    _clean_content,
+    has_clock_expr,
 )
 
 # 给模型的额外说明（跟人设 system_prompt 分开放，人设仍然由用户自己改）
@@ -499,8 +503,16 @@ class ToolRegistry:
         text = self._text_arg(args)
         result = self._via(text, self.skills._handle_schedule)  # noqa: SLF001
         if not result.ok and "没听懂" in result.reply:
-            # 交白卷时给一句更像"没排成"的话
-            result.reply = "这条日程我没排上——说清楚点，比如「下周三下午三点半跟导师见面」。"
+            # 交白卷时给一句更像"没排成"的话；能看出「有事情、就差钟点」就直接问几点
+            name = _clean_content(text)
+            looks_event = bool(ACTIVITY_NOUN.search(text) or TRIGGER_APPOINT.search(text))
+            if looks_event and not has_clock_expr(text):
+                result.reply = (
+                    f"「{name}」这件事我还没排上——几点开始？"
+                    f"把时间带上再说一遍就行，比如「下午三点{name}」。"
+                )
+            else:
+                result.reply = "这条日程我没排上——说清楚点，比如「下周三下午三点半跟导师见面」。"
         return result
 
     def _add_memo(self, args: dict) -> ToolResult:
@@ -614,6 +626,22 @@ class ToolRegistry:
         return ToolResult(True, action=result.action, reply=result.reply, data=result.data)
 
 
+def call_name(call: dict) -> str:
+    """取出工具名（容忍 ``{"function": {...}}`` 与扁平两种形状）。"""
+    return str(((call or {}).get("function") or call or {}).get("name") or "")
+
+
+def call_text(call: dict) -> str:
+    """取出这次调用的 ``text`` 参数（没有就返回空串）。"""
+    args = ((call or {}).get("function") or call or {}).get("arguments") or {}
+    if isinstance(args, str):
+        try:
+            args = json.loads(args) if args.strip() else {}
+        except json.JSONDecodeError:
+            args = {}
+    return str((args or {}).get("text") or "").strip()
+
+
 def describe_calls(calls: list[dict]) -> str:
     """日志/评估用：把 tool_calls 变成一行字。"""
     parts = []
@@ -633,4 +661,6 @@ __all__ = [
     "parse_tool_call_text",
     "repair_args",
     "reroute_correction",
+    "call_name",
+    "call_text",
 ]

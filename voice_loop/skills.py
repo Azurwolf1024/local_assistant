@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from .nlp_time import (
+    _apply_period,
     clock_text,
     cn2num,
     cn_number,
@@ -116,6 +117,9 @@ _SCHEDULE_VERBS = (
     "帮我", "麻烦你", "麻烦", "请", "到时候", "记得", "提醒我", "帮我记", "记录一下", "记录",
     "记一下", "记下来", "记下", "添加", "新增", "创建", "新建", "排入", "安排", "加",
     "每天", "每", "有个", "有", "我要", "我", "你", "的", "去", "上", "在", "是",
+    # 量词与「把字句」：「有一场造物社的活动」→ 标题不该留「一场」；
+    # 「把后天下午两点的体检记上」→ 标题不该留「把…记上」
+    "一场", "一次", "一门", "一节", "一项", "一个", "把", "将",
 )
 _LOCATION = re.compile(r"(?:地点|教室)\s*[:：]?\s*([^，,。;；]+)")
 # 标题里不该残留周期说法：「每月5号交房租」的标题应该是「交房租」
@@ -123,6 +127,7 @@ _REPEAT_WORDS = re.compile(
     r"(?:每(?:个)?年\s*(?:\d{1,2}|[一二三四五六七八九十]+)\s*月\s*(?:\d{1,2}|[一二三四五六七八九十]+)\s*[号日]?"
     r"|每(?:个)?月\s*(?:\d{1,2}|[一二三四五六七八九十]+)\s*[号日]?"
     r"|每\s*(?:\d{1,3}|[一二三四五六七八九十两]+|半)\s*(?:个)?\s*(?:天|日|小时|钟头|分钟|分)"
+    r"|每\s*(?:\d{1,2}|[一二三四五六七八九十两]+)\s*个?\s*(?:周|星期|礼拜)"   # 每两周
     r"|每(?:个)?(?:月|年|天))"
 )
 
@@ -156,7 +161,7 @@ def _split_title_location(text: str) -> tuple[str, str]:
     head = _WEEKLY.sub("", head)
     head = _REPEAT_WORDS.sub("", head)
     head = re.sub(r"\s+", " ", head)
-    return _strip_leading(head, _SCHEDULE_VERBS), loc
+    return _TAIL_FILLER.sub("", _strip_leading(head, _SCHEDULE_VERBS)), loc
 
 
 # --------------------------------------------------------------------------- #
@@ -177,10 +182,20 @@ class SkillResult:
 # 时间词清洗（从提醒内容里去掉「明天早上七点」这类表达）
 # --------------------------------------------------------------------------- #
 _NUM = r"(?:\d{1,2}|[一二三四五六七八九十两]+)"
+# 一个钟点（带「到/至/~」的成对写法也算一个整体：「下午3点到4点半」整段剥掉，
+# 否则标题里会残留一个「到有一场造物社的活动」）
+_CLOCK_TOKEN = rf"(?:{_NUM}\s*[点時时](?:半|\s*{_NUM}\s*分)?|\d{{1,2}}\s*[:：]\s*\d{{1,2}})"
+_TIME_RANGE = re.compile(
+    rf"({_CLOCK_TOKEN})\s*(?:到|至|~|—|-)\s*({_CLOCK_TOKEN})"
+)
+
 _TIME_WORDS = re.compile(
     r"(?:大后天|后天|明天|明日|今天|今日|今早|明早|今晚|明晚|"
     r"凌晨|早上|早晨|清晨|上午|中午|正午|下午|傍晚|晚上|夜里|夜晚|半夜|"
     r"(?:下{1,2}个?|上个?|这|本)?(?:周|星期|礼拜)[一二三四五六日天末]|"
+    rf"{_CLOCK_TOKEN}\s*(?:到|至|~|—|-)\s*{_CLOCK_TOKEN}|"    # 3点到4点半：整体
+    rf"{_NUM}\s*月\s*{_NUM}\s*[号日]?|"                       # 9月23号
+    rf"{_NUM}\s*[号日](?![一二三四五六七八九十])|"              # 23号
     rf"{_NUM}\s*[点時时](?:半|{_NUM}\s*分)?|"
     r"\d{1,2}\s*[:：]\s*\d{1,2}|"
     rf"{_NUM}?个?半?(?:小时|钟头|分钟|分|秒)|"
@@ -188,14 +203,35 @@ _TIME_WORDS = re.compile(
     r")"
 )
 
+
+def parse_clock_range(text: str, now: datetime | None = None) -> tuple[tuple[int, int], tuple[int, int]] | None:
+    """「下午3点到4点半」→ ((15, 0), (16, 30))；没有区间就返回 None。
+
+    为什么要它：① 标题里不该残留「到4点半」；② 记下时长，下一项/提醒才不会把
+    一个 90 分钟的活动当成一小时。时段词（下午）对**两端都生效**，这一点交给
+    :func:`_apply_period`，不然「到四点半」会被算成上午 4:30。
+    """
+    m = _TIME_RANGE.search(text or "")
+    if m is None:
+        return None
+    c1 = parse_clock(m.group(1))
+    c2 = parse_clock(m.group(2))
+    if c1 is None or c2 is None:
+        return None
+    h1 = _apply_period(c1[0], text, c1[1], now)
+    h2 = _apply_period(c2[0], text, c2[1], now)
+    return (h1, c1[1]), (h2, c2[1])
+
+
 _FILLER = re.compile(
     # 长词必须放在前面：正则的 | 是「先匹配到就用」，
     # 否则「我说我…」会被先匹配掉开头的「我」，剩下「说我有跆拳道课」这种怪句子
     r"^(?:麻烦你|帮我|我说我|我说|到时候|别忘了|别忘|一定|记得|记着|给我|"
-    r"请|你|我|要|去|来|有|一下|一个|个|的|把|给|向|从|和|跟)+"
+    r"请|你|我|要|去|来|有|一下|一个|一场|一次|一门|一节|一项|个|的|把|给|向|从|和|跟)+"
 )
 _TAIL_FILLER = re.compile(
-    r"(?:这件事|这个事情|一下|到时候|记得|提醒我|叫我|这个|那个|吧|哦|啊|呀|呢|了|的|吗)+" + r"$"
+    r"(?:这件事|这个事情|记录一下|记下来|记一下|记上|记下|一下|到时候|记得|提醒我|叫我"
+    r"|这个|那个|吧|哦|啊|呀|呢|了|的|吗)+" + r"$"
 )
 # 只剩这些词就说明用户没说具体要干什么
 _NOT_A_TOPIC = {
@@ -233,6 +269,17 @@ TRIGGER_APPOINT = re.compile(
 PLAN_VERB = re.compile(
     r"(?:要去|得去|去见|去找|去拿|去交|去办|去开|去听|去参加|"
     r"去见|见|找|约|参加|出席|值班|接|送|交|提交|办理|面签)"
+)
+
+# ★活动类★：句子里既没有「安排/记录」动词，也没有「课/会议/见面」这种词，
+# 但「有…活动/比赛/演出/社团活动」说到底也是一条日程。
+# 实测踩到（2026-09-20）：用户连说四遍
+# 「9月23号下午3点到4点半，有一场造物社的活动」「下周三下午3点社团活动」
+# 一条都没排上，只建了个闹钟——因为技能层根本不认这类说法。
+ACTIVITY_NOUN = re.compile(
+    r"(活动|比赛|大赛|赛事|演出|表演|汇报演出|讲座|培训|排练|聚会|团建|展会|运动会"
+    r"|志愿|义工|社团|学生会|班会|例会|升旗|实验|实训|军训|婚礼|生日会|宣讲|分享会"
+    r"|联谊|见面会|茶话会|路演|答辩会)"
 )
 
 # 「我的备忘有哪些 / 我现在有什么备忘录吗」这类是查询，不是添加。
@@ -345,8 +392,10 @@ def _clean_content(text: str) -> str:
     t = _TIME_WORDS.sub("", text or "")
     t = re.sub(r"^[，。、,.\s:：]+", "", t)
     t = _FILLER.sub("", t)
-    t = _TAIL_FILLER.sub("", t)
+    # ★先去掉标点、再削尾巴★：「有社团活动，到时候记得提醒我。」句末那个句号
+    # 会让锚在 $ 的 _TAIL_FILLER 对不上，标题里就留下「到时候记得提醒我」。
     t = re.sub(r"[，。、,.\s:：]+", "", t)
+    t = _TAIL_FILLER.sub("", t)
     return t.strip()
 
 
@@ -654,8 +703,13 @@ class Skills:
         # 闹钟只是一次性响一声，说完就找不着了。
         # 判据是「约会词 + 明确时刻 + 明确日期」——「十分钟后提醒我跟导师打电话」
         # 没有日期，仍然是闹钟。
+        # ★活动类也算★（2026-09-20）：「下周三下午3点，我有社团活动，到时候记得提醒我。」
+        # 本来是件要记下来的事，以前被闹钟分支抢走，日程里什么都没有。
+        # ★带课/会议/安排这类词的也算★（同一天发现）：
+        # 「明天下午三点安排项目评审会，提前30分钟提醒我」被闹钟抢走，日程里同样什么都没有。
         if (
-            TRIGGER_APPOINT.search(text)
+            (TRIGGER_APPOINT.search(text) or ACTIVITY_NOUN.search(text)
+             or TRIGGER_SCHEDULE.search(text))
             and has_clock_expr(text)
             and parse_date_hint(text, now) is not None
         ):
@@ -1290,11 +1344,19 @@ class Skills:
             and has_clock_expr(text)
             and parse_date_hint(text, now) is not None
         )
+        # 活动类：「下周三下午3点有社团活动」「9月23号下午3点到4点半，有一场造物社的活动」
+        # 同样要求日期 + 时刻，光说「今天有活动」不会当成新增
+        activity = (
+            bool(ACTIVITY_NOUN.search(text))
+            and has_clock_expr(text)
+            and parse_date_hint(text, now) is not None
+        )
         looks_add = (
             (m is not None and TRIGGER_SCHEDULE.search(text))
             or rule is not None
             or appoint
             or plan
+            or activity
         )
         if not is_query and looks_add and (
             has_clock_expr(text) or rule is not None or appoint or plan
@@ -1331,6 +1393,16 @@ class Skills:
             until = parse_until(text, now)
             note = self._note_of(text)
             repeat = (rule or {}).get("repeat", "once")
+            # 「下午3点到4点半」→ 时长 90 分钟（存下来，下一项/提醒才不会当成一小时）
+            span = parse_clock_range(text, now)
+            duration = 0
+            if span is not None:
+                start_min = span[0][0] * 60 + span[0][1]
+                end_min = span[1][0] * 60 + span[1][1]
+                if end_min <= start_min:
+                    end_min += 24 * 60
+                if 0 < end_min - start_min <= 12 * 60:
+                    duration = end_min - start_min
 
             if wd is not None and repeat in ("weekly", "biweekly"):
                 item: dict = {
@@ -1371,6 +1443,8 @@ class Skills:
                 "time": f"{first.hour:02d}:{first.minute:02d}",
                 "remind_before": leads,
             }
+            if duration:
+                item["duration_minutes"] = duration
             if repeat == "interval":
                 # 「每 3 天一次」不默认占时长，周期就是「结束后 N 天」里的 N
                 item["duration_minutes"] = 0
@@ -1468,6 +1542,16 @@ class Skills:
             return None                     # 「今天的课不上吗？」是问句，别真去取消
         items = self.schedule.load()
         if not items:
+            # ★日程空的时候，别把「要新增」的句子拦下来★
+            # 「明天下午三点安排项目评审会，提前30分钟提醒我」里的「提前」会撞上
+            # _SCHEDULE_EDIT，于是空日程时回一句「没什么可以改的」，明明是要新增却排不上
+            # （实测 2026-09-20，全新数据目录时必现）。
+            if (
+                self._SCHEDULE_ADD.search(text)
+                or ACTIVITY_NOUN.search(text)
+                or TRIGGER_APPOINT.search(text)
+            ):
+                return None
             return SkillResult(
                 reply="日程里现在还是空的，没什么可以改的。", action="schedule_change"
             )
