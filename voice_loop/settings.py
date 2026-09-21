@@ -256,9 +256,16 @@ class SkillsConfig:
 
 @dataclass
 class BargeInConfig:
-    """语音打断：它还在说话时你一开口就停下来听你说。"""
+    """打断。
 
-    enabled: bool = True
+    ★默认走「按 Esc」。★``enabled`` 只管**语音自动打断**（开口就停）：
+    它在真实环境里很难调准，最常见的失败是把自己外放的声音当成你在插话，
+    于是自我打断、套娃——实测踩过，所以默认关掉。想折腾再把它打开。
+    不管这个开关怎么设，``Esc`` 永远能用。
+    """
+
+    enabled: bool = False        # 语音自动打断（实验性，实测容易自我打断）
+    key: str = "esc+enter"       # 按键打断用哪些键（esc / enter / ctrl-c，可用 + 连接）
     min_seconds: float = 0.25    # 连续说多久才算插话（太小了容易被噪音打断）
     min_rms: float = 0.015       # 判定下限（幅度），压住底噪
     margin: float = 1.6          # 比「麦克风里听到的回声」响几倍才算插话（调大更稳、调小更灵敏）

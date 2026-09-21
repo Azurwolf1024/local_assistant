@@ -241,6 +241,7 @@ class VoiceLoop:
 
         self._stop = threading.Event()
         self._interrupt = threading.Event()
+        self._hotkey = None            # 按键打断（默认 Esc）的监听线程
         self._muted = threading.Event()      # 播放期间忽略麦克风，避免自我唤醒
         self._needs_flush = False            # 播放过之后，下次监听前要清一次回声
         self._speak_lock = threading.Lock()  # 保证同一时刻只有一处发声
@@ -336,7 +337,7 @@ class VoiceLoop:
                 if not noticed and float(np.max(np.abs(frame))) > 0.05:
                     noticed = True
                     print(
-                        "  [提示] 我刚在说话，这段语音被忽略了；想让我听，等我说完或按回车打断",
+                        "  [提示] 我刚在说话，这段语音被忽略了；想让我听，等我说完或按 Esc 打断",
                         flush=True,
                     )
                 segmenter.reset()
@@ -1202,7 +1203,7 @@ class VoiceLoop:
         finally:
             self._barge_finish()
             if self._interrupt.is_set():
-                # 回车打断 / 语音打断都要把剩下没放完的清掉
+                # 按键打断 / 语音打断都要把剩下没放完的清掉
                 self.speaker.interrupt()
             self._in_reply = False
             self._muted.clear()
@@ -1222,8 +1223,34 @@ class VoiceLoop:
     # ======================================================================
     # 交互
     # ======================================================================
-    def _start_interrupt_watcher(self) -> None:
-        """播放过程中按回车即可打断。后台运行时没有终端，自动跳过。"""
+    def _start_interrupt_watcher(self, raw_key: bool = True) -> None:
+        """播放过程中按 Esc 即可打断。后台运行时没有终端，自动跳过。
+
+        ``raw_key=False`` 时退回「按回车」的老办法（ptt 模式下回车另有用途，
+        读裸按键会和录音抢同一个输入，所以那里不用它）。
+        """
+        active = lambda: bool(  # noqa: E731
+            self._in_reply or self.speaker.speaking or self.speaker.pending
+        )
+
+        def interrupt_now(label: str) -> None:
+            self._interrupt.set()
+            self.speaker.interrupt()
+            print(f"  [打断] 已打断{label}", flush=True)
+
+        if raw_key:
+            try:
+                from .hotkey import KeyWatcher, keys_from_spec
+
+                keys = keys_from_spec(str(getattr(self.settings.bargein, "key", "esc+enter")))
+                self._hotkey = KeyWatcher(
+                    lambda: interrupt_now("（Esc）"), active, keys=keys, logger=self.log
+                )
+                self._hotkey.start()
+                return
+            except Exception as exc:  # noqa: BLE001 - 读不到裸按键就退回回车方案
+                self.log.debug(f"裸按键监听装不上（{exc}），退回「按回车打断」")
+
         try:
             if sys.stdin is None or not sys.stdin.isatty():
                 self.log.debug("当前没有交互终端，跳过「回车打断」监听")
@@ -1237,10 +1264,8 @@ class VoiceLoop:
                 if line == "":
                     time.sleep(0.2)
                     continue
-                if self._in_reply or self.speaker.speaking or self.speaker.pending:
-                    self._interrupt.set()
-                    self.speaker.interrupt()
-                    print("  [打断] 已打断", flush=True)
+                if active():
+                    interrupt_now("")
 
         self._watcher = threading.Thread(target=watch, daemon=True, name="interrupt")
         self._watcher.start()
@@ -1440,7 +1465,7 @@ class VoiceLoop:
             f"  模式: {'自动断句（直接说话，停顿即发送）' if mode == 'vad' else '回车录制'}"
             + (f"\n  技能: {self.skills.stats()}" if self.skills else "")
             + f"\n  提示: 说「{self.settings.chat.exit_phrases[0]}」退出"
-            + ("；回答过程中按回车可打断" if mode == "vad" else "")
+            + ("；回答过程中按 Esc 可打断" if mode == "vad" else "")
             + "\n"
         )
 
@@ -1520,11 +1545,11 @@ class VoiceLoop:
                 else ""
             )
             + (
-                "  打断: 你直接开口就停下听你说"
+                "  打断: 你直接开口、或按 Esc 都行"
                 if self.bargein is not None
-                else "  打断: 只能按回车（[bargein] enabled=false）"
+                else "  打断: 按 Esc（[bargein] enabled=false，语音自动打断关着）"
             )
-            + "；按回车也能打断\n"
+            + "\n"
             + (f"  技能: {self.skills.stats()}\n" if self.skills else "")
             + "  提示: Ctrl+C 退出"
             + ("；字幕/提醒会显示在屏幕上\n" if self.subtitle is not None else "\n")
@@ -1537,6 +1562,7 @@ class VoiceLoop:
         self.log.info(f"服务已启动 PID={os.getpid()}")
 
         self.mic.open()
+        # 常驻服务没有「按回车录音」这回事，所以直接用裸按键（Esc）
         self._start_interrupt_watcher()
         if self.scheduler:
             self.scheduler.start()
@@ -1735,6 +1761,13 @@ class VoiceLoop:
 
     def close(self) -> None:
         self._stop.set()
+        if self._hotkey is not None:
+            # 按键监听要收尾：POSIX 下它把终端设成了 cbreak，得还原回去
+            try:
+                self._hotkey.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self._hotkey = None
         if self.scheduler:
             self.scheduler.stop()
         if self.mcp is not None:
