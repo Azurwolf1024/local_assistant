@@ -158,6 +158,29 @@ def _check(cfg, area) -> int:
     ok("到点自动隐藏",
        not _user32.IsWindowVisible(wintypes.HWND(hwnd)) or _diff(before, gone, phys) < 3.0)
 
+    # ★字幕跟声音同步★：还在说话时不能隐藏（用户报的 bug：话音未落、字幕先没了）
+    print("\n  —— 同步检查：还在说话时不该隐藏 ——")
+    speaking = True
+    overlay.set_keepalive(lambda: speaking)
+    overlay.show_user("字幕同步测试")
+    overlay.update("这句话比较长，要念好一会儿，字幕必须一直留着，不能先说没就没。")
+    time.sleep(1.2)
+    _user32.IsWindowVisible(wintypes.HWND(hwnd))
+    print(f"  假装还在说话，等 {cfg.hold_seconds + 4:.0f} 秒（超过 hold_seconds 也不该隐藏）…")
+    time.sleep(cfg.hold_seconds + 4.0)
+    still = bool(_user32.IsWindowVisible(wintypes.HWND(hwnd)))
+    shown = _grab()
+    l3, t3, r3, b3 = _logical_rect(hwnd)
+    phys3 = (int(l3 * scale), int(t3 * scale), int(r3 * scale), int(b3 * scale))
+    ok("还在说话 → 不隐藏", still and _diff(before, shown, phys3) > 3.0)
+
+    speaking = False
+    print(f"  说完之后再等 {cfg.hold_seconds + 2:.0f} 秒（这时才该隐藏）…")
+    time.sleep(cfg.hold_seconds + 2.0)
+    ok("说完之后 → 到点隐藏",
+       not _user32.IsWindowVisible(wintypes.HWND(hwnd)))
+    overlay.set_keepalive(None)
+
     overlay.stop()
     print("\n" + "=" * 66)
     print(" 全部通过 √" if not failures else f" {failures} 项未通过")

@@ -184,6 +184,13 @@ class VoiceLoop:
                     margin=int(sub_cfg.margin),
                     logger=self.log,
                 )
+                # ★字幕跟声音同步★：还在生成回答、或者扬声器里还有没放完的音频，
+                # 就一直不隐藏；真的停下来之后再停留 hold_seconds 秒（见 subtitle._tick）
+                self.subtitle.set_keepalive(
+                    lambda: bool(
+                        self._in_reply or self.speaker.pending > 0 or self.speaker.speaking
+                    )
+                )
                 self.subtitle.start()
             except Exception as exc:  # noqa: BLE001
                 self.log.warning(f"字幕初始化失败：{exc}")

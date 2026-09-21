@@ -12,7 +12,9 @@
       任务栏在左/右/上、或者屏幕有 DPI 缩放都能算对）
     - 流式追加时把渲染合并到 ~25 帧/秒，长回答超出 max_lines 就只显示末尾
     - 中文换行自己按像素宽度算（Tk 的 wraplength 对连续中文不可靠）
-    - 说完 ``hold_seconds`` 秒自动隐藏；没有图形环境 / tkinter 不可用时静默降级
+    - ★跟着声音走★：只要「还在生成 或 扬声器还在响」就不隐藏（``set_keepalive``），
+      真的停下来之后再停留 ``hold_seconds`` 秒才收——否则长回答会出现
+      「话音未落、字幕没了」；没有图形环境 / tkinter 不可用时静默降级
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ import logging
 import queue
 import threading
 import time
+from collections.abc import Callable
 from ctypes import wintypes
 
 from . import ui
@@ -151,6 +154,10 @@ class SubtitleOverlay:
         self._changed_at = 0.0
         self._visible = False
         self._last_render = 0.0
+        # 「现在还在说话/还在生成吗」——由 pipeline 注入，让字幕跟着声音走，
+        # 而不是不管说没说完全靠倒计时隐藏
+        self._keepalive: Callable[[], bool] | None = None
+        self._kept = False
 
         # 配色
         self._bg = "#0f131a"
@@ -211,6 +218,15 @@ class SubtitleOverlay:
 
     def clear(self) -> None:
         self._put("clear", "")
+
+    def set_keepalive(self, fn: Callable[[], bool] | None) -> None:
+        """注入「还在说话吗」的判断，避免话音未落字幕就先隐藏了。
+
+        ``fn`` 每帧在 UI 线程里被调一次，必须是很快、不阻塞的判断
+        （pipeline 里传的是「正在生成 或 扬声器还在响」）。
+        传 ``None`` 就退回纯计时隐藏——关掉语音播报时就是这种情况。
+        """
+        self._keepalive = fn
 
     def _put(self, kind: str, payload: str) -> None:
         if not self.enabled or self._closing:
@@ -354,10 +370,25 @@ class SubtitleOverlay:
                     make_click_through(self._hwnd)
                     self._visible = True
                 self._place(root)
-        elif self._visible and (now - self._changed_at) > self.hold_seconds:
-            self._win.withdraw()
-            self._visible = False
-            self.log.debug("字幕已自动隐藏")
+        elif self._visible:
+            # ★只要还在说话就不隐藏★：以前是纯倒计时（hold_seconds 到了就藏），
+            # 长回答还在念、字就先没了（用户报的「字幕和语音不同步」就是这个）。
+            kept = False
+            if self._keepalive is not None:
+                try:
+                    kept = bool(self._keepalive())
+                except Exception:  # noqa: BLE001 - 判断出错就当没在说话
+                    kept = False
+            if kept:
+                self._kept = True
+            else:
+                if self._kept:      # 刚说完：从现在开始计 hold_seconds
+                    self._kept = False
+                    self._changed_at = now
+                if (now - self._changed_at) > self.hold_seconds:
+                    self._win.withdraw()
+                    self._visible = False
+                    self.log.debug("字幕已自动隐藏")
 
     # ------------------------------------------------------------------ 窗口细节
     def _place(self, root) -> None:

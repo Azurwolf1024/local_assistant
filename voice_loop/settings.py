@@ -285,7 +285,7 @@ class SubtitleConfig:
     enabled: bool = True
     width: int = 920            # 字幕条最大宽度（像素），屏幕太窄会自动缩
     alpha: float = 0.86         # 不透明度，越小声越透
-    hold_seconds: float = 6.0   # 说完后多久自动隐藏
+    hold_seconds: float = 6.0   # ★说完之后★再停留几秒才隐藏（说话期间不会隐藏）
     font_size: int = 20         # 正文字号
     max_lines: int = 4          # 最多显示几行，超出只显示末尾（前面加「…」）
     show_user_text: bool = True  # 要不要连「你说：…」一起显示（能看出有没有听错）

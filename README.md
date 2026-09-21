@@ -183,7 +183,7 @@ flowchart LR
 │  ├─ system_ops.py            # 系统操作：关/开显示器（只关屏，不休眠）
 │  ├─ bargein.py               # 语音自动打断（实验性、默认关）：分清「自己的回声」和「你在插话」
 │  ├─ hotkey.py                # ★ 按 Esc 打断：裸按键监听，只在说话时读键盘
-│  ├─ subtitle.py              # 底部半透明字幕（帮手里说的话都显示出来）
+│  ├─ subtitle.py              # 底部半透明字幕（帮手里说的话都显示出来，跟声音同步）
 │  ├─ toast.py                 # 右下角可视提醒弹窗
 │  ├─ ui.py                    # Tk 窗口宿主（一个进程只能有一个 Tk 解释器）
 │  ├─ nlp_time.py              # 中文时间解析（明天早上七点 / 十分钟后 / 下周三）
@@ -204,7 +204,7 @@ flowchart LR
 │  ├─ test_bargein.py          # ★ 打断：合成对照 + 真机回声自测（--echo）/ 回环（--live）
 │  ├─ test_hotkey.py           # ★ 按 Esc 打断：只在说话时读、丢掉积压按键、不吞 Ctrl+C
 │  ├─ test_wake_cycle.py       # ★ 待机→唤醒→空闲回收→再次唤醒（含 Whisper 竞态）
-│  ├─ test_subtitle.py         # ★ 字幕：可见性 / 居中 / 点得穿 / 自动隐藏（--check）
+│  ├─ test_subtitle.py         # ★ 字幕：可见性 / 居中 / 点得穿 / 说话期间不隐藏 / 自动隐藏（--check）
 │  ├─ test_toast.py            # 看一眼右下角可视提醒长什么样
 │  ├─ test_dialog.py           # 对话链路自测（不用麦克风）
 │  ├─ bench_llm.py             # ★ 换模型前的体检（延迟 / 是否思考 / 看图识字）
@@ -437,8 +437,11 @@ python scripts/test_bargein.py --live    # 真机回环：量回声 + 你自己�
   （用的是 ``WS_EX_TRANSPARENT``，配合已经存在的 ``WS_EX_LAYERED``）
 - 位置按 Windows 的「桌面工作区」算，自动避开任务栏；任务栏在左/右/上、
   或者屏幕开了 DPI 缩放都能摆对
-- 说完了 `hold_seconds` 秒（默认 6）自动隐藏；LLM 流式输出是边生成边上屏的
-- 回答太长时最多显示 `max_lines` 行，超出的部分只留末尾并在开头标一个「…」
+- ★字幕跟声音同步★：只要**还在生成回答、或扬声器里还有没放完的音频**就绝不隐藏；
+  真的停下来之后再停留 `hold_seconds` 秒（默认 6）。以前是纯倒计时（不管说没说完全看时间），
+  长回答会出现「话音未落、字先没了」——那是真事，已修
+- LLM 流式输出是边生成边上屏的；回答太长时最多显示 `max_lines` 行，
+  超出的部分只留末尾并在开头标一个「…」
 
 调参在 `config.toml` 的 `[subtitle]`：
 
@@ -447,7 +450,7 @@ python scripts/test_bargein.py --live    # 真机回环：量回声 + 你自己�
 | `enabled` | 总开关 |
 | `width` | 字幕条最大宽度，屏幕比这窄会自动缩 |
 | `alpha` | 不透明度，0.2~1.0，越小越透 |
-| `hold_seconds` | 说完多久自动隐藏 |
+| `hold_seconds` | ★说完之后★再停留几秒才隐藏（说话/生成期间不会隐藏） |
 | `font_size` / `max_lines` | 字号 / 最多几行 |
 | `show_user_text` | 要不要连「你说：…」一起显示 |
 | `margin` | 离任务栏上方多少像素 |
@@ -499,7 +502,7 @@ python scripts/test_skills_route.py    # 技能路由 + 关屏幕 + 课表 + 提
 python scripts/test_bargein.py         # 打断：合成回声/插话对照（--echo 真机回声自测）
 python scripts/test_hotkey.py          # 按 Esc 打断：假键盘驱动，验按键与护栏逻辑
 python scripts/test_wake_cycle.py      # 待机 → 唤醒 → 空闲回收 → 再次唤醒
-python scripts/test_subtitle.py --check # 字幕：真的截屏量一遍可见性/居中/点穿/自动隐藏
+python scripts/test_subtitle.py --check # 字幕：真的截屏量一遍可见性/居中/点穿/同步/自动隐藏
 python scripts/test_toast.py           # 看一眼右下角可视提醒长什么样
 python scripts/test_dialog.py --no-tts # 13 轮对话，只看文本与耗时
 python scripts/test_wake.py --rounds 5 # ★ 拿真实嗓音试唤醒词，看被听成什么
