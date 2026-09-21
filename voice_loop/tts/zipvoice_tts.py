@@ -35,6 +35,8 @@ from ..settings import Settings
 
 # 参考音频的推荐上限（秒）。再长不会更像，只会更慢、更不稳。
 REF_MAX_SECONDS = 15.0
+# 超过这个长度就提醒一句（prompt 越长每句都要多等）
+LONG_REF_SECONDS = 20.0
 
 # 假名（含半角）——出现它就当日语
 _KANA_RE = re.compile(r"[\u3041-\u309f\u30a0-\u30ff\uff66-\uff9d]")
@@ -63,6 +65,77 @@ def missing_files(settings: Settings) -> list[Path]:
     return [p for p in wanted if not p.exists()]
 
 
+# 目录里的 *清单文件* 解析结果缓存：{(目录,): ((文件,mtime,size)..., {文件名小写: 文本})}
+_MANIFEST_CACHE: dict[Path, tuple[tuple, dict[str, str]]] = {}
+
+
+def _join_paragraph(lines: list[str]) -> str:
+    """把段落拼成一行（中文之间不留空格，英文单词之间留）。"""
+    text = " ".join(x.strip() for x in lines if x.strip())
+    return re.sub(r"(?<=[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef])\s+(?=[\u4e00-\u9fff])", "", text)
+
+
+def manifest_texts(directory: Path) -> dict[str, str]:
+    """把同目录下的 ``*.txt`` 当成「文件名 + 文本」清单读进来。
+
+    格式（实测的素材就是这个样）——一行文件名、空行、一段文本：
+
+        任命助理
+
+        博士，请坐。别紧张，我只是来查看你的身体状况。……
+
+        交谈1
+
+        我会定期为你进行理学检查，……
+
+    也认 ``文件名  文本`` 这种一行搞定的写法（分隔符用 tab / 冒号 / 两个空格）。
+    返回 ``{音频文件名小写: 文本}``；目录里没有清单就返回空字典。
+    """
+    files = sorted(p for p in directory.glob("*.txt") if p.is_file())
+    if not files:
+        return {}
+    try:
+        stamp = tuple((str(p), p.stat().st_mtime_ns, p.stat().st_size) for p in files)
+    except OSError:
+        return {}
+    cached = _MANIFEST_CACHE.get(directory)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+
+    stems = {p.stem.lower() for p in directory.glob("*.wav")}
+    stems |= {p.name.lower() for p in directory.glob("*.wav")}
+    found: dict[str, str] = {}
+    for path in files:
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for i, raw in enumerate(lines):
+            line = raw.strip()
+            if not line:
+                continue
+            head = line.split("\t")[0].strip()
+            name = head.strip("：: ").lower()
+            if name not in stems:
+                continue
+            rest = line[len(head):].strip().strip("：:\t ")
+            if rest:  # 一行搞定的写法
+                found.setdefault(name, rest)
+                continue
+            # ★文件名和文本之间可能隔着一个空行★（实测素材就是「名字 / 空行 / 段落」）
+            j = i + 1
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            para: list[str] = []
+            while j < len(lines) and lines[j].strip():
+                para.append(lines[j])
+                j += 1
+            if para:
+                found.setdefault(name, _join_paragraph(para))
+    _MANIFEST_CACHE[directory] = (stamp, found)
+    return found
+
+
 class ZipVoiceTts:
     name = "zipvoice"
 
@@ -76,6 +149,14 @@ class ZipVoiceTts:
         self._min_chars = max(4, int(getattr(cfg, "clone_min_chars", 16) or 16))
         self._threads = max(1, int(getattr(cfg, "clone_threads", 2) or 2))
         self._speed = float(getattr(cfg, "clone_speed", 1.0) or 1.0)
+        if self._speed > 1.0:
+            # 实测：1.15 时输出从 3.62s 变成 1.37s（10 字/秒），已经算坏了
+            print(
+                f"[tts] clone_speed={self._speed:g} 会把它弄坏（实测 1.15 → 快 3 倍且含糊），"
+                "已按 1.0 处理；想更快去调参考音频（短的=快）",
+                file=sys.stderr,
+            )
+        self._speed = min(1.0, max(0.5, self._speed))
         self._max_ref_seconds = max(
             2.0, float(getattr(cfg, "clone_max_seconds", REF_MAX_SECONDS) or REF_MAX_SECONDS)
         )
@@ -183,26 +264,38 @@ class ZipVoiceTts:
         samples = np.asarray(samples, dtype=np.float32)
         if samples.ndim > 1:  # 只取第一声道（ZipVoice 只要单声道）
             samples = samples[:, 0]
-        before = samples.size / float(rate)
-        samples = self._trim(rate, samples)
-        cap = int(self._max_ref_seconds * rate)
-        if samples.size > cap:
-            samples = samples[:cap]
-        after = samples.size / float(rate)
+        full = self._trim(rate, samples)
+        before = full.size / float(rate)
 
-        text = (text or "").strip() or self._text_for(path, samples, rate, quiet=quiet)
-        text = self._normalize_text(text, quiet=quiet)
+        ref_text, from_file = self._resolve_text(path, text)
+        if ref_text:
+            # ★文本来自文件就不裁音频★：那段文本是整段的说明，截了就“声不对词”
+            use = full
+            if not quiet and before > LONG_REF_SECONDS:
+                print(
+                    f"[tts] 参考音频 {before:.1f}s（偏长，每句都要多等一会儿）。"
+                    f"想快就换一条 5~15 秒的，并同时把文本换成那一条的。",
+                    file=sys.stderr,
+                )
+        else:
+            # 没有文本 → 可裁，然后拿裁完的音频去转写（这样文本和音频一定是一致的）
+            cap = int(self._max_ref_seconds * rate)
+            use = full[:cap] if 0 < cap < full.size else full
+            ref_text = self._auto_text(path, use, rate, quiet=quiet)
+        after = use.size / float(rate)
+        text = self._normalize_text(ref_text, quiet=quiet)
         if not text and not quiet:
-            print("[tts] 没能拿到参考文本，音色会明显退化（建议手工写一个同名 .txt）", file=sys.stderr)
+            print("没拿到参考文本，音色会明显退化（同名 .txt 或同目录清单里写一条）", file=sys.stderr)
 
-        self._ref_audio = np.ascontiguousarray(samples, dtype=np.float32)
+        self._ref_audio = np.ascontiguousarray(use, dtype=np.float32)
         self._ref_rate = int(rate)
         self._ref_text = text
         self._ref_path = path
         if not quiet:
+            src = "参数" if not ref_text else ("文件" if from_file else "自动转写")
             print(
-                f"[tts] 参考音色：{path.name}"
-                f"（{before:.1f}s → {after:.1f}s @ {rate}Hz，文本 {len(text)} 字）",
+                f"[tts] 参考音色：{path.name}（{before:.1f}s → {after:.1f}s @ {rate}Hz，"
+                f"文本 {len(text)} 字，来自{src}）",
                 flush=True,
             )
         return True
@@ -260,8 +353,15 @@ class ZipVoiceTts:
             print(f"[tts] 参考文本是日语 → 已转罗马字：{roman[:50]}{tail}", flush=True)
         return roman or text
 
-    def _text_for(self, path: Path, samples: np.ndarray, rate: int, quiet: bool = False) -> str:
-        """参考文本：同名 .txt → （可选）本地 ASR 自动转写。"""
+    def _resolve_text(self, path: Path, explicit: str = "") -> tuple[str, bool]:
+        """找参考文本，返回 ``(文本, 是否来自文件)``。
+
+        顺序：调用方给的 → 同名 ``.txt`` → 同目录清单（如 ``kaltsit.txt``）。
+        「来自文件」意味着这段文本描述的是**整段音频**，所以音频不能裁（见 set_reference）。
+        """
+        text = (explicit or "").strip()
+        if text:
+            return text, False
         sidecar = path.with_suffix(".txt")
         if sidecar.exists():
             try:
@@ -269,15 +369,22 @@ class ZipVoiceTts:
             except OSError:
                 text = ""
             if text:
-                return text
+                return text, True
+        listed = manifest_texts(path.parent).get(path.name.lower()) or manifest_texts(
+            path.parent
+        ).get(path.stem.lower())
+        return (listed or ""), bool(listed)
+
+    def _auto_text(self, path: Path, samples: np.ndarray, rate: int, quiet: bool = False) -> str:
+        """没有现成文本时用本地 ASR 转写**这段音频**，并缓存成同名 .txt。"""
         if not bool(getattr(self.settings.tts, "clone_autotext", True)):
             return ""
         text = self._transcribe(path, samples, rate, quiet=quiet)
         if text:
             try:  # 落盘当缓存，也方便手工修正
-                sidecar.write_text(text + "\n", encoding="utf-8")
+                path.with_suffix(".txt").write_text(text + "\n", encoding="utf-8")
                 if not quiet:
-                    print(f"[tts] 自动转写的参考文本已写入 {sidecar}（不对就改它）", flush=True)
+                    print(f"[tts] 自动转写的参考文本已写入 {path.with_suffix('.txt')}（不对就改它）", flush=True)
             except OSError:
                 pass
         return text
@@ -327,6 +434,11 @@ class ZipVoiceTts:
         gen.reference_sample_rate = self._ref_rate
         gen.reference_text = self._ref_text
         gen.num_steps = self._num_steps
+        # 语速：<1 更慢、>1 更快（1.0 = 模型自己的节奏）
+        try:
+            gen.speed = self._speed
+        except Exception:  # pragma: no cover - 老版本没有这个字段
+            pass
         try:
             gen.extra["min_char_in_sentence"] = str(self._min_chars)
         except Exception:  # pragma: no cover - 老版本没有 extra
@@ -414,6 +526,7 @@ class ZipVoiceTts:
             "engine": self.name,
             "reference": self.reference,
             "num_steps": self._num_steps,
+            "speed": self._speed,
             "text_len": len(text),
             "audio_seconds": audio_s,
             "synth_seconds": elapsed,

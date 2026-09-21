@@ -107,23 +107,41 @@ def test_reference_prep() -> None:
 
 
 def test_reference_text(settings) -> None:
-    print("\n[3] 参考文本（同名 .txt 优先 / 日语转罗马字）")
-    from voice_loop.tts.zipvoice_tts import ZipVoiceTts
+    print("\n[3] 参考文本（同名 .txt / 同目录清单 / 日语转罗马字）")
+    from voice_loop.tts.zipvoice_tts import ZipVoiceTts, manifest_texts
 
     stub = ZipVoiceTts.__new__(ZipVoiceTts)
     stub.settings = settings
 
     with tempfile.TemporaryDirectory() as tmp:
-        wav = Path(tmp) / "ref.wav"
-        wav.write_bytes(b"")  # 只用来定位同名 .txt
-        sidecar = Path(tmp) / "ref.txt"
+        d = Path(tmp)
+        wav = d / "ref.wav"
+        wav.write_bytes(b"")  # 只用来定位同名 .txt / 参与清单匹配
+        sidecar = d / "ref.txt"
 
         sidecar.write_text("这是一段参考文本。\n", encoding="utf-8")
-        check(stub._text_for(wav, np.zeros(16, np.float32), 16000), "这是一段参考文本。", "同名 .txt 被读到")
+        text, from_file = stub._resolve_text(wav)
+        check((text, from_file), ("这是一段参考文本。", True), "同名 .txt 优先，且算「来自文件」")
 
-        sidecar.write_text("", encoding="utf-8")
+        sidecar.unlink()
+        check(stub._resolve_text(wav), ("", False), "没有文本来源时返回空")
+
+        # ★清单格式★：一行文件名 + 空行 + 一段文本（实测素材就是这种）
+        (d / "任命助理.wav").write_bytes(b"")  # 清单只认「目录里真有的音频」
+        (d / "kaltsit.txt").write_text(
+            "任命助理\n\n博士，请坐。别紧张。\n\nref\n\n清单里的文本。\n", encoding="utf-8"
+        )
+        check(manifest_texts(d).get("ref"), "清单里的文本。", "清单解析：文件名 + 段落")
+        check(stub._resolve_text(wav), ("清单里的文本。", True), "清单认得出来，也算「来自文件」")
+        check(manifest_texts(d).get("任命助理"), "博士，请坐。别紧张。", "清单里其它条目也在")
+
+        # 一行搞定的写法
+        (d / "tabs.txt").write_text("ref\tTab 分隔的文本\n", encoding="utf-8")
+        (d / "kaltsit.txt").unlink()
+        check(manifest_texts(d).get("ref"), "Tab 分隔的文本", "清单兼容「文件名 + tab + 文本」")
+
         settings.tts.clone_autotext = False
-        check(stub._text_for(wav, np.zeros(16, np.float32), 16000), "", "关掉自动转写且 .txt 为空 → 返回空")
+        check(stub._auto_text(wav, np.zeros(16, np.float32), 16000), "", "关掉自动转写 → 返回空")
 
     # 罗马字
     jp = "ドクター、今日の仕事も真面目に。"
@@ -168,11 +186,35 @@ def test_full(settings) -> None:
     from voice_loop.tts.zipvoice_tts import ZipVoiceTts
 
     settings.tts.backend = "zipvoice"
-    settings.tts.clone_audio = "data/personas/kalsit/任命助理.wav"
+    settings.tts.clone_audio = "data/personas/kaltsit/干员报到.wav"
     settings.tts.clone_text = ""
     engine = ZipVoiceTts(settings)
     check(engine.sample_rate, 24000, "输出采样率 24000 Hz")
     check_true(bool(engine.reference_text), f"拿到参考文本（{engine.reference_text[:24]}…）")
+
+    # ★截断规则★：文本来自文件 → 不能截（截了文本就对不上，会「乱说」，实测踩过）；
+    #              没有文本（靠自动转写）→ 可以截，因为是对着截完的音频转写的。
+    print("    · 截断规则")
+    import shutil
+    import tempfile
+
+    settings.tts.clone_max_seconds = 3.0  # 故意设一个很小的上限来暴露问题
+    with_file_text = ZipVoiceTts(settings)
+    used = with_file_text._ref_audio.size / with_file_text._ref_rate
+    check_true(used > 3.5, f"文本来自清单 → 音频没被截（用了 {used:.1f}s，上限 3s）")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        bare = Path(tmp) / "bare.wav"
+        shutil.copyfile(settings.resolve("data/personas/kaltsit/干员报到.wav"), bare)
+        settings.tts.clone_audio = str(bare)
+        settings.tts.clone_autotext = False
+        no_text = ZipVoiceTts(settings)
+        capped = no_text._ref_audio.size / no_text._ref_rate
+        check(no_text.reference_text, "", "没有文本来源时文本为空")
+        check_true(capped <= 3.2, f"没有文本 → 音频按上限截（{capped:.1f}s ≤ 3s）")
+    settings.tts.clone_max_seconds = with_file_text._max_ref_seconds
+    settings.tts.clone_autotext = True
+    settings.tts.clone_audio = "data/personas/kaltsit/干员报到.wav"
     text = "我在，博士。"
     t0 = time.perf_counter()
     parts = [pcm for _r, pcm in engine.synth(text)]

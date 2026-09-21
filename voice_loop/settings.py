@@ -147,11 +147,12 @@ class TtsConfig:
     clone_text: str = ""             # 参考音频的逐字文本；留空则用同名 .txt 或本地 ASR 转写
     clone_autotext: bool = True      # 参考文本留空时自动转写，并把结果缓存成同名 .txt
     clone_romanize: bool = True      # 参考文本是日语时自动转罗马字（ZipVoice 只认中英文）
-    clone_max_seconds: float = 15.0  # 参考音频最多截取多少秒（太长更慢也更不稳）
-    clone_steps: int = 4             # 流匹配步数：4 最快，8~16 更稳更慢
+    clone_max_seconds: float = 15.0  # 参考音频截取上限；★只有文本靠自动转写时才截★，
+                                     # 文本从文件/清单来的时候不截（截了文本就对不上，会乱说）
+    clone_steps: int = 4             # 流匹配步数：4 最快，8 慢一倍（输出时长完全一样，实测）
     clone_min_chars: int = 16        # 段内最短切句字数（越小出声越快）
     clone_threads: int = 2           # onnxruntime 线程数
-    clone_speed: float = 1.0         # 语速（>1 更快）
+    clone_speed: float = 1.0         # 语速：1.0=模型自己的节奏；<1 更慢；★>1 会弄坏（已夹到 ≤1.0）★
     clone_guidance: float = 0.0      # 0 = 用库默认，>0 才覆盖
     clone_t_shift: float = 0.0       # 0 = 用库默认
     clone_target_rms: float = 0.0    # 0 = 用库默认
