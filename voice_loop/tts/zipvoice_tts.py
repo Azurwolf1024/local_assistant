@@ -49,6 +49,20 @@ def _resample(x: np.ndarray, src: int, dst: int) -> np.ndarray:
     return np.interp(idx, np.arange(x.size, dtype=np.float64), x).astype(np.float32)
 
 
+def missing_files(settings: Settings) -> list[Path]:
+    """缺哪些模型文件（空列表 = 齐了）。create_tts 用它在启动时就退到 Piper。"""
+    base = settings.resolve(settings.tts.clone_dir)
+    wanted = [
+        base / "tokens.txt",
+        base / "encoder.int8.onnx",
+        base / "decoder.int8.onnx",
+        base / "lexicon.txt",
+        base / "espeak-ng-data",
+        settings.resolve(settings.tts.clone_vocoder),
+    ]
+    return [p for p in wanted if not p.exists()]
+
+
 class ZipVoiceTts:
     name = "zipvoice"
 
@@ -74,7 +88,7 @@ class ZipVoiceTts:
             ) from None
         self._sh = sherpa_onnx
 
-        self._missing = self._check_files()
+        self._missing = missing_files(settings)
         if self._missing:
             raise FileNotFoundError(
                 "找不到 ZipVoice 模型文件：\n  "
@@ -88,6 +102,9 @@ class ZipVoiceTts:
         silence_s = max(0.0, float(cfg.sentence_silence))
         self._silence = np.zeros(int(self._rate * silence_s), dtype=np.int16)
         self._synth_calls = 0
+        # 没参考音频时退回 Piper 出声（宁可音色不对，也不能把嘴弄哑）
+        self._fallback = None
+        self._warned_no_ref = False
 
         # 参考音频（音色）
         self._ref_audio: np.ndarray | None = None
@@ -99,18 +116,6 @@ class ZipVoiceTts:
             self.set_reference(audio, str(getattr(cfg, "clone_text", "") or ""), quiet=True)
 
     # ------------------------------------------------------------------ 模型
-    def _check_files(self) -> list[Path]:
-        base = self._clone_dir
-        wanted = [
-            base / "tokens.txt",
-            base / "encoder.int8.onnx",
-            base / "decoder.int8.onnx",
-            base / "lexicon.txt",
-            base / "espeak-ng-data",
-            self._vocoder,
-        ]
-        return [p for p in wanted if not p.exists()]
-
     def _create_engine(self):
         cfg = self.settings.tts
         sh = self._sh
@@ -328,16 +333,29 @@ class ZipVoiceTts:
             pass
         return gen
 
+    def _speak_without_reference(self, text: str) -> Iterator[tuple[int, np.ndarray]]:
+        """没参考音频就直接用 Piper 出声——音色不对是小事，答不上话是大事。"""
+        if not self._warned_no_ref:
+            self._warned_no_ref = True
+            print(
+                "[tts] ZipVoice 没有可用的参考音频，这一句先用 Piper 出声"
+                "（在 [tts] clone_audio 或角色的 voice_ref 里指定音频文件）",
+                file=sys.stderr,
+            )
+        if self._fallback is None:
+            from .piper_tts import PiperTts  # noqa: PLC0415 - 只在真用到时才导入
+
+            self._fallback = PiperTts(self.settings)
+        yield from self._fallback.synth(text)
+
     def synth(self, text: str) -> Iterator[tuple[int, np.ndarray]]:
         """边生成边产出：第一个 chunk 出来就交给播放器，不必等整句合成完。"""
         text = (text or "").strip()
         if not text:
             return
         if self._ref_audio is None:
-            raise RuntimeError(
-                "zipvoice 还没设参考音频：在 [tts] 里填 clone_audio（和 clone_text），"
-                "或在角色文件里填 voice_ref / voice_ref_text"
-            )
+            yield from self._speak_without_reference(text)
+            return
         gen = self._gen_config()
         box: queue.Queue = queue.Queue()
         errors: list[BaseException] = []
@@ -409,6 +427,9 @@ class ZipVoiceTts:
         fn(self)
 
     def close(self) -> None:
+        if self._fallback is not None:
+            self._fallback.close()
+            self._fallback = None
         self._engine = None  # type: ignore[assignment]
         self._ref_audio = None
         import gc  # noqa: PLC0415

@@ -929,17 +929,29 @@ def cmd_selftest(settings: Settings, args: argparse.Namespace) -> int:
         print(f"  × {exc}")
 
     # 4. TTS
-    print("\n[4] 语音合成 (Piper)")
+    backend = (settings.tts.backend or "piper").strip().lower()
+    clone_ref = str(getattr(settings.tts, "clone_audio", "") or "").strip()
+    print(f"\n[4] 语音合成（{'音色克隆' if backend == 'zipvoice' else 'Piper'}）")
     try:
         require_models(settings, need_asr=False)
         from voice_loop.tts import create_tts
 
         tts = create_tts(settings)
         info = tts.benchmark("你好，我是本地部署的中文语音助手。")
+        if backend == "zipvoice":
+            who = f"zipvoice · 参考 {Path(clone_ref).name}" if clone_ref else "zipvoice · 没设参考音频（会退到 Piper）"
+        else:
+            who = settings.tts.voice
         print(
-            f"  √ {settings.tts.voice}  采样率 {info['sample_rate']} Hz  "
+            f"  √ {who}  采样率 {info['sample_rate']} Hz  "
             f"合成 {info['audio_seconds']:.2f}s 用时 {info['synth_seconds']:.2f}s  RTF {info['rtf']:.2f}"
         )
+        if backend == "zipvoice":
+            # 对话体感看的是「首段出声」，不是总 RTF
+            first = float(info.get("first_chunk_seconds") or 0.0)
+            steps = int(getattr(settings.tts, "clone_steps", 4) or 4)
+            print(f"    步数 {steps}  首段出声 {first:.2f}s（Piper 是 0.13s）")
+            print('    · 克隆音色是「说多久、等多久」；想更快就把 [tts] backend 改回 "piper"')
         if not args.no_play:
             import sounddevice as sd
             from voice_loop.audio import Speaker
@@ -975,7 +987,7 @@ def cmd_selftest(settings: Settings, args: argparse.Namespace) -> int:
             sample = settings.sessions_dir / "selftest_asr.wav"
             _rate, _pcm = create_tts(settings).synth_bytes("你好，这是一段用于测试的语音。")
             save_wav(sample, _pcm.astype("float32") / 32768.0, _rate)
-            print(f"   · 没有示例音频，已用 Piper 合成 {sample.name}")
+            print(f"   · 没有示例音频，已用当前 TTS（{settings.tts.backend}）合成 {sample.name}")
 
         audio, rate = load_wav(sample, 16000)
         for r in router.transcribe_both(audio, rate):

@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**SenseVoiceSmall / Whisper-large-v3-turbo → Ollama qwen3.5:4b → Piper 中文女声**
+**SenseVoiceSmall / Whisper-large-v3-turbo → Ollama qwen3.5:4b → 凯尔希音色（ZipVoice 零样本克隆，可一行改回 Piper）**
 
 完全跑在本机的「说话 → 识别 → 思考 → 说话」闭环，不联网、不上传任何数据。
 支持唤醒词常驻待命、闹钟与会议提醒、备忘、日程查询，并且边说边播（首音 1~2 秒）。
@@ -27,7 +27,7 @@ flowchart LR
     I -->|tool_call| Q["工具层<br/>复用同一套技能与守卫"]
     Q --> J
     H --> J
-    J --> K["Piper<br/>zh_CN-huayan-medium"]
+    J --> K["凯尔希音色<br/>ZipVoice 克隆（可改回 Piper）"]
     K --> L["🔊 边说边播"]
 
     M["调度器<br/>每 5s 轮询"] -. 到点播报 .-> J
@@ -117,7 +117,7 @@ flowchart LR
 | --- | --- | --- |
 | ASR | SenseVoice 快路径 + Whisper 按需复核 + 标点移植 | 中文短句 0.1s 出结果，长句/可疑结果才花 3s 让 Whisper 复核 |
 | 意图 | **模型先选工具，正则技能层兜底** | 说法千变万化，正则只能盖住写过的那些（踩过：误删日程、纠正丢空）。模型选工具实测 29/29 全对，而算时间/守卫仍在代码里 |
-| TTS 分块 | **只在句末切，短句合并** | Piper 中文音色看不到标点，切太碎会又平又顿，见第 6 节 |
+| TTS 分块 | **只在句末切，短句合并** | Piper 中文音色看不到标点，切太碎会又平又顿，见第 6 节；克隆后端更在意分块长短——它一段生成一次，每块都要等 |
 | 播放 | 单独线程 + 队列，随时可打断 | 边生成边播，说错了按回车立刻停 |
 
 ### 1.3 要不要上 agent 执行循环（多轮工具）？——实测：不用
@@ -905,9 +905,10 @@ python scripts/tts_probe.py "你好[[,]]世界"   # 看注入停顿的效果
 | Whisper turbo int8（5.6s 音频）**Arc 核显** | **0.49 s（RTF 0.087，快 6.8 倍）** |
 | Whisper 首次在核显上编译图 | 约 10 s（只在第一次，之后有缓存） |
 | Piper 合成 | RTF 0.04~0.07，首块 0.12 s |
+| **ZipVoice 克隆合成（当前默认）** | **RTF 1.1~1.4，首段 1.4~2.7 s**（参考 10 s / 4 步，CPU） |
 | qwen3.5:4b 生成 | **17.6 tok/s**（qwen2.5:7b 是 12.3） |
 | qwen3.5:4b 热首字 | 0.5 s（冷启动加载 3.4 GB 约 4 s） |
-| **端到端首音** | **0.7 ~ 2.1 s** |
+| **端到端首音** | **0.7 ~ 2.1 s（Piper）/ 2~5 s（克隆）** |
 
 优化建议，按收益排序：
 
@@ -1187,6 +1188,7 @@ python main.py gpu --enable-igpu          # 让 Ollama 用上核显（写环境�
 | Whisper turbo int8（5.6 s 音频） | 3.3 s | **0.49 s** | 快 6.8 倍；首次要编译图约 10 s |
 | SenseVoiceSmall | 0.08 s | — | sherpa-onnx 官方轮子只有 CPU，但已经够快 |
 | Piper TTS | RTF 0.04 | — | 瓶颈不在 TTS，加速收益很小 |
+| ZipVoice 克隆 TTS | RTF 1.1~1.4 | 未验证 | **当前真正的瓶颈**；sherpa-onnx 的 zipvoice 例子只给了 `provider="cpu"`，换 provider 能不能用还没试 |
 | qwen3.5:4b 生成 | 12.3 tok/s（旧模型） | **17.6 tok/s** | 新模型在核显上更快；预填稍慢（284 vs 345 tok/s） |
 | qwen3.5:4b 看图（1024） | 14.6 s | **7.3 s** | 一个模型同时管文本和看图，省掉那 3.2 GB 的视觉模型 |
 
@@ -1251,6 +1253,8 @@ $env:OLLAMA_IGPU_ENABLE = "1"      # 这一句不能省，否则从当前窗口�
 
 - **NPU 跑 Whisper**：会崩，已写进测试（`scripts/test_accel.py` 断言 auto 不选 NPU）。
 - **TTS 上 GPU**：Piper 是 RTF 0.04，加速收益远小于折腾成本；
+  克隆后端（ZipVoice）CPU 上 RTF 1.1~1.4，是目前唯一值得折腾的加速位，
+  但 sherpa-onnx 的例子只给了 `provider="cpu"`，能不能走 OpenVINO / 核显还没验证。
   `[tts] use_cuda` 只对装了 CUDA 版 onnxruntime 的机器有用，配错时 `main.py gpu` 会提醒你。
 
 ## 13. MCP：自己搭的工具协议层
@@ -1478,7 +1482,7 @@ Piper 的每个声线是一个 onnx 文件。在角色里写 `"voice": "zh_CN-hu
 ### 换成角色本人的音色（零样本克隆，实测）
 
 上面那条路只能换成「另一个 Piper 音色」。想要**凯尔希本人的音色**，用的是零样本克隆：
-给一小段她的语音（参考音频）+ 这段语音的逐字文本，模型就用她的音色读中文。
+给一小段她的语音（参考音频）+ 这段语音的逐字文本，模型就用她的音色读中文。**这是当前默认后端。**
 
 后端已经接好，用的是**本机早就装着的 sherpa-onnx**（不用 torch、不用 CUDA、不加新运行时）：
 
@@ -1489,12 +1493,15 @@ python scripts/tts_clone_probe.py --ref data/personas/kalsit/任命助理.wav --
 
 ```toml
 [tts]
-backend = "zipvoice"                                  # ← 只改这一行就换声线，改回 "piper" 即还原
+backend = "zipvoice"                                  # 默认：用角色本人的音色；改回 "piper" 即还原
 clone_audio = "data/personas/kalsit/任命助理.wav"      # 参考音频（5~15 秒、单人、无背景音乐）
 clone_text = ""                                       # 留空 = 同名 .txt，再没有就本地 ASR 自动转写
 clone_steps = 4                                       # 4 最快；8 慢一倍；16 慢三倍，音质提升有限
 clone_max_seconds = 10.0                              # 参考音频截取上限，见下表
 ```
+
+两个后端都不会哑：克隆模型没装全、或参考音频不可用时会**自动退回 Piper 出声**
+（`main.py selftest` 与 `create_tts` 都会把原因打出来）。
 
 角色文件里也能各配各的（`voice_ref` / `voice_ref_text`），切换角色时**当场换音色**，
 不用重启：已经加载了就直接换参考音频，还没加载就写进配置、等下次加载生效。
@@ -1512,6 +1519,7 @@ clone_max_seconds = 10.0                              # 参考音频截取上限
 
 结论：**RTF ≈ 1.1~1.4，基本是「说多久、等多久」**，首段出声 1.4~2.7 s（Piper 是 0.13 s）。
 步数线性翻倍而音质提升有限，所以默认 4 步；参考音频越长越慢（且不会更像），默认截到 10 s。
+另外**唤醒后的第一句还要多等约 2 s**——克隆模型是唤醒时才加载的（待机时释放，不占内存）。
 
 #### 三条硬约束（都实测踩过）
 
@@ -1560,5 +1568,8 @@ ZipVoice 这条路的好处是：**运行时本机早就装好了**（sherpa-onn
 不碰 torch、CPU 就能跑，实测 RTF 1.1~1.4。代价是文本前端只认中英文——所以有了上面那段罗马字绕法。
 
 > 说在前面：**音色像不像只能用耳朵判断**。`scripts/tts_clone_probe.py` 会把生成结果写成
-> `sessions/tts_clone_probe/*.wav`，跟 Piper 的同一句话放在一起，自己听一遍再决定用哪个后端。
-> 日常对话（要快）继续用 Piper，想要「她在说话」的观感就把 `backend` 改成 `zipvoice`。
+> `sessions/tts_clone_probe/*.wav`，跟 Piper 的同一句话放在一起。
+>
+> 现在默认就是克隆音色。它换来的是「像她」，代价是「说多久、等多久」——
+> 一句话 2 秒就得等 2.5 秒才出声。想让对话更干脆，把 `[tts] backend` 改回 `"piper"`，
+> 改一行就生效，其余什么都不用动。

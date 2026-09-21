@@ -117,15 +117,19 @@ file = "data/characters.json"
 default = ""            # 没指定角色时用谁（id 或名字）；留空 = 用文件里 default=true 的那个
 extra_prompt = ""        # 追加到任何角色后面的附加要求（想全局改口风写这里）
 
-# ── 语音合成 (Piper) ────────────────────────────────────────────────────────
+# ── 语音合成 ─────────────────────────────────────────────────────────────────
+# backend：
+#   "zipvoice" = 用角色本人的音色读中文（零样本克隆，就是凯尔希的声线）——当前默认
+#   "piper"    = 低延迟固定音色（首段 0.13s），想要「反应快」时改回去
+# 两个都不会哑：克隆模型没装全 / 参考音频不可用时自动退回 Piper 出声。
 [tts]
-backend = "piper"
-voice = "zh_CN-huayan-medium"                 # 中文女声
+backend = "zipvoice"
+voice = "zh_CN-huayan-medium"                 # piper 后端用的声线（中文女声）
 model = "models/tts/piper/zh_CN-huayan-medium.onnx"
 config = "models/tts/piper/zh_CN-huayan-medium.onnx.json"
 use_cuda = false
 
-# 音色 / 语调
+# piper 的音色 / 语调（zipvoice 后端不用这几个）
 length_scale = 1.0            # 语速：1.0 最自然，>1 更慢，<1 更快
 noise_scale = 0.667           # 音高起伏
 noise_w_scale = 0.85          # 音长起伏，调大（0.9~1.0）更有感情
@@ -141,10 +145,10 @@ max_chunk_chars = 60          # 整句超过该长度才允许在逗号处切
 max_hold_seconds = 1.2        # 攒句最长等待：超时也先送出去，保证响应
 first_chunk_min_chars = 8     # 首块最少字数（越小出声越快）
 
-# ── 音色克隆（backend 改成 "zipvoice" 才生效）────────────────────────────────
+# ── 音色克隆（backend = "zipvoice" 时生效）────────────────────────────────
 # 用一小段「参考音频 + 它的逐字文本」把角色音色搬到中文输出上。
 # 实测（Core Ultra 5 / CPU）：RTF 1.1~1.4、首段 1.4~2.7s；Piper 是 RTF 0.05、首段 0.13s。
-# 想换音色就改 backend，想换回来也只要改这一行——两条路都留着。
+# 就是「说多久、等多久」——想快就改回 backend = "piper"，只改这一行。
 #   试听：python scripts/tts_clone_probe.py --ref <wav> --compare
 #   模型：python scripts/download_models.py --only zipvoice（156 MB）
 clone_dir = "models/tts/zipvoice/sherpa-onnx-zipvoice-distill-int8-zh-en-emilia"

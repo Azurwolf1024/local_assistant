@@ -2,6 +2,7 @@
 
 不依赖模型文件也能跑的部分（默认就跑这些）：
     - 后端分发：backend 名字写错要报错，不能静默退回 piper
+    - 护栏：克隆模型没装全 → 自动退回 Piper 出声（绝不把嘴弄哑）
     - 参考音频预处理：掐静音、截断上限、单声道
     - 参考文本：同名 .txt 优先；日语自动转罗马字；没有 pykakasi 也不能崩
     - 角色字段：voice_ref / voice_ref_text 能读进来
@@ -29,6 +30,7 @@ if str(ROOT) not in sys.path:
 from voice_loop.persona import Character  # noqa: E402
 from voice_loop.settings import load_settings  # noqa: E402
 from voice_loop.tts import create_tts  # noqa: E402
+from voice_loop.tts.zipvoice_tts import missing_files  # noqa: E402
 
 PASS = 0
 FAIL = 0
@@ -64,6 +66,20 @@ def test_backend_dispatch(settings) -> None:
     check_true(hasattr(engine, "unload"), "懒加载壳有 unload()")
     check_true(hasattr(engine, "configure"), "懒加载壳有 configure()")
     check(engine.loaded, False, "刚创建时没有加载模型")
+
+
+    print("    · 克隆模型没装全时不能把嘴弄哑")
+    real_dir = settings.tts.clone_dir
+    try:
+        settings.tts.backend = "zipvoice"
+        settings.tts.clone_dir = "models/tts/zipvoice/不存在的模型目录"
+        check(len(missing_files(settings)) > 0, True, "缺文件能报出来（给下载脚本提示用）")
+        fallback = create_tts(settings, lazy=False)
+        check(fallback.name, "piper", "模型没装全 → 自动退回 Piper 出声（不报错、不哑）")
+    finally:
+        settings.tts.clone_dir = real_dir
+        settings.tts.backend = "piper"
+    check(missing_files(settings), [], "模型真装好了（缺文件列表为空）")
 
 
 def test_reference_prep() -> None:
@@ -168,6 +184,16 @@ def test_full(settings) -> None:
     check_true(audio_s < 8.0, f"时长没失控（{audio_s:.2f}s，失控会 >10s）")
     check_true(float(np.max(np.abs(pcm))) > 1000, "有实际波形（不是静音）")
     print(f"         RTF {elapsed / audio_s:.2f}（首次含预热，1~2 属正常）")
+
+    print("\n[6] 参考音频不可用时退回 Piper（不报错）")
+    settings.tts.clone_audio = "data/personas/kalsit/没有这个文件.wav"
+    settings.tts.clone_text = ""
+    bare = ZipVoiceTts(settings)
+    check(bare.reference, "（未设参考音频）", "参考音频没读到时不报错，只是没设上")
+    pieces = [(r, p) for r, p in bare.synth("我在，博士。")]
+    rates = {r for r, _ in pieces}
+    check(22050 in rates, True, f"改用了 Piper 的采样率出声（{sorted(rates)}）")
+    check_true(sum(p.size for _r, p in pieces) > 4000, "确实出音了（不是静音）")
 
 
 def main() -> int:
