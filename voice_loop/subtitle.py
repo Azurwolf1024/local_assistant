@@ -158,6 +158,11 @@ class SubtitleOverlay:
         # 而不是不管说没说完全靠倒计时隐藏
         self._keepalive: Callable[[], bool] | None = None
         self._kept = False
+        # 「现在念到第几个字了」——同样由 pipeline 注入。★为什么需要它★：
+        # 折叠只留末尾，长回答会把「正在念的那句」折掉、屏幕上反而是没念到的后文；
+        # 有了它，字幕只显示到念过的地方，折叠就落在已经念完的部分上。
+        self._progress: Callable[[], int | None] | None = None
+        self._shown_pos: int | None = None
 
         # 配色
         self._bg = "#0f131a"
@@ -227,6 +232,36 @@ class SubtitleOverlay:
         传 ``None`` 就退回纯计时隐藏——关掉语音播报时就是这种情况。
         """
         self._keepalive = fn
+
+    def set_progress(self, fn: Callable[[], int | None] | None) -> None:
+        """注入「现在念到第几个字（字符下标）」，返回 ``None`` = 不限制（显示全文）。
+
+        作用：字幕只显示到念过的地方，这样折叠（``max_lines``）折掉的一定是
+        **已经念完的部分**，正在念的那句始终在下面看得见。
+        同样在 UI 线程里每帧调一次，必须快。
+        """
+        self._progress = fn
+        if fn is None:
+            self._shown_pos = None      # 撤掉限制就恢复显示全文
+
+    def _poll_progress(self) -> None:
+        """问一次「念到哪儿了」，变了就标脏（单独成方法是为了能脱离 Tk 测）。"""
+        if self._progress is None:
+            return
+        try:
+            pos = self._progress()
+        except Exception:  # noqa: BLE001 - 判断出错就不限制
+            pos = None
+        if pos != self._shown_pos:
+            self._shown_pos = pos
+            self._dirty = True
+
+    def _visible_body(self) -> str:
+        """按「念到哪儿」裁一下要显示的正文。"""
+        if self._shown_pos is None:
+            return self._body
+        end = max(0, min(len(self._body), int(self._shown_pos)))
+        return self._body[:end]
 
     def _put(self, kind: str, payload: str) -> None:
         if not self.enabled or self._closing:
@@ -319,6 +354,10 @@ class SubtitleOverlay:
         if self._closing:
             return
         now = time.monotonic()
+
+        # 「念到哪儿了」先问一遍：它比 25 帧/秒的节流更该及时跟上
+        self._poll_progress()
+
         # 渲染合并到 ~25 帧/秒：LLM 一秒能吐几十个 delta，不必每个都重排
         idle = self._queue.empty()
         if idle and now - self._last_render < 0.05:
@@ -339,6 +378,7 @@ class SubtitleOverlay:
             elif kind == "clear":
                 self._user_text = ""
                 self._body = ""
+                self._shown_pos = None
             self._dirty = True
             self._changed_at = now
 
@@ -355,7 +395,7 @@ class SubtitleOverlay:
                     self._visible = False
             else:
                 lines = self._wrap(
-                    self._body, self._font_main, self._wrap_px, self.max_lines
+                    self._visible_body(), self._font_main, self._wrap_px, self.max_lines
                 )
                 self._lbl_main.configure(text="\n".join(lines))
                 if self._user_text and self.show_user_text:

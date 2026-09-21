@@ -191,6 +191,10 @@ class VoiceLoop:
                         self._in_reply or self.speaker.pending > 0 or self.speaker.speaking
                     )
                 )
+                # ★字幕只显示到「已经念到的地方」★：折叠只留末尾，
+                # 长回答会把正在念的那句折掉、屏幕上反而是没念到的后文
+                if bool(getattr(sub_cfg, "sync_speech", True)):
+                    self.subtitle.set_progress(self._spoken_position)
                 self.subtitle.start()
             except Exception as exc:  # noqa: BLE001
                 self.log.warning(f"字幕初始化失败：{exc}")
@@ -249,6 +253,15 @@ class VoiceLoop:
         self._stop = threading.Event()
         self._interrupt = threading.Event()
         self._hotkey = None            # 按键打断（默认 Esc）的监听线程
+        # 字幕同步用：这一轮念到第几个字、已经排了多少秒音频
+        self._spoken_chars = 0
+        self._spoken_seconds = 0.0
+        self._speech_marks: list[tuple[int, float]] = []  # (累计字数, 累计音频秒)
+        self._play_anchor_audio = 0.0  # 「从这一刻开始播」对应的音频秒数
+        self._play_anchor_time = 0.0
+        self._last_submit_at = 0.0
+        self._sync_active = False      # 这一轮说话是否还在进行（字幕据此裁显示范围）
+        self._speech_begin_at = 0.0
         self._muted = threading.Event()      # 播放期间忽略麦克风，避免自我唤醒
         self._needs_flush = False            # 播放过之后，下次监听前要清一次回声
         self._speak_lock = threading.Lock()  # 保证同一时刻只有一处发声
@@ -393,6 +406,109 @@ class VoiceLoop:
     # ======================================================================
     # 发声
     # ======================================================================
+    _WAIT_FIRST_SECONDS = 15.0   # 开声后等第一段音频的上限（超了就放弃字幕限制）
+    _GAP_SECONDS = 3.0           # 句间空白容忍度（超过就认为这一轮说完了）
+
+    def _speech_reset(self) -> None:
+        self._spoken_chars = 0
+        self._spoken_seconds = 0.0
+        self._speech_marks = []
+        self._play_anchor_audio = 0.0
+        self._play_anchor_time = 0.0
+
+    def _speech_begin(self) -> None:
+        """一轮发言开始：进度从零算起，字幕开始只显示「念过的部分」。"""
+        if not self.tts_enabled:
+            return
+        self._speech_reset()
+        self._sync_active = True
+        self._speech_begin_at = time.monotonic()
+
+    def _speech_end(self) -> None:
+        """一轮发言结束：字幕放开限制，显示全文（方便回头读）。"""
+        self._sync_active = False
+
+    def _speak_chunk(self, chunk: str) -> bool:
+        """合成并排队一小段，顺手把字幕进度往前推。
+
+        返回「真的排出音频了吗」。字幕那边靠 :meth:`_spoken_position` 问
+        「现在念到第几个字」，所以这里要记住每段念到了哪、以及它有多长。
+        """
+        if not chunk or not chunk.strip():
+            return False
+        # 上一句已经放完了 → 这是新的一句，进度重新算（提醒 / 技能回答常走这条）
+        if self._spoken_chars and not (self.speaker.pending > 0 or self.speaker.speaking):
+            self._speech_reset()
+        self._sync_active = True
+        if not (self.speaker.pending > 0 or self.speaker.speaking):
+            # 队列是空的：这一段提交下去就会立刻开始播 → 记下播放时间锚点
+            self._play_anchor_audio = self._spoken_seconds
+            self._play_anchor_time = time.monotonic()
+        queued = 0.0
+        for rate, pcm in self.tts.synth(chunk):
+            if self._interrupt.is_set():
+                break
+            self.speaker.submit(pcm, rate)
+            queued += pcm.size / float(rate or 1)
+        if not queued:
+            return False
+        self._spoken_chars += len(chunk)
+        self._spoken_seconds += queued
+        self._speech_marks.append((self._spoken_chars, self._spoken_seconds))
+        self._last_submit_at = time.monotonic()
+        return True
+
+    def _played_audio_seconds(self) -> float:
+        """已经播出去多少秒音频（估算）。
+
+        队列空了就认为「全部已播」；在播的话从最后一个播放锚点按实时往上加。
+        两个滑窗不要求精确对应——字幕只要「接近」声音就行。
+        """
+        if not self._speech_marks:
+            return 0.0
+        if not (self.speaker.pending > 0 or self.speaker.speaking):
+            return self._spoken_seconds
+        if not self._play_anchor_time:
+            return 0.0
+        played = self._play_anchor_audio + (time.monotonic() - self._play_anchor_time)
+        return max(0.0, min(self._spoken_seconds, played))
+
+    def _spoken_position(self) -> int | None:
+        """字幕该显示到第几个字；``None`` = 不限制（显示全文）。
+
+        它会在 UI 线程里被每帧调一次，所以只做几十次运算、不加锁。
+        """
+        if not self.tts_enabled or not self._sync_active:
+            return None
+        playing = self.speaker.pending > 0 or self.speaker.speaking
+        if not playing:
+            if not self._speech_marks:
+                # 这一轮已经开声、但第一段还没合成出来（克隆音色要 2~3 秒）：
+                # ★先一个字都不显示★，免得把还没念的全文（带折叠）先撮上屏。
+                # 超出 WAIT_FIRST 秒还没声（TTS 出问题了）就放弃限制。
+                if time.monotonic() - self._speech_begin_at < self._WAIT_FIRST_SECONDS:
+                    return 0
+                self._sync_active = False
+                return None
+            # 队列空：句与句之间的小空白算在同一轮里；
+            # 真结束了（_speech_end）或空了很久，就把全文放开
+            if time.monotonic() - self._last_submit_at < self._GAP_SECONDS:
+                return self._spoken_chars
+            self._sync_active = False
+            return None
+        if not self._speech_marks:
+            return 0                      # 声音还没出来 → 一个字都先不显示
+        played = self._played_audio_seconds()
+        marks = list(self._speech_marks)   # 快照：pipeline 线程还在往后追加
+        prev_chars, prev_sec = 0, 0.0
+        for chars, sec in marks:
+            if played <= sec:
+                span = sec - prev_sec
+                frac = 1.0 if span <= 0 else min(1.0, max(0.0, (played - prev_sec) / span))
+                return int(round(prev_chars + (chars - prev_chars) * frac))
+            prev_chars, prev_sec = chars, sec
+        return prev_chars
+
     def _submit_chunks(self, text: str) -> None:
         tts_cfg = self.settings.tts
         chunker = SpeechChunker(
@@ -402,16 +518,18 @@ class VoiceLoop:
             max_hold_seconds=0.0,
         )
         for chunk in chunker.feed(text) + chunker.flush():
-            for rate, pcm in self.tts.synth(chunk):
-                if self._interrupt.is_set():
-                    return
-                self.speaker.submit(pcm, rate)
+            if self._interrupt.is_set():
+                return
+            self._speak_chunk(chunk)
 
     def speak_text(self, text: str, wait: bool = True, fresh: bool = False) -> float:
         """直接朗读一段文字（技能回答、提醒播报）。"""
         text = prepare_for_reading(text)
         if not text:
             return 0.0
+        # ★先告诉字幕「这一轮开始发声了」★：这样它从一开始就只显示念过的部分，
+        # 不会先把全文（带折叠）闪一下再跳回去
+        self._speech_begin()
         # 字幕先上屏：即使关掉了语音播报（tts_enabled=False）也要看得见回答
         if self.subtitle is not None:
             if fresh:
@@ -432,6 +550,7 @@ class VoiceLoop:
                 self._submit_chunks(text)
                 if wait:
                     self._drain_playback()
+                    self._speech_end()
         finally:
             self._barge_finish()
             self._muted.clear()
@@ -1102,14 +1221,13 @@ class VoiceLoop:
             nonlocal first_audio
             if not self.tts_enabled:
                 return
-            for rate, pcm in self.tts.synth(sentence):
-                if self._interrupt.is_set():
-                    return
-                if first_audio is None:
-                    first_audio = time.perf_counter() - t0
-                self.speaker.submit(pcm, rate)
+            if self._speak_chunk(sentence) and first_audio is None:
+                first_audio = time.perf_counter() - t0
 
         try:
+            # ★从回答一开始就告诉字幕「这一轮要发声了」★：这样字幕不会先把
+            # 全文（折叠后的末尾）闪一下，再跳回正在念的那句
+            self._speech_begin()
             with self._speak_lock:
                 for ev in self.llm.chat_events(
                     prompt,
@@ -1166,6 +1284,7 @@ class VoiceLoop:
                     for sentence in chunker.flush():
                         speak(sentence)
                     self._drain_playback()
+                    self._speech_end()
 
             if not calls and hold_for_route and not self._interrupt.is_set():
                 # 模型一个字都没念、也没调工具：交给 respond() 问过技能层再决定

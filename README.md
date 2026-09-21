@@ -205,6 +205,7 @@ flowchart LR
 │  ├─ test_hotkey.py           # ★ 按 Esc 打断：只在说话时读、丢掉积压按键、不吞 Ctrl+C
 │  ├─ test_wake_cycle.py       # ★ 待机→唤醒→空闲回收→再次唤醒（含 Whisper 竞态）
 │  ├─ test_subtitle.py         # ★ 字幕：可见性 / 居中 / 点得穿 / 说话期间不隐藏 / 自动隐藏（--check）
+│  ├─ test_subtitle_sync.py    # ★ 字幕与语音同步：只显示念到的部分、段内插值不越界
 │  ├─ test_toast.py            # 看一眼右下角可视提醒长什么样
 │  ├─ test_dialog.py           # 对话链路自测（不用麦克风）
 │  ├─ bench_llm.py             # ★ 换模型前的体检（延迟 / 是否思考 / 看图识字）
@@ -440,8 +441,14 @@ python scripts/test_bargein.py --live    # 真机回环：量回声 + 你自己�
 - ★字幕跟声音同步★：只要**还在生成回答、或扬声器里还有没放完的音频**就绝不隐藏；
   真的停下来之后再停留 `hold_seconds` 秒（默认 6）。以前是纯倒计时（不管说没说完全看时间），
   长回答会出现「话音未落、字先没了」——那是真事，已修
-- LLM 流式输出是边生成边上屏的；回答太长时最多显示 `max_lines` 行，
-  超出的部分只留末尾并在开头标一个「…」
+- ★只显示「已经念到的地方」★（`sync_speech`，默认开）：折叠（`max_lines`）只留末尾，
+  而长回答生成得比念得快，以前会把「正在念的那句」折掉、屏幕上反而是还没念到的后文。
+  现在字幕按「已播出去的音频秒数」在句子内部插值，只裁到念过的地方——
+  所以**正在念的那句永远在屏幕最下面**，被折掉的一定是已经念完的部分。
+  副作用：克隆音色合成第一段要 2~3 秒，这段时间字幕是空的（不会先把没念的全文撮上去）；
+  Piper 只要 0.1 秒，几乎无感。真的想回到「立刻显示全文」就把它设成 `false`
+- LLM 流式输出是边生成边上屏的（只是超出「念到的地方」的部分先不显示）；
+  回答太长时最多显示 `max_lines` 行，超出的部分只留末尾并在开头标一个「…」
 
 调参在 `config.toml` 的 `[subtitle]`：
 
@@ -451,6 +458,7 @@ python scripts/test_bargein.py --live    # 真机回环：量回声 + 你自己�
 | `width` | 字幕条最大宽度，屏幕比这窄会自动缩 |
 | `alpha` | 不透明度，0.2~1.0，越小越透 |
 | `hold_seconds` | ★说完之后★再停留几秒才隐藏（说话/生成期间不会隐藏） |
+| `sync_speech` | 字幕只显示「已经念到的地方」（默认 true；false = 立刻显示全文） |
 | `font_size` / `max_lines` | 字号 / 最多几行 |
 | `show_user_text` | 要不要连「你说：…」一起显示 |
 | `margin` | 离任务栏上方多少像素 |
@@ -503,6 +511,7 @@ python scripts/test_bargein.py         # 打断：合成回声/插话对照（--
 python scripts/test_hotkey.py          # 按 Esc 打断：假键盘驱动，验按键与护栏逻辑
 python scripts/test_wake_cycle.py      # 待机 → 唤醒 → 空闲回收 → 再次唤醒
 python scripts/test_subtitle.py --check # 字幕：真的截屏量一遍可见性/居中/点穿/同步/自动隐藏
+python scripts/test_subtitle_sync.py  # 字幕只显示念到的部分 + 段内插值（不装窗口、不出声）
 python scripts/test_toast.py           # 看一眼右下角可视提醒长什么样
 python scripts/test_dialog.py --no-tts # 13 轮对话，只看文本与耗时
 python scripts/test_wake.py --rounds 5 # ★ 拿真实嗓音试唤醒词，看被听成什么
