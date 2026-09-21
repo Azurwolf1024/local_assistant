@@ -420,7 +420,10 @@ def test_schedule_model() -> None:
           ("这个月" in r.reply and "9月30日" in r.reply and "月度对账" in r.reply), True)
     r = skills.handle("下个月有什么安排", now=fri)
     check("「下个月」报下个月", ("下个月" in r.reply and "10月" in r.reply), True)
-    r = skills.handle("这周有什么安排")
+    # 注意：必须传 now=fri。这条断言的意思是「周五问这周，周三周四的不该出现」，
+    # 不传 now 就用真实日期——真实日期变成周一/周二时，这周本来就包含周三的课，
+    # 断言会假失败（实测：2026-09-21 周一）。
+    r = skills.handle("这周有什么安排", now=fri)
     print(f"        {r.reply}")
     check("「这周」不列已经过去的（周五问，周三周四的课不该出现）",
           ("9月16日" not in r.reply and "AIAA3102" not in r.reply), True)

@@ -30,6 +30,8 @@
       "avoid": ["不要用「作为一个AI」"],         // 明确不要出现什么
       "lines": [{"scene": "被唤醒", "text": "我在，博士。"}],
       "voice": "",                            // 可选：这个角色用自己的 piper 声线
+      "voice_ref": "",                        // 可选：克隆音色的参考音频（wav，backend = "zipvoice" 时用）
+      "voice_ref_text": "",                   // 可选：参考音频的逐字文本；留空则用同名 .txt 或自动转写
       "temperature": 0.7,                     // 可选：覆盖全局温度（0 = 用全局）
       "notes": "给自己看的备注"                 // 不进提示词
     }
@@ -84,6 +86,8 @@ class Character:
     avoid: list[str] = field(default_factory=list)      # 明确不要出现的东西
     lines: list[dict] = field(default_factory=list)     # 示例台词 [{scene, text}]
     voice: str = ""                       # piper 声线名（空 = 用 config.toml 的 [tts]）
+    voice_ref: str = ""                   # 克隆音色的参考音频（backend = "zipvoice" 时生效）
+    voice_ref_text: str = ""              # 参考音频的逐字文本（空 = 同名 .txt / 自动转写）
     temperature: float = 0.0              # 0 = 用全局 [llm] temperature
     default: bool = False
     enabled: bool = True
@@ -137,6 +141,8 @@ class Character:
             avoid=[str(s).strip() for s in _list("avoid")],
             lines=lines,
             voice=str(raw.get("voice") or "").strip(),
+            voice_ref=str(raw.get("voice_ref") or "").strip(),
+            voice_ref_text=str(raw.get("voice_ref_text") or "").strip(),
             temperature=float(raw.get("temperature") or 0.0),
             default=bool(raw.get("default")),
             enabled=bool(raw.get("enabled", True)),

@@ -191,10 +191,12 @@ flowchart LR
 │  ├─ audio.py                 # 麦克风、VAD、播放器
 │  ├─ llm.py                   # Ollama 客户端
 │  ├─ asr/                     # sensevoice / whisper_ov / router
-│  └─ tts/piper_tts.py
+│  └─ tts/                     # piper_tts.py（快）/ zipvoice_tts.py（音色克隆）/ lazy.py（按需加载）
 ├─ scripts/
 │  ├─ download_models.py       # 一键下载模型
 │  ├─ test_offline.py          # 离线自测（分块/时间/技能/唤醒/生命周期，含 09-19 那次误解析误删的回归）
+│  ├─ tts_clone_probe.py       # ★ 音色克隆试听/测速（生成 wav 供耳朵判断，可与 Piper 对比）
+│  ├─ test_tts_clone.py        # ★ 克隆后端测试（--full 会真的加载模型跑一句）
 │  ├─ test_skills_route.py     # 技能路由 + 关屏 + 课表 + 提醒文案 + 重启不丢数据
 │  ├─ test_bargein.py          # ★ 打断：合成对照 + 真机回声自测（--echo）/ 回环（--live）
 │  ├─ test_wake_cycle.py       # ★ 待机→唤醒→空闲回收→再次唤醒（含 Whisper 竞态）
@@ -475,6 +477,8 @@ python scripts/test_toast.py           # 看一眼右下角可视提醒长什么
 python scripts/test_dialog.py --no-tts # 13 轮对话，只看文本与耗时
 python scripts/test_wake.py --rounds 5 # ★ 拿真实嗓音试唤醒词，看被听成什么
 python scripts/tts_probe.py --compare  # 生成语调对比音频
+python scripts/tts_clone_probe.py --ref data/personas/kalsit/任命助理.wav --compare   # 音色克隆试听 + 与 Piper 比延迟
+python scripts/test_tts_clone.py       # 克隆后端（默认不加载模型，秒级；--full 才真跑）
 python scripts/test_mic_loopback.py    # 扬声器放一句、麦克风收，诊断麦克风
 python scripts/say.py "凯尔希，现在几点了"   # 不想开口时，让电脑替你喊唤醒词
 python scripts/clean_junk_data.py --apply    # 清理早期版本写坏的备忘/闹钟（先备份）
@@ -1143,6 +1147,9 @@ Piper 的 `zh_CN-huayan-medium` 是官方唯一的中文女声。调 `noise_w_sc
   右下角、调试、终端就都一致了。
 - **控制台中文**：重定向到管道/文件时 Windows 用 cp936，代码里已把
   `✓ ✗` 换成 GBK 安全的 `√ ×`。直接看控制台或输出到文件再看都正常。
+- **音色克隆（可选）**：只用 `sherpa-onnx`（本机早有）+ 纯 Python 的 `pykakasi`
+  （把日语参考文本转罗马字，见第 14 节）。**不需要 torch / CUDA / MNN**；
+  `IndexTTS` 那条路暂时走不通——它的中文前端依赖 `pynini`，Python 3.13 没有 wheel（实测）。
 
 ---
 
@@ -1467,3 +1474,91 @@ python main.py --character amiya text       # 临时用某个角色（chat / lis
 Piper 的每个声线是一个 onnx 文件。在角色里写 `"voice": "zh_CN-huayan-medium"` 之外的名字，
 把那两个文件（`.onnx` + `.onnx.json`）放进 `models/tts/piper/` 即可；
 **没装的时候只警告、继续用全局声线**（不会把嘴弄哑）。用 `python main.py persona --voices` 看缺哪个。
+
+### 换成角色本人的音色（零样本克隆，实测）
+
+上面那条路只能换成「另一个 Piper 音色」。想要**凯尔希本人的音色**，用的是零样本克隆：
+给一小段她的语音（参考音频）+ 这段语音的逐字文本，模型就用她的音色读中文。
+
+后端已经接好，用的是**本机早就装着的 sherpa-onnx**（不用 torch、不用 CUDA、不加新运行时）：
+
+```powershell
+python scripts/download_models.py --only zipvoice    # 156 MB（模型 104 + 声码器 52）
+python scripts/tts_clone_probe.py --ref data/personas/kalsit/任命助理.wav --compare
+```
+
+```toml
+[tts]
+backend = "zipvoice"                                  # ← 只改这一行就换声线，改回 "piper" 即还原
+clone_audio = "data/personas/kalsit/任命助理.wav"      # 参考音频（5~15 秒、单人、无背景音乐）
+clone_text = ""                                       # 留空 = 同名 .txt，再没有就本地 ASR 自动转写
+clone_steps = 4                                       # 4 最快；8 慢一倍；16 慢三倍，音质提升有限
+clone_max_seconds = 10.0                              # 参考音频截取上限，见下表
+```
+
+角色文件里也能各配各的（`voice_ref` / `voice_ref_text`），切换角色时**当场换音色**，
+不用重启：已经加载了就直接换参考音频，还没加载就写进配置、等下次加载生效。
+
+#### 实测数据（Core Ultra 5 225H，纯 CPU）
+
+| 参考音频 | 步数 | 首段出声 | 音频时长 | RTF |
+| --- | --- | --- | --- | --- |
+| 凯尔希 15 s | 4 | 4.49 s | 3.11 s | 1.44 |
+| 凯尔希 10 s | 4 | 2.73 s | 2.10 s | 1.30 |
+| 凯尔希 6 s | 4 | 1.37 s | 1.29 s | 1.07 |
+| 凯尔希 6 s | 8 | 2.73 s | 1.29 s | 2.13 |
+| 凯尔希 6 s | 16 | 5.39 s | 1.29 s | 4.19 |
+| **Piper 对照** | — | **0.13 s** | 5.06 s | **0.05** |
+
+结论：**RTF ≈ 1.1~1.4，基本是「说多久、等多久」**，首段出声 1.4~2.7 s（Piper 是 0.13 s）。
+步数线性翻倍而音质提升有限，所以默认 4 步；参考音频越长越慢（且不会更像），默认截到 10 s。
+
+#### 三条硬约束（都实测踩过）
+
+1. **参考文本必须和音频逐字一致**，不一致音色明显退化。文本留空时会用**本机已有的
+   SenseVoice 自动转写**（`clone_autotext = true`），结果缓存成同名 `.txt`，不对可以直接改。
+2. **参考音频要单人、干净、5~15 秒**。首尾静音会自动掐掉；背景音乐会让音色飘。
+3. **它只认中文和英文**。这是最费事的一条，见下。
+
+#### 日语参考音频怎么办（这就是「保留中文输出 + 用日语原声」的答案）
+
+凯尔希的音色包是日语。直接喂进去会这样：
+
+```
+Ignore OOV 'ド'   →   Failed to convert prompt text 'ドクター' to token IDs
+```
+
+假名被当前端 OOV 丢掉，输出退化成**复读乱语**——一句 17 字的中文，生成了 22.6 秒音频（正常 3 秒）。
+
+绕法：**把日语转成罗马字**，前端就当英文词、交给 espeak 念，和原音基本对得上：
+
+| 参考文本 | 输出时长 | 结论 |
+| --- | --- | --- |
+| 日语原文（自动转写） | 0.08 s | 前端直接报错，废 |
+| 空文本 | 22.59 s | 退化，复读乱语 |
+| 中文意译 | 16.05 s | 退化 |
+| **罗马字（`dokutaa kakete…`）** | **3.11 s** | **正常** |
+
+所以本项目的做法是：**SenseVoice 转写 → pykakasi 转罗马字 → 喂给 ZipVoice**，全自动，
+只要 `clone_romanize = true`（默认开）。相关依赖就一个纯 Python 的 `pykakasi`：
+
+```powershell
+python -m pip install pykakasi
+```
+
+#### 为什么不用 `IndexTTS-2.5-MNN`
+
+你提到的这个项目，GitHub 上**搜不到**（`index-tts mnn` 是 0 条结果）。现状是：
+
+- IndexTTS 是 2.4 万星的官方项目，确实支持跨语种克隆，但它是 **PyTorch + 多 GB 权重**，
+  且官方中文前端依赖 `pynini`——**Python 3.13 没有 wheel**（实测 `No matching distribution found`），
+  要跑得专门建一个 3.12 环境、再下几个 GB。CPU 上 RTF 未知，大概率比 1.4 更慢。
+- MNN 系的项目（`mnn-tts`、`Bert-VITS2-MNN`、`CosyVoice3-MNN`…）基本都是**给 Android 用的
+  C++ 工程**，Windows 上要自己编；而且没有哪个是「IndexTTS-2.5 的 MNN 版」。
+
+ZipVoice 这条路的好处是：**运行时本机早就装好了**（sherpa-onnx 自带它）、模型 156 MB、
+不碰 torch、CPU 就能跑，实测 RTF 1.1~1.4。代价是文本前端只认中英文——所以有了上面那段罗马字绕法。
+
+> 说在前面：**音色像不像只能用耳朵判断**。`scripts/tts_clone_probe.py` 会把生成结果写成
+> `sessions/tts_clone_probe/*.wav`，跟 Piper 的同一句话放在一起，自己听一遍再决定用哪个后端。
+> 日常对话（要快）继续用 Piper，想要「她在说话」的观感就把 `backend` 改成 `zipvoice`。

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -95,7 +95,14 @@ def test_add_schedule() -> None:
     check("排进日程了", r.ok, True)
     check("动作是新增", r.action, "schedule_add")
     item = skills.schedule.load()[0]
-    check("日期算对了（模型自己算会错成 10-04）", item.get("start"), "2026-09-23 15:30")
+    # ★别写死日期★：「下周三」是相对真实日期算的，真实日期一变就不是 9/23 了
+    #（实测：2026-09-21 周一跑到这里，下周三已经变成 9/30）。改成日期无关的断言。
+    start = datetime.strptime(str(item.get("start")), "%Y-%m-%d %H:%M")
+    check("时间对", start.strftime("%H:%M"), "15:30")
+    check("是周三（周一=0）", start.weekday(), 2)
+    nxt_monday = datetime.now().date() + timedelta(days=7 - datetime.now().weekday())
+    check("落在下周（没跳到更远的周三，模型自己算会错成 10-04）",
+          nxt_monday <= start.date() <= nxt_monday + timedelta(days=6), True)
     check("标题干净", item.get("title"), "跟导师见面")
 
     r = reg.call(tool_call("add_schedule", text="下周三下午三点半跟导师见面"))
@@ -153,10 +160,13 @@ def test_reads() -> None:
     print("\n[4] 只读工具：模型能查到真数据（这是它以前会编的地方）")
     tmp = Path(tempfile.mkdtemp(prefix="voiceloop_tool_"))
     _settings, skills, reg = build(tmp)
+    # 下次见面排到「下周的周三」——动态算，才能保证「下周」一定含它
+    monday = datetime.now().date() - timedelta(days=datetime.now().weekday())
+    next_wed = monday + timedelta(days=9)
     skills.schedule.save([
         {"title": "AIAA3102 机器学习", "kind": "course", "repeat": "weekly", "weekday": 2,
          "time": "09:00", "location": "教学楼 A302", "remind_before": [15]},
-        {"title": "跟导师见面", "kind": "meeting", "repeat": "once", "start": "2026-09-23 15:30",
+        {"title": "跟导师见面", "kind": "meeting", "repeat": "once", "start": f"{next_wed} 15:30",
          "time": "15:30", "remind_before": [10]},
     ])
     skills.alarms.save([{"when": "2026-09-19 07:00:00", "what": "起床", "fired": False}])

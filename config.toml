@@ -141,6 +141,28 @@ max_chunk_chars = 60          # 整句超过该长度才允许在逗号处切
 max_hold_seconds = 1.2        # 攒句最长等待：超时也先送出去，保证响应
 first_chunk_min_chars = 8     # 首块最少字数（越小出声越快）
 
+# ── 音色克隆（backend 改成 "zipvoice" 才生效）────────────────────────────────
+# 用一小段「参考音频 + 它的逐字文本」把角色音色搬到中文输出上。
+# 实测（Core Ultra 5 / CPU）：RTF 1.1~1.4、首段 1.4~2.7s；Piper 是 RTF 0.05、首段 0.13s。
+# 想换音色就改 backend，想换回来也只要改这一行——两条路都留着。
+#   试听：python scripts/tts_clone_probe.py --ref <wav> --compare
+#   模型：python scripts/download_models.py --only zipvoice（156 MB）
+clone_dir = "models/tts/zipvoice/sherpa-onnx-zipvoice-distill-int8-zh-en-emilia"
+clone_vocoder = "models/tts/zipvoice/vocos_24khz.onnx"
+clone_audio = "data/personas/kalsit/任命助理.wav"   # 参考音频（凯尔希日语原声）
+clone_text = ""              # 逐字文本：留空=同名 .txt，再没有就本地 ASR 自动转写
+clone_autotext = true        # 自动转写并缓存成同名 .txt（可手工改）
+clone_romanize = true        # 参考文本是日语时自动转罗马字（ZipVoice 只认中英文）
+clone_max_seconds = 10.0     # 参考音频截取上限：15s→4.5s 出声，10s→2.7s，6s→1.4s
+clone_steps = 4              # 流匹配步数：4 最快；8 慢一倍；16 慢三倍（音质提升有限）
+clone_min_chars = 16         # 段内最短切句字数（越小出声越快）
+clone_threads = 2            # onnxruntime 线程数
+clone_speed = 1.0
+clone_guidance = 0.0         # 0 = 用库默认
+clone_t_shift = 0.0          # 0 = 用库默认
+clone_target_rms = 0.0       # 0 = 用库默认
+clone_feat_scale = 0.0       # 0 = 用库默认
+
 # ── 唤醒词 / 常驻服务 ───────────────────────────────────────────────────────
 [wake]
 enabled = true

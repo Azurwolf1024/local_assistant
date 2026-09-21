@@ -37,6 +37,16 @@ SILERO_VAD_URLS = [
     "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx",
 ]
 
+# 零样本音色克隆（ZipVoice，中英双语，sherpa-onnx 跑）
+ZIPVOICE_URLS = [
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/sherpa-onnx-zipvoice-distill-int8-zh-en-emilia.tar.bz2",
+    "https://ghfast.top/https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/sherpa-onnx-zipvoice-distill-int8-zh-en-emilia.tar.bz2",
+]
+ZIPVOICE_VOCODER_URLS = [
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/vocoder-models/vocos_24khz.onnx",
+    "https://ghfast.top/https://github.com/k2-fsa/sherpa-onnx/releases/download/vocoder-models/vocos_24khz.onnx",
+]
+
 
 def human(n: float) -> str:
     for unit in ("B", "KB", "MB", "GB"):
@@ -135,9 +145,37 @@ def fetch_piper(voice: str = "zh_CN-huayan-medium", force: bool = False) -> None
         download_with_fallback(hf_urls(PIPER_REPO, base + suffix), out / (voice + suffix), force=force)
 
 
+def fetch_zipvoice(force: bool = False) -> None:
+    """ZipVoice 音色克隆：模型包（104 MB）+ 声码器（52 MB）。"""
+    print("[4/4] ZipVoice 音色克隆（中英双语零样本克隆）")
+    out = MODELS / "tts" / "zipvoice"
+    out.mkdir(parents=True, exist_ok=True)
+    tarball = out / "sherpa-onnx-zipvoice-distill-int8-zh-en-emilia.tar.bz2"
+    target = out / "sherpa-onnx-zipvoice-distill-int8-zh-en-emilia"
+    if target.exists() and not force:
+        print(f"      已解包，跳过：{target.name}")
+    else:
+        download_with_fallback(ZIPVOICE_URLS, tarball, force=force)
+        print("      解包中…")
+        import tarfile
+
+        with tarfile.open(tarball, "r:bz2") as tar:
+            tar.extractall(out)  # noqa: S202 - 官方发布包
+        tarball.unlink(missing_ok=True)
+    download_with_fallback(
+        ZIPVOICE_VOCODER_URLS, out / "vocos_24khz.onnx", force=force
+    )
+    print("      完成。用法见 README 第 14 节，试听：python scripts/tts_clone_probe.py --help")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="下载本地语音链路模型")
-    ap.add_argument("--only", nargs="*", choices=["sensevoice", "vad", "piper"], help="只下载指定模型")
+    ap.add_argument(
+        "--only",
+        nargs="*",
+        choices=["sensevoice", "vad", "piper", "zipvoice"],
+        help="只下载指定模型",
+    )
     ap.add_argument("--force", action="store_true", help="强制重新下载")
     args = ap.parse_args()
 
@@ -148,6 +186,8 @@ def main() -> int:
         fetch_silero_vad(args.force)
     if "piper" in targets:
         fetch_piper(force=args.force)
+    if "zipvoice" in targets:
+        fetch_zipvoice(force=args.force)
 
     print("\n完成。模型目录：")
     for p in sorted(MODELS.rglob("*")):

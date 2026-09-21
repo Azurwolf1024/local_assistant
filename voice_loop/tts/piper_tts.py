@@ -21,6 +21,7 @@ import numpy as np
 
 from ..settings import Settings
 from ..text import ensure_terminal, inject_pauses
+from .lazy import LazyTts as GenericLazyTts
 
 
 def _load_piper():
@@ -159,53 +160,11 @@ class PiperTts:
         gc.collect()
 
 
-class LazyTts:
-    """按需加载、可卸载的 Piper 封装，对外接口与 :class:`PiperTts` 一致。
+class LazyTts(GenericLazyTts):
+    """Piper 的按需加载外壳（通用实现见 :mod:`voice_loop.tts.lazy`）。
 
     待唤醒时完全不存在于内存里；被唤醒后才加载，睡回去时再释放。
     """
 
-    name = "piper"
-
     def __init__(self, settings: Settings, logger=None) -> None:
-        self.settings = settings
-        self.log = logger
-        self._engine: PiperTts | None = None
-        self._lock = threading.Lock()
-        self.inject_pauses = bool(getattr(settings.tts, "inject_pauses", False))
-
-    @property
-    def loaded(self) -> bool:
-        return self._engine is not None
-
-    def load(self) -> PiperTts:
-        with self._lock:
-            if self._engine is None:
-                t0 = time.perf_counter()
-                self._engine = PiperTts(self.settings)
-                if self.log:
-                    self.log.info(
-                        f"TTS 已加载：{self.settings.tts.voice}（{time.perf_counter() - t0:.1f}s）"
-                    )
-            return self._engine
-
-    def unload(self) -> None:
-        with self._lock:
-            if self._engine is not None:
-                self._engine.close()
-                self._engine = None
-                if self.log:
-                    self.log.info("TTS 已卸载")
-
-    @property
-    def sample_rate(self) -> int:
-        return self.load().sample_rate
-
-    def synth(self, text: str) -> Iterator[tuple[int, np.ndarray]]:
-        yield from self.load().synth(text)
-
-    def synth_bytes(self, text: str) -> tuple[int, np.ndarray]:
-        return self.load().synth_bytes(text)
-
-    def benchmark(self, text: str = "你好，这是一次语音合成的速度测试。") -> dict:
-        return self.load().benchmark(text)
+        super().__init__(settings, PiperTts, logger, name="piper")

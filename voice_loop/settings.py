@@ -138,6 +138,25 @@ class TtsConfig:
     max_hold_seconds: float = 1.2    # 攒句最长等待时间
     speak_streaming: bool = True     # 边生成边朗读（关掉则整体生成完再播）
 
+    # ---- 零样本音色克隆后端（backend = "zipvoice"，见 voice_loop/tts/zipvoice_tts.py）----
+    # 用「一小段参考音频 + 这段音频的逐字文本」把音色搬到中文输出上。
+    # 参考音频要求：单人、无背景音乐、5~15 秒；参考文本必须跟音频逐字一致。
+    clone_dir: str = "models/tts/zipvoice/sherpa-onnx-zipvoice-distill-int8-zh-en-emilia"
+    clone_vocoder: str = "models/tts/zipvoice/vocos_24khz.onnx"
+    clone_audio: str = ""            # 参考音频路径（wav）
+    clone_text: str = ""             # 参考音频的逐字文本；留空则用同名 .txt 或本地 ASR 转写
+    clone_autotext: bool = True      # 参考文本留空时自动转写，并把结果缓存成同名 .txt
+    clone_romanize: bool = True      # 参考文本是日语时自动转罗马字（ZipVoice 只认中英文）
+    clone_max_seconds: float = 15.0  # 参考音频最多截取多少秒（太长更慢也更不稳）
+    clone_steps: int = 4             # 流匹配步数：4 最快，8~16 更稳更慢
+    clone_min_chars: int = 16        # 段内最短切句字数（越小出声越快）
+    clone_threads: int = 2           # onnxruntime 线程数
+    clone_speed: float = 1.0         # 语速（>1 更快）
+    clone_guidance: float = 0.0      # 0 = 用库默认，>0 才覆盖
+    clone_t_shift: float = 0.0       # 0 = 用库默认
+    clone_target_rms: float = 0.0    # 0 = 用库默认
+    clone_feat_scale: float = 0.0    # 0 = 用库默认
+
 
 @dataclass
 class ChatConfig:

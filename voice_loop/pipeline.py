@@ -660,12 +660,25 @@ class VoiceLoop:
         self._apply_voice(char, reason)
         self.log.info(f"[角色] 生效：{char.label}（{reason or '设定'}）")
 
+    def _tts_label(self) -> str:
+        """启动横幅用的一行说明（不加载模型，纯看配置）。"""
+        cfg = self.settings.tts
+        if (cfg.backend or "piper").strip().lower() == "zipvoice":
+            ref = str(getattr(cfg, "clone_audio", "") or "").strip()
+            name = ref.replace("\\", "/").rsplit("/", 1)[-1] if ref else "未设参考音频"
+            return f"zipvoice（参考 {name}，{int(getattr(cfg, 'clone_steps', 4) or 4)} 步）"
+        return f"piper / {cfg.voice}"
+
     def _apply_voice(self, char: Character, reason: str = "") -> None:
         """角色自带声线时换声线。
 
         Piper 的声线是绑在 onnx 模型上的，换就必须卸载重载（下次说话时自然加载）。
-        声线文件不存在就只警告、继续用当前的——**绝不能因为换声线把嘴弄哑了**。
+        克隆后端（zipvoice）换的是「参考音频」。
+        声线/参考不存在就只警告、继续用当前的——**绝不能因为换声线把嘴弄哑了**。
         """
+        if (self.settings.tts.backend or "piper").strip().lower() == "zipvoice":
+            self._apply_reference(char, reason)
+            return
         want = (char.voice or "").strip()
         tts_cfg = self.settings.tts
         current = str(getattr(tts_cfg, "voice", "") or "")
@@ -687,6 +700,26 @@ class VoiceLoop:
         if callable(unload):
             unload()
         self.log.info(f"[角色] 声线：{current} → {want}（{reason or '切换'}）")
+
+    def _apply_reference(self, char: Character, reason: str = "") -> None:
+        """克隆后端下，换角色 = 换参考音频（没有就用 [tts] clone_audio 当默认）。"""
+        tts_cfg = self.settings.tts
+        want = str(getattr(char, "voice_ref", "") or "").strip()
+        text = str(getattr(char, "voice_ref_text", "") or "").strip()
+        current = str(getattr(tts_cfg, "clone_audio", "") or "")
+        if not want or (want == current and text == str(getattr(tts_cfg, "clone_text", "") or "")):
+            return
+        path = self.settings.resolve(want)
+        if not path.exists():
+            self.log.warning(f"角色 {char.name} 想用参考音色 {want}，但文件不在（继续用 {current or '全局参考'}）")
+            print(f"[角色] 参考音频 {want} 不存在，继续用当前的", flush=True)
+            return
+        tts_cfg.clone_audio = want
+        tts_cfg.clone_text = text
+        configure = getattr(self.tts, "configure", None)
+        if callable(configure):  # 已经加载了就当场换；没加载等下次加载自然生效
+            configure(lambda engine: engine.set_reference(want, text))
+        self.log.info(f"[角色] 参考音色：{current or '（无）'} → {want}（{reason or '切换'}）")
 
     def _switch_character(self, cid: str) -> Character | None:
         """唤醒词点了谁的名就切到谁（人设 + 应答语 + 声线）。"""
@@ -1403,7 +1436,7 @@ class VoiceLoop:
             f"\n=== 本地语音助手已启动 ===\n"
             f"  ASR : {self.settings.asr.strategy} / {'+'.join(self.asr.available) or '未加载'}\n"
             f"  LLM : {self.settings.llm.model} @ {self.settings.llm.host}\n"
-            f"  TTS : piper / {self.settings.tts.voice}\n"
+            f"  TTS : {self._tts_label()}\n"
             f"  模式: {'自动断句（直接说话，停顿即发送）' if mode == 'vad' else '回车录制'}"
             + (f"\n  技能: {self.skills.stats()}" if self.skills else "")
             + f"\n  提示: 说「{self.settings.chat.exit_phrases[0]}」退出"
@@ -1473,7 +1506,7 @@ class VoiceLoop:
             f"\n=== 本地语音助手 · 常驻服务 ===\n"
             f"  ASR : {asr_desc}\n"
             f"  LLM : {self.settings.llm.model} @ {self.settings.llm.host}\n"
-            f"  TTS : piper / {self.settings.tts.voice}\n"
+            f"  TTS : {self._tts_label()}\n"
             f"  唤醒词: {words}    (可直接编辑 {self._wake_path}，保存即生效)\n"
             + (
                 f"  角色  : {self.persona.stats()}\n" if self.persona is not None else ""
