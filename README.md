@@ -197,6 +197,8 @@ flowchart LR
 │  ├─ test_offline.py          # 离线自测（分块/时间/技能/唤醒/生命周期，含 09-19 那次误解析误删的回归）
 │  ├─ tts_clone_probe.py       # ★ 音色克隆试听/测速（生成 wav 供耳朵判断，可与 Piper 对比）
 │  ├─ test_tts_clone.py        # ★ 克隆后端测试（--full 会真的加载模型跑一句）
+│  ├─ import_lines.py          # ★ 把「名字+文本」清单导进角色的 lines（只添加，不替换）
+│  ├─ test_import_lines.py     # ★ 导入程序测试（两种排版 / 去重 / 过滤 / 自动找 json / 备份）
 │  ├─ test_skills_route.py     # 技能路由 + 关屏 + 课表 + 提醒文案 + 重启不丢数据
 │  ├─ test_bargein.py          # ★ 打断：合成对照 + 真机回声自测（--echo）/ 回环（--live）
 │  ├─ test_wake_cycle.py       # ★ 待机→唤醒→空闲回收→再次唤醒（含 Whisper 竞态）
@@ -479,6 +481,7 @@ python scripts/test_wake.py --rounds 5 # ★ 拿真实嗓音试唤醒词，看�
 python scripts/tts_probe.py --compare  # 生成语调对比音频
 python scripts/tts_clone_probe.py --ref data/personas/kalsit/任命助理.wav --compare   # 音色克隆试听 + 与 Piper 比延迟
 python scripts/test_tts_clone.py       # 克隆后端（默认不加载模型，秒级；--full 才真跑）
+python scripts/test_import_lines.py    # 台词导入：只添加不替换、两种清单排版、过滤、备份
 python scripts/test_mic_loopback.py    # 扬声器放一句、麦克风收，诊断麦克风
 python scripts/say.py "凯尔希，现在几点了"   # 不想开口时，让电脑替你喊唤醒词
 python scripts/clean_junk_data.py --apply    # 清理早期版本写坏的备忘/闹钟（先备份）
@@ -1601,3 +1604,42 @@ ZipVoice 这条路的好处是：**运行时本机早就装好了**（sherpa-onn
 > 现在默认就是克隆音色。它换来的是「像她」，代价是「说多久、等多久」——
 > 一句话 2 秒就得等 2.5 秒才出声。想让对话更干脆，把 `[tts] backend` 改回 `"piper"`，
 > 改一行就生效，其余什么都不用动。
+
+### 从清单文件导入台词（只添加，不替换）
+
+上面那些台词素材是「文件名 + 文本」的清单（`data/personas/kaltsit/kaltsit.txt`，38 条）。
+`scripts/import_lines.py` 可以把任意这样的清单导进任意/对应 json 的数组字段：
+
+```powershell
+# 只看会发生什么（默认试运行，不写文件）
+python scripts/import_lines.py data/personas/kaltsit/kaltsit.txt
+
+# 真写进去：目标 json 自动找（同目录 <名字>.json → 上一级 <名字>.json → 索引里对应的 file）
+python scripts/import_lines.py data/personas/kaltsit/kaltsit.txt --apply
+
+# 指定目标 / 场景名 / 过滤
+python scripts/import_lines.py 台词.txt --json data/personas/amiya.json --apply \
+    --scene 随意对话 --skip 作战 --max-chars 40
+```
+
+- **只添加，不替换**：原有内容一个字不动，同文本的条目自动跳过（实测：38 条里
+  已有 6 条被手工搬过 → 只新增 32 条，再跑一次 0 新增）。
+- 写入前自动备份成 `<名字>.json.bak`（`.bak` 已进 `.gitignore`），回滚就是拷回来。
+- 清单两种排版都认：**名字紧接正文**（实测素材）和 *名字 / 空行 / 正文*；
+  也认 `名字<TAB>正文`。整份都是段落的文本用 `--plain`。
+- `--key` / `--as text` 可以导到别的字段（例如 `style`，写纯字符串而不是 `{scene,text}`）。
+- 写之前会量一遍角色提示词长度，给你一个「+多少字」的数字。
+
+**「台词多了会不会变成长篇大论/复读」——实测：不会，反而更短。**
+
+只把 system prompt 换掉（其余完全一样），每题问 2 遍，数汉字：
+
+| 配置 | 提示词 | 回答长度（6 次） | 平均 |
+| --- | --- | --- | --- |
+| 39 条台词（导入后） | 2547 字 | 31 / 31 / 64 / 65 / 67 / 71 | **54.8 字** |
+| 只有最初 7 条 | 1326 字 | 48 / 65 / 85 / 89 / 91 / 94 | **78.7 字** |
+
+原因大概是这些台词本身就是「短、克制、不说教」的口吻，提示词里也明确写了
+「只看语气，不要原样重复」，所以它是往**更像凯尔希**的方向收敛。
+（这条推翻了我最初在工具里写的担心，已经把提示改成实测结论。）
+运行 `scripts/test_import_lines.py` 可以复验「只添加」的 36 条断言。

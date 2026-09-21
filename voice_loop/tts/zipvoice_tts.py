@@ -31,6 +31,7 @@ from pathlib import Path
 
 import numpy as np
 
+from ..manifest import manifest_pairs
 from ..settings import Settings
 
 # 参考音频的推荐上限（秒）。再长不会更像，只会更慢、更不稳。
@@ -65,75 +66,21 @@ def missing_files(settings: Settings) -> list[Path]:
     return [p for p in wanted if not p.exists()]
 
 
-# 目录里的 *清单文件* 解析结果缓存：{(目录,): ((文件,mtime,size)..., {文件名小写: 文本})}
-_MANIFEST_CACHE: dict[Path, tuple[tuple, dict[str, str]]] = {}
-
-
-def _join_paragraph(lines: list[str]) -> str:
-    """把段落拼成一行（中文之间不留空格，英文单词之间留）。"""
-    text = " ".join(x.strip() for x in lines if x.strip())
-    return re.sub(r"(?<=[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef])\s+(?=[\u4e00-\u9fff])", "", text)
+# 目录里的 *清单文件* 解析结果缓存见 voice_loop/manifest.py
 
 
 def manifest_texts(directory: Path) -> dict[str, str]:
-    """把同目录下的 ``*.txt`` 当成「文件名 + 文本」清单读进来。
+    """目录里「能当参考文本用」的清单条目：``{音频名(小写): 文本}``。
 
-    格式（实测的素材就是这个样）——一行文件名、空行、一段文本：
-
-        任命助理
-
-        博士，请坐。别紧张，我只是来查看你的身体状况。……
-
-        交谈1
-
-        我会定期为你进行理学检查，……
-
-    也认 ``文件名  文本`` 这种一行搞定的写法（分隔符用 tab / 冒号 / 两个空格）。
-    返回 ``{音频文件名小写: 文本}``；目录里没有清单就返回空字典。
+    格式见 :mod:`voice_loop.manifest`（一行名字 + 空行 + 一段文本）。这里只保留
+    **目录里真有对应音频**的条目——免得把别的 txt 里的段落当成某个音频的台词。
     """
-    files = sorted(p for p in directory.glob("*.txt") if p.is_file())
-    if not files:
-        return {}
-    try:
-        stamp = tuple((str(p), p.stat().st_mtime_ns, p.stat().st_size) for p in files)
-    except OSError:
-        return {}
-    cached = _MANIFEST_CACHE.get(directory)
-    if cached is not None and cached[0] == stamp:
-        return cached[1]
-
     stems = {p.stem.lower() for p in directory.glob("*.wav")}
     stems |= {p.name.lower() for p in directory.glob("*.wav")}
-    found: dict[str, str] = {}
-    for path in files:
-        try:
-            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError:
-            continue
-        for i, raw in enumerate(lines):
-            line = raw.strip()
-            if not line:
-                continue
-            head = line.split("\t")[0].strip()
-            name = head.strip("：: ").lower()
-            if name not in stems:
-                continue
-            rest = line[len(head):].strip().strip("：:\t ")
-            if rest:  # 一行搞定的写法
-                found.setdefault(name, rest)
-                continue
-            # ★文件名和文本之间可能隔着一个空行★（实测素材就是「名字 / 空行 / 段落」）
-            j = i + 1
-            while j < len(lines) and not lines[j].strip():
-                j += 1
-            para: list[str] = []
-            while j < len(lines) and lines[j].strip():
-                para.append(lines[j])
-                j += 1
-            if para:
-                found.setdefault(name, _join_paragraph(para))
-    _MANIFEST_CACHE[directory] = (stamp, found)
-    return found
+    if not stems:
+        return {}
+    return {k: v for k, v in manifest_pairs(directory).items() if k in stems}
+
 
 
 class ZipVoiceTts:

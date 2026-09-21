@@ -23,6 +23,9 @@ models/asr/sensevoice-small/*.txt
 # ZipVoice 音色克隆：模型 + espeak-ng-data（一堆小文件）+ 声码器，共 156 MB，靠下载脚本重建
 models/tts/zipvoice/
 
+# 导入/迁移脚本留下的备份（别把 .bak 提交进 git，要留就留在本地）
+*.bak
+
 # 运行产物
 sessions/
 data/backup/
