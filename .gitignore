@@ -35,7 +35,11 @@ models/tts/zipvoice/
 # 运行产物
 sessions/
 data/backup/
+data/vision/          # 截图/摄像头抓拍（含隐私，且是运行产物，别进 git）
 *.log
+
+# 角色素材音频：44 MB 的配音 wav，只放本地（同目录的 *.txt 清单要进 git，那是台词文本）
+data/personas/*/*.wav
 *.wav
 
 # 编辑器

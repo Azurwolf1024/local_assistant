@@ -150,6 +150,28 @@ check(off.apply(src, RATE).size, src.size, "enabled=False 时原样返回")
 check_true("关" in off.describe(), "describe 说明关闭状态")
 check_true("首 40ms" in fixer.describe(), "describe 说明当前参数")
 
+print("\n== 10. 过短停顿拉长（trim_min_gap_ms）==")
+# 实测背景：「我在，博士。」的逗号停顿只有 60ms，人类在逗号要停 200~400ms
+short_gap = np.concatenate([silence(200), tone(300), silence(60), tone(300), silence(200)])
+raw = ms(trim_silence(short_gap, RATE))
+stretched = ms(trim_silence(short_gap, RATE, min_gap_ms=240))
+check(round(stretched - raw), 180, "60ms 停顿 → 240ms（时长 +180ms）")
+check(round(ms(trim_silence(short_gap, RATE, min_gap_ms=0))), round(raw), "min_gap_ms=0 时不动（默认）")
+
+long_gap = np.concatenate([silence(200), tone(300), silence(300), tone(300), silence(200)])
+check(
+    round(ms(trim_silence(long_gap, RATE, min_gap_ms=240))),
+    round(ms(trim_silence(long_gap, RATE))),
+    "300ms 停顿不会被拉长（只动「过短」的）",
+)
+check(speech_frames(trim_silence(short_gap, RATE, min_gap_ms=240)), speech_frames(short_gap), "拉长停顿不影响语音帧")
+
+print("\n== 11. PacingFixer 带上新参数 ==")
+cfg_gap = TtsConfig()
+cfg_gap.trim_min_gap_ms = 240
+check(PacingFixer.from_config(cfg_gap).min_gap_ms, 240, "from_config 读到 trim_min_gap_ms")
+check_true("拉到 240ms" in PacingFixer.from_config(cfg_gap).describe(), "describe 里说明拉长值")
+
 print(f"\n通过 {PASS} / 失败 {FAIL}")
 print(f"EXIT={0 if FAIL == 0 else 1}")
 sys.exit(0 if FAIL == 0 else 1)

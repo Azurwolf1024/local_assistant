@@ -24,8 +24,9 @@ FRAME_MS = 10          # 判有声/无声的窗长
 THRESHOLD = 0.05       # 峰值 RMS 的这个比例以下算静音
 DEFAULT_LEAD_MS = 40   # 开头保留的静音（不是 0，免得第一个字被啃掉）
 DEFAULT_TAIL_MS = 80   # 结尾保留的静音
-DEFAULT_MAX_PAUSE_MS = 0   # 0 = 不动句内停顿
-DEFAULT_MIN_PAUSE_MS = 260  # 压停顿时的下限
+DEFAULT_MAX_PAUSE_MS = 0   # 0 = 不压缩句内停顿
+DEFAULT_MIN_PAUSE_MS = 260  # 压停顿时保留的下限
+DEFAULT_MIN_GAP_MS = 0      # 0 = 不拉长过短的停顿；>0 = 句内停顿短于它就拉到它
 
 
 def _to_int16(pcm) -> np.ndarray:
@@ -53,10 +54,16 @@ def trim_silence(
     tail_ms: int = DEFAULT_TAIL_MS,
     max_pause_ms: int = DEFAULT_MAX_PAUSE_MS,
     min_pause_ms: int = DEFAULT_MIN_PAUSE_MS,
+    min_gap_ms: int = DEFAULT_MIN_GAP_MS,
     frame_ms: int = FRAME_MS,
     threshold: float = THRESHOLD,
 ) -> np.ndarray:
-    """掐首尾死静音（可选压句内长停顿），返回新的 int16 数组。
+    """掐首尾死静音 + 调句内停顿，返回新的 int16 数组。
+
+    ``min_gap_ms`` 是**反方向**的旋钮：句内停顿短于它就**拉长**到它。
+    实测（微调后的凯尔希）：「我在，博士。」的逗号停顿只有 60ms，而人类在逗号要停
+    200~400ms —— 听起来就是「一顿一顿、像机器」。拉长它不改音高（只是插静音），
+    所以比变速安全。注意它只影响「已经很短的」停顿，长句里本来就 300ms+ 的停顿不动。
 
     保守原则：**任何异常输入都原样返回**（宁可多一秒静音，也不能把话剪没）。
     另外开头/结尾的补白不会超过原本就有的静音长度——所以对「本来就没有静音」
@@ -99,6 +106,9 @@ def trim_silence(
             if max_pause_ms > 0 and gap_ms > max_pause_ms:
                 keep_ms = max(min_pause_ms, 0)
                 pieces.append(np.zeros(int(rate * keep_ms / 1000), dtype=np.int16))
+            elif min_gap_ms > 0 and gap_ms < min_gap_ms:
+                # 太短的停顿 → 拉长到 min_gap_ms（人类在逗号处会停，模型常常给得极短）
+                pieces.append(np.zeros(int(rate * min_gap_ms / 1000), dtype=np.int16))
             else:
                 pieces.append(x[i * hop : j * hop])
             i = j
@@ -128,12 +138,14 @@ class PacingFixer:
         tail_ms: int = DEFAULT_TAIL_MS,
         max_pause_ms: int = DEFAULT_MAX_PAUSE_MS,
         min_pause_ms: int = DEFAULT_MIN_PAUSE_MS,
+        min_gap_ms: int = DEFAULT_MIN_GAP_MS,
     ) -> None:
         self.enabled = bool(enabled)
         self.lead_ms = max(0, int(lead_ms))
         self.tail_ms = max(0, int(tail_ms))
         self.max_pause_ms = max(0, int(max_pause_ms))
         self.min_pause_ms = max(0, int(min_pause_ms))
+        self.min_gap_ms = max(0, int(min_gap_ms))
 
     @classmethod
     def from_config(cls, cfg) -> "PacingFixer":
@@ -143,6 +155,7 @@ class PacingFixer:
             tail_ms=int(getattr(cfg, "trim_tail_ms", DEFAULT_TAIL_MS) or 0),
             max_pause_ms=int(getattr(cfg, "trim_max_pause_ms", DEFAULT_MAX_PAUSE_MS) or 0),
             min_pause_ms=int(getattr(cfg, "trim_min_pause_ms", DEFAULT_MIN_PAUSE_MS) or 0),
+            min_gap_ms=int(getattr(cfg, "trim_min_gap_ms", DEFAULT_MIN_GAP_MS) or 0),
         )
 
     def apply(self, pcm: np.ndarray, rate: int) -> np.ndarray:
@@ -155,10 +168,13 @@ class PacingFixer:
             tail_ms=self.tail_ms,
             max_pause_ms=self.max_pause_ms,
             min_pause_ms=self.min_pause_ms,
+            min_gap_ms=self.min_gap_ms,
         )
 
     def describe(self) -> str:
         if not self.enabled:
             return "静音裁剪：关"
         pause = "不动句内停顿" if self.max_pause_ms <= 0 else f"句内停顿压到 {self.min_pause_ms}ms"
+        if self.min_gap_ms > 0:
+            pause += f"；过短停顿拉到 {self.min_gap_ms}ms"
         return f"静音裁剪：首 {self.lead_ms}ms / 尾 {self.tail_ms}ms / {pause}"

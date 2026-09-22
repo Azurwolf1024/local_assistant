@@ -163,9 +163,12 @@ class TtsConfig:
     trim_output_silence: bool = True  # 关掉就完全用模型原始输出
     trim_lead_ms: int = 40            # 开头保留的静音（别设 0，免得第一个字被啃）
     trim_tail_ms: int = 80            # 结尾保留的静音
-    trim_max_pause_ms: int = 0        # 0 = 不动句内停顿；>0 = 把超过此值的停顿压到 trim_min_pause_ms
+    trim_max_pause_ms: int = 0        # 0 = 不压缩句内停顿；>0 = 把超过此值的停顿压到 trim_min_pause_ms
                                       #   实测单次停顿都 <0.6s，阈值 600~1200 无效；要压得用 450→260
     trim_min_pause_ms: int = 260      # 压停顿时的下限
+    trim_min_gap_ms: int = 0          # 0 = 不拉长过短的停顿；>0 = 句内停顿短于它就拉到它
+                                      #   ★实测：「我在，博士。」的逗号只停 60ms（人类 200~400ms），
+                                      #   拉到 220~260 就像人话了；不改音高，比变速安全★
 
 
 @dataclass
