@@ -5,6 +5,8 @@ __pycache__/
 .venv/
 venv/
 .conda/
+# 微调 ZipVoice 用的独立环境（torch 2.13 + k2 + piper_phonemize，几 GB，不进 git）
+.venv-zipvoice/
 build/
 dist/
 .pytest_cache/
