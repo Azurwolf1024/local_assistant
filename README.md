@@ -1545,8 +1545,43 @@ clone_max_seconds = 10.0                              # 参考音频截取上限
 两个后端都不会哑：克隆模型没装全、或参考音频不可用时会**自动退回 Piper 出声**
 （`main.py selftest` 与 `create_tts` 都会把原因打出来）。
 
-角色文件里也能各配各的（`voice_ref` / `voice_ref_text`），切换角色时**当场换音色**，
-不用重启：已经加载了就直接换参考音频，还没加载就写进配置、等下次加载生效。
+角色文件里也能各配各的（`voice_ref` / `voice_ref_text` / `voice_model`），切换角色时**当场换音色**，
+不用重启：只换参考音频就直接换；换**模型目录**（微调过的角色声线）就卸载重载，
+下次说话时用她自己的模型。没配的角色自动切回 `[tts] clone_dir` 的默认模型——
+这样「一个角色换过声线，别人跟着遭殃」不会发生。
+
+### 给角色训专属声线（标准化流程）
+
+素材够的角色（有音频 + 每个音频都有对应文本）可以训一份自己的模型，从此不依赖零样本克隆：
+
+```powershell
+python scripts/persona_voice.py --list                      # 谁够条件、谁缺什么
+python scripts/persona_voice.py --persona kaltsit           # 一条龙：数据→训练→导出→安装
+python scripts/persona_voice.py --persona kaltsit --verify  # 用助手环境加载新模型试一句
+```
+
+约定（不满足可以显式覆盖）：
+
+| 位置 | 约定 | 覆盖方式 |
+| --- | --- | --- |
+| 素材音频 | `data/personas/<id>/*.wav` | 人格文件里的 `voice_dir` |
+| 素材文本 | `data/personas/<id>/<id>.txt`（名字一行 + 正文一行，见第 14 节） | 同上 |
+| 数据集 | `data/finetune/<id>/`（24kHz + TSV，已 gitignore） | `--data-dir` |
+| 训好的模型 | `models/tts/zipvoice/personas/<id>/` | `--install-dir` |
+
+跑完把这一行写进人格文件就生效（或在 `data/characters.json` 的索引条目里临时覆盖）：
+
+```json
+"voice_model": "models/tts/zipvoice/personas/kaltsit"
+```
+
+> ⚠️ **单说话人微调会把音色收敛到一个人**：这份模型只适合该角色，别的角色别配它，
+> 否则也会变成她的声音（没配的角色走 `[tts] clone_dir` 的默认模型，不受影响）。
+
+训练规模按「目标 epoch 数」自动换算（`--epochs`，默认 20）：实测 283 秒素材 →
+每批最多 60 秒 → 1 epoch ≈ 4.7 批 → 100 iter ≈ 21 epoch ≈ 1.2 小时（14 线程 CPU）。
+详见下面「想拿这些素材微调模型」一节里的实测表。
+
 #### 实测数据（Core Ultra 5 225H，纯 CPU）
 
 同一句话（「我在，博士。今天的日程已经排好了。」14 个汉字）换不同参考音频的效果。
@@ -1664,27 +1699,50 @@ trim_min_pause_ms = 260
 设 `trim_max_pause_ms = 450` 后中位语速 4.78 → 5.68 字/秒、长/短比 1.39 → 1.25×，但整体偏快。
 裁剪逻辑见 `voice_loop/tts/pacing.py`，测试 `python scripts/test_trim_pacing.py`（31 条）。
 
-### 想拿这些素材微调模型（可选，卡在 Linux 环境）
+### 想拿这些素材微调模型（可选，Windows 原生就能跑）
+
+通用的做法是上面的 `scripts/persona_voice.py`（按角色一条龙）。这一节记的是**底层的
+实测事实**，需要手工调参或排障时看：
 
 把「语速不稳」当模型问题是查错了方向（见上一节），但如果就是想让模型更像本人，
-ZipVoice 官方支持微调，路已经探到一半：
+ZipVoice 官方支持微调，这条路**在本机已经打通到「能开跑」**：
 
 ```powershell
-# 数据这一腿本机就能干完：产出官方配方要的 TSV（24kHz 单声道、掐静音、train/dev）
-python scripts/prepare_tts_dataset.py --dir data/personas/kaltsit --out data/finetune/kaltsit
-python scripts/prepare_tts_dataset.py ... --apply --path-prefix /mnt/d/local_AI/   # WSL 用
-python scripts/test_prepare_dataset.py        # 24 条
+# 1) 数据：产出官方配方要的 TSV（24kHz 单声道、掐静音、train/dev 切分）
+python scripts/prepare_tts_dataset.py --dir data/personas/kaltsit --out data/finetune/kaltsit `
+    --apply --path-prefix D:/local_AI/          # 路径前缀让 TSV 里是绝对路径
+python scripts/test_prepare_dataset.py          # 24 条测试
+
+# 2) 训练环境：独立 venv，别动助手环境（torch 版本和助手那边不一样）
+python -m venv .venv-zipvoice
+.venv-zipvoice\Scripts\python.exe -m pip install torch==2.11.0 torchaudio==2.11.0 `
+    --index-url https://download.pytorch.org/whl/cpu
+# k2 轮子在 huggingface.co 上，本机连不上 → 走镜像下到本地再装（★文件名不能改★）
+#   https://hf-mirror.com/csukuangfj2/k2/resolve/main/windows-cpu/1.24.4.dev20260625/
+#       k2-1.24.4.dev20260625+cpu.torch2.11.0-cp313-cp313-win_amd64.whl
+.venv-zipvoice\Scripts\python.exe -m pip install <上一步下载的 whl>
+.venv-zipvoice\Scripts\python.exe -m pip install piper_phonemize lhotse vocos safetensors `
+    tensorboard pydub cn2an inflect jieba pypinyin huggingface_hub "setuptools<81" `
+    -f https://k2-fsa.github.io/icefall/piper_phonemize.html `
+    -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# 3) 仓库与权重
+git clone --depth 1 https://github.com/k2-fsa/ZipVoice.git .zipvoice-src
+#   k2-fsa/ZipVoice 的 zipvoice/{model.pt(468MB),tokens.txt,model.json} 走 hf-mirror 下到
+#   .zipvoice-src/download/zipvoice/
 ```
 
-剩下的三件事（实测结论，2026-09-21）：
+实测结论（2026-09-21）：
 
-| 环节 | 结论 |
+| 环节 | 结果 |
 |---|---|
-| 数据 | 38 条 / 4.8 分钟；口径达标的 30 对（8 条 <0.8s 的极短音被过滤，只占 1.6% 时长） |
-| `piper_phonemize` | **有 cp313 win_amd64 轮子** ✓（`-f https://k2-fsa.github.io/icefall/piper_phonemize.html`） |
-| `k2` | **只有 manylinux/macos 轮子，没有 Windows 版** ✗ → 训练必须在 Linux 里跑，本机 WSL/Docker 都没装 |
-| 配方 | `egs/zipvoice/run_finetune.sh`：`--finetune 1 --world-size 4 --use-fp16 1 --num-iters 10000 --max-duration 500` |
-| 规模 | 4.8 分钟数据配 `--max-duration 500` 是半轮一个 iter → 10000 iter ≈ 上万轮；要跑得降到 `--max-duration` 几十秒 + 几百 iter |
+| 数据 | 38 条 / 4.8 分钟 → 30 对可用（8 条 <0.8s 的极短音被过滤，只占 1.6% 时长），27/3 切分 |
+| `piper_phonemize` | ✓ cp313 win_amd64 轮子，`phonemize_espeak('你好，博士。','cmn')` 实测出音素 |
+| `k2` | ✓ cp313 win_amd64 轮子（**别再以为只能 Linux**：那页 4385 个轮子里 1079 个是 `win_amd64`），`import k2` 实测通过 |
+| 版本对齐 | torchaudio 的 CPU index 上 cp313 只到 2.11 → **torch/torchaudio 都用 2.11.0**，k2 也要选 `torch2.11.0` 那个轮子 |
+| 训练脚本 | ✓ 依赖栈全部导入成功（`python -m zipvoice.bin.train_zipvoice --help` 能跑） |
+| 配方 | `egs/zipvoice/run_finetune.sh`：prepare_dataset → prepare_tokens(`--tokenizer emilia`) → compute_fbank → 下载权重 → `train_zipvoice --finetune 1 --base-lr 1e-4 --num-iters ...` |
+| 规模 | 4.8 分钟数据配官方的 `--num-iters 10000 --max-duration 500` ≈ 上万轮，纯过拟合；要跑得把 `--max-duration` 降到几十秒、`--num-iters` 降到几百 |
 | 算力 | 本机纯 CPU（CUDA/XPU 都不可用），时间以小时~天计；**开跑前先跑 100 iter 实测 iters/分钟** |
 
 ### 从清单文件导入台词（只添加，不替换）

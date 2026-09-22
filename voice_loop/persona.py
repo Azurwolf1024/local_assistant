@@ -32,6 +32,10 @@
       "voice": "",                            // 可选：这个角色用自己的 piper 声线
       "voice_ref": "",                        // 可选：克隆音色的参考音频（wav，backend = "zipvoice" 时用）
       "voice_ref_text": "",                   // 可选：参考音频的逐字文本；留空则用同名 .txt 或自动转写
+      "voice_model": "",                      // 可选：这个角色专用的 ZipVoice 模型目录
+                                              //   （用 scripts/persona_voice.py 微调出来的，
+                                              //    如 models/tts/zipvoice/personas/kaltsit）
+      "voice_dir": "",                        // 可选：语音素材目录（空 = data/personas/<id>/）
       "temperature": 0.7,                     // 可选：覆盖全局温度（0 = 用全局）
       "notes": "给自己看的备注"                 // 不进提示词
     }
@@ -88,6 +92,9 @@ class Character:
     voice: str = ""                       # piper 声线名（空 = 用 config.toml 的 [tts]）
     voice_ref: str = ""                   # 克隆音色的参考音频（backend = "zipvoice" 时生效）
     voice_ref_text: str = ""              # 参考音频的逐字文本（空 = 同名 .txt / 自动转写）
+    voice_model: str = ""                 # 这个角色专用的 ZipVoice 模型目录
+                                          #   （空 = 用 [tts] clone_dir；见 scripts/persona_voice.py）
+    voice_dir: str = ""                   # 语音素材目录（空 = data/personas/<id>/）
     temperature: float = 0.0              # 0 = 用全局 [llm] temperature
     default: bool = False
     enabled: bool = True
@@ -143,6 +150,8 @@ class Character:
             voice=str(raw.get("voice") or "").strip(),
             voice_ref=str(raw.get("voice_ref") or "").strip(),
             voice_ref_text=str(raw.get("voice_ref_text") or "").strip(),
+            voice_model=str(raw.get("voice_model") or "").strip(),
+            voice_dir=str(raw.get("voice_dir") or "").strip(),
             temperature=float(raw.get("temperature") or 0.0),
             default=bool(raw.get("default")),
             enabled=bool(raw.get("enabled", True)),

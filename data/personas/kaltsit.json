@@ -244,6 +244,7 @@
   ],
   "voice": "",
   "voice_ref": "data/personas/kaltsit/干员报到.wav",
+  "voice_model": "models/tts/zipvoice/personas/kaltsit",
   "voice_ref_text": "",
   "temperature": 0.0,
   "notes": "默认角色。别名是拿 scripts/test_wake.py 一条条实测攒的，别删。voice_ref = 克隆音色的参考音频（凯尔希中文配音，素材在 data/personas/kaltsit/，同目录 kaltsit.txt 是逐条文本清单）。★参考音频决定音色和语速★：短参考说得快（4.5s→4.9 字/秒），7~14s 最自然（3.6~3.9 字/秒）。"

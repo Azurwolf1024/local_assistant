@@ -145,8 +145,9 @@ def build(args: argparse.Namespace) -> int:
     print(f"\n已写出：{tsv_train}（{len(train_lines)} 行）")
     print(f"        {tsv_dev}（{len(dev_lines)} 行）")
     print(f"        {wav_dir}（{len(rows)} 个 24kHz 单声道 wav）")
-    print("\n下一步（ZipVoice 仓库 egs/zipvoice 下，需要 Linux 环境，见 README）：")
-    print("  PYTHONPATH=../../ python3 -m zipvoice.bin.prepare_dataset \\")
+    print("\n下一步（在 ZipVoice 仓库根目录下跑，见 README「想拿这些素材微调模型」）：")
+    print("  $env:PYTHONPATH = <ZipVoice 仓库路径>")
+    print("  python -m zipvoice.bin.prepare_dataset \\")
     print(f"      --tsv-path {args.out}/custom_train.tsv --prefix kalsit \\")
     print("      --subset raw_train --num-jobs 4 --output-dir data/manifests")
     return 0

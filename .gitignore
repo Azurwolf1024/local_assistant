@@ -7,6 +7,10 @@ venv/
 .conda/
 # 微调 ZipVoice 用的独立环境（torch 2.13 + k2 + piper_phonemize，几 GB，不进 git）
 .venv-zipvoice/
+# ZipVoice 官方仓库 + 预训练权重（自己 clone/下载重建，468 MB 进 git 没意义）
+.zipvoice-src/
+# 微调数据集（从 data/personas/kaltsit 重新生成即可）
+data/finetune/
 build/
 dist/
 .pytest_cache/

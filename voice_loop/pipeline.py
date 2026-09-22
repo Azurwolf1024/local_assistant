@@ -131,6 +131,12 @@ class VoiceLoop:
         self.speaker = Speaker(settings)
         self.llm = OllamaClient(settings.llm)
         self.tts = create_tts(settings, self.log, lazy=self.lazy)
+        # ★角色声线的「默认值」快照★：切角色时用角色自己的，切回来时得能回默认，
+        # 否则一个角色换过模型/声线后，另一个没配声线的角色会跟着沿用她
+        self._base_voice = str(getattr(settings.tts, "voice", "") or "")
+        self._base_clone_dir = str(getattr(settings.tts, "clone_dir", "") or "")
+        self._base_clone_audio = str(getattr(settings.tts, "clone_audio", "") or "")
+        self._base_clone_text = str(getattr(settings.tts, "clone_text", "") or "")
         # 技能与提醒
         self.skills: Skills | None = Skills(settings, self.log) if enable_skills else None
         # 工具层（旧的进程内注册表）：MCP 宿主没就绪时当兼底，也还是不少单测的入口
@@ -793,20 +799,28 @@ class VoiceLoop:
         if (cfg.backend or "piper").strip().lower() == "zipvoice":
             ref = str(getattr(cfg, "clone_audio", "") or "").strip()
             name = ref.replace("\\", "/").rsplit("/", 1)[-1] if ref else "未设参考音频"
-            return f"zipvoice（参考 {name}，{int(getattr(cfg, 'clone_steps', 4) or 4)} 步）"
+            model = str(getattr(cfg, "clone_dir", "") or "").replace("\\", "/").rstrip("/")
+            model = model.rsplit("/", 1)[-1] if model else ""
+            return (
+                f"zipvoice（模型 {model}，参考 {name}，"
+                f"{int(getattr(cfg, 'clone_steps', 4) or 4)} 步）"
+            )
         return f"piper / {cfg.voice}"
 
     def _apply_voice(self, char: Character, reason: str = "") -> None:
-        """角色自带声线时换声线。
+        """角色自带声线时换声线（Piper 换模型，克隆后端换模型+参考音频）。
 
-        Piper 的声线是绑在 onnx 模型上的，换就必须卸载重载（下次说话时自然加载）。
-        克隆后端（zipvoice）换的是「参考音频」。
-        声线/参考不存在就只警告、继续用当前的——**绝不能因为换声线把嘴弄哑了**。
+        ★「不同角色唤醒不同声线」就在这一条路上★：唤醒词命中 → _switch_character
+        → _apply_character → _apply_voice。
+
+        Piper 的声线绑在 onnx 模型上，换就必须卸载重载；ZipVoice 多了个「模型目录」
+        维度（微调过的角色用自己那份），同样要卸载重载；只换参考音频则当场生效。
+        声线/模型/参考不存在就只警告、继续用当前的——**绝不能因为换声线把嘴弄哑了**。
         """
         if (self.settings.tts.backend or "piper").strip().lower() == "zipvoice":
             self._apply_reference(char, reason)
             return
-        want = (char.voice or "").strip()
+        want = (char.voice or "").strip() or self._base_voice
         tts_cfg = self.settings.tts
         current = str(getattr(tts_cfg, "voice", "") or "")
         if not want or want == current:
@@ -829,24 +843,72 @@ class VoiceLoop:
         self.log.info(f"[角色] 声线：{current} → {want}（{reason or '切换'}）")
 
     def _apply_reference(self, char: Character, reason: str = "") -> None:
-        """克隆后端下，换角色 = 换参考音频（没有就用 [tts] clone_audio 当默认）。"""
+        """克隆后端下，换角色 = 换「模型目录」+「参考音频」（都没配就用回默认）。
+
+        两种代价分开算：
+        - 只换参考音频：``configure(set_reference)`` 当场生效，不用重载；
+        - 换模型目录：必须 ``unload()``，下次说话时用新目录重新构造引擎
+            （代价≈一次加载，实测 ZipVoice 加载几秒到十几秒）。
+        模型目录里的文件不齐就不要切——宁可音色不对，也不能哑。
+        """
         tts_cfg = self.settings.tts
-        want = str(getattr(char, "voice_ref", "") or "").strip()
+        # ---- ① 模型目录（微调过的角色声线）----
+        want_model = str(getattr(char, "voice_model", "") or "").strip()
+        target_model = want_model or self._base_clone_dir
+        current_model = str(getattr(tts_cfg, "clone_dir", "") or "")
+        model_changed = False
+        if target_model and target_model != current_model:
+            if want_model:  # 角色指定的：先确认目录真的可用
+                path = self.settings.resolve(want_model)
+                missing = self._missing_voice_model(path) if path.is_dir() else [path]
+                if missing:
+                    self.log.warning(
+                        f"角色 {char.name} 的声音模型不完整：{missing[0]}（继续用 {current_model}）"
+                    )
+                    print(
+                        f"[角色] 声音模型 {want_model} 缺文件（{missing[0]}），继续用当前模型",
+                        flush=True,
+                    )
+                else:
+                    tts_cfg.clone_dir = want_model
+                    model_changed = True
+            else:  # 角色没配 → 回默认（比如刚从配过的角色切过来）
+                tts_cfg.clone_dir = self._base_clone_dir
+                model_changed = True
+        # ---- ② 参考音频 ----
+        want = str(getattr(char, "voice_ref", "") or "").strip() or self._base_clone_audio
         text = str(getattr(char, "voice_ref_text", "") or "").strip()
-        current = str(getattr(tts_cfg, "clone_audio", "") or "")
-        if not want or (want == current and text == str(getattr(tts_cfg, "clone_text", "") or "")):
-            return
-        path = self.settings.resolve(want)
-        if not path.exists():
-            self.log.warning(f"角色 {char.name} 想用参考音色 {want}，但文件不在（继续用 {current or '全局参考'}）")
-            print(f"[角色] 参考音频 {want} 不存在，继续用当前的", flush=True)
-            return
-        tts_cfg.clone_audio = want
-        tts_cfg.clone_text = text
-        configure = getattr(self.tts, "configure", None)
-        if callable(configure):  # 已经加载了就当场换；没加载等下次加载自然生效
-            configure(lambda engine: engine.set_reference(want, text))
-        self.log.info(f"[角色] 参考音色：{current or '（无）'} → {want}（{reason or '切换'}）")
+        ref_changed = False
+        if want:
+            path = self.settings.resolve(want)
+            if not path.exists():
+                self.log.warning(f"角色 {char.name} 想用参考音色 {want}，但文件不在（继续用当前参考）")
+                print(f"[角色] 参考音频 {want} 不存在，继续用当前的", flush=True)
+            elif want != str(getattr(tts_cfg, "clone_audio", "") or "") or text != str(
+                getattr(tts_cfg, "clone_text", "") or ""
+            ):
+                tts_cfg.clone_audio = want
+                tts_cfg.clone_text = text
+                ref_changed = True
+        if model_changed:
+            # 构造函数会自己按 clone_audio 设参考，所以卸载后不用再 configure
+            unload = getattr(self.tts, "unload", None)
+            if callable(unload):
+                unload()
+            self.log.info(
+                f"[角色] 声音模型：{current_model.rsplit('/', 1)[-1] or '（默认）'} → "
+                f"{target_model.rsplit('/', 1)[-1]}（{reason or '切换'}，下次说话时加载）"
+            )
+        elif ref_changed:
+            configure = getattr(self.tts, "configure", None)
+            if callable(configure):  # 已经加载了就当场换；没加载等下次加载自然生效
+                configure(lambda engine: engine.set_reference(want, text))
+            self.log.info(f"[角色] 参考音色 → {want}（{reason or '切换'}）")
+
+    def _missing_voice_model(self, path) -> list[str]:
+        """角色的声音模型目录缺哪些文件（空列表 = 齐了）。"""
+        wanted = ["tokens.txt", "encoder.int8.onnx", "decoder.int8.onnx", "lexicon.txt", "espeak-ng-data"]
+        return [str(path / name) for name in wanted if not (path / name).exists()]
 
     def _switch_character(self, cid: str) -> Character | None:
         """唤醒词点了谁的名就切到谁（人设 + 应答语 + 声线）。"""
