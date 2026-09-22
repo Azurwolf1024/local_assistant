@@ -166,11 +166,39 @@ check(
 )
 check(speech_frames(trim_silence(short_gap, RATE, min_gap_ms=240)), speech_frames(short_gap), "拉长停顿不影响语音帧")
 
+# ★微空隙（字与字之间的自然音渡，10~40ms）绝不能被撑成静音★：
+# 无差别撑开会变成「每个字之间都垫一段等长静音」→ 听着卡顿（实测一句话 11 个空隙
+# 里 8 个是这种，全撑 = 白加 1.84 秒死气）。
+micro = np.concatenate([silence(200), tone(300), silence(30), tone(300), silence(200)])
+check(
+    round(ms(trim_silence(micro, RATE, min_gap_ms=240))),
+    round(ms(trim_silence(micro, RATE))),
+    "30ms 微空隙不动（低于门槛 60ms）",
+)
+check(
+    round(ms(trim_silence(micro, RATE, min_gap_ms=240, min_gap_floor_ms=0))) - round(ms(trim_silence(micro, RATE))),
+    210,
+    "门槛设 0 时才会被撑开（对比：+210ms）",
+)
+edge = np.concatenate([silence(200), tone(300), silence(70), tone(300), silence(200)])
+check(
+    round(ms(trim_silence(edge, RATE, min_gap_ms=240))) - round(ms(trim_silence(edge, RATE))),
+    170,
+    "70ms 刚过门槛 → 拉长到 240ms（+170ms）",
+)
+
 print("\n== 11. PacingFixer 带上新参数 ==")
 cfg_gap = TtsConfig()
 cfg_gap.trim_min_gap_ms = 240
 check(PacingFixer.from_config(cfg_gap).min_gap_ms, 240, "from_config 读到 trim_min_gap_ms")
+check(PacingFixer.from_config(cfg_gap).min_gap_floor_ms, 60, "from_config 读到门槛默认 60ms")
 check_true("拉到 240ms" in PacingFixer.from_config(cfg_gap).describe(), "describe 里说明拉长值")
+check_true("60~240ms" in PacingFixer.from_config(cfg_gap).describe(), "describe 里说明门槛")
+check(
+    round(ms(trim_silence(micro, RATE, min_gap_ms=240, min_gap_floor_ms=90))) ,
+    round(ms(trim_silence(micro, RATE))),
+    "门槛可以自己调（90ms 时 30ms 空隙仍然不动）",
+)
 
 print(f"\n通过 {PASS} / 失败 {FAIL}")
 print(f"EXIT={0 if FAIL == 0 else 1}")
