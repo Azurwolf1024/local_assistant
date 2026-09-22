@@ -145,10 +145,15 @@ def build(args: argparse.Namespace) -> int:
     print(f"\n已写出：{tsv_train}（{len(train_lines)} 行）")
     print(f"        {tsv_dev}（{len(dev_lines)} 行）")
     print(f"        {wav_dir}（{len(rows)} 个 24kHz 单声道 wav）")
-    print("\n下一步（在 ZipVoice 仓库根目录下跑，见 README「想拿这些素材微调模型」）：")
+    # prefix 决定 manifest / exp / 安装目录的名字，按约定就是角色 id（= --out 的目录名）。
+    # ★别再拿 kalsit 当示例★：那是当初打错的名字，照抄会装到 personas/kalsit 而找不到。
+    guess = Path(args.out).name
+    print("\n下一步（一般不用手工跑，一条龙会按顺序做完 1~8 步）：")
+    print(f"  python scripts/persona_voice.py --persona {guess}")
+    print("  想单步跑/排障：见 README「给角色训专属声线（标准化流程，Windows 原生）」，底层命令是")
     print("  $env:PYTHONPATH = <ZipVoice 仓库路径>")
     print("  python -m zipvoice.bin.prepare_dataset \\")
-    print(f"      --tsv-path {args.out}/custom_train.tsv --prefix kalsit \\")
+    print(f"      --tsv-path {args.out}/custom_train.tsv --prefix {guess} \\")
     print("      --subset raw_train --num-jobs 4 --output-dir data/manifests")
     return 0
 
