@@ -243,7 +243,7 @@
     }
   ],
   "voice": "",
-  "voice_ref": "data/personas/kaltsit/干员报到.wav",
+  "voice_ref": "data/personas/kaltsit/精英化晋升1.wav",
   "voice_model": "models/tts/zipvoice/personas/kaltsit",
   "voice_ref_text": "",
   "temperature": 0.0,

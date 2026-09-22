@@ -49,6 +49,9 @@ DEFAULT_CONFIG: dict = {
     "idle_timeout": 180,
     "min_silence": 0.3,
     "fuzzy_ratio": 0.75,
+    # 对话进行中放宽一点：待唤醒时宁可漏听也不能被环境杂音叫醒；
+    # 已经在对话里时上下文已经确定了，认出来（尤其想中途换人）更划算。
+    "session_fuzzy_ratio": 0.7,
 }
 
 
@@ -148,6 +151,7 @@ class WakeSettings:
     idle_timeout: float = 0.0     # 0 表示 json 里没写，用 config.toml 的值
     min_silence: float = 0.3
     fuzzy_ratio: float = 0.75
+    session_fuzzy_ratio: float = 0.7   # ★对话进行中★用的阈值（比待唤醒宽一点）
 
 
 class WakeWordMatcher:
@@ -201,6 +205,12 @@ class WakeWordMatcher:
             ),
             min_silence=float(raw.get("min_silence", DEFAULT_CONFIG["min_silence"])),
             fuzzy_ratio=float(raw.get("fuzzy_ratio", DEFAULT_CONFIG["fuzzy_ratio"])),
+            session_fuzzy_ratio=float(
+                raw.get(
+                    "session_fuzzy_ratio",
+                    DEFAULT_CONFIG.get("session_fuzzy_ratio", 0.7),
+                )
+            ),
         )
         self._patterns = []
         self._build_patterns(self._settings.words, self._settings.aliases, "")
@@ -278,8 +288,13 @@ class WakeWordMatcher:
         return self._settings.enabled and bool(self._patterns)
 
     # ------------------------------------------------------------------ 匹配
-    def match(self, text: str) -> WakeHit | None:
-        """判断这句话里有没有唤醒词。"""
+    def match(self, text: str, ratio: float | None = None) -> WakeHit | None:
+        """判断这句话里有没有唤醒词。
+
+        ``ratio`` 可以临时覆盖模糊阈值（对话进行中会放宽一点，见
+        :attr:`WakeSettings.session_fuzzy_ratio`）——待唤醒时宁可漏听也不能被
+        环境杂音叫醒，而已经在对话里时上下文已经确定了，认出来更划算。
+        """
         if not self.enabled:
             return None
         norm, raw_pos = _scan(text)
@@ -306,8 +321,10 @@ class WakeWordMatcher:
         # 2) 模糊匹配：滑窗逐段比对，取最像的那一段
         #    窗口最小长度取 主唤醒词长度-1（但不能少于 3），
         #    否则「凯尔希」这种 3 字词会被任意两字窗口误命中。
-        ratio, word, a, b, character = self._best_window(norm)
-        if ratio >= self._settings.fuzzy_ratio:
+        #    ★注意别把 best 的值写回 ratio★：那样条件会变成 x >= x，永远成立（踩过）。
+        best_ratio, word, a, b, character = self._best_window(norm)
+        threshold = self._settings.fuzzy_ratio if ratio is None else float(ratio)
+        if best_ratio >= threshold:
             return hit_of(word, a, b, True, character)
         return None
 

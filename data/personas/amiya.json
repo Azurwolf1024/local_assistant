@@ -191,7 +191,7 @@
     }
   ],
   "voice": "",
-  "voice_ref": "data/personas/amiya/交谈1.wav",
+  "voice_ref": "data/personas/amiya/行动失败.wav",
   "voice_model": "models/tts/zipvoice/personas/amiya",
   "temperature": 0.0,
   "notes": "第二个角色的现成例子：改 name/background/lines 就能换成别人；喊「阿米娅」就会切到她，喊「凯尔希」再切回来。"

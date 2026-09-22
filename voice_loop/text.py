@@ -161,12 +161,17 @@ class SpeechChunker:
         first_min_chars: int = 8,
         min_chunk_chars: int = 14,
         max_hold_seconds: float = 1.2,
+        first_chunk_max_chars: int = 0,
     ) -> None:
         self.max_chars = max(8, int(max_chars))
         self.hard_limit = max(self.max_chars * 2, 40)
         self.first_min_chars = max(1, int(first_min_chars))
         self.min_chunk_chars = max(1, int(min_chunk_chars))
         self.max_hold_seconds = max(0.0, float(max_hold_seconds))
+        # 第一块最多多少字（0 = 不限）。★克隆音色很吃「首块多长」★：
+        # ZipVoice 一次 generate 要整块生成完才回音频，所以首块 60 字 = 开口前先等 8 秒。
+        # 限到十几字 + 允许在逗号处切，开口等待能压到 2 秒上下（后面几块照旧按句切）。
+        self.first_chunk_max_chars = max(0, int(first_chunk_max_chars))
         self._buf = ""
         self._pending = ""
         self._emitted = 0
@@ -236,7 +241,12 @@ class SpeechChunker:
 
             if kind == "sentence":
                 # 完整句子：够长就直接送，太短就留着和下一句合并
-                if len(self._pending) >= self._need_chars():
+                # ★首块例外★（只有显式设了 first_chunk_max_chars 才启用）：一遇到句末就送，
+                # 不再攒长——ZipVoice 整块生成完才回音频，首块攒到 60 字就是「开口前
+                # 先等 8 秒」（实测 8.08s → 1.91s）。默认 0 = 保持老行为（Piper 那边
+                # 短句合并是特意调过的，不能被这条改掉）。
+                first_chunk = self._emitted == 0 and self.first_chunk_max_chars > 0
+                if first_chunk or len(self._pending) >= self._need_chars():
                     self._emit(chunks)
             elif kind in ("clause", "hard"):
                 # 长句被从句标点切开 / 硬切：立即送，避免积压
@@ -256,9 +266,14 @@ class SpeechChunker:
                 return i + 1, "sentence"
 
         # 2) 整句过长 -> 从句标点处切
-        if len(buf) >= self.max_chars:
+        #    ★第一块例外★：第一块一到 first_chunk_max_chars 就在逗号处切，
+        #    否则「首块 60 字」= 开口前等 8 秒（克隆模型整块生成完才出声）。
+        limit = self.max_chars
+        if self._emitted == 0 and self.first_chunk_max_chars:
+            limit = min(limit, max(self.first_min_chars, self.first_chunk_max_chars))
+        if len(buf) >= limit:
             best = -1
-            for i in range(min(len(buf) - 1, self.max_chars)):
+            for i in range(min(len(buf) - 1, limit)):
                 if buf[i] in _CLAUSE_END:
                     best = i
             if best >= 0:

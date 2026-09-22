@@ -133,6 +133,8 @@ class TtsConfig:
     sentence_silence: float = 0.08   # 块之间的补白，仅用于避免拼接感
     inject_pauses: bool = False      # 用 [[,]] 强化标点停顿（停顿更清晰但语气偏平）
     first_chunk_min_chars: int = 8   # 首块最少字数（越小出声越快）
+    first_chunk_max_chars: int = 0   # 首块最多字数（0 = 不限）；克隆音色下建议 12~20：
+                                     #   ZipVoice 整块生成完才回音频，首块 60 字 = 开口前等 8 秒
     min_chunk_chars: int = 14        # 短于此长度的句子会与下一句合并
     max_chunk_chars: int = 60        # 整句超过此长度才从句标点处切
     max_hold_seconds: float = 1.2    # 攒句最长等待时间

@@ -26,6 +26,7 @@ from .audio import BaseSegmenter, MicReader, MicRecorder, Speaker, make_segmente
 from .bargein import BargeInDetector
 from .llm import OllamaClient, OllamaError
 from .mcp import MCPHost
+from .names import NameCorrector
 from .persona import Character, CharacterRegistry, render_system_prompt
 from .scheduler import ReminderScheduler
 from .settings import Settings
@@ -225,6 +226,15 @@ class VoiceLoop:
                 self.log.warning(f"角色设定加载失败（改用 config.toml 的 system_prompt）：{exc}")
                 self.persona = None
                 self.character = None
+        # ★人名校正★：ASR 对少见人名（游戏角色名）很不敏感，先把听错的名字改回规范名，
+        # 后面唤醒匹配、对话里的称呼、送给大模型的正文就都是干净的名字（见 voice_loop/names.py）。
+        self.names = NameCorrector.from_characters(
+            self.persona.all(only_enabled=True) if self.persona else []
+        )
+        if self.wake.settings.words and not self.names.names:
+            self.names = NameCorrector([
+                w for w in [*self.wake.settings.words, *self.wake.settings.aliases] if w
+            ], self.wake.settings.aliases)
         self._idle_timeout = float(
             self.wake.settings.idle_timeout or settings.wake.idle_timeout
         )
@@ -522,6 +532,7 @@ class VoiceLoop:
             first_min_chars=int(tts_cfg.first_chunk_min_chars),
             min_chunk_chars=int(tts_cfg.min_chunk_chars),
             max_hold_seconds=0.0,
+            first_chunk_max_chars=int(getattr(tts_cfg, "first_chunk_max_chars", 0) or 0),
         )
         for chunk in chunker.feed(text) + chunker.flush():
             if self._interrupt.is_set():
@@ -932,6 +943,39 @@ class VoiceLoop:
         words = [w for w in (self.wake.character_words or self.wake.settings.words) if w]
         return "」或「".join(words[:3]) if words else "唤醒词"
 
+    def _resolve_address(self, text: str) -> tuple[str | None, str]:
+        """★对话进行中★也认一下「你在叫谁」：返回 ``(要处理的请求, 提示语)``。
+
+        - 喊**当前这位**的名字（含听错的写法）→ 把名字摘掉，剩下的当请求
+          （「开尔西，现在几点了」→「现在几点了」）；
+        - 整句只有名字 → 返回 ``None``（上层回一句应答语，别把名字本身送给大模型）；
+        - 喊的是**别人** → 原样放过，只提示一句怎么切（对话中间不换人）。
+
+        ★为什么要有它★：唤醒之后没人会每次都规规矩矩先喊名字。原来这条路上完全不看
+        唤醒词，名字会被当成请求的一部分送进大模型（听着就是「它没听懂我在叫它」）。
+        文本里听错的名字在这之前已经被 :mod:`voice_loop.names` 改成规范名了，
+        所以这里既认「凯尔希」也认「开尔西」。
+        """
+        if self.wake is None or not self.wake.enabled:
+            return text, ""
+        strict = float(getattr(self.wake.settings, "fuzzy_ratio", 0.75) or 0.75)
+        loose = float(getattr(self.wake.settings, "session_fuzzy_ratio", 0.0) or 0.0) or strict
+        hit = self.wake.match(text, ratio=loose)
+        if hit is None:
+            return text, ""
+
+        who = self.persona.get(hit.character) if (self.persona and hit.character) else None
+        current = self.character.id if self.character else ""
+        if who is not None and who.id != current:
+            # 对话中不换人（用户明确说过不要）：提醒一句就行，别把名字摘掉
+            return text, f"[对话中] 你喊的是 {who.name}——想换人先说「没事了」，再喊名字"
+
+        request = self.wake.strip_word(text, hit).strip()
+        mark = "（模糊）" if hit.fuzzy else ""
+        if len(request) < 2:
+            return None, f"[对话中认名]{mark} 认出「{hit.word}」"
+        return request, ""
+
     def _check_stop_file(self) -> bool:
         """后台运行时用停止文件优雅退出（比 taskkill 干净）。"""
         try:
@@ -1260,6 +1304,7 @@ class VoiceLoop:
             first_min_chars=int(tts_cfg.first_chunk_min_chars),
             min_chunk_chars=int(tts_cfg.min_chunk_chars),
             max_hold_seconds=float(tts_cfg.max_hold_seconds),
+            first_chunk_max_chars=int(getattr(tts_cfg, "first_chunk_max_chars", 0) or 0),
         )
         self._interrupt.clear()
         t0 = time.perf_counter()
@@ -1589,7 +1634,21 @@ class VoiceLoop:
         rate = int(self.settings.audio.sample_rate)
         t0 = time.perf_counter()
         result = self.asr.transcribe(audio, rate)
-        return result.text.strip(), result, time.perf_counter() - t0
+        return self._fix_names(result.text.strip()), result, time.perf_counter() - t0
+
+    def _fix_names(self, text: str) -> str:
+        """把句首听错的人名改回规范名（只认不准的词，拿不准就不改）。"""
+        if not text or self.names is None or not self.names.enabled:
+            return text
+        fixed, hits = self.names.correct(text)
+        for hit in hits:
+            print(
+                f"[人名] 听到「{hit.spoken}」→ 认成「{hit.name}」"
+                f"（相似度 {hit.score:.2f}）",
+                flush=True,
+            )
+            self.log.info(f"人名校正：{hit.spoken!r} → {hit.name!r}")
+        return fixed
 
     def _process(self, text: str, result: AsrResult | None, asr_seconds: float = 0.0) -> bool:
         """处理一句识别结果，返回 True 表示要退出。"""
@@ -1783,6 +1842,9 @@ class VoiceLoop:
                     # 角色文件改了（改了人设/加了角色/补了别名）→ 重新装上
                     if self.persona is not None and self.persona.maybe_reload():
                         self.wake.set_characters(self.persona.all(only_enabled=True))
+                        self.names = NameCorrector.from_characters(
+                            self.persona.all(only_enabled=True)
+                        )
                         keep = self.persona.get(self.character.id) if self.character else None
                         self._apply_character(keep or self.persona.default(), reason="热重载")
                         print(f"[角色设定已更新] {self.persona.stats()}\n")
@@ -1814,7 +1876,23 @@ class VoiceLoop:
                         self.session.open()
                         if not is_meaningful(text):
                             continue
-                        if self._process(text, result, asr_seconds):
+                        # ★对话中也要能认名字★（含听错的）：喊别人就换人，喊自己就摘掉名字，
+                        # 整句只有名字就当「叫一声」——别把名字本身送给大模型。
+                        spoken, request = text, None
+                        request, address_note = self._resolve_address(text)
+                        if request is None:      # 整句只是个名字 → 回一句应答语
+                            ack = (
+                                (self.character.ack if self.character else "")
+                                or self.wake.settings.ack
+                                or ""
+                            ).strip()
+                            print(f"\n你说：{spoken}（只是叫一声）\n助手：{ack}\n", flush=True)
+                            if ack:
+                                self.speak_text(ack, fresh=True)
+                            continue
+                        if address_note:
+                            print(f"\n{address_note}", flush=True)
+                        if self._process(request, result, asr_seconds):
                             break
                         continue
 
