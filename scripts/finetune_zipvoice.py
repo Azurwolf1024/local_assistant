@@ -26,6 +26,7 @@ import argparse
 import concurrent.futures
 import gzip
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -284,8 +285,10 @@ def stage_env(args) -> int:
         "权重 model.pt": (args.weights / "model.pt", True),
         "权重 tokens.txt": (args.weights / "tokens.txt", True),
         "权重 model.json": (args.weights / "model.json", True),
-        "训练 TSV": (args.data_dir / "custom_train.tsv", True),
-        "验证 TSV": (args.data_dir / "custom_dev.tsv", True),
+        # ★TSV 是第 1 步自己生成的，缺了不算错★：否则「新角色一条龙」（--stage 1）
+        # 会在预检就被拦住（踩过：阿米娅第一次跑 EXIT=1，什么都没干）
+        "训练 TSV": (args.data_dir / "custom_train.tsv", False),
+        "验证 TSV": (args.data_dir / "custom_dev.tsv", False),
         # manifest / fbank 是第 2~4 步自己会生成的，缺了不算错（否则第一次跑必失败）
         "train manifest": (args.fbank_dir / f"{args.prefix}_cuts_train.jsonl.gz", False),
         "dev manifest": (args.fbank_dir / f"{args.prefix}_cuts_dev.jsonl.gz", False),
