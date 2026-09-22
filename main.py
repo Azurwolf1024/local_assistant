@@ -951,6 +951,9 @@ def cmd_selftest(settings: Settings, args: argparse.Namespace) -> int:
             first = float(info.get("first_chunk_seconds") or 0.0)
             steps = int(getattr(settings.tts, "clone_steps", 4) or 4)
             print(f"    步数 {steps}  首段出声 {first:.2f}s（Piper 是 0.13s）")
+            from voice_loop.tts.pacing import PacingFixer
+
+            print(f"    {PacingFixer.from_config(settings.tts).describe()}")
             print('    · 克隆音色是「说多久、等多久」；想更快就把 [tts] backend 改回 "piper"')
         if not args.no_play:
             import sounddevice as sd

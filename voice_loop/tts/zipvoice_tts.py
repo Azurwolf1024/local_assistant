@@ -33,6 +33,7 @@ import numpy as np
 
 from ..manifest import manifest_pairs
 from ..settings import Settings
+from .pacing import PacingFixer
 
 # 参考音频的推荐上限（秒）。再长不会更像，只会更慢、更不稳。
 REF_MAX_SECONDS = 15.0
@@ -130,6 +131,8 @@ class ZipVoiceTts:
         silence_s = max(0.0, float(cfg.sentence_silence))
         self._silence = np.zeros(int(self._rate * silence_s), dtype=np.int16)
         self._synth_calls = 0
+        # 输出静音裁剪：去掉模型每段开头那 0.5~1.5 秒死静音（见 tts/pacing.py）
+        self._pacing = PacingFixer.from_config(cfg)
         # 没参考音频时退回 Piper 出声（宁可音色不对，也不能把嘴弄哑）
         self._fallback = None
         self._warned_no_ref = False
@@ -438,7 +441,11 @@ class ZipVoiceTts:
             if item is None:
                 break
             pcm = np.clip(item, -1.0, 1.0)
-            yield self._rate, (pcm * 32767.0).astype(np.int16)
+            piece = (pcm * 32767.0).astype(np.int16)
+            # 每段开头有 0.5~1.5 秒死静音（实测），剪掉——顺带把首段出声提前
+            piece = self._pacing.apply(piece, self._rate)
+            if piece.size:
+                yield self._rate, piece
         thread.join(timeout=0.1)
         if errors:
             raise RuntimeError(f"ZipVoice 合成失败：{errors[0]}")

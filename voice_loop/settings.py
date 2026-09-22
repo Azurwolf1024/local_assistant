@@ -157,6 +157,15 @@ class TtsConfig:
     clone_t_shift: float = 0.0       # 0 = 用库默认
     clone_target_rms: float = 0.0    # 0 = 用库默认
     clone_feat_scale: float = 0.0    # 0 = 用库默认
+    # ---- 输出静音裁剪（见 voice_loop/tts/pacing.py）----
+    # ★实测：模型会在每段音频开头塞 0.58~1.48 秒纯数字静音（参考音频只有 0.04s），
+    #   这才是「语速忽快忽慢」的真凶（发音速率本身很稳，5.88~7.48 字/有声秒）。★
+    trim_output_silence: bool = True  # 关掉就完全用模型原始输出
+    trim_lead_ms: int = 40            # 开头保留的静音（别设 0，免得第一个字被啃）
+    trim_tail_ms: int = 80            # 结尾保留的静音
+    trim_max_pause_ms: int = 0        # 0 = 不动句内停顿；>0 = 把超过此值的停顿压到 trim_min_pause_ms
+                                      #   实测单次停顿都 <0.6s，阈值 600~1200 无效；要压得用 450→260
+    trim_min_pause_ms: int = 260      # 压停顿时的下限
 
 
 @dataclass
