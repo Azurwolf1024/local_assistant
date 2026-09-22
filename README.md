@@ -1664,6 +1664,29 @@ trim_min_pause_ms = 260
 设 `trim_max_pause_ms = 450` 后中位语速 4.78 → 5.68 字/秒、长/短比 1.39 → 1.25×，但整体偏快。
 裁剪逻辑见 `voice_loop/tts/pacing.py`，测试 `python scripts/test_trim_pacing.py`（31 条）。
 
+### 想拿这些素材微调模型（可选，卡在 Linux 环境）
+
+把「语速不稳」当模型问题是查错了方向（见上一节），但如果就是想让模型更像本人，
+ZipVoice 官方支持微调，路已经探到一半：
+
+```powershell
+# 数据这一腿本机就能干完：产出官方配方要的 TSV（24kHz 单声道、掐静音、train/dev）
+python scripts/prepare_tts_dataset.py --dir data/personas/kaltsit --out data/finetune/kaltsit
+python scripts/prepare_tts_dataset.py ... --apply --path-prefix /mnt/d/local_AI/   # WSL 用
+python scripts/test_prepare_dataset.py        # 24 条
+```
+
+剩下的三件事（实测结论，2026-09-21）：
+
+| 环节 | 结论 |
+|---|---|
+| 数据 | 38 条 / 4.8 分钟；口径达标的 30 对（8 条 <0.8s 的极短音被过滤，只占 1.6% 时长） |
+| `piper_phonemize` | **有 cp313 win_amd64 轮子** ✓（`-f https://k2-fsa.github.io/icefall/piper_phonemize.html`） |
+| `k2` | **只有 manylinux/macos 轮子，没有 Windows 版** ✗ → 训练必须在 Linux 里跑，本机 WSL/Docker 都没装 |
+| 配方 | `egs/zipvoice/run_finetune.sh`：`--finetune 1 --world-size 4 --use-fp16 1 --num-iters 10000 --max-duration 500` |
+| 规模 | 4.8 分钟数据配 `--max-duration 500` 是半轮一个 iter → 10000 iter ≈ 上万轮；要跑得降到 `--max-duration` 几十秒 + 几百 iter |
+| 算力 | 本机纯 CPU（CUDA/XPU 都不可用），时间以小时~天计；**开跑前先跑 100 iter 实测 iters/分钟** |
+
 ### 从清单文件导入台词（只添加，不替换）
 
 上面那些台词素材是「文件名 + 文本」的清单（`data/personas/kaltsit/kaltsit.txt`，38 条）。
