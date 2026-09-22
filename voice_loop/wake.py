@@ -338,6 +338,19 @@ class WakeWordMatcher:
         norm = normalize(text)
         return self._best_window(norm)[0] if norm else 0.0
 
+    def best_target(self, text: str) -> tuple[float, str, str]:
+        """最像的那个唤醒词：``(相似度, 主唤醒词, 角色 id)``。
+
+        用来给「喊错了」的提示指路——**得说清该往哪个文件里加别名**：
+        装了角色时别名住在角色自己的人格文件里，指向全局 wakewords.json 会白忙一场
+        （见 :meth:`set_characters`）。
+        """
+        norm = normalize(text)
+        if not norm:
+            return 0.0, "", ""
+        ratio, word, _a, _b, character = self._best_window(norm)
+        return ratio, word, character
+
     def strip_word(self, text: str, hit: WakeHit | None = None) -> str:
         """去掉唤醒词，返回剩下的「请求内容」。
 

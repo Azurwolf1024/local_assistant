@@ -216,7 +216,8 @@ flowchart LR
 │  ├─ test_persona.py          # ★ 角色：结构化人设 / 多角色唤醒归属 / 切换 / 热重载
 │  ├─ test_vision.py           # 看图自测（编图 / 找文件 / 识别）
 │  ├─ test_accel.py            # 加速设备选择（核显 / NPU / 回退）
-│  ├─ test_wake.py             # ★ 唤醒词实测与调优（打印听到的内容 / 自动写 aliases）
+│  ├─ test_wake.py             # ★ 唤醒词实测与调优（打印听到的内容 / --apply 写进对应角色）
+│  ├─ test_wake_apply.py       # ★ 唤醒词 --apply 写对文件了吗（纯离线，不碰麦克风）
 │  ├─ test_mic_loopback.py     # 麦克风回环诊断（放一段语音，看能不能听到 + 识别）
 │  ├─ clean_junk_data.py       # 清理早期版本写坏的备忘/闹钟
 │  ├─ say.py                   # 用扬声器念一句话（不想开口时测唤醒词用）
@@ -638,6 +639,9 @@ python main.py see --fix --screen              # 只做本地部分，不调模�
 ```
 
 - **保存即生效**，前台/后台都会在几秒内自动重新加载，不用重启。
+- ⚠️ **多角色时这里的 `words`/`aliases` 只是兜底**：只要 `data/characters.json` 里有**一个**可用角色，
+  运行期的匹配表就**只用角色自己的**（人格文件里的 `wake_words` / `aliases`）重建，
+  这份全局的对不上号了。所以「调唤醒词」现在默认是改人格文件——见第 14 节。
 - `aliases` 是最关键的一栏。语音识别经常听错，尤其是三字人名：
   实测单独说「凯尔希」时，两套 ASR 分别听成 **「开尔信」** 和 **「太尔西」**。
   把听错的说法填进 `aliases` 就能命中。
@@ -645,15 +649,27 @@ python main.py see --fix --screen              # 只做本地部分，不调模�
   ```powershell
   python main.py stop                      # 先停掉常驻服务，两边别抢麦克风
   python scripts/test_wake.py --rounds 5   # 说 5 次，看每次被听成什么
+  python scripts/test_wake.py --char amiya # 只测阿米娅那几个词
   python scripts/test_wake.py --apply      # 未命中时直接写进 aliases
   ```
+  **写到哪里（这个弄错过）**：`--apply` 写进「被喊的那位」的**人格文件**
+  （`data/personas/<id>.json` 的 `aliases`），**不是**这个全局文件。
+  因为运行期只用角色文件建匹配表（`WakeWordMatcher.set_characters`），
+  写全局那份会「看着成功、其实不生效」。没有可用角色时才退回这里。
+  开始时会把每个词该写哪个文件列出来：
+  ```
+    阿米娅    → 阿米娅（amiya）      现有别名 7 个  [amiya.json]
+    凯尔希    → 凯尔希（kaltsit）    现有别名 2 个  [kaltsit.json]
+  ```
+  写人格文件同样几秒内热重载，不用重启。自测（不碰麦克风）：
+  `python scripts/test_wake_apply.py`。
   输出会告诉你：SenseVoice 听到的是什么（**只有它算数**，因为待唤醒时只加载了它）、
   命中的是精确/别名还是模糊匹配、与唤醒词的相似度、以及该不该调 `fuzzy_ratio`：
   ```
-  SenseVoice 听到：'可尔西'
-  × 未命中。与「凯尔希」相似度 0.67（需要 ≥ 0.75 才算模糊命中）
-    → 建议把 '可尔西' 加进 aliases
-    → 已写入
+  SenseVoice 听到：'阿米呀'
+  × 未命中。最像「阿米娅」（阿米娅（amiya））相似度 0.67，需要 ≥ 0.75 才算模糊命中
+    → 建议把 '阿米呀' 加进「阿米娅」的 aliases（amiya.json）
+    → 已写入 amiya.json（「阿米娅」现有别名 8 个）
   ```
   后台上跑着服务时，它同样会在日志里直接告诉你听到了什么：
   ```
@@ -1053,12 +1069,12 @@ python scripts/test_tools.py --live --model <模型>   # 工具选择会不会�
 
 ```
 [未唤醒] 听到：开儿戏
-          和「凯尔希」相似度 0.67，就差一点：把它加进 wakewords.json 的 aliases，
+          和「凯尔希」相似度 0.67，就差一点：把它加进人格文件（kaltsit.json）的 aliases，
           或者把 fuzzy_ratio 降到 0.62
 ```
 
 照着提示做即可（改 aliases 几秒内自动生效，不用重启）。还可以：
-① 跑 `python scripts/test_wake.py --rounds 5` 用真实嗓音测，`--apply` 自动写入 aliases；
+① 跑 `python scripts/test_wake.py --rounds 5` 用真实嗓音测，`--apply` 自动写进对应角色的人格文件；
 ② 把 `min_silence` 从 0.3 调到 0.45（说话尾音被切掉时有用）；
 ③ 跑 `python main.py selftest` 看第 7 项是否命中。
 

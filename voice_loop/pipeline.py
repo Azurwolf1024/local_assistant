@@ -1555,7 +1555,13 @@ class VoiceLoop:
             self.log.debug(f"[未唤醒] {text}")
             return
 
-        ratio = self.wake.best_ratio(plain)
+        ratio, word, char_id = self.wake.best_target(plain)
+        target = word or "唤醒词"
+        hint_file = self._wake_path.name          # 没有角色时就是全局那本
+        if char_id and self.persona is not None:
+            path = (self.persona.files or {}).get(char_id)
+            if path is not None:
+                hint_file = f"{Path(path).name}（角色「{target}」的别名住这里）"
         close = ratio >= 0.6
         # 短句最可能是喊唤醒词喊错了；长句只有「很像」时才值得刷屏
         if not (2 <= len(key) <= 8 or close):
@@ -1566,18 +1572,16 @@ class VoiceLoop:
             return
         self._last_miss = plain
 
-        words = self.wake.settings.words
-        target = words[0] if words else "唤醒词"
         if close:
             hint = (
                 f"和「{target}」相似度 {ratio:.2f}，就差一点：把它加进 "
-                f"{self._wake_path.name} 的 aliases，或者把 fuzzy_ratio 降到 "
+                f"{hint_file} 的 aliases，或者把 fuzzy_ratio 降到 "
                 f"{max(0.5, round(ratio - 0.05, 2))}"
             )
         else:
             hint = (
                 f"和「{target}」相似度 {ratio:.2f}，降阈值没用，"
-                f"只能把它加进 {self._wake_path.name} 的 aliases"
+                f"只能把它加进 {hint_file} 的 aliases"
             )
         print(f"[未唤醒] 听到：{plain}\n          {hint}", flush=True)
 
@@ -1712,6 +1716,12 @@ class VoiceLoop:
         """
         wall = self.wake.settings.words
         words = "、".join(wall) or "（未配置）"
+        # ★唤醒词住在哪要说清★：装了角色就是各角色的人格文件，全局那本只是兜底；
+        # 打印错文件会让人改半天没反应。
+        if self.wake.characters_loaded() and self.persona is not None:
+            wake_where = f"各角色的 data/personas/<id>.json（{self.persona.path.name} 里指到的人格文件）"
+        else:
+            wake_where = str(self._wake_path)
         asr_desc = f"{self.settings.asr.strategy} / SenseVoice" + (
             " 常驻 + Whisper 按需" if self.lazy else " + Whisper"
         )
@@ -1720,7 +1730,7 @@ class VoiceLoop:
             f"  ASR : {asr_desc}\n"
             f"  LLM : {self.settings.llm.model} @ {self.settings.llm.host}\n"
             f"  TTS : {self._tts_label()}\n"
-            f"  唤醒词: {words}    (可直接编辑 {self._wake_path}，保存即生效)\n"
+            f"  唤醒词: {words}    (改 {wake_where}，保存即生效)\n"
             + (
                 f"  角色  : {self.persona.stats()}\n" if self.persona is not None else ""
             )
