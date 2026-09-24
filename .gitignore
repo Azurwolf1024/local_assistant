@@ -35,6 +35,7 @@ models/tts/zipvoice/
 # 运行产物
 sessions/
 data/backup/
+data/ref_cache/       # 净化后的参考音频（从 data/personas 里的 wav 生成，能删）
 data/vision/          # 截图/摄像头抓拍（含隐私，且是运行产物，别进 git）
 *.log
 

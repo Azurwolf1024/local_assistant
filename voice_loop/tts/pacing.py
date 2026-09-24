@@ -27,6 +27,11 @@ DEFAULT_TAIL_MS = 80   # 结尾保留的静音
 DEFAULT_MAX_PAUSE_MS = 0   # 0 = 不压缩句内停顿
 DEFAULT_MIN_PAUSE_MS = 260  # 压停顿时保留的下限
 DEFAULT_MIN_GAP_MS = 0      # 0 = 不拉长过短的停顿；>0 = 句内停顿短于它就拉到它
+# ★按比例压长停顿★（2026-09-25）：模型在逗号处能停 0.6~1.3 秒（人类 0.2~0.3 秒），
+# 听起来就是「说到一半卡住」。平压到 260ms 很干净，但会把**逗号和句号压成一样长**——
+# 语气的长短对比就没了。比例压只吃掉「超出部分」的 65%，长短关系原样保留。
+DEFAULT_SHRINK_PAUSE = 0.0        # 0 = 关；0.35 = 把超出部分压掉 65%
+DEFAULT_SHRINK_OVER_MS = 450      # 超过它才开始压
 # ★只拉长「本来就是停顿」的空隙★：中文里字与字之间有 10~40ms 的自然音渡
 # （塞音成阻、擦音弱段），把那些也撑成 240ms 会让每个字之间都垫一段等长静音，
 # 听感就是「一顿一顿」——实测一句 11 个空隙里有 8 个是这种微空隙，
@@ -61,6 +66,8 @@ def trim_silence(
     min_pause_ms: int = DEFAULT_MIN_PAUSE_MS,
     min_gap_ms: int = DEFAULT_MIN_GAP_MS,
     min_gap_floor_ms: int = DEFAULT_MIN_GAP_FLOOR_MS,
+    shrink_pause: float = DEFAULT_SHRINK_PAUSE,
+    shrink_over_ms: int = DEFAULT_SHRINK_OVER_MS,
     frame_ms: int = FRAME_MS,
     threshold: float = THRESHOLD,
 ) -> np.ndarray:
@@ -116,6 +123,13 @@ def trim_silence(
             if max_pause_ms > 0 and gap_ms > max_pause_ms:
                 keep_ms = max(min_pause_ms, 0)
                 pieces.append(np.zeros(int(rate * keep_ms / 1000), dtype=np.int16))
+            elif shrink_pause > 0 and gap_ms > shrink_over_ms:
+                # ★按比例压★：keep = 下限 + 超出部分 × shrink
+                #   shrink=0.35 → 1.31s 的怪停顿变 0.63s，而 0.5s 的停顿仍比 0.3s 的长，
+                #   长短关系没被抹平（这是与「平压到 260ms」的关键差别）
+                ratio = max(0.0, min(0.95, shrink_pause))
+                keep_ms = min_pause_ms + (gap_ms - min_pause_ms) * ratio
+                pieces.append(np.zeros(int(rate * keep_ms / 1000), dtype=np.int16))
             elif min_gap_ms > 0 and min_gap_floor_ms <= gap_ms < min_gap_ms:
                 # 本来就是停顿（≥门槛）但太短 → 拉长到 min_gap_ms
                 # （人类在逗号处会停，模型的短句常常给得极短）
@@ -151,6 +165,8 @@ class PacingFixer:
         min_pause_ms: int = DEFAULT_MIN_PAUSE_MS,
         min_gap_ms: int = DEFAULT_MIN_GAP_MS,
         min_gap_floor_ms: int = DEFAULT_MIN_GAP_FLOOR_MS,
+        shrink_pause: float = DEFAULT_SHRINK_PAUSE,
+        shrink_over_ms: int = DEFAULT_SHRINK_OVER_MS,
     ) -> None:
         self.enabled = bool(enabled)
         self.lead_ms = max(0, int(lead_ms))
@@ -159,6 +175,8 @@ class PacingFixer:
         self.min_pause_ms = max(0, int(min_pause_ms))
         self.min_gap_ms = max(0, int(min_gap_ms))
         self.min_gap_floor_ms = max(0, int(min_gap_floor_ms))
+        self.shrink_pause = max(0.0, float(shrink_pause))
+        self.shrink_over_ms = max(0, int(shrink_over_ms))
 
     @classmethod
     def from_config(cls, cfg) -> "PacingFixer":
@@ -174,6 +192,8 @@ class PacingFixer:
                 if getattr(cfg, "trim_min_gap_floor_ms", None) is not None
                 else DEFAULT_MIN_GAP_FLOOR_MS
             ),
+            shrink_pause=float(getattr(cfg, "trim_shrink_pause", DEFAULT_SHRINK_PAUSE) or 0.0),
+            shrink_over_ms=int(getattr(cfg, "trim_shrink_over_ms", DEFAULT_SHRINK_OVER_MS) or 0),
         )
 
     def apply(self, pcm: np.ndarray, rate: int) -> np.ndarray:
@@ -188,12 +208,89 @@ class PacingFixer:
             min_pause_ms=self.min_pause_ms,
             min_gap_ms=self.min_gap_ms,
             min_gap_floor_ms=self.min_gap_floor_ms,
+            shrink_pause=self.shrink_pause,
+            shrink_over_ms=self.shrink_over_ms,
         )
 
     def describe(self) -> str:
         if not self.enabled:
             return "静音裁剪：关"
-        pause = "不动句内停顿" if self.max_pause_ms <= 0 else f"句内停顿压到 {self.min_pause_ms}ms"
+        pause = "不动句内停顿" if self.max_pause_ms <= 0 and self.shrink_pause <= 0 else ""
+        if self.max_pause_ms > 0:
+            pause = f"句内停顿压到 {self.min_pause_ms}ms"
+        if self.shrink_pause > 0:
+            pause += f"；>{self.shrink_over_ms}ms 的停顿按比例压 {self.shrink_pause:.2f}"
         if self.min_gap_ms > 0:
             pause += f"；{self.min_gap_floor_ms}~{self.min_gap_ms}ms 的停顿拉到 {self.min_gap_ms}ms"
         return f"静音裁剪：首 {self.lead_ms}ms / 尾 {self.tail_ms}ms / {pause}"
+
+
+# --------------------------------------------------------------------------- #
+# 块间电平对齐（「忽大忽小」的补丁）
+# --------------------------------------------------------------------------- #
+def voiced_db(pcm, rate: int, frame_ms: int = FRAME_MS, threshold: float = THRESHOLD) -> float:
+    """这一段音频的有声部分有多响（dBFS 中位）；没声就返回 NaN。"""
+    x = _to_int16(pcm)
+    active = _active_frames(x, rate, frame_ms, threshold)
+    hop = max(1, int(rate * frame_ms / 1000))
+    n = x.size // hop
+    if n == 0:
+        return float("nan")
+    rms = np.sqrt((x[: n * hop].astype(np.float64).reshape(n, hop) ** 2).mean(axis=1))
+    voiced = rms[active[:n] & (rms > 1e-6)]
+    if voiced.size == 0:
+        return float("nan")
+    return float(20.0 * np.log10(np.median(voiced) / 32768.0))
+
+
+class LevelMatcher:
+    """把每块的有声电平拉向「最近几块的中位」，**单块修正有上限**。
+
+    为什么需要（2026-09-25 实测）：ZipVoice 是**采样生成**的——同一个参考、同一句话
+    连跑三次，输出时长 6.85/6.41/6.61s、整条高频 8.2/4.6/8.6%（不是确定性的），
+    有声电平也跟着抖（实测波动 6.9~8.9 dB）。听感上就是「一句大声一句小声」。
+
+    上限（``max_db``）是安全绳：只想修「明显的忽大忽小」，不想把语气里的轻重也压平，
+    所以默认 0 = 关，建议 1.0~2.0。
+    """
+
+    def __init__(self, max_db: float = 0.0, alpha: float = 0.35, warmup: int = 1) -> None:
+        self.max_db = max(0.0, float(max_db))
+        self.alpha = float(min(0.9, max(0.05, alpha)))
+        self.warmup = max(0, int(warmup))
+        self._target: float | None = None
+        self._seen = 0
+        self.last_applied_db = 0.0
+
+    @property
+    def enabled(self) -> bool:
+        return self.max_db > 0
+
+    def reset(self) -> None:
+        self._target = None
+        self._seen = 0
+        self.last_applied_db = 0.0
+
+    def apply(self, pcm: np.ndarray, rate: int) -> np.ndarray:
+        if not self.enabled:
+            return pcm
+        level = voiced_db(pcm, rate)
+        if level != level:                      # NaN：这一段没声，别用它当基准
+            return pcm
+        if self._target is None or self._seen < self.warmup:
+            self._target = level
+            self._seen += 1
+            self.last_applied_db = 0.0
+            return pcm
+        gain_db = float(np.clip(self._target - level, -self.max_db, self.max_db))
+        self._target = (1.0 - self.alpha) * self._target + self.alpha * level
+        self.last_applied_db = gain_db
+        if abs(gain_db) < 0.05:
+            return pcm
+        out = np.clip(pcm.astype(np.float64) * (10.0 ** (gain_db / 20.0)), -32768, 32767)
+        return out.astype(np.int16)
+
+    def describe(self) -> str:
+        if not self.enabled:
+            return "块间电平对齐：关"
+        return f"块间电平对齐：上限 ±{self.max_db:.1f} dB"

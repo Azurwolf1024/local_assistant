@@ -179,6 +179,26 @@ class TtsConfig:
                                       #   字与字之间有 10~40ms 的自然音渡，无差别撑成 240ms 会让
                                       #   每个字都垫一段等长静音 → 整句「一顿一顿」（实测 11 个空隙
                                       #   里 8 个是这种，白加 1.84 秒死气）。别设为 0。
+    trim_shrink_pause: float = 0.0    # ★按比例压长停顿★（0 = 关，建议 0.35）
+                                      #   实测模型会在逗号处停 0.6~1.3 秒（人类 0.2~0.3 秒）
+                                      #   → 听起来「说到一半卡住」。平压到 260ms 干净，但会把
+                                      #   逗号与句号压成一样长（语气对比没了）；比例压只吃掉
+                                      #   超出部分的 65%，长短关系原样保留（字/有声秒不变）。
+    trim_shrink_over_ms: int = 450     # 超过它才开始按比例压
+    # ---- 音质：沙沙声与语气连贯（见 voice_loop/tts/refclean.py）----
+    # ★先听后改★：这几个默认都是「不处理」，量出来的数字只能筛掉明显差的，
+    #   最终好不好听要耳朵定（工具：scripts/ab_voice.py）。
+    ref_clean: str = "off"            # 参考音频净化：off | gate | gate+tilt
+                                      #   推理时那条参考是噪声的「载体」（交叉实验：×1.8~2.5）
+    ref_clean_strength: float = 0.7    # 谱门强度 0~1（越大越干净，过大可能削气声）
+    ref_tilt_hz: float = 7000.0        # gate+tilt 的高架截止频率
+    ref_tilt_db: float = 0.0           # 0 = 不降；-3 = 轻降（沙沙声在 >7kHz，但**齿音也在**）
+    ref_cache_dir: str = "data/ref_cache"   # 净化后的参考写到这里（能试听「模型到底听到了什么」）
+    out_tilt_hz: float = 0.0          # 输出去喉声：0 = 关；>0 = 这个频率以上整体衰减
+    out_tilt_db: float = 0.0          # 衰减量（-3 一级，-6 明显；会同时削齿音）
+    chunk_level_db: float = 0.0       # 块间电平对齐的上限 dB（0 = 关；1.5 = 只修明显的忽大忽小）
+    join_pause_comma_ms: int = 0      # 逗号接缝补白（0 = 用 sentence_silence 的老行为）
+    join_pause_period_ms: int = 0     # 句号接缝补白（同上）
 
 
 @dataclass

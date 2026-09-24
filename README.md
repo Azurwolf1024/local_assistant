@@ -12,7 +12,7 @@
 ## 这份 README 里有什么
 
 **这里只讲怎么装、怎么用。** 所有「为什么这么设计」「实测多少」「踩过什么坑」
-都在 [`docs/ENGINEERING_LOG.md`](docs/ENGINEERING_LOG.md)（工程日志，1200+ 行实测记录）。
+都在 [`docs/ENGINEERING_LOG.md`](docs/ENGINEERING_LOG.md)（工程日志，1300+ 行实测记录）。
 
 | 想干什么 | 去哪看 |
 | --- | --- |
@@ -184,7 +184,8 @@ flowchart LR
 │  ├─ voice_data.py            # 角色声线素材：够不够、缺什么（persona_voice 用）
 │  ├─ asr/                     # base.py（接口）/ sensevoice.py（快）/ whisper_ov.py（准）/ router.py
 │  └─ tts/                     # base.py（接口）/ piper_tts.py（快）/ zipvoice_tts.py（音色克隆）
-│                              # lazy.py（按需加载）/ pacing.py（停顿与断句）/ precision.py（int8/fp32）
+│                              # lazy.py（按需加载）/ pacing.py（停顿与断句）/ refclean.py（参考净化+去嘶声）
+│                              # precision.py（int8/fp32 选哪份模型）
 ├─ scripts/
 │  ├─ download_models.py       # 一键下载模型
 │  ├─ test_offline.py          # 离线自测（分块/时间/技能/唤醒/生命周期，含 09-19 那次误解析误删的回归）
@@ -227,6 +228,8 @@ flowchart LR
 │  ├─ probe_npu.py             # ★ NPU 到底值不值得用（分阶段实测，含核显对照）
 │  ├─ ab_clone_model.py        # ★ 声线 A/B：精度×步数的客观指标 + 试听 wav
 │  ├─ test_precision.py        # ★ 精度（int8/fp32）与平台降级的离线测试
+│  ├─ test_refclean.py         # ★ 参考净化 / 输出去嘶 / 电平对齐 / 压长停顿（纯离线）
+│  ├─ ab_voice.py              # ★ 音质 A/B：沙沙声与语气连贯，配对多遍 + 写试听 wav
 │  ├─ say.py                   # 用扬声器念一句话（不想开口时测唤醒词用）
 │  └─ tts_probe.py             # TTS 调音工具（含语调对比）
 ├─ docs/
@@ -889,6 +892,12 @@ python main.py skills
 > 语速阶梯实测）在 [`docs/ENGINEERING_LOG.md`](docs/ENGINEERING_LOG.md) 的「6. 语调和断句」。
 > 克隆音色下真正影响「听着自然」的四个旋钮：`first_chunk_max_chars`、
 > `trim_min_gap_ms`、`trim_min_gap_floor_ms`、`trim_min_pause_ms`（都在 `config.toml` 的 `[tts]`）。
+>
+> **2026-09-25 新增两组（都按实测默认打开了）**：
+> 去沙沙声用 `out_tilt_hz` / `out_tilt_db`（默认 7 kHz 以上 −3 dB，5 遍配对全部变干净）；
+> 保语气连贯用 `trim_shrink_pause`（按比例压长停顿，不压成一样长）+ `chunk_level_db`
+> （块间电平对齐）+ `join_pause_comma_ms` / `join_pause_period_ms`（按标点的接缝补白）。
+> 想听出差别：`python scripts/ab_voice.py --hiss` / `--rhythm`，产物在 `sessions/voice_ab2/`。
 
 ## 7. 实测性能（要换机器 / 换模型先看这个）
 
@@ -1437,6 +1446,14 @@ python scripts/ab_clone_model.py
 > 所以 `clone_precision` 默认仍是 `int8`，**先挑干净的参考**（下表），精度排最后。
 > 完整推导见 [`docs/ENGINEERING_LOG.md`](docs/ENGINEERING_LOG.md) 第 16.7 节；
 > 体检与选参考：`python scripts/pick_voice_ref.py`。
+>
+> **⚠️ 2026-09-25 更正**：16.7 那句「沙沙声来自素材底噪/参考音频」是**指标假象**——
+> 它用的「安静帧高频」量的是 −78 dBFS 的数字静音（耳朵听不到）。换成相对语音电平的口径后，
+> 两条参考的安静帧高频是 0.37% / 1.06%，**都干净**；而把参考真去净化（谱门/高架）
+> 在 5 遍配对里反而让输出更亮。**能稳定去掉沙沙声的是输出侧的高架**
+> （`[tts] out_tilt_hz` / `out_tilt_db`，默认已开 −3 dB@7 kHz：阿米娅整条高频 31.7% → 21.3%，
+> 5 遍配对 5/5 变干净，而且每遍之间的差别也小了）。-6 dB@6 kHz 更明显但齿音更闷，
+> **这一档请自己听一遍**（`sessions/voice_ab2/tilt_*.wav`）。详见工程日志第 18 节。
 
 > 手工调参/排障时可以单步跑：`scripts/finetune_zipvoice.py --stage 1..8`（分步版）、
 > `scripts/prepare_tts_dataset.py --dir data/personas/<id> --out data/finetune/<id> --apply`

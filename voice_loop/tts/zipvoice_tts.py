@@ -33,7 +33,8 @@ import numpy as np
 
 from ..manifest import manifest_pairs
 from ..settings import Settings
-from .pacing import PacingFixer
+from . import refclean as rc
+from .pacing import LevelMatcher, PacingFixer
 from .precision import (
     DEFAULT_PRECISION,
     PRECISION_FILES,
@@ -151,6 +152,14 @@ class ZipVoiceTts:
         self._synth_calls = 0
         # 输出静音裁剪：去掉模型每段开头那 0.5~1.5 秒死静音（见 tts/pacing.py）
         self._pacing = PacingFixer.from_config(cfg)
+        # 块间电平对齐 + 接缝补白 + 输出去喉声（见 tts/refclean.py 开头的实测）
+        self._level = LevelMatcher(float(getattr(cfg, "chunk_level_db", 0.0) or 0.0))
+        self._out_tilt_hz = float(getattr(cfg, "out_tilt_hz", 0.0) or 0.0)
+        self._out_tilt_db = float(getattr(cfg, "out_tilt_db", 0.0) or 0.0)
+        self._join_ms = {
+            "comma": max(0, int(getattr(cfg, "join_pause_comma_ms", 0) or 0)),
+            "period": max(0, int(getattr(cfg, "join_pause_period_ms", 0) or 0)),
+        }
         # 没参考音频时退回 Piper 出声（宁可音色不对，也不能把嘴弄哑）
         self._fallback = None
         self._warned_no_ref = False
@@ -254,6 +263,27 @@ class ZipVoiceTts:
         text = self._normalize_text(ref_text, quiet=quiet)
         if not text and not quiet:
             print("没拿到参考文本，音色会明显退化（同名 .txt 或同目录清单里写一条）", file=sys.stderr)
+
+        # ★参考音频净化★：底噪→沙沙声这条通路上，参考是「载体」
+        # （交叉实测：同模型换参考 ×1.8~2.5）。默认 off，见 [tts] ref_clean。
+        clean_mode = str(getattr(self.settings.tts, "ref_clean", rc.DEFAULT_MODE) or "off").strip().lower()
+        if clean_mode not in rc.MODES:
+            if not quiet:
+                print(f"[tts] ref_clean={clean_mode!r} 认不得，按 off 处理（可选 {'/'.join(rc.MODES)}）",
+                      file=sys.stderr)
+            clean_mode = "off"
+        if clean_mode != "off":
+            use, info = rc.process(
+                use,
+                rate,
+                clean_mode,
+                strength=float(getattr(self.settings.tts, "ref_clean_strength", rc.DEFAULT_STRENGTH)),
+                tilt_hz=float(getattr(self.settings.tts, "ref_tilt_hz", rc.DEFAULT_TILT_HZ) or rc.DEFAULT_TILT_HZ),
+                tilt_db=float(getattr(self.settings.tts, "ref_tilt_db", 0.0) or 0.0),
+            )
+            if not quiet:
+                print(f"[tts] 参考音频净化：{rc.describe(info)}", flush=True)
+            self._dump_cleaned_ref(path, use, rate, clean_mode)
 
         self._ref_audio = np.ascontiguousarray(use, dtype=np.float32)
         self._ref_rate = int(rate)
@@ -428,6 +458,39 @@ class ZipVoiceTts:
             self._fallback = PiperTts(self.settings)
         yield from self._fallback.synth(text)
 
+    def _dump_cleaned_ref(self, path: Path, audio: np.ndarray, rate: int, mode: str) -> None:
+        """把净化后的参考写一份到 data/ref_cache/——能直接听「模型到底听到了什么」。
+
+        文件名带源文件与模式，换参数不会覆盖旧的那份（方便回头 AB）。
+        """
+        try:
+            import soundfile as sf  # noqa: PLC0415
+
+            base = self.settings.resolve(getattr(self.settings.tts, "ref_cache_dir", "data/ref_cache"))
+            base.mkdir(parents=True, exist_ok=True)
+            tag = mode.replace("+", "_")
+            strength = float(getattr(self.settings.tts, "ref_clean_strength", rc.DEFAULT_STRENGTH))
+            tilt_db = float(getattr(self.settings.tts, "ref_tilt_db", 0.0) or 0.0)
+            name = f"{path.stem}_{tag}_s{strength:g}_t{tilt_db:g}.wav"
+            sf.write(str(base / name), audio, rate)
+        except Exception as exc:  # noqa: BLE001 - 落盘失败不能影响出声
+            print(f"[tts] 净化后的参考写不出来（{exc}）", file=sys.stderr)
+
+    def _pause_after(self, text: str) -> np.ndarray:
+        """这一块末尾该补多长的空白。
+
+        ``join_pause_*`` 没配（默认）就用老的 ``sentence_silence``；配了则按块末标点给：
+        逗号短、句号长——人类就是这么断的，比固定值听着“像在说话”而不是“像在读稿”。
+        """
+        if not self._join_ms["comma"] and not self._join_ms["period"]:
+            return self._silence
+        tail = (text or "").rstrip()
+        last = tail[-1] if tail else ""
+        ms = self._join_ms["period"] if last in "。！？!?…" else self._join_ms["comma"]
+        if ms <= 0:
+            return self._silence
+        return np.zeros(int(self._rate * ms / 1000.0), dtype=np.int16)
+
     def synth(self, text: str) -> Iterator[tuple[int, np.ndarray]]:
         """边生成边产出：第一个 chunk 出来就交给播放器，不必等整句合成完。"""
         text = (text or "").strip()
@@ -462,6 +525,12 @@ class ZipVoiceTts:
             piece = (pcm * 32767.0).astype(np.int16)
             # 每段开头有 0.5~1.5 秒死静音（实测），剪掉——顺带把首段出声提前
             piece = self._pacing.apply(piece, self._rate)
+            # 块间电平对齐（默认关）：采样生成导致同一句话每次响度不同
+            piece = self._level.apply(piece, self._rate)
+            if self._out_tilt_hz > 0 and self._out_tilt_db < 0 and piece.size:
+                shaped = rc.tilt(piece.astype(np.float32) / 32768.0, self._rate,
+                                 self._out_tilt_hz, self._out_tilt_db)
+                piece = np.clip(shaped * 32768.0, -32768, 32767).astype(np.int16)
             if piece.size:
                 yield self._rate, piece
         thread.join(timeout=0.1)
@@ -469,8 +538,9 @@ class ZipVoiceTts:
             raise RuntimeError(f"ZipVoice 合成失败：{errors[0]}")
 
         self._synth_calls += 1
-        if self._silence.size:
-            yield self._rate, self._silence
+        join = self._pause_after(text)
+        if join.size:
+            yield self._rate, join
 
     def synth_bytes(self, text: str) -> tuple[int, np.ndarray]:
         parts: list[np.ndarray] = []

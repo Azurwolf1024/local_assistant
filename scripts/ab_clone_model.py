@@ -95,6 +95,100 @@ def lead_silence(pcm: np.ndarray, rate: int) -> float:
     return first * FRAME_MS / 1000.0
 
 
+# ★2026-09-25 新增：把「安静帧高频」限定在**可闻**的电平区间★
+# 旧口径是「能量最低 25% 的帧」，实测踩坑：那些帧的 RMS 只有 **-78.8 dBFS**（数字静音附近的
+# 抖动/转换器底噪），HF 却是 82%；而 25~50% 那批（-37.6 dBFS，真停顿）HF 只有 3.2%。
+# 于是「阿米娅素材底噪大」是**指标假象**。耳朵能听到的“沙沙声”只在 -60~-30 dBFS 那段。
+AUDIBLE_QUIET_DB = (-60.0, -30.0)
+
+
+def _as_float(pcm: np.ndarray) -> np.ndarray:
+    """统一成 [-1,1] 浮点——★int16 直接当浮点算会让电平整体偏 +90 dB★（踩过：
+    「可闻安静帧」永远空、底噪 p10 报 12.6 dBFS 这种不可能的值）。"""
+    x = np.asarray(pcm)
+    if x.dtype == np.int16:
+        return x.astype(np.float64) / 32768.0
+    x = x.astype(np.float64)
+    return x / 32768.0 if np.max(np.abs(x), initial=0.0) > 2.0 else x
+
+
+def frame_db(pcm: np.ndarray, rate: int) -> tuple[np.ndarray, np.ndarray, int]:
+    """逐帧 (RMS dBFS, >6kHz 能量占比, hop)。三个新指标都建在它上面。"""
+    x = _as_float(pcm)
+    hop = max(1, int(rate * FRAME_MS / 1000))
+    n = x.size // hop
+    if n < 2:
+        return np.zeros(0), np.zeros(0), hop
+    frames = x[: n * hop].reshape(n, hop)
+    freqs = np.fft.rfftfreq(hop, 1.0 / rate)
+    high = freqs > 6000
+    rms = np.sqrt((frames**2).mean(axis=1))
+    db = 20 * np.log10(np.maximum(rms, 1e-12))
+    spec = np.abs(np.fft.rfft(frames * np.hanning(hop), axis=1)) ** 2
+    total = spec.sum(axis=1) + 1e-12
+    return db, spec[:, high].sum(axis=1) / total, hop
+
+
+# 安静帧的**相对**口径：比这句话自己的语音电平低 45~15 dB（绝对区间在不同音量下不可比）
+QUIET_BELOW_SPEECH_DB = (45.0, 15.0)
+SILENCE_FLOOR_DB = -120.0        # 低于它的帧当「数字零」，不算底噪
+
+
+def audible_quiet_hf(pcm: np.ndarray, rate: int) -> tuple[float, float]:
+    """(安静帧的高频占比 %, 这些帧占多少 %)——★沙沙声听得见与否看它★。
+
+    安静帧 = 电平在「语音 −45 dB」到「语音 −15 dB」之间的帧（停顿、气口、塞音成阻），
+    但排除数字零（ZipVoice 的停顿是**精确的 0**，把它们算进来会把指标拉成 nan）。
+    """
+    db, hf, _ = frame_db(pcm, rate)
+    if db.size == 0:
+        return float("nan"), 0.0
+    speech = float(np.percentile(db, 90))
+    lo = max(speech - QUIET_BELOW_SPEECH_DB[0], SILENCE_FLOOR_DB)
+    hi = speech - QUIET_BELOW_SPEECH_DB[1]
+    m = (db >= lo) & (db <= hi)
+    return (float(np.median(hf[m]) * 100) if m.any() else float("nan")), float(m.mean() * 100)
+
+
+def floor_db(pcm: np.ndarray, rate: int, pct: float = 10.0) -> float:
+    """帧电平的 p10（dBFS）——停顿里到底有多响（数字零不算）。"""
+    db, _, _ = frame_db(pcm, rate)
+    if db.size == 0:
+        return float("nan")
+    nz = db[db > SILENCE_FLOOR_DB]
+    if nz.size == 0:
+        return float(SILENCE_FLOOR_DB)
+    return float(np.percentile(nz, pct))
+
+
+def gaps_ms(pcm: np.ndarray, rate: int, min_ms: float = 120.0) -> list[float]:
+    """句内「真停顿」的毫秒列表（≥ min_ms）——看节奏稳不稳。"""
+    active = _active_frames(pcm, rate, FRAME_MS, THRESHOLD)
+    if active.size == 0:
+        return []
+    out: list[float] = []
+    i = 0
+    while i < active.size:
+        if active[i]:
+            i += 1
+            continue
+        j = i
+        while j < active.size and not active[j]:
+            j += 1
+        if i > 0 and j < active.size:            # 首尾静音不算“停顿”
+            ms = (j - i) * FRAME_MS
+            if ms >= min_ms:
+                out.append(float(ms))
+        i = j
+    return out
+
+
+def voiced_seconds(pcm: np.ndarray, rate: int) -> float:
+    """有声（非静音）总秒数——算「字/有声秒」用。"""
+    active = _active_frames(pcm, rate, FRAME_MS, THRESHOLD)
+    return float(active.sum() * FRAME_MS / 1000.0)
+
+
 # ---------------------------------------------------------------- 单次合成
 def synth_once(model_dir: Path, ref: Path, text: str, precision: str, steps: int):
     from voice_loop.tts.zipvoice_tts import ZipVoiceTts

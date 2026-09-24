@@ -11,8 +11,9 @@
    采样就能差 3 倍（那是噪声，不是差异）。所以加了第二个指标：
    **安静帧高频占比** = 只取能量最低的 25% 帧（停顿、塞音成阻、气口），那里的高频
    只可能是**底噪/气声**，跟句子无关，两组之间才可比。
-   实测：凯尔希 7.61% vs 阿米娅 **36.39%**（安静帧占比两边都是 ~25%，同一把尺子）。
-   → 「阿米娅听着毛」的根在**素材底噪**，不在模型结构、不在 int8、不在步数。
+   ⚠️ 2026-09-25 更正：旧口径选中的帧是 **−78 dBFS 的数字静音**（HF 92%），
+   量的是听不见的东西 → 换相对电平口径后两条参考是 **0.37% / 1.06%**，都干净。
+   沙沙声其实在**模型侧**，能稳定压下去的是输出侧的高架（见日志 18.3）。
 3. `--cross` 再把「模型」和「参考」分开：同一模型换参考、同一参考换模型，比谁的影响大。
    实测（长句 / 4 步 / int8）：换参考 ×1.8~2.5，换模型 ×1.1~1.6
    → **推理时那条参考是噪声的「载体」**：参考自己只差 1.4 倍，到输出里被放大成 2.5 倍。
@@ -33,7 +34,13 @@ import soundfile as sf
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from scripts.ab_clone_model import TEXTS, hf_ratio, lead_silence, rms_swing  # noqa: E402
+from scripts.ab_clone_model import (  # noqa: E402
+    TEXTS,
+    audible_quiet_hf,
+    hf_ratio,
+    lead_silence,
+    rms_swing,
+)
 
 PERSONA_DIR = ROOT / "models" / "tts" / "zipvoice" / "personas"
 DATA_DIR = ROOT / "data" / "personas"
@@ -48,26 +55,21 @@ MIN_REF_S, MAX_REF_S = 3.5, 8.0
 
 # ----------------------------------------------------------------- 指标
 def quiet_hf(path: Path) -> tuple[float, float, float]:
-    """返回 (整条高频占比, 安静帧高频占比, 安静帧占比)，单位 %。"""
+    """返回 (整条高频占比, 安静帧高频占比, 安静帧占比)，单位 %。
+
+    ★2026-09-25 改了口径★：旧版取「能量最低 25% 的帧」，实测那些帧是 −78 dBFS 的
+    数字静音（HF 92%），量的是耳朵听不到的东西，于是得出「阿米娅素材底噪大 4.5 倍」
+    这个**假结论**。现在用相对口径：安静帧 = 比这句自己的语音电平低 45~15 dB，
+    且排除数字零（实现在 ab_clone_model.py，与 A/B 脚本共用一把尺子）。
+    """
     x, rate = sf.read(str(path), dtype="float32", always_2d=True)
-    mono = (x[:, 0] if x.shape[1] == 1 else x.mean(axis=1)).astype(np.float64)
-    hop = max(1, int(rate * FRAME_MS / 1000))
-    n = mono.size // hop
+    mono = (x[:, 0] if x.shape[1] == 1 else x.mean(axis=1)).astype(np.float32)
+    n = mono.size // max(1, int(rate * FRAME_MS / 1000))
     if n < 4:
         return float("nan"), float("nan"), 0.0
-    frames = mono[: n * hop].reshape(n, hop)
-    freqs = np.fft.rfftfreq(hop, 1.0 / rate)
-    high = freqs > 6000
-    rms = np.sqrt((frames**2).mean(axis=1))
-    spec = np.abs(np.fft.rfft(frames * np.hanning(hop), axis=1)) ** 2
-    total = spec.sum(axis=1) + 1e-12
-    per_frame = spec[:, high].sum(axis=1) / total
-    quiet = (rms <= np.percentile(rms, QUIET_PCT)) & (rms > 1e-6)
-    return (
-        float(spec[:, high].sum() / total.sum() * 100),
-        float(per_frame[quiet].mean() * 100) if quiet.any() else float("nan"),
-        float(quiet.mean() * 100),
-    )
+    whole = hf_ratio(np.clip(mono * 32768.0, -32768, 32767).astype(np.int16), rate) * 100
+    quiet, share = audible_quiet_hf(mono, rate)
+    return float(whole), float(quiet), float(share)
 
 
 def measure(path: Path) -> dict | None:
