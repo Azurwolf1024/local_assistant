@@ -83,7 +83,7 @@ def test_specs() -> None:
     shutil.rmtree(tmp, ignore_errors=True)
 
 
-def test_add_schedule() -> None:
+def test_add_event() -> None:
     print("\n[2] add_event：模型给原话，日期由 nlp_time 算")
     tmp = Path(tempfile.mkdtemp(prefix="voicelool_tool_"))
     _settings, skills, reg = build(tmp)
@@ -136,7 +136,7 @@ def test_memo() -> None:
 
 
 def test_alarm() -> None:
-    print("\n[3b] add_alarm：一次性提醒不能塞进日程")
+    print("\n[3b] 一次性提醒（没有类别、没有时长也一样是事件）")
     tmp = Path(tempfile.mkdtemp(prefix="voiceloop_tool_"))
     _s, skills, reg = build(tmp)
     r = reg.call(tool_call("add_event", text="明天早上七点叫我起床"))
@@ -292,7 +292,7 @@ def main() -> int:
     print(" 工具层测试（模型选工具，确定性代码干活）")
     print("=" * 66)
     test_specs()
-    test_add_schedule()
+    test_add_event()
     test_memo()
     test_alarm()
     test_reads()

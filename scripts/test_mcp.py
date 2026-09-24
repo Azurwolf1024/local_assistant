@@ -235,7 +235,7 @@ def test_host(tmp: Path) -> None:
         check("自家的名字不带前缀", "list_memos" in names)
         check("外来/第二个服务器带 mcp__ 前缀", "mcp__ro__list_memos" in names)
         check("★白名单挡掉了写操作★", "mcp__ro__add_memo" not in names
-              and "mcp__ro__add_alarm" not in names, str(sorted(names))[:90])
+              and "mcp__ro__add_event" not in names, str(sorted(names))[:90])
         check("模型看到的工具数 = 8 + 2", len(host.specs()) == 10, f"{len(host.specs())} 个")
         check("specs 是 Ollama 形状", host.specs()[0]["type"] == "function"
               and "parameters" in host.specs()[0]["function"])

@@ -38,8 +38,6 @@ from .tools import (
     SUSPICIOUS_START,
     TOOL_HINT,
     ToolRegistry,
-    call_name,
-    call_text,
     describe_calls,
     looks_like_tool_text,
     parse_tool_call_text,
@@ -1194,7 +1192,6 @@ class VoiceLoop:
         assert self.tools is not None
         out: list[tuple[bool, str]] = []
         fixed: list[dict] = []
-        scheduled_texts: set[str] = set()
         for call in calls:
             new_call = repair_args(call, stats.user_text)
             if new_call is not call:
@@ -1205,19 +1202,11 @@ class VoiceLoop:
                 self.log.info(f"[工具] 这一句是在改上一条，已改走 fix_last：{stats.user_text}")
             fixed.append(routed)
         for call in fixed:
-            # ★同一句话既排了日程、又定了闹钟 → 闹钟是重复的★
-            # 实测（2026-09-20）：「下周三下午3点，我有社团活动，到时候记得提醒我。」
-            # 模型会同时调 add_schedule 与 add_alarm，text 一模一样；日程本身带提前提醒，
-            # 再来个闹钟就是同一件事响两次。日程排成了才跳过闹钟（没排成就照旧定闹钟）。
-            name = call_name(call)
-            same_text = call_text(call)
-            if name == "add_alarm" and same_text and same_text in scheduled_texts:
-                self.log.info(f"[工具] 这句已经排进日程（日程自带提醒），跳过重复的闹钟：{same_text}")
-                print("      [工具] 这句已排进日程，重复的闹钟就不定了", flush=True)
-                continue
+            # ★同一句话只说一遍，不管模型把同一个工具调了几次★：
+            # 实测（2026-09-20）「下周三下午3点，我有社团活动，到时候记得提醒我。」
+            # 模型会同时调两个新增工具、text 一模一样——合并前是两个工具（日程 + 闹钟），
+            # 合并后是同一个工具调两遍，两种都靠事件层的 _find_duplicate 去重（回「已经记过了」）。
             ok, text = self._call_tool(call)
-            if ok and name == "add_schedule" and same_text:
-                scheduled_texts.add(same_text)
             out.append((ok, text))
         stats.extra["tool"] = describe_calls(fixed)
         stats.extra["tool_ok"] = all(ok for ok, _ in out)
@@ -2004,9 +1993,8 @@ class VoiceLoop:
                     if self.skills:
                         print(f"  {self.skills.stats()}")
                         for name, path in (
-                            ("闹钟", self.skills.alarms.path),
+                            ("事件", self.skills.store.path),
                             ("备忘", self.skills.memos.path),
-                            ("日程", self.skills.schedule.path),
                         ):
                             print(f"  {name}: {path}")
                     continue

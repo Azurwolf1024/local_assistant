@@ -37,9 +37,10 @@ def settings_for_standalone() -> Settings:
     if override:
         base = Path(override)
         settings.skills.data_dir = str(base)
-        settings.skills.alarm_file = str(base / "alarms.json")
+        settings.skills.event_file = str(base / "events.json")
         settings.skills.memo_file = str(base / "memos.json")
-        settings.skills.schedule_file = str(base / "schedule.json")
+        settings.skills.alarm_file = str(base / "alarms.json")      # 迁移数据源
+        settings.skills.schedule_file = str(base / "schedule.json")  # 迁移数据源
     return settings
 
 INSTRUCTIONS = (

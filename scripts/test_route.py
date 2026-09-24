@@ -239,7 +239,7 @@ def test_rules_first() -> None:
 # --------------------------------------------------------------------------- #
 def test_new_tools() -> None:
     """新铺开的四个工具：改 / 取消 / 报时 / 纠正（都复用技能层的守卫）。"""
-    print("\n[4] 新工具（change_schedule / cancel_alarm / now / fix_last）")
+    print("\n[4] 新工具（change_event / now / fix_last）")
     with tempfile.TemporaryDirectory(prefix="route_tools_") as td:
         tmp = Path(td)
         loop = make_loop(tmp)
@@ -366,7 +366,7 @@ def test_no_double_reminder() -> None:
     """同一句话既排了日程、又定了闹钟 → 闹钟是重复的，不该定。
 
     实测（2026-09-20）：「下周三下午3点，我有社团活动，到时候记得提醒我。」
-    模型同时调 add_schedule 与 add_alarm，text 一模一样——日程本身带提前提醒，
+    模型把同一个新增工具调了两次，text 一模一样——事件层按 (标题, 时间) 去重，
     再来个闹钟就是同一件事响两次。
     """
     print("\n[7] 同一句话不重复记（同一工具被连着调两次）")

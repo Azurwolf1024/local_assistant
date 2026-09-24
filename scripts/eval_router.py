@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from voice_loop.settings import load_settings  # noqa: E402
 
 # 内置样本：(句子, 期望)。期望写 None = 这句话**不该调任何工具**（闲聊）。
-# 写成集合是因为有些说法用哪个工具都算对（「那件事是什么时候」→ list_schedule）。
+# 写成集合是因为有些说法用哪个工具都算对（「那件事是什么时候」→ list_events）。
 # 为什么要标预期：不标就只能按关键词猜「这句算不算命令」，量不出选对率（猜过，不准）。
 BUILTIN: list[tuple[str, set[str] | None]] = [
     # 查

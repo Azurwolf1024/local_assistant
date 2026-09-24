@@ -1874,7 +1874,7 @@ class Skills:
             if items:
                 total += len(items)
                 detail = "、".join(
-                    f"{clock_text(w)}{i.get('title', '安排')}"
+                    f"{clock_text(w)}{display_title(i)}"
                     + (f"（地点{i['location']}）" if i.get("location") else "")
                     for w, i in items
                 )
@@ -1913,9 +1913,9 @@ class Skills:
         delta = (when - now).total_seconds()
         where = f"，地点{item['location']}" if item.get("location") else ""
         if delta <= 0:
-            return SkillResult(reply=f"你正在进行：{item.get('title', '')}{where}。", action="event_next")
+            return SkillResult(reply=f"你正在进行：{display_title(item)}{where}。", action="event_next")
         return SkillResult(
-            reply=f"下一项是{humanize(when, now)}的{item.get('title', '安排')}{where}，还有{humanize_delta(delta)}。",
+            reply=f"下一项是{humanize(when, now)}的{display_title(item)}{where}，还有{humanize_delta(delta)}。",
             action="event_next",
         )
     # ======================================================================

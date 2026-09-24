@@ -253,11 +253,12 @@ data_dir = "data"
 #   迁移：python scripts/migrate_events.py（默认试运行）→ 详见工程日志第 17 节
 #   ★代码还没切过去，运行期仍读下面两个旧文件★
 event_file = "data/events.json"
-alarm_file = "data/alarms.json"        # 迁移数据源（切换后只剩这个用途）
+alarm_file = "data/alarms.json"        # 迁移数据源（已迁完，只剩 scripts/migrate_events.py 读它）
 memo_file = "data/memos.json"
 schedule_file = "data/schedule.json"   # 迁移数据源
 check_interval = 5            # 后台检查提醒的间隔（秒）
-default_remind_before = 10    # 日程默认提前几分钟提醒
+default_remind_before = 10    # 只有「手写进 json、又没写 remind_before」的条目才用这个兜底
+                             #（语音说出来的条目：没说「提前多久」就是 [0] 到点响）
 speak_duplicate = false
 visual_alert = true           # 提醒时同时弹出右下角可视窗（没开扬声器也不会错过）
 visual_timeout = 25           # 可视窗多少秒后自动关闭（可随时点「知道了」或按 Esc 关掉）
@@ -340,7 +341,7 @@ say_first = "我看一眼。"       # 看图前先说的那句话（留空则不
 # 也能挂到 stdio 给别的 agent（Copilot / Claude Code）当 MCP 服务器用：
 #     python -m voice_loop.mcp.serve skills
 #     python main.py mcp                 # 看当前有哪些工具、来自哪个服务器
-#     python main.py mcp --call list_schedule --args "{\"text\": \"下周\"}"
+#     python main.py mcp --call list_events --args "{\"text\": \"下周\"}"
 [mcp]
 enabled = true
 
@@ -349,7 +350,7 @@ enabled = true
 name = "skills"
 transport = "inproc"
 module = "voice_loop.mcp.servers.skills"
-namespace = false              # 工具名保持 list_schedule / add_memo 原样：模型已经认得这 8 个
+namespace = false              # 工具名保持 list_events / add_memo 原样：模型已经认得这 8 个
 timeout = 15
 
 # 想更隔离就把它挪到子进程（每次调用多几毫秒，但服务器崩了不影响助手）：

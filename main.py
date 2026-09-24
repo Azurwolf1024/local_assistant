@@ -564,14 +564,16 @@ def cmd_gpu(settings: Settings, args: argparse.Namespace) -> int:
 
 
 def cmd_skills(settings: Settings, args: argparse.Namespace) -> int:
-    """查看/测试生活技能（时间、闹钟、备忘、日程）。"""
+    """查看/测试生活技能（时间、事件、备忘）。"""
+    from voice_loop.event_text import leads_text
+    from voice_loop.events import display_title, leads_of, repeat_text
     from voice_loop.skills import Skills
 
     skills = Skills(settings, logging.getLogger("voice_loop"))
 
     if args.clear:
-        n = {"alarm": skills.alarms.clear(), "memo": skills.memos.clear(), "schedule": skills.schedule.clear()}
-        print(f"已清空：提醒 {n['alarm']} 条 / 备忘 {n['memo']} 条 / 日程 {n['schedule']} 条")
+        n = {"event": skills.store.clear(), "memo": skills.memos.clear()}
+        print(f"已清空：事件 {n['event']} 条 / 备忘 {n['memo']} 条")
         return 0
 
     if args.text:
@@ -587,43 +589,35 @@ def cmd_skills(settings: Settings, args: argparse.Namespace) -> int:
     print("技能数据：")
     print(f"  {skills.stats()}")
     for label, path in (
-        ("提醒/闹钟", skills.alarms.path),
+        ("事件（提醒/闹钟/日程）", skills.store.path),
         ("备忘", skills.memos.path),
-        ("日程", skills.schedule.path),
         ("唤醒词", settings.resolve(settings.wake.file)),
     ):
         mark = "√" if path.exists() else "×"
         print(f"  {mark} {label}: {path}")
 
-    alarms = [a for a in skills.alarms.load() if not a.get("fired")]
-    if alarms:
-        print("\n待触发提醒：")
-        for i, a in enumerate(sorted(alarms, key=lambda x: x.get("when", "")), 1):
-            print(f"  {i}. {a.get('when')}  {a.get('what')}")
     memos = skills.memos.load()
     if memos:
         print("\n备忘：")
         for i, m in enumerate(memos[:10], 1):
             print(f"  {i}. {m.get('content')}")
-    sched = skills.schedule.load()
-    if sched:
-        print("\n日程（下一次 / 规则 / 提前提醒）：")
+
+    items = skills.store.load()
+    if items:
+        # ★闹钟和日程现在是同一种东西★，所以只列一张表：下一次发生 + 规则 + 提前提醒
         now = datetime.now()
-        for i, it in enumerate(sched, 1):
-            nxt = skills.next_occurrence(it, now)
-            leads = skills._leads_of(it)                       # noqa: SLF001
-            lead_text = "、".join(
-                "到点" if v <= 0 else (f"{v // 1440}天" if v % 1440 == 0 else f"{v // 60}小时" if v % 60 == 0 else f"{v}分钟")
-                for v in leads
-            )
+        rows = sorted(
+            ((skills._next_of(it, now), it) for it in items),   # noqa: SLF001
+            key=lambda p: (p[0] is None, p[0] or now),
+        )
+        print(f"\n事件（{len(rows)} 条，下一次 / 规则 / 提前提醒）：")
+        for i, (nxt, it) in enumerate(rows, 1):
             where = f"  @{it['location']}" if it.get("location") else ""
             note = f"  备注：{it['note']}" if it.get("note") else ""
-            link = f"  关联：{it.get('linked')}" if it.get("linked") else ""
-            skip = f"  跳过：{it['skip']}" if it.get("skip") else ""
             print(
                 f"  {i}. {nxt.strftime('%m-%d %H:%M') if nxt else '（已结束）'}"
-                f"  {skills._repeat_text(it)}  {it.get('title')}{where}{note}{link}{skip}"
-                f"\n     提前提醒：{lead_text}"
+                f"  {repeat_text(it)}  {display_title(it)}{where}{note}"
+                f"\n     提前提醒：{leads_text(leads_of(it))}"
             )
     print("\n提示：直接编辑上面这些 json 文件即可增删；用 python main.py skills \"今天有什么课\" 可以测试识别。")
     return 0
