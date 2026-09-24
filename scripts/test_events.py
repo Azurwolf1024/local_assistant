@@ -2,7 +2,7 @@
 
 要守住的底线：
 1. **发生时间引擎对三种事件是同一套**：一次性（含秒级）、按周/双周、按月（31 号要回退月末）、
-   按年、间隔循环（「结束后 N 天」），以及 until / skip 两个刹车；
+   按年、间隔循环（「结束后 N 天」）、**每天/工作日（固定钟点）**，以及 until / skip 两个刹车；
 2. **二维去重**：(发生时间, 提前量) 各播一次，第二次调用不能再响；
 3. **两种事件共用到期引擎**，但**故意的策略差异**要保住：闹钟错过多久都会补报，
    日程「到点」那次只在 5 分钟内算数（否则三天前那节课的播报会突然冒出来）；
@@ -122,6 +122,56 @@ def test_occurrences() -> None:
     plain["weekday"] = 2
     check(ev.first_after(plain, MON).strftime("%m-%d"), "09-23", "first_after 给调度器用")
     check(ev.first_after(once, MON + timedelta(days=1)), None, "过期的一次性没有下一次")
+
+
+# ------------------------------------------- 2b 工作日 / 每天（固定钟点）
+def test_workdays() -> None:
+    """用户的真实场景：「我工作日早上 9 点有课，所以每个工作日 8:30 给我个闹钟」。
+
+    ★这是旧设计明确做不到的★：旧 `_handle_alarm` 碰到 repeat 就丢给日程处理，
+    而日程只认「每周X / 每N天」，根本没有「工作日」这个概念。
+    """
+    print("\n[2b] 工作日 / 每天（固定钟点，不是漂移的 24 小时）")
+    WK0 = datetime(2026, 9, 21, 7, 0)      # 星期一 07:00（当天 08:30 还没到）
+    check(ev.repeat_of({"repeat": "工作日"}), "weekdays", "「工作日」→ weekdays")
+    check(ev.repeat_of({"repeat": "每天"}), "daily", "「每天」→ daily")
+
+    wk = ev.new_event("起床", kind="reminder", start="2026-09-18 08:30",
+                      repeat="weekdays", remind_before=[0])
+    check(ev.repeat_of(wk), "weekdays", "闹钟可以带周期（旧设计里这条路径不通）")
+    # 2026-09-18 是星期五；从星期五中午往后看，周末必须跳过
+    got = [d.strftime("%m-%d %a") for d in ev.occurrences(wk, datetime(2026, 9, 18, 12, 0), limit=6)]
+    check(got, ["09-21 Mon", "09-22 Tue", "09-23 Wed", "09-24 Thu", "09-25 Fri", "09-28 Mon"],
+          "★工作日 08:30：周一到周五，跳掉 09-26/27★")
+    check(all(d.hour == 8 and d.minute == 30 for d in ev.occurrences(wk, MON, limit=8)),
+          True, "每个工作日的时刻都是 08:30")
+
+    from_stale = ev.occurrences(dict(wk, start="2026-08-03 08:30"), WK0, limit=2)
+    check([d.strftime("%m-%d") for d in from_stale], ["09-21", "09-22"],
+          "★锚点很早以前也不能失控：只从 since 往后发★")
+
+    check(ev.occurrences(wk, MON, limit=1)[0].strftime("%m-%d %H:%M"),
+          "09-22 08:30", "★当天那一场已经过了就不再发（不补昨天的）★")
+
+    wk["until"] = "2026-09-24"
+    check([d.strftime("%m-%d") for d in ev.occurrences(wk, WK0, limit=9)],
+          ["09-21", "09-22", "09-23", "09-24"], "工作日也遵守 until（放寒假了就停）")
+    wk.pop("until")
+    wk["state"] = {"skipped": ["2026-09-22", "2026-09-23"]}
+    # 注意 limit 是「要几个」，不是「看到哪天」；10-01~10-02 是国庆调休也照样照发（以后要接节假日表）
+    check([d.strftime("%m-%d") for d in ev.occurrences(wk, WK0, limit=9)],
+          ["09-21", "09-24", "09-25", "09-28", "09-29", "09-30", "10-01", "10-02", "10-05"],
+          "工作日也遵守 skip（中秋放假一天），周末始终跳掉")
+
+    dy = ev.new_event("吃药", kind="reminder", start="2026-09-18 07:00",
+                      repeat="daily", remind_before=[0])
+    check([d.strftime("%m-%d %H:%M") for d in ev.occurrences(dy, datetime(2026, 9, 18, 12, 0), limit=3)],
+          ["09-19 07:00", "09-20 07:00", "09-21 07:00"], "每天 07:00：包括周末")
+    check([d.strftime("%m-%d %H:%M") for d in ev.occurrences(dy, datetime(2026, 9, 18, 6, 0), limit=2)],
+          ["09-18 07:00", "09-19 07:00"], "当天还没到就含当天")
+
+    check(ev.repeat_text(wk), "每个工作日", "播报说人话")
+    check(ev.repeat_text(dy), "每天", "播报说人话（每天）")
 
 
 # --------------------------------------------------------------- 3 状态
@@ -374,6 +424,7 @@ def test_migrate() -> None:
 def main() -> int:
     test_normalize()
     test_occurrences()
+    test_workdays()
     test_state()
     test_due()
     test_chain()

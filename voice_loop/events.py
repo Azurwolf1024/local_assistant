@@ -72,7 +72,7 @@ from typing import Any, Iterable
 from .store import JsonStore
 
 # ----------------------------------------------------------------- 常量与归一
-REPEATS = ("once", "weekly", "biweekly", "monthly", "yearly", "interval")
+REPEATS = ("once", "daily", "weekdays", "weekly", "biweekly", "monthly", "yearly", "interval")
 KINDS = ("reminder", "event")
 DEFAULT_LEAD = 10          # 没有 remind_before 时的默认提前量（分钟）
 FIRED_KEEP = 40            # state.fired 最多留多少条
@@ -83,7 +83,10 @@ _REPEAT_ALIASES = {
     "每两周": "biweekly", "双周": "biweekly", "两周一": "biweekly",
     "每月": "monthly", "每个月": "monthly", "月": "monthly",
     "每年": "yearly", "年": "yearly", "每年重复": "yearly",
-    "间隔": "interval", "after_end": "interval", "每天": "interval",
+    "间隔": "interval", "after_end": "interval",
+    # ★固定钟点的两种★：daily = 每天同一个时刻；weekdays = 每个工作日（周一到周五）
+    "每天": "daily", "每日": "daily", "每天重复": "daily",
+    "工作日": "weekdays", "每个工作日": "weekdays", "周一到周五": "weekdays",
     "一次": "once", "一次性": "once", "none": "once", "": "once",
 }
 
@@ -196,6 +199,28 @@ def occurrences(item: dict, since: datetime, limit: int = 16) -> list[datetime]:
         if until is not None and cand.date() > until:
             return False
         return str(cand.date()) not in skipped
+
+    if rep in ("daily", "weekdays"):
+        # 固定钟点的两种：一点说哪个时刻，就天/每个工作日都在那个时刻。
+        # ★不是「上次结束的 24 小时后」★——那样会漂（前一天晚睡就整体后移）。
+        hh2, mm2 = parse_hhmm(item.get("time") or (anchor.strftime("%H:%M") if anchor else "09:00"))
+        base = (anchor or since).replace(hour=hh2, minute=mm2, second=0, microsecond=0)
+        if base < since:
+            base += timedelta(days=max(0, (since - base).days))
+        k = 0
+        while len(out) < limit and k <= limit + 14:
+            cand = base + timedelta(days=k)
+            k += 1
+            if cand < since:
+                continue
+            if rep == "weekdays" and cand.weekday() >= 5:
+                continue          # 周六周日跳过
+            if until is not None and cand.date() > until:
+                break
+            if not usable(cand):
+                continue
+            out.append(cand)
+        return out
 
     if rep in ("weekly", "biweekly"):
         weekday = int(item.get("weekday", -1))
@@ -753,7 +778,40 @@ def describe(item: dict) -> str:
     start = item.get("start") or ""
     when = "一次性" if rep == "once" else f"重复({rep})"
     extra = f" 链←{item['chain'].get('after')}" if isinstance(item.get("chain"), dict) else ""
-    return f"[{item.get('id')}] {when} {start} {item.get('title')}{extra}"
+    return f"[{item.get('id')}] {kind_of(item):<8} {when} {start} {item.get('title')}{extra}"
+
+
+# 周期 → 人话（列表和回复都用它，别再各写一份）
+REPEAT_TEXT = {
+    "daily": "每天",
+    "weekdays": "每个工作日",
+    "weekly": "每周",
+    "biweekly": "每两周",
+    "monthly": "每月",
+    "yearly": "每年",
+}
+
+
+def repeat_text(item: dict) -> str:
+    """把周期说成人话；一次性返回空串。带星期/日期的会用上。"""
+    rep = repeat_of(item)
+    if rep == "once":
+        return ""
+    if rep == "weekly" and item.get("weekday") is not None:
+        names = ["一", "二", "三", "四", "五", "六", "日"]
+        wd = int(item["weekday"])
+        return f"每周{names[wd % 7]}" if 0 <= wd <= 6 else "每周"
+    if rep == "monthly" and item.get("day"):
+        return f"每月{int(item['day'])}号"
+    if rep == "interval":
+        if item.get("every_minutes") and int(item["every_minutes"]) % 60 == 0:
+            return f"每{int(item['every_minutes']) // 60}小时"
+        if item.get("every_minutes"):
+            return f"每{int(item['every_minutes'])}分钟"
+        if item.get("every_days"):
+            return f"每{int(item['every_days'])}天"
+        return "每隔一段"
+    return REPEAT_TEXT.get(rep, rep)
 
 
 def now_text() -> str:

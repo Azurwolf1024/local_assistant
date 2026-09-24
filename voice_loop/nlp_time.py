@@ -291,17 +291,33 @@ _EVERY_HOURS = re.compile(r"每\s*(\d{1,3}|[一二三四五六七八九十两]+|
 _EVERY_DAYS = re.compile(r"每\s*(\d{1,3}|[一二三四五六七八九十两]+)\s*天")
 _EVERY_WEEKS = re.compile(r"每\s*(\d{1,2}|[一二三四五六七八九十两]+)\s*(?:个)?\s*(?:周|星期|礼拜)")
 _DAILY = re.compile(r"每天|每晚|每早|每日")
+# ★工作日★：用户的真实需求是「工作日早上 8 点半给我定闹钟」——
+# 它不能用「每 7 天」或「每天」硬拼（周六周日要跳掉），所以做成独立的一种周期。
+_WORKDAYS = re.compile(r"工作日|周一到周五|周一至周五|星期一到星期五|礼拜一到礼拜五")
 _HOURLY = re.compile(r"每小时|每个小时")
 _WEEKDAY_IN_TEXT = re.compile(r"(?:周|星期|礼拜)\s*([一二三四五六日天])")
 _MONTH_IN_TEXT = re.compile(r"(\d{1,2}|[一二三四五六七八九十]+)\s*月\s*(\d{1,2}|[一二三四五六七八九十]+)\s*[号日]")
 _DAY_IN_TEXT = re.compile(r"(\d{1,2}|[一二三四五六七八九十]+)\s*[号日]")
 
 
-def parse_repeat(text: str) -> dict | None:
-    """解析重复周期，返回可以直接并进日程条目的字段。
+def parse_weekday(text: str) -> int | None:
+    """「周三 / 星期三 / 礼拜天」→ 0（周一）… 6（周日）；没说返回 None。
 
-    支持：每周三 / 每两周周三 / 每月5号 / 每年3月1日 / 每3天 / 每2小时 / 每天。
-    ``interval`` 的意思是「这次结束后再过 N 天/分钟」，不是固定日历周期。
+    和 :func:`parse_date_hint` 的区别：它只说**星期几**，不管这是本周还是下周。
+    「每周交周报」这种没写星期几的情况需要它来判断要不要兜底。
+    """
+    m = _WEEKDAY_IN_TEXT.search(text or "")
+    return _WEEKDAY_CN.get(m.group(1)) if m else None
+
+
+def parse_repeat(text: str) -> dict | None:
+    """解析重复周期，返回可以直接并进事件条目的字段。
+
+    支持：每周三 / 每两周周三 / 每月5号 / 每年3月1日 / 每3天 / 每2小时 /
+    **每天** / **工作日（周一到周五）**。
+
+    ``weekly`` / ``daily`` / ``weekdays`` 是**固定日历周期**（点说一个钟点，就总是在那时刻）；
+    ``interval`` 是「这次结束后再过 N 天/分钟」（会漂移），两者别混。
     """
     t = text or ""
     m = _YEARLY.search(t)
@@ -322,6 +338,10 @@ def parse_repeat(text: str) -> dict | None:
             if day:
                 out["day"] = int(day)
         return out
+    # ★工作日要在「每N天/每天」之前判★（「工作日」里有个「天」字，但前面没有数字，
+    # 其实不会误配——放前面是为了意图更清楚，不依赖正则的巧合）
+    if _WORKDAYS.search(t):
+        return {"repeat": "weekdays"}
     m = _EVERY_MINUTES.search(t)
     if m:
         n = cn2num(m.group(1))
@@ -355,10 +375,13 @@ def parse_repeat(text: str) -> dict | None:
     if _HOURLY.search(t):
         return {"repeat": "interval", "every_minutes": 60}
     if _DAILY.search(t):
-        return {"repeat": "interval", "every_days": 1}
+        # ★改动★：以前返回 interval+every_days=1（= 上次结束的 24 小时后，会漂），
+        # 现在是固定钟点的 daily——「每天早上七点吃药」就该天在七点。
+        return {"repeat": "daily"}
     wd = _WEEKDAY_IN_TEXT.search(t)
-    if wd and re.search(r"每(?:个)?(?:周|星期|礼拜)", t):
-        return {"repeat": "weekly", "weekday": _WEEKDAY_CN[wd.group(1)]}
+    if re.search(r"每(?:个)?(?:周|星期|礼拜)", t):
+        # 光说「每周」也算每周重复（只是没指定星期几，由调用方按说话那天兜底）
+        return {"repeat": "weekly", "weekday": _WEEKDAY_CN[wd.group(1)]} if wd else {"repeat": "weekly"}
     return None
 
 

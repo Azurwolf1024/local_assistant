@@ -264,7 +264,10 @@ def test_schedule_model() -> None:
         ("每年3月1日开学", {"repeat": "yearly", "month": 3, "day": 1}),
         ("每3天浇一次花", {"repeat": "interval", "every_days": 3}),
         ("每2小时起来活动", {"repeat": "interval", "every_minutes": 120}),
-        ("每天吃药", {"repeat": "interval", "every_days": 1}),
+        # ★每天/工作日是「固定钟点」，不是「上次结束后 24 小时」★（那样会漂）
+        ("每天吃药", {"repeat": "daily"}),
+        ("工作日早上八点半叫我起床", {"repeat": "weekdays"}),
+        ("每周交周报", {"repeat": "weekly"}),
         ("明天下午三点开会", None),
     ]:
         check(f"周期 {text}", parse_repeat(text), expect)
@@ -315,7 +318,8 @@ def test_schedule_model() -> None:
     check("每月标题不带「每月5号」", "每月" not in next(t for t in items if "房租" in t), True)
     check("每年存下了月日",
           (find("开学").get("month"), find("开学").get("day")), (3, 1))
-    check("间隔循环存的是间隔", find("吃药").get("every_days"), 1)
+    check("每天循环存成固定钟点",
+          (find("吃药").get("repeat"), find("吃药").get("time")), ("daily", "09:00"))
     check("截止日期落盘", find("吃药").get("until"), "2026-12-31")
 
     print("    · 周期推进（next_occurrence）")
