@@ -181,44 +181,85 @@ def test_due() -> None:
 
 # ---------------------------------------------------------------- 5 事件链
 def test_chain() -> None:
-    print("\n[5] 事件链（上游没完成 → 下游的提醒被挡住）")
-    a = ev.new_event("写完报告", kind="reminder", start="2026-09-21 20:00")
+    print("\n[5] 事件链（上游没结束 → 下游的提醒被挡住；判定是纯时间的）")
+    # A 有 60 分钟时长：10:00 开始 → 11:00 结束
+    a = ev.new_event("写完报告", start="2026-09-21 10:00", duration_minutes=60)
     a["id"] = 1
-    b = ev.new_event("发邮件给导师", kind="reminder", start="2026-09-21 20:00")
+    # B 自己定在 10:30（A 还在进行）——★故意让「被挡」只有一个原因：链★
+    b = ev.new_event("发邮件给导师", kind="reminder", start="2026-09-21 10:30")
     b["id"] = 2
     b["chain"] = {"after": 1, "on": "done", "then": "notify"}
-    c = ev.new_event("不相关的闹钟", kind="reminder", start="2026-09-21 20:00")
+    c = ev.new_event("不相关的闹钟", kind="reminder", start="2026-09-21 10:30")
     c["id"] = 3
-
     items = [a, b, c]
-    check(ev.blocked_ids(items), {"2"}, "★A 没完成 → B 被挡，C 不受影响★")
-    check(ev.chain_targets_of(items, a, "done"), [b], "A 完成后该唤醒谁")
+
+    early, during, after = (datetime(2026, 9, 21, 9, 30),
+                            datetime(2026, 9, 21, 10, 30),
+                            datetime(2026, 9, 21, 11, 5))
+
+    check(ev.blocked_ids(items, early), {"2"}, "★A 还没开始 → B 被挡，C 不受影响★")
+    check(ev.blocked_ids(items, during), {"2"}, "★A 进行中（10:30）也挡着★")
+    check(ev.blocked_ids(items, after), set(), "★A 结束（11:00）之后自动解锁——不需要谁来说「做完了」★")
+
+    got = ev.due(items, during, default_lead=10)
+    check(sorted(it["title"] for it, _s, _l in got), sorted(["不相关的闹钟"]),
+          "★到点了但被链挡住，所以不播报（同时刻的 C 照播）★")
+    got = ev.due(items, after, default_lead=10)
+    check([it["title"] for it, _s, _l in got], ["发邮件给导师"],
+          "★解锁后补播（闹钟没有回看上限）★")
+
+    check(ev.chain_targets_of(items, a, "done"), [b], "A 完成后该唤醒谁（报告用）")
     check(ev.chain_targets_of(items, a, "start"), [], "on=start 的下游不匹配 on=done")
 
-    got = ev.due(items, datetime(2026, 9, 21, 20, 0), default_lead=10,
-                 blocked=ev.blocked_ids(items))
-    check(sorted(it["title"] for it, _s, _l in got), sorted(["写完报告", "不相关的闹钟"]),
-          "被挡住的下游不播报")
+    # 手动标记完成 = 提前解锁（可选覆盖）
+    early = ev.new_event("提前做完的报告", start="2026-09-21 10:00", duration_minutes=60)
+    early["id"] = 11
+    follower = ev.new_event("提醒我发邮件", kind="reminder", start="2026-09-21 10:30")
+    follower["id"] = 12
+    follower["chain"] = {"after": 11, "on": "done"}
+    check(ev.blocked_ids([early, follower], during), {"12"}, "默认按时间挡着")
+    ev.mark_done(early, datetime(2026, 9, 21, 10, 0))
+    check(ev.blocked_ids([early, follower], during), set(), "手动标记完成 → 提前解锁")
 
-    ev.mark_done(a)
-    check(ev.blocked_ids(items), set(), "★A 完成后 B 解锁★")
-    got = ev.due(items, datetime(2026, 9, 21, 20, 1), default_lead=10,
-                 blocked=ev.blocked_ids(items))
-    check([it["title"] for it, _s, _l in got], ["发邮件给导师"], "解锁后就能播了")
-
-    orphan = ev.new_event("上游被删的", kind="reminder", start="2026-09-21 20:00")
-    orphan["id"] = 4
-    orphan["chain"] = {"after": 99, "on": "done"}
-    check(ev.blocked_ids([orphan]), set(), "★上游被删了就不再挡★（否则永远不响）")
-
+    # on=start：上游一开始就解锁
     starter = ev.new_event("上课", start="2026-09-21 09:00")
     starter["id"] = 5
     after_start = ev.new_event("课后交作业", kind="reminder", start="2026-09-21 09:00")
     after_start["id"] = 6
     after_start["chain"] = {"after": 5, "on": "start"}
-    check(ev.blocked_ids([starter, after_start]), {"6"}, "on=start：上游还没开始 → 挡")
-    ev.mark_fired(starter, datetime(2026, 9, 21, 9, 0), 10)
-    check(ev.blocked_ids([starter, after_start]), set(), "上游播报过就算「开始了」")
+    check(ev.blocked_ids([starter, after_start], datetime(2026, 9, 21, 8, 30)), {"6"},
+          "on=start：上游还没开始（8:30）→ 挡")
+    check(ev.blocked_ids([starter, after_start], datetime(2026, 9, 21, 9, 5)), set(),
+          "on=start：上游一开始（9:00）就解锁")
+
+    # ★重复链要按「每一次发生」算，不能第一次解锁后永远解锁★
+    weekly = ev.new_event("周三组会", start="2026-09-23 14:00", repeat="weekly",
+                          duration_minutes=60)
+    weekly["weekday"] = 2
+    weekly["id"] = 21
+    report = ev.new_event("写周报", kind="reminder", start="2026-09-23 15:30")
+    report["id"] = 22
+    report["chain"] = {"after": 21, "on": "done"}
+    check(ev.blocked_ids([weekly, report], datetime(2026, 9, 23, 14, 30)), {"22"},
+          "本周组会还在开（14:30）→ 挡")
+    check(ev.blocked_ids([weekly, report], datetime(2026, 9, 23, 15, 5)), set(),
+          "本周组会 15:00 结束 → 解锁")
+    check(ev.blocked_ids([weekly, report], datetime(2026, 9, 30, 14, 30)), {"22"},
+          "★下一周（9-30）同样要等那次结束——不是「第一次解锁后永远解锁」★")
+    check(ev.blocked_ids([weekly, report], datetime(2026, 9, 30, 15, 5)), set(),
+          "下周 15:00 之后又解锁")
+
+    orphan = ev.new_event("上游被删的", kind="reminder", start="2026-09-21 20:00")
+    orphan["id"] = 4
+    orphan["chain"] = {"after": 99, "on": "done"}
+    check(ev.blocked_ids([orphan], during), set(), "★上游被删了就不再挡★（否则永远不响）")
+
+    # 没有时长的 A：开始即结束（on=done 与 on=start 等价）
+    nodur = ev.new_event("没写时长的会", start="2026-09-21 12:00")
+    nodur["id"] = 31
+    nodur["chain"] = {"after": 31, "on": "done"}
+    check(ev.end_of(nodur, datetime(2026, 9, 21, 12, 0)), datetime(2026, 9, 21, 12, 0),
+          "没有时长 → 结束时刻 = 开始时刻")
 
 
 # ---------------------------------------------------------------- 6 存储

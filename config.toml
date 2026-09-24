@@ -245,9 +245,17 @@ log_file = "sessions/listen.log"
 [skills]
 enabled = true
 data_dir = "data"
-alarm_file = "data/alarms.json"
+# ★统一事件表★：闹钟和日程本质是同一种东西（都是「事件」，只是属性不同），
+# 正在合并成这一份文件，并顺带支持**事件链**（「A 结束之后才提醒 B」）。
+#   · 闹钟 = kind="reminder" + 没有 repeat + remind_before=[0]
+#   · 事件链 = 条目里的 "chain": {"after": <上游 id>, "on": "done"|"start"}
+#     完成判定按上游的结束时间**自动算**（start + duration_minutes），不用你说「做完了」
+#   迁移：python scripts/migrate_events.py（默认试运行）→ 详见工程日志第 17 节
+#   ★代码还没切过去，运行期仍读下面两个旧文件★
+event_file = "data/events.json"
+alarm_file = "data/alarms.json"        # 迁移数据源（切换后只剩这个用途）
 memo_file = "data/memos.json"
-schedule_file = "data/schedule.json"
+schedule_file = "data/schedule.json"   # 迁移数据源
 check_interval = 5            # 后台检查提醒的间隔（秒）
 default_remind_before = 10    # 日程默认提前几分钟提醒
 speak_duplicate = false

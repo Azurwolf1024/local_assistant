@@ -316,7 +316,12 @@ def mark_fired(item: dict, start: datetime, lead: int) -> str:
 
 
 def mark_done(item: dict, start: datetime | None = None) -> None:
-    """标记某一次（或整条）完成——事件链的上游条件就是它。"""
+    """**手动**标记某一次（或整条）提前完成——是链的时间判定的**覆盖**，不是必要条件。
+
+    默认的完成判定是**纯时间推导**（见 :func:`end_of` / :func:`chain_blocked`）：
+    「到 A 的结束时刻就算完成」，所以不需要用户开口说「做完了」。
+    这个函数留着给两种场景：① 提前完成了（早于结束时刻）；② 事后补记。
+    """
     st = state_of(item)
     key = start.isoformat() if start else "*"
     done = {str(k) for k in st["done"]}
@@ -325,12 +330,61 @@ def mark_done(item: dict, start: datetime | None = None) -> None:
 
 
 def is_done(item: dict, start: datetime | None = None) -> bool:
+    """有没有被**手动**标记过完成（不看时间）。整条标记过（"*"）也算。"""
     done = {str(k) for k in state_of(item).get("done") or []}
     return "*" in done or (start is not None and start.isoformat() in done)
 
 
+def end_of(item: dict, start: datetime) -> datetime:
+    """一次发生的**结束时刻** = 开始 + ``duration_minutes``。
+
+    ★没有时长就等于开始时刻★（「没有时长的 A」= 开始即结束），
+    所以那种情况下 ``on: done`` 和 ``on: start`` 是一回事。
+    """
+    minutes = max(0, int(item.get("duration_minutes", 0) or 0))
+    return start + timedelta(minutes=minutes)
+
+
+def _occurrence_before(item: dict, at: datetime) -> datetime | None:
+    """``at`` 之前（含）最近的一次发生；没有就返回 None。"""
+    best: datetime | None = None
+    for cand in occurrences(item, at - timedelta(days=400), limit=8):
+        if cand <= at and (best is None or cand > best):
+            best = cand
+    return best
+
+
+def chain_blocked(item: dict, start: datetime, all_items: list[dict], now: datetime) -> bool:
+    """这次发生该不该被链挡住（上游还没达到条件）。**纯时间推导，不写状态**。
+
+    语义（2026-09-24 与用户确认）：
+
+    * ``then`` 固定是 **notify**——**解锁提醒**：B 到点该不该提醒，看上游满足没有；
+      而不是「把 B 也标记成做完」。
+    * ``on: done``（默认）：上游那次发生**的结束时刻已经过去**就解锁；
+      ``on: start``：上游那次发生**已经开始**就解锁。
+    * 按**每一次发生**判定：重复的链（「每周三组会结束后提醒我写周报」）
+      要求每个 B 之前有一次已结束的 A——这样不会「第一次解锁后永远解锁」。
+    * 上游被删掉 → 不再挡（否则下游永远不响，这是链最容易埋的死锁）。
+    * ``state.done`` 里手动标记过算提前完成（可选的覆盖）。
+    """
+    chain = item.get("chain")
+    if not isinstance(chain, dict):
+        return False
+    up = next((it for it in all_items if str(it.get("id")) == str(chain.get("after"))), None)
+    if up is None:
+        return False
+    if is_done(up) or is_done(up, _occurrence_before(up, now)):
+        return False
+    prev = _occurrence_before(up, now)
+    if prev is None:
+        return True                    # 上游还没发生过 → 挡
+    mark = prev if str(chain.get("on", "done")) == "start" else end_of(up, prev)
+    return not (mark <= now)            # 上游那一刻还没到 → 挡
+
+
 def chain_targets_of(items: Iterable[dict], upstream: dict, on: str) -> list[dict]:
-    """上游事件达到状态 ``on`` 时，哪些下游该被唤醒。"""
+    """下游里哪些挂在 ``upstream`` 上、且 ``on`` 相同的（报告/调试用）。"""
     uid = upstream.get("id")
     out = []
     for item in items:
@@ -343,12 +397,23 @@ def chain_targets_of(items: Iterable[dict], upstream: dict, on: str) -> list[dic
     return out
 
 
+def blocked_ids(items: list[dict], now: datetime) -> set[str]:
+    """当前被链挡住的「下一次发生」属于哪些事件——给报告用（`due()` 内部按每一次算）。"""
+    out: set[str] = set()
+    for item in items:
+        if not isinstance(item.get("chain"), dict):
+            continue
+        nxt = first_after(item, now - timedelta(seconds=1)) or _occurrence_before(item, now)
+        if nxt is not None and chain_blocked(item, nxt, items, now):
+            out.add(str(item.get("id")))
+    return out
+
+
 # ----------------------------------------------------------------- 到期引擎
 def due(
     items: list[dict],
     now: datetime,
     default_lead: int = DEFAULT_LEAD,
-    blocked: set[str] | None = None,
 ) -> list[tuple[dict, datetime, int]]:
     """到点的 (事件, 发生时间, 提前量)；**会就地写回 state.fired**。
 
@@ -363,13 +428,11 @@ def due(
     ★看的时间窗是 ``now + 最大提前量`` 而不是 ``now``★：提前 30 分钟的提醒
     必须在「开始时间之前」就发出来，只盯着已经过去的时刻是永远发不出来的。
 
-    ``blocked``：被事件链挡住的下游事件 id 集合（上游还没完成时，下游不播报）。
+    事件链在**每一次发生**上现算（:func:`chain_blocked`）：上游没结束之前，
+    这一次不播报——但**不写任何状态**，所以改上游时间/删上游都能立刻反应。
     """
     out: list[tuple[dict, datetime, int]] = []
-    blocked = blocked or set()
     for item in items:
-        if str(item.get("id")) in blocked:
-            continue
         kind = kind_of(item)
         leads = leads_of(item, default_lead)
         max_lead = max(leads) if leads else 0
@@ -391,37 +454,16 @@ def due(
                     continue   # 迟太久的那次不算（见上面的策略说明）
                 if is_fired(item, start, lead):
                     continue
+                if chain_blocked(item, start, items, now):
+                    continue   # 上游还没到（链门）
                 mark_fired(item, start, lead)
                 out.append((item, start, lead))
     return out
 
 
-# ----------------------------------------------------------------- 链的求解
-def blocked_ids(items: list[dict]) -> set[str]:
-    """哪些事件的提醒现在应该被链挡住（上游还没达到条件）。
-
-    只挡**提醒**，不挡别人查：「这周有什么安排」仍然应该能看见它，
-    否则用户会以为链上的事丢了。挡的是「到点自动播报」这一件事。
-    """
-    by_id = {str(it.get("id")): it for it in items}
-    out: set[str] = set()
-    for item in items:
-        chain = item.get("chain")
-        if not isinstance(chain, dict):
-            continue
-        up = by_id.get(str(chain.get("after")))
-        if up is None:
-            continue                      # 上游没了（被删）→ 不再挡，免得永远不响
-        if str(chain.get("on", "done")) == "done" and not is_done(up):
-            out.add(str(item.get("id")))
-        elif str(chain.get("on", "done")) == "start" and not _has_started(up):
-            out.add(str(item.get("id")))
-    return out
-
-
-def _has_started(up: dict) -> bool:
-    st = state_of(up)
-    return bool(st.get("done")) or bool(st.get("fired"))
+# ----------------------------------------------------------------- 链的报告
+# 真正的链判定在 :func:`chain_blocked`（在上面，按每一次发生现算）；
+# 这里只剩「给人和日志看」的汇总。
 
 
 # ----------------------------------------------------------------- 存储
@@ -501,17 +543,18 @@ class EventStore:
     # ------------------------------------------------------------ 到期封装
     def due_now(self, now: datetime) -> list[tuple[dict, datetime, int]]:
         items = self.load()
-        got = due(items, now, self.default_lead, blocked=blocked_ids(items))
+        got = due(items, now, self.default_lead)
         if got:
             self.save(items)      # due() 已经就地写回了 state.fired
         return got
 
-    def pending_context(self) -> dict[str, Any]:
-        """给「A 完成后再做 B」用的上下文：链上每个事件当前的状态。"""
+    def pending_context(self, now: datetime | None = None) -> dict[str, Any]:
+        """给「A 结束之后才提醒 B」类问题做报告：谁被挡着、为什么。"""
         items = self.load()
+        now = now or datetime.now()
         return {
             "items": items,
-            "blocked": blocked_ids(items),
+            "blocked": blocked_ids(items, now),
             "chains": [it for it in items if isinstance(it.get("chain"), dict)],
         }
 

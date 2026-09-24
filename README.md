@@ -572,7 +572,8 @@ python main.py see --fix --screen              # 只做本地部分，不调模�
 
 > **正在合并**：`data/alarms.json`（闹钟）与 `data/schedule.json`（日程）本质是同一种东西
 > （都是「事件」，只是属性不同），正在合并成一份 `data/events.json`，并顺带支持**事件链**
-> （「A 做完了再提醒 B」）。事件层与迁移工具已就位、有 86 条测试；
+> （「A 结束之后才提醒 B」——完成判定按 A 的结束时间自动算，不用你说「做完了」）。
+> 事件层与迁移工具已就位、有 94 条测试；
 > **代码还没切过去，所以现在仍以下面两张表为准**。详见
 > [`docs/ENGINEERING_LOG.md`](docs/ENGINEERING_LOG.md) 第 17 节。
 
