@@ -244,8 +244,8 @@
   ],
   "voice": "",
   "voice_ref": "data/personas/kaltsit/干员报到.wav",
-  "voice_model": "models/tts/zipvoice/personas/kaltsit",
+  "voice_model": "",
   "voice_ref_text": "",
   "temperature": 0.0,
-  "notes": "默认角色。别名是拿 scripts/test_wake.py 一条条实测攒的，别删。voice_ref = 克隆音色的参考音频（凯尔希中文配音，素材在 data/personas/kaltsit/，同目录 kaltsit.txt 是逐条文本清单）。★参考音频决定音色和语速★：短参考说得快（4.5s→4.9 字/秒），7~14s 最自然（3.6~3.9 字/秒）。"
+  "notes": "默认角色。别名是拿 scripts/test_wake.py 一条条实测攒的，别删。voice_ref = 克隆音色的参考音频（凯尔希中文配音，素材在 data/personas/kaltsit/，同目录 kaltsit.txt 是逐条文本清单）。★参考音频决定音色和语速★：短参考说得快（4.5s→4.9 字/秒），7~14s 最自然（3.6~3.9 字/秒）。★voice_model 置空 = 用 config.toml 的出厂模型（2026-09-25 改回：微调版 10-12kHz 高频比真人高 8dB，就是那个沙沙声）。想换回微调版就填 models/tts/zipvoice/personas/kaltsit。可选参考：ref_join_B.wav（两条素材拼接，8.2s，实测音区更稳）。"
 }

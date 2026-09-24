@@ -22,7 +22,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from voice_loop.tts import pitch as pk  # noqa: E402
-from voice_loop.tts.zipvoice_tts import pitch_guard_verdict  # noqa: E402
+from voice_loop.tts.zipvoice_tts import (  # noqa: E402
+    pitch_guard_verdict,
+    pitch_target,
+    register_adoptable,
+)
 
 FAILED: list[str] = []
 
@@ -163,7 +167,24 @@ def main() -> int:
     long_hi = pk.median_filter(np.array([100.0, 100.0, 100.0, 100.0, 100.0, 300.0, 300.0, 300.0, 300.0, 300.0]), 3)
     check("持续的高音不会被当成毛刺抹掉", float(long_hi[-1]), 300.0)
     check("全 NaN 输入不炸", pk.stats(np.full(10, np.nan))["voiced_pct"], 0.0)
-
+    # ★靶子怎么选★：实测不同模型/参考的整体音区会系统性偏移 1.5~2.0 半音，
+    # 拿参考当靶子会在第一句就误判重采（白慢一倍）；用户听到的「异常」是句与句不一致。
+    print("\n[10] 音区基准：第一句放宽、之后用自己的中位、离参考太远不进基准")
+    t0, l0 = pitch_target([], 180.0, 1.5)
+    check_close("没有样本 → 靶子 = 参考音 180Hz", t0, 180.0, 1e-9)
+    check_close("没有样本 → 阈值放宽到 1.5+1.0", l0, 2.5, 1e-9)
+    t1, l1 = pitch_target([188.0, 190.0, 186.0], 180.0, 1.5)
+    check_close("有样本 → 靶子 = 最近几句的中位", t1, 188.0, 1e-9)
+    check_close("有样本 → 阈值回到 1.5", l1, 1.5, 1e-9)
+    check_close("中位抗单句离群（掺一个 210 也不会跑）", pitch_target([186.0, 188.0, 190.0, 210.0], 180.0, 1.5)[0], 189.0, 1e-9)
+    check("差 1.6 半音的那句会被拦下来重采",
+          pitch_guard_verdict(pk.semitone(190.0 * 2 ** (1.6 / 12), 190.0), l1, 0, 2), True)
+    check("差 1.4 半音的那句放过",
+          pitch_guard_verdict(pk.semitone(190.0 * 2 ** (1.4 / 12), 190.0), l1, 0, 2), False)
+    check("离参考 +1.8 半音（拼接参考那种）→ 能进基准", register_adoptable(180.0 * 2 ** (1.8 / 12), 180.0), True)
+    check("离参考 +3.1 半音 → 不进基准（防慢漂移）", register_adoptable(180.0 * 2 ** (3.1 / 12), 180.0), False)
+    check("没参考音时也能进基准", register_adoptable(190.0, None), True)
+    check("量不出来（None）不进基准", register_adoptable(None, 180.0), False)
     print("\n" + "=" * 70)
     if FAILED:
         print(f" 失败 {len(FAILED)} 项：{FAILED}")

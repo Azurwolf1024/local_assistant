@@ -26,6 +26,7 @@ import re
 import sys
 import threading
 import time
+from collections import deque
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -63,6 +64,41 @@ def pitch_guard_verdict(dev_st: float | None, limit_st: float, attempt: int, tri
     if attempt + 1 >= max(1, int(tries)):
         return False
     return abs(float(dev_st)) > float(limit_st)
+
+
+# 音区靶子的两条护栏（都在 pitch_target / register_adoptable 里用，纯函数好单测）
+PITCH_BASELINE_CLAMP_ST = 2.5   # 基准最多离参考音频这么远（防「一步一步挪走」的慢漂移）
+PITCH_FIRST_SLACK_ST = 1.0      # 第一句放宽这么多：这个声音天生比参考高一点就认了
+
+
+def pitch_target(samples, ref_f0: float | None, limit_st: float) -> tuple[float | None, float]:
+    """返回 (音区靶子 Hz, 该用多大阈值)。
+
+    ★为什么靶子不是「参考音频自己的音区」★：实测不同模型/参考的整体音区会**系统性**偏移
+    1.5~2.0 半音（拼接参考 B 就是 +1.6），拿参考当靶子会在第一句就误判重采、白慢一倍；
+    而用户能听出来的「异常高亢/低沉」是**句与句之间不一致**，不是「跟参考不一样」。
+    所以：没有样本时用参考音当靶子、并放宽 ``PITCH_FIRST_SLACK_ST``；
+    有样本之后用**最近几句自己的中位**当靶子（抗单句离群），把「离参考多远」交给
+    ``register_adoptable`` 的钳位去管，防慢漂移。
+    """
+    vals = [float(v) for v in (samples or []) if v == v and float(v) > 0]
+    if not vals:
+        return (float(ref_f0) if ref_f0 and ref_f0 > 0 else None), min(
+            PITCH_BASELINE_CLAMP_ST, max(0.1, float(limit_st)) + PITCH_FIRST_SLACK_ST
+        )
+    vals.sort()
+    mid = len(vals) // 2
+    med = vals[mid] if len(vals) % 2 else 0.5 * (vals[mid - 1] + vals[mid])
+    return float(med), max(0.1, float(limit_st))
+
+
+def register_adoptable(med: float | None, ref_f0: float | None) -> bool:
+    """这句的音区能不能进「基准样本」？（离参考音太远就不进——防慢漂移）"""
+    if med is None or med != med or med <= 0:
+        return False
+    if not (ref_f0 and ref_f0 > 0):
+        return True
+    return abs(12.0 * np.log2(float(med) / float(ref_f0))) <= PITCH_BASELINE_CLAMP_ST
 
 
 def _resample(x: np.ndarray, src: int, dst: int) -> np.ndarray:
@@ -182,6 +218,8 @@ class ZipVoiceTts:
         self._pitch_guard_st = max(0.0, float(getattr(cfg, "pitch_guard_st", 0.0) or 0.0))
         self._pitch_guard_tries = max(1, int(getattr(cfg, "pitch_guard_tries", 1) or 1))
         self._ref_f0: float | None = None
+        # 最近几句**被接受**的音区（靶子用它的中位，见 pitch_target 的注释）
+        self._pitch_recent: deque[float] = deque(maxlen=9)
 
         # 参考音频（音色）
         self._ref_audio: np.ndarray | None = None
@@ -572,8 +610,10 @@ class ZipVoiceTts:
     def synth(self, text: str) -> Iterator[tuple[int, np.ndarray]]:
         """边生成边产出：第一个 chunk 出来就交给播放器，不必等整句合成完。
 
-        ★音区守卫★（``pitch_guard_st`` > 0 时）：第一块量出整句音区，偏离参考音频
-        超过阈值就**丢掉重采**（不重采就变成「上一句正常、下一句整句拔高」）。
+        ★音区守卫★（``pitch_guard_st`` > 0 时）：每句量出整体音区，偏离**基准**超过阈值
+        就丢掉重采（不重采就变成「上一句正常、下一句整句拔高，或者反过来」）。
+        基准 = 最近几句被接受的音区中位（第一句用参考音频的音区 + 一点宽限），
+        规矩写在 :func:`pitch_target` 的注释里。
         """
         text = (text or "").strip()
         if not text:
@@ -582,7 +622,8 @@ class ZipVoiceTts:
             yield from self._speak_without_reference(text)
             return
         gen = self._gen_config()
-        tries = self._pitch_guard_tries if (self._pitch_guard_st > 0 and self._ref_f0) else 1
+        target, limit = pitch_target(self._pitch_recent, self._ref_f0, self._pitch_guard_st)
+        tries = self._pitch_guard_tries if (limit > 0 and target) else 1
         dev: float | None = None
         produced = False
         for attempt in range(tries):
@@ -590,17 +631,20 @@ class ZipVoiceTts:
             first = next(pieces, None)
             if first is None:
                 break
+            med: float | None = None
             if tries > 1:
-                dev = pitchkit.register_st(first[1], self._rate, float(self._ref_f0))
-            if pitch_guard_verdict(dev, self._pitch_guard_st, attempt, tries):
+                med = pitchkit.f0_median(first[1], self._rate)
+                dev = pitchkit.semitone(med, target) if med else None
+            if pitch_guard_verdict(dev, limit, attempt, tries):
                 print(
-                    f"[tts] 这一遍整句音区偏了 {dev:+.1f} 半音（靶子 {self._ref_f0:.0f}Hz），"
+                    f"[tts] 这一遍整句音区偏了 {dev:+.1f} 半音（靶子 {target:.0f}Hz），"
                     f"重采第 {attempt + 2} 遍…",
                     flush=True,
                 )
                 for _ in pieces:  # ★把这一遍抽干★：同一个引擎上并发跑两次不保险
                     pass
                 continue
+            self._remember_register(med)
             yield first
             produced = True
             yield from pieces
@@ -608,7 +652,7 @@ class ZipVoiceTts:
         if not produced:
             return
         self._synth_calls += 1
-        if dev is not None and abs(dev) > self._pitch_guard_st:
+        if dev is not None and abs(dev) > limit:
             print(
                 f"[tts] 音区还是偏 {dev:+.1f} 半音（重采到上限了），先用这一遍出声",
                 flush=True,
@@ -616,6 +660,20 @@ class ZipVoiceTts:
         join = self._pause_after(text)
         if join.size:
             yield self._rate, join
+
+    def _remember_register(self, med: float | None) -> None:
+        """把这一句的音区记进基准（第一句会打印一行，方便回查）。"""
+        if med is None or not register_adoptable(med, self._ref_f0):
+            return
+        first = not self._pitch_recent
+        self._pitch_recent.append(float(med))
+        if first and self._pitch_guard_st > 0:
+            ref = f"参考音 {self._ref_f0:.0f}Hz" if self._ref_f0 else "参考音量不出来"
+            print(
+                f"[tts] 音区基准 {med:.0f}Hz（第一句；{ref}）——"
+                f"之后偏离它超过 {self._pitch_guard_st:g} 半音就重采",
+                flush=True,
+            )
 
     def synth_bytes(self, text: str) -> tuple[int, np.ndarray]:
         parts: list[np.ndarray] = []
