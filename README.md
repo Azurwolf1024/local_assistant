@@ -205,6 +205,8 @@ flowchart LR
 │  ├─ clean_junk_data.py       # 清理早期版本写坏的备忘/闹钟
 │  ├─ check_deploy.py          # ★ 搬家/换系统前的只读自检（七类问题 + 怎么办）
 │  ├─ pick_voice_ref.py        # ★ 声线体检：毛不毛先看参考/素材，附参考候选与 2×2 交叉
+│  ├─ migrate_events.py        # ★ 闹钟+日程 → 统一事件表 events.json（默认试运行）
+│  ├─ test_events.py           # ★ 事件层测试（发生时间 / 二维去重 / 到期 / 事件链 / 迁移）
 │  ├─ probe_npu.py             # ★ NPU 到底值不值得用（分阶段实测，含核显对照）
 │  ├─ ab_clone_model.py        # ★ 声线 A/B：精度×步数的客观指标 + 试听 wav
 │  ├─ test_precision.py        # ★ 精度（int8/fp32）与平台降级的离线测试
@@ -567,6 +569,12 @@ python main.py see --fix --screen              # 只做本地部分，不调模�
 ---
 
 ## 5. 三个可配置的 json
+
+> **正在合并**：`data/alarms.json`（闹钟）与 `data/schedule.json`（日程）本质是同一种东西
+> （都是「事件」，只是属性不同），正在合并成一份 `data/events.json`，并顺带支持**事件链**
+> （「A 做完了再提醒 B」）。事件层与迁移工具已就位、有 86 条测试；
+> **代码还没切过去，所以现在仍以下面两张表为准**。详见
+> [`docs/ENGINEERING_LOG.md`](docs/ENGINEERING_LOG.md) 第 17 节。
 
 ### 5.1 唤醒词 `data/wakewords.json`
 

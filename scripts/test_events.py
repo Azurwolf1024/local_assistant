@@ -1,0 +1,346 @@
+"""统一事件层（voice_loop/events.py）的离线测试。
+
+要守住的底线：
+1. **发生时间引擎对三种事件是同一套**：一次性（含秒级）、按周/双周、按月（31 号要回退月末）、
+   按年、间隔循环（「结束后 N 天」），以及 until / skip 两个刹车；
+2. **二维去重**：(发生时间, 提前量) 各播一次，第二次调用不能再响；
+3. **两种事件共用到期引擎**，但**故意的策略差异**要保住：闹钟错过多久都会补报，
+   日程「到点」那次只在 5 分钟内算数（否则三天前那节课的播报会突然冒出来）；
+4. **一个文件两个视图**：闹钟视图保存时不能把日程洗掉，反之亦然（这是合并的最大风险）；
+5. 迁移要对得上账：旧 `fired` / `_fired` / `skip` 一个都不能丢，id 不能撞。
+
+    python scripts/test_events.py
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+import tempfile
+from datetime import datetime, timedelta
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from voice_loop import events as ev  # noqa: E402
+
+PASS = 0
+FAIL = 0
+
+
+def check(got, expect, label: str) -> None:
+    global PASS, FAIL
+    if got == expect:
+        PASS += 1
+        print(f"  [ok]   {label}")
+    else:
+        FAIL += 1
+        print(f"  [FAIL] {label}：得到 {got!r}，期望 {expect!r}")
+
+
+def check_true(cond, label: str) -> None:
+    check(bool(cond), True, label)
+
+
+MON = datetime(2026, 9, 21, 10, 0)          # 2026-09-21 是星期一
+WED = datetime(2026, 9, 23, 8, 0)
+
+
+# ------------------------------------------------------------------ 1 归一
+def test_normalize() -> None:
+    print("\n[1] 字段归一（兼容旧写法）")
+    check(ev.repeat_of({"repeat": "每周"}), "weekly", "「每周」→ weekly")
+    check(ev.repeat_of({}), "once", "缺省 → once")
+    check(ev.repeat_of({"repeat": "banana"}), "once", "认不出来 → once")
+    check(ev.kind_of({"kind": "alarm"}), "reminder", "旧的 kind=alarm → reminder")
+    check(ev.kind_of({"kind": "course"}), "event", "旧的 kind=course → event")
+    check(ev.kind_of({}), "event", "缺省 → event")
+
+    check(ev.leads_of({}, 10), [10], "没写提醒 → 用默认值")
+    check(ev.leads_of({"remind_before": 30}), [30], "旧写法的整数 → [30]")
+    check(ev.leads_of({"remind_before": [0, 30, 30]}), [30, 0], "去重 + 从大到小")
+    check(ev.leads_of({"remind_before": []}, 15), [15], "空数组 → 默认值")
+    check(ev.leads_of({"remind_before": ["x", 5]}), [5], "坏值跳过")
+    check(ev.parse_hhmm("09:30"), (9, 30), "HH:MM")
+    check(ev.parse_hhmm("坏"), (9, 0), "解析不了 → 09:00")
+
+    check(ev.interval_delta({"every_days": 3, "duration_minutes": 30}),
+          timedelta(minutes=30 + 3 * 24 * 60), "间隔 = 结束后 + N 天")
+    check(ev.interval_delta({"every_minutes": 10}), timedelta(minutes=10), "按分钟间隔")
+    check(ev.interval_delta({}), timedelta(minutes=24 * 60), "缺省每天")
+
+
+# ------------------------------------------------------------- 2 发生时间
+def test_occurrences() -> None:
+    print("\n[2] 发生时间（三种事件同一套引擎）")
+    once = ev.new_event("喝水", kind="reminder", start="2026-09-21 10:05:30")
+    got = ev.occurrences(once, MON)
+    check([d.strftime("%H:%M:%S") for d in got], ["10:05:30"], "一次性保留秒（「十分钟后」靠它）")
+    check(ev.occurrences(once, MON + timedelta(hours=1)), [], "已经过去的一次性不再产生发生")
+
+    weekly = ev.new_event("组会", start="2026-09-23 14:00", repeat="weekly", remind_before=[10])
+    weekly["weekday"] = 2
+    got = ev.occurrences(weekly, MON, limit=3)
+    check([d.strftime("%m-%d %H:%M") for d in got],
+          ["09-23 14:00", "09-30 14:00", "10-07 14:00"], "每周三")
+
+    weekly["until"] = "2026-09-30"
+    check([d.strftime("%m-%d") for d in ev.occurrences(weekly, MON, limit=5)],
+          ["09-23", "09-30"], "until 之后不再发生")
+
+    weekly.pop("until")
+    ev.mark_done(weekly, datetime(2026, 9, 23, 14, 0))     # 顺带试一下 done 不影响发生
+    weekly["state"]["skipped"] = ["2026-09-23"]
+    check([d.strftime("%m-%d") for d in ev.occurrences(weekly, MON, limit=3)],
+          ["09-30", "10-07", "10-14"], "skip 跳过某一天，但课表留着")
+
+    bi = ev.new_event("双周组会", start="2026-09-23 14:00", repeat="biweekly")
+    bi["weekday"] = 2
+    check([d.strftime("%m-%d") for d in ev.occurrences(bi, MON, limit=3)],
+          ["09-23", "10-07", "10-21"], "双周要有锚点相位（不然会漂）")
+
+    monthly = ev.new_event("对账", start="2026-01-31 21:00", repeat="monthly")
+    monthly["day"] = 31
+    check([d.strftime("%m-%d") for d in ev.occurrences(monthly, datetime(2026, 1, 1), limit=3)],
+          ["01-31", "02-28", "03-31"], "每月 31 号：小月回退到月末（2026 不是闰年）")
+
+    yearly = ev.new_event("开学典礼", start="2026-03-01 09:00", repeat="yearly")
+    yearly["month"], yearly["day"] = 3, 1
+    check([d.strftime("%Y-%m-%d") for d in ev.occurrences(yearly, datetime(2026, 1, 1), limit=2)],
+          ["2026-03-01", "2027-03-01"], "每年")
+
+    interval = ev.new_event("浇花", start="2026-09-21 08:00", repeat="interval")
+    interval["every_days"] = 3
+    interval["duration_minutes"] = 10
+    # since 要早于锚点，否则 08:00 那次会被当成「已经过去」而不列出来
+    got = ev.occurrences(interval, datetime(2026, 9, 21, 7, 0), limit=3)
+    check([d.strftime("%m-%d %H:%M") for d in got],
+          ["09-21 08:00", "09-24 08:10", "09-27 08:20"], "间隔循环：每次从**上次结束**往后算")
+
+    plain = ev.new_event("组会", start="2026-09-23 14:00", repeat="weekly")
+    plain["weekday"] = 2
+    check(ev.first_after(plain, MON).strftime("%m-%d"), "09-23", "first_after 给调度器用")
+    check(ev.first_after(once, MON + timedelta(days=1)), None, "过期的一次性没有下一次")
+
+
+# --------------------------------------------------------------- 3 状态
+def test_state() -> None:
+    print("\n[3] 三种状态分开记")
+    item = ev.new_event("吃药", start="2026-09-24 09:00")
+    check(ev.is_fired(item, datetime(2026, 9, 24, 9, 0), 10), False, "一开始没播过")
+    key = ev.mark_fired(item, datetime(2026, 9, 24, 9, 0), 10)
+    check(key, "2026-09-24T09:00:00|10", "去重键 = 发生时间|提前量")
+    check(ev.is_fired(item, datetime(2026, 9, 24, 9, 0), 10), True, "播过就记住了")
+    check(ev.is_fired(item, datetime(2026, 9, 24, 9, 0), 0), False, "★同一个发生的另一个提前量不受影响★")
+    check(ev.is_fired(item, datetime(2026, 10, 1, 9, 0), 10), False, "★下一次发生也不受影响★")
+
+    for i in range(60):                    # 上限：不能无限增长
+        ev.mark_fired(item, datetime(2026, 9, 24, 9, 0) + timedelta(minutes=i), 10)
+    check(len(item["state"]["fired"]), ev.FIRED_KEEP, f"fired 最多留 {ev.FIRED_KEEP} 条")
+
+    other = ev.new_event("开会", start="2026-09-24 15:00")
+    check(ev.is_done(other), False, "默认没完成")
+    ev.mark_done(other, datetime(2026, 9, 24, 15, 0))
+    check(ev.is_done(other, datetime(2026, 9, 24, 15, 0)), True, "某一次完成")
+    check(ev.is_done(other, datetime(2026, 10, 1, 15, 0)), False, "★但下一次不算完成★")
+    ev.mark_done(other)
+    check(ev.is_done(other, datetime(2026, 10, 1, 15, 0)), True, "整条标记完成 → 每次算完成")
+
+
+# --------------------------------------------------------------- 4 到期
+def test_due() -> None:
+    print("\n[4] 到期引擎（两种事件共用，但策略差异是故意的）")
+    alarm = ev.new_event("起床", kind="reminder", start="2026-09-21 07:00:00")
+    gone = ev.new_event("很久以前的闹钟", kind="reminder", start="2026-09-18 07:00:00")
+    meeting = ev.new_event("跟导师见面", start="2026-09-21 10:30", remind_before=[10, 0])
+    stale = ev.new_event("三天前的课", start="2026-09-18 09:00", remind_before=[10, 0])
+
+    items = [alarm, gone, meeting, stale]
+    now = datetime(2026, 9, 21, 10, 25)
+    got = ev.due(items, now, default_lead=10)
+    labels = sorted(it["title"] for it, _s, _l in got)
+    check(labels, ["很久以前的闹钟", "起床", "跟导师见面"],
+          "闹钟过了也补报；日程在 10 分钟窗口内提醒；★三天前那次到点不补报★")
+
+    got2 = ev.due(items, now, default_lead=10)
+    check(got2, [], "★同一个到期的第二次调用不能再响★")
+
+    got3 = ev.due(items, datetime(2026, 9, 21, 10, 30), default_lead=10)
+    check([it["title"] for it, _s, lead in got3 if lead == 0], ["跟导师见面"], "到点那一次（lead=0）")
+
+    got4 = ev.due(items, datetime(2026, 9, 21, 10, 36), default_lead=10)
+    check(got4, [], "★迟过 5 分钟的「到点」不算数★（上面那条已经响过，这里再验一次窗口）")
+
+    fresh = ev.new_event("刚错过的会", start="2026-09-21 10:25", remind_before=[0])
+    check([it["title"] for it, _s, _l in ev.due([fresh], datetime(2026, 9, 21, 10, 29), 10)],
+          ["刚错过的会"], "5 分钟内赶到还算数")
+    fresh2 = ev.new_event("错过太久的会", start="2026-09-21 10:25", remind_before=[0])
+    check(ev.due([fresh2], datetime(2026, 9, 21, 10, 31), 10), [], "超过就放弃")
+
+
+# ---------------------------------------------------------------- 5 事件链
+def test_chain() -> None:
+    print("\n[5] 事件链（上游没完成 → 下游的提醒被挡住）")
+    a = ev.new_event("写完报告", kind="reminder", start="2026-09-21 20:00")
+    a["id"] = 1
+    b = ev.new_event("发邮件给导师", kind="reminder", start="2026-09-21 20:00")
+    b["id"] = 2
+    b["chain"] = {"after": 1, "on": "done", "then": "notify"}
+    c = ev.new_event("不相关的闹钟", kind="reminder", start="2026-09-21 20:00")
+    c["id"] = 3
+
+    items = [a, b, c]
+    check(ev.blocked_ids(items), {"2"}, "★A 没完成 → B 被挡，C 不受影响★")
+    check(ev.chain_targets_of(items, a, "done"), [b], "A 完成后该唤醒谁")
+    check(ev.chain_targets_of(items, a, "start"), [], "on=start 的下游不匹配 on=done")
+
+    got = ev.due(items, datetime(2026, 9, 21, 20, 0), default_lead=10,
+                 blocked=ev.blocked_ids(items))
+    check(sorted(it["title"] for it, _s, _l in got), sorted(["写完报告", "不相关的闹钟"]),
+          "被挡住的下游不播报")
+
+    ev.mark_done(a)
+    check(ev.blocked_ids(items), set(), "★A 完成后 B 解锁★")
+    got = ev.due(items, datetime(2026, 9, 21, 20, 1), default_lead=10,
+                 blocked=ev.blocked_ids(items))
+    check([it["title"] for it, _s, _l in got], ["发邮件给导师"], "解锁后就能播了")
+
+    orphan = ev.new_event("上游被删的", kind="reminder", start="2026-09-21 20:00")
+    orphan["id"] = 4
+    orphan["chain"] = {"after": 99, "on": "done"}
+    check(ev.blocked_ids([orphan]), set(), "★上游被删了就不再挡★（否则永远不响）")
+
+    starter = ev.new_event("上课", start="2026-09-21 09:00")
+    starter["id"] = 5
+    after_start = ev.new_event("课后交作业", kind="reminder", start="2026-09-21 09:00")
+    after_start["id"] = 6
+    after_start["chain"] = {"after": 5, "on": "start"}
+    check(ev.blocked_ids([starter, after_start]), {"6"}, "on=start：上游还没开始 → 挡")
+    ev.mark_fired(starter, datetime(2026, 9, 21, 9, 0), 10)
+    check(ev.blocked_ids([starter, after_start]), set(), "上游播报过就算「开始了」")
+
+
+# ---------------------------------------------------------------- 6 存储
+def test_store() -> None:
+    print("\n[6] 存储与两种视图")
+    with tempfile.TemporaryDirectory() as tmp:
+        store = ev.EventStore(Path(tmp) / "events.json", default_lead=10)
+
+        a = store.append(ev.new_event("起床", kind="reminder", start="2026-09-22 07:00:00"))
+        s = store.append(ev.new_event("组会", start="2026-09-23 14:00", repeat="weekly"))
+        check(a["id"], 1, "append 自动给 id")
+        check_true(bool(a.get("created_at")), "append 自动给 created_at")
+        check(store.next_id(), 3, "next_id 取最大值 +1")
+        check(store.by_id(2)["title"], "组会", "by_id")
+        check([it["title"] for it in store.by_title("组会")], ["组会"], "by_title")
+        check(a["remind_before"], [0], "★reminder 缺省 remind_before=[0]★")
+        check_true("state" not in a, "没有状态时不写空的 state（文件要干净）")
+
+        alarms = store.view("reminder")
+        sched = store.view("event")
+        check([it["title"] for it in alarms.load()], ["起床"], "闹钟视图只看见 reminder")
+        check([it["title"] for it in sched.load()], ["组会"], "日程视图只看见 event")
+
+        # ★最关键的两条：各自的 save 不能洗掉对方★
+        alarms.save([])
+        check([it["title"] for it in sched.load()], ["组会"], "★闹钟视图 save([]) 之后日程还在★")
+        alarms.append(ev.new_event("喝水", kind="reminder", start="2026-09-22 09:00"))
+        check([it["title"] for it in sched.load()], ["组会"], "★闹钟视图 append 之后日程还在★")
+
+        sched.append(ev.new_event("面试", start="2026-09-24 10:00"))
+        check(sorted(it["title"] for it in alarms.load()), ["喝水"], "反过来也一样")
+        check(len(store.load()), 3, "合起来一共 3 条")
+
+        check(alarms.update(1, start="2026-09-22 09:30")["start"], "2026-09-22 09:30",
+              "update 的下标是「这一类里的第几个」")
+        check(sched.load()[0]["title"], "组会", "update 没有动到另一类")
+        alarms.remove_at(1)
+        check(alarms.load(), [], "remove_at 只删这一类")
+        check(len(sched.load()), 2, "日程不受影响")
+
+        # 就地改字段再 save（旧代码的写法）必须生效
+        item = alarms.load()
+        check(item, [], "先清空以便下一步")
+        alarms.append(ev.new_event("打电话", kind="reminder", start="2026-09-22 11:00"))
+        for it in alarms.load():
+            it["state"] = {"fired": [ev.fired_key(datetime(2026, 9, 22, 11, 0), 0)]}
+        alarms.save(alarms.load())
+        check(bool(alarms.load()[0].get("state", {}).get("fired")), True,
+              "★load() 给的是原对象，就地改完再 save 能写回★")
+
+        # 文件本身要能被人看懂
+        raw = json.loads(store.path.read_text(encoding="utf-8"))
+        check(isinstance(raw, list), True, "存的是数组")
+        check(all(it.get("kind") in ev.KINDS for it in raw), True, "每条都有 kind")
+
+
+# ---------------------------------------------------------------- 7 迁移
+def test_migrate() -> None:
+    print("\n[7] 迁移旧数据")
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        alarms = base / "alarms.json"
+        sched = base / "schedule.json"
+        alarms.write_text(json.dumps({
+            "_说明": "闹钟",
+            "items": [
+                {"when": "2026-09-23 15:30:00", "what": "约导师见面", "fired": False,
+                 "kind": "alarm", "id": 1, "created_at": "2026-09-18 18:48:12", "_note": "双保险"},
+                {"when": "2026-09-20 17:00:00", "what": "乐队排练", "fired": True,
+                 "kind": "alarm", "id": 2, "fired_at": "2026-09-20 17:17:23"},
+            ],
+        }, ensure_ascii=False), encoding="utf-8")
+        sched.write_text(json.dumps({
+            "_说明": "日程",
+            "items": [
+                {"title": "跟导师见面", "kind": "meeting", "repeat": "once",
+                 "start": "2026-09-23 15:30", "time": "15:30", "remind_before": [10], "id": 1},
+                {"title": "AIAA3102", "kind": "course", "repeat": "weekly", "weekday": 2,
+                 "time": "09:00", "duration_minutes": 90, "location": "教学楼 A302",
+                 "remind_before": [1440, 30], "id": 2, "skip": ["2026-09-30"],
+                 "_fired": ["2026-09-23T09:00:00|30"]},
+            ],
+        }, ensure_ascii=False), encoding="utf-8")
+
+        items, stats = ev.migrate_legacy(alarms, sched)
+        check(stats, {"alarm": 2, "schedule": 2, "fired": 2, "skipped": 1}, "统计对得上")
+        check([it["id"] for it in items], [1, 2, 3, 4], "★id 重新编号，两个文件不会再撞★")
+
+        first = items[0]
+        check((first["kind"], first["title"], first["start"], first["remind_before"]),
+              ("reminder", "约导师见面", "2026-09-23 15:30:00", [0]),
+              "闹钟 → start/title/[0]")
+        check(first["_note"], "双保险", "注释字段带过来")
+        check(first["created_at"], "2026-09-18 18:48:12", "created_at 带过来")
+
+        second = items[1]
+        check(ev.is_fired(second, datetime(2026, 9, 20, 17, 0), 0), True, "★fired=true → 二维键记上★")
+        check(second.get("_fired_at"), "2026-09-20 17:17:23", "fired_at 留着当备注")
+
+        course = items[3]
+        check((course["kind"], course["category"]), ("event", "course"), "日程 → kind=event + category")
+        check(course["remind_before"], [1440, 30], "多个提前量原样")
+        check(course["state"]["skipped"], ["2026-09-30"], "★skip → state.skipped★")
+        check(course["state"]["fired"], ["2026-09-23T09:00:00|30"], "★_fired → state.fired★")
+        check_true("skip" not in course and "_fired" not in course, "旧的字段名不再留")
+
+        # 迁移结果直接能喂给引擎
+        got = ev.occurrences(course, datetime(2026, 9, 28), limit=2)
+        check([d.strftime("%m-%d") for d in got], ["10-07", "10-14"], "迁完就能算发生（9-30 被跳过）")
+
+
+def main() -> int:
+    test_normalize()
+    test_occurrences()
+    test_state()
+    test_due()
+    test_chain()
+    test_store()
+    test_migrate()
+    print(f"\n{'=' * 60}\n通过 {PASS}，失败 {FAIL}")
+    return 1 if FAIL else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

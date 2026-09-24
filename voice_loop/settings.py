@@ -265,6 +265,9 @@ class PersonaConfig:
 class SkillsConfig:
     enabled: bool = True
     data_dir: str = "data"
+    # ★统一事件表★：闹钟、日程、事件链现在是**同一种东西**（见 voice_loop/events.py）。
+    # alarm_file / schedule_file 只剩「迁移数据源」这个用途，运行期不再读它们。
+    event_file: str = "data/events.json"
     alarm_file: str = "data/alarms.json"
     memo_file: str = "data/memos.json"
     schedule_file: str = "data/schedule.json"
