@@ -152,6 +152,10 @@ class TtsConfig:
     clone_max_seconds: float = 15.0  # 参考音频截取上限；★只有文本靠自动转写时才截★，
                                      # 文本从文件/清单来的时候不截（截了文本就对不上，会乱说）
     clone_steps: int = 4             # 流匹配步数：4 最快，8 慢一倍（输出时长完全一样，实测）
+    clone_precision: str = "int8"     # 用哪一份 onnx：int8（125 MB，快）/ fp32（600 MB，量化损失小）
+                                     #   ★两份可以共存★（装的时候用 --precision both），
+                                     #   目录里没这一份就自动退回 int8；哪个更好听要自己 AB
+                                     #   （sessions/ab_fp32/ 里已经生成好了，直接对比听）
     clone_min_chars: int = 16        # 段内最短切句字数（越小出声越快）
     clone_threads: int = 2           # onnxruntime 线程数
     clone_speed: float = 1.0         # 语速：1.0=模型自己的节奏；<1 更慢；★>1 会弄坏（已夹到 ≤1.0）★

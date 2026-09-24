@@ -78,11 +78,17 @@ class VoiceData:
 
     @property
     def trained(self) -> bool:
-        """训好的模型目录是否完整可用。"""
+        """训好的模型目录是否完整可用（int8 / fp32 任一套算数）。
+
+        精度定义在 :mod:`voice_loop.tts.precision`，跟真正加载模型时**同一份**。
+        """
         if not self.model_dir or not self.model_dir.is_dir():
             return False
-        wanted = ["tokens.txt", "encoder.int8.onnx", "decoder.int8.onnx", "lexicon.txt", "espeak-ng-data"]
-        return all((self.model_dir / name).exists() for name in wanted)
+        from .tts.precision import has_any  # noqa: PLC0415 - 只有查这个属性时才需要
+
+        if not has_any(self.model_dir):
+            return False
+        return all((self.model_dir / name).exists() for name in ("tokens.txt", "lexicon.txt", "espeak-ng-data"))
 
     @property
     def status(self) -> str:

@@ -114,6 +114,7 @@ def do_train(item: VoiceData, args) -> int:
         "--stage", str(args.stage),
         "--stop-stage", str(args.stop_stage),
         "--threads", str(args.threads),
+        "--precision", args.precision,
     ]
     if args.epochs:
         # 按「目标 epoch 数」自动推迭代数（比拍一个 iter 数靠谱）
@@ -255,6 +256,12 @@ def main() -> int:
     ap.add_argument("--iters", type=int, default=0, help="直接指定 iter 数（覆盖 --epochs）")
     ap.add_argument("--max-duration", type=int, default=60, help="一个 batch 的总时长（秒）")
     ap.add_argument("--threads", type=int, default=0, help="训练线程数（0 = 全部逻辑核）")
+    ap.add_argument(
+        "--precision",
+        choices=["int8", "fp32", "both"],
+        default="int8",
+        help="安装时装哪份 onnx：int8（默认）/ fp32 / both（两份共存，方便 A/B）",
+    )
     ap.add_argument("--force", action="store_true", help="安装时覆盖已有文件")
     ap.add_argument("--no-wire", action="store_true", help="跑完不自动写 voice_model（只打印提示）")
     ap.add_argument("--dry-run", action="store_true", help="只打印会执行什么")
@@ -279,10 +286,14 @@ def main() -> int:
         return 1
     if args.verify:
         return do_verify(item, args)
-    if why:
+    # 「只装另一份精度」不该被素材检查拦住：都导出过了，要的是文件，不是数据。
+    install_only = args.stage == 8 and args.stop_stage == 8
+    if why and not install_only:
         print(f"× {item.name}：{why}")
         print("（盘点用 --list；补好素材再来）")
         return 1
+    if why:
+        print(f"（{why}）—— 只装模型不受影响，继续")
 
     print(f"角色：{item.name}（{item.id}）")
     print(f"素材：{item.audio_dir}  {len(item.clips)} 条 / {item.seconds:.1f} 秒 / 文本覆盖 {item.text_coverage:.0%}")

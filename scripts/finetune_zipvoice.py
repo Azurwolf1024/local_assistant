@@ -589,18 +589,38 @@ def stage_export(args) -> int:
     return 0
 
 
+# 精度 →（导出目录里的文件名, 角色目录里的文件名）
+# ★两边文件名不一样，别搞混★：
+#   官方 `onnx_export` 产出 → `text_encoder.onnx` / `text_encoder_int8.onnx`
+#                             `fm_decoder.onnx`  / `fm_decoder_int8.onnx`
+#   sherpa-onnx 要的是       → `encoder.onnx` / `encoder.int8.onnx`
+#                             `decoder.onnx` / `decoder.int8.onnx`
+PRECISION_FILES = {
+    "int8": (
+        ("**/text_encoder_int8.onnx", "encoder.int8.onnx"),
+        ("**/fm_decoder_int8.onnx", "decoder.int8.onnx"),
+    ),
+    "fp32": (
+        ("**/text_encoder.onnx", "encoder.onnx"),
+        ("**/fm_decoder.onnx", "decoder.onnx"),
+    ),
+}
+
+
 def stage_install(args) -> int:
     """把导出的 ONNX 装成一个**完整的角色模型目录**。
 
-    ★两边文件名不一样，别搞混★：
-      官方 `onnx_export` 产出 → `text_encoder.onnx` / `text_encoder_int8.onnx`
-                                `fm_decoder.onnx`  / `fm_decoder_int8.onnx`
-      sherpa-onnx 要的是       → `encoder.int8.onnx` / `decoder.int8.onnx`
-      另外还要 `tokens.txt`、`lexicon.txt`、`espeak-ng-data/`（文本前端；声码器是共用的）。
+    ``--precision`` 决定装哪一份（导出那一步**两份都会生成**，见
+    `.zipvoice-src/zipvoice/bin/onnx_export.py` 末尾）：
+      - ``int8``（默认）：125 MB，快；出厂模型就是这个精度。
+      - ``fp32``：600 MB（4.8 倍），慢一些，但省掉了动态量化的精度损失。
+      - ``both``：两份都装，运行时有得选（见 config.toml 的 ``clone_precision``）。
 
-    做法：先把出厂模型目录（``--base-model``）里那几样整份拷过去当模板，
-    再把 encoder/decoder 换成微调后的——这样角色目录**自包含**，
-    persona 的 ``voice_model`` 指过去就能直接用，运行时不需要回退逻辑。
+    另外还要 `tokens.txt`、`lexicon.txt`、`espeak-ng-data/`（文本前端；声码器是共用的），
+    这几样从出厂目录（``--base-model``）拷，让角色目录**自包含**。
+
+    ★不要再把出厂目录的 encoder/decoder 当模板拷进来★：那是**出厂音色**，
+    万一微调的文件没装成功，运行时会静默用出厂声线发声（听上去「音色突然变了」）。
 
     换之前会比对 token 表：实测本项目微调前后 ``tokens.txt`` 是**逐字节相同**的
     （训练脚本用的是权重自带那份），所以 lexicon / espeak-ng-data 不用动；
@@ -614,16 +634,17 @@ def stage_install(args) -> int:
         else ROOT / "models" / "tts" / "zipvoice" / "personas" / args.prefix
     )
 
+    wanted = ["int8", "fp32"] if args.precision == "both" else [args.precision]
     exported: dict[str, Path] = {}
-    for pattern, target in (
-        ("**/text_encoder_int8.onnx", "encoder.int8.onnx"),
-        ("**/fm_decoder_int8.onnx", "decoder.int8.onnx"),
-    ):
-        found = sorted(src.glob(pattern))
-        if found:
-            exported[target] = found[0]
+    for precision in wanted:
+        for pattern, target in PRECISION_FILES[precision]:
+            found = sorted(src.glob(pattern))
+            if found:
+                exported[target] = found[0]
+            else:
+                print(f"⚠ {src} 里没找到 {pattern}（{precision}），这一份跳过")
     if not exported:
-        print(f"{src} 里没找到导出的 int8 onnx，先跑导出那一步")
+        print(f"{src} 里没找到导出的 onnx，先跑导出那一步（--stage 7）")
         return 1
     if not base.is_dir():
         print(f"出厂模型目录不在：{base}（用 --base-model 指定）")
@@ -632,7 +653,8 @@ def stage_install(args) -> int:
     dst.mkdir(parents=True, exist_ok=True)
     print(f"出厂模板：{base}")
     print(f"安装到  ：{dst}")
-    for name in ("tokens.txt", "lexicon.txt", "encoder.int8.onnx", "decoder.int8.onnx"):
+    print(f"精度    ：{'、'.join(wanted)} → {', '.join(sorted(exported))}")
+    for name in ("tokens.txt", "lexicon.txt"):
         source = base / name
         if not source.exists():
             continue
@@ -646,7 +668,8 @@ def stage_install(args) -> int:
         shutil.copytree(espeak_src, dst / "espeak-ng-data")
         print(f"  拷入 espeak-ng-data/（{len(list((dst / 'espeak-ng-data').iterdir()))} 项）")
 
-    for target_name, path in exported.items():
+    for target_name in sorted(exported):
+        path = exported[target_name]
         out = dst / target_name
         if out.exists() and not args.force:
             backup = out.with_suffix(out.suffix + ".bak")
@@ -671,8 +694,14 @@ def stage_install(args) -> int:
                 "先跑 --verify 听一句再说。"
             )
 
+    for name in ("encoder.onnx", "decoder.onnx", "encoder.int8.onnx", "decoder.int8.onnx"):
+        f = dst / name
+        if f.exists():
+            print(f"  目录里现在有 {name}（{human_size(f.stat().st_size)}）")
+
     print("\n校验（用助手自己的解释器加载这份模型试一句）：")
     print(f"  python scripts/persona_voice.py --persona {args.prefix} --verify")
+    print("  想换精度就改 config.toml 里的 tts.clone_precision（int8 / fp32）")
     return 0
 
 
@@ -700,7 +729,13 @@ def main() -> int:
     ap.add_argument(
         "--base-model",
         default=str(ROOT / "models" / "tts" / "zipvoice" / "sherpa-onnx-zipvoice-distill-int8-zh-en-emilia"),
-        help="出厂模型目录（复制它当模板，再把 encoder/decoder 换成微调后的）",
+        help="出厂模型目录（只从它拷 tokens/lexicon/espeak-ng-data 当模板）",
+    )
+    ap.add_argument(
+        "--precision",
+        choices=["int8", "fp32", "both"],
+        default="int8",
+        help="装哪种精度的 onnx：int8（125 MB，默认）/ fp32（600 MB）/ both",
     )
     ap.add_argument(
         "--keep-epochs",

@@ -47,6 +47,7 @@ from .tools import (
     reroute_correction,
 )
 from .tts import create_tts
+from .tts import precision
 from . import ui
 from .wake import WakeSession, WakeWordMatcher, is_standby
 
@@ -917,9 +918,18 @@ class VoiceLoop:
             self.log.info(f"[角色] 参考音色 → {want}（{reason or '切换'}）")
 
     def _missing_voice_model(self, path) -> list[str]:
-        """角色的声音模型目录缺哪些文件（空列表 = 齐了）。"""
-        wanted = ["tokens.txt", "encoder.int8.onnx", "decoder.int8.onnx", "lexicon.txt", "espeak-ng-data"]
-        return [str(path / name) for name in wanted if not (path / name).exists()]
+        """角色的声音模型目录缺哪些文件（空列表 = 齐了）。
+
+        精度按 ``tts.clone_precision`` 算，且**只要有一套能用就不算缺**——
+        目录里常会有 int8 / fp32 两份（做 A/B 用），报告得跟运行时一致。
+        """
+        wanted = ["tokens.txt", "lexicon.txt", "espeak-ng-data"]
+        missing = [str(path / name) for name in wanted if not (path / name).exists()]
+        if missing:
+            return missing
+        if precision.has_any(path):
+            return []
+        return [str(path / name) for name in precision.PRECISION_FILES[precision.want_precision(self.settings)]]
 
     def _switch_character(self, cid: str) -> Character | None:
         """唤醒词点了谁的名就切到谁（人设 + 应答语 + 声线）。"""

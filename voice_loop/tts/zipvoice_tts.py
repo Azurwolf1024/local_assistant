@@ -34,6 +34,12 @@ import numpy as np
 from ..manifest import manifest_pairs
 from ..settings import Settings
 from .pacing import PacingFixer
+from .precision import (
+    DEFAULT_PRECISION,
+    PRECISION_FILES,
+    model_names,
+    want_precision,
+)
 
 # 参考音频的推荐上限（秒）。再长不会更像，只会更慢、更不稳。
 REF_MAX_SECONDS = 15.0
@@ -56,10 +62,11 @@ def _resample(x: np.ndarray, src: int, dst: int) -> np.ndarray:
 def missing_files(settings: Settings) -> list[Path]:
     """缺哪些模型文件（空列表 = 齐了）。create_tts 用它在启动时就退到 Piper。"""
     base = settings.resolve(settings.tts.clone_dir)
+    encoder, decoder = model_names(base, want_precision(settings))
     wanted = [
         base / "tokens.txt",
-        base / "encoder.int8.onnx",
-        base / "decoder.int8.onnx",
+        base / encoder,
+        base / decoder,
         base / "lexicon.txt",
         base / "espeak-ng-data",
         settings.resolve(settings.tts.clone_vocoder),
@@ -125,6 +132,17 @@ class ZipVoiceTts:
                 + "\n请执行：python scripts/download_models.py --only zipvoice"
             )
 
+        self._precision = want_precision(settings)
+        self._encoder, self._decoder = model_names(self._clone_dir, self._precision)
+        if self._encoder != PRECISION_FILES[self._precision][0]:
+            # 说了要用 fp32 但目录里没有 → 静默退回会让人以为「换了没效果」
+            print(
+                f"[tts] 这个角色目录里没有 {PRECISION_FILES[self._precision][0]}，"
+                f"按 {DEFAULT_PRECISION} 加载（想用 fp32："
+                f"python scripts/finetune_zipvoice.py --stage 8 --precision both --prefix <角色>）",
+                file=sys.stderr,
+            )
+
         self._engine = self._create_engine()
         self._rate = int(getattr(self._engine, "sample_rate", 24000) or 24000)
 
@@ -152,8 +170,8 @@ class ZipVoiceTts:
         sh = self._sh
         kw = {
             "tokens": str(self._clone_dir / "tokens.txt"),
-            "encoder": str(self._clone_dir / "encoder.int8.onnx"),
-            "decoder": str(self._clone_dir / "decoder.int8.onnx"),
+            "encoder": str(self._clone_dir / self._encoder),
+            "decoder": str(self._clone_dir / self._decoder),
             "data_dir": str(self._clone_dir / "espeak-ng-data"),
             "lexicon": str(self._clone_dir / "lexicon.txt"),
             "vocoder": str(self._vocoder),
