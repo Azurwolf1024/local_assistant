@@ -204,6 +204,7 @@ flowchart LR
 │  ├─ test_mic_loopback.py     # 麦克风回环诊断（放一段语音，看能不能听到 + 识别）
 │  ├─ clean_junk_data.py       # 清理早期版本写坏的备忘/闹钟
 │  ├─ check_deploy.py          # ★ 搬家/换系统前的只读自检（七类问题 + 怎么办）
+│  ├─ pick_voice_ref.py        # ★ 声线体检：毛不毛先看参考/素材，附参考候选与 2×2 交叉
 │  ├─ probe_npu.py             # ★ NPU 到底值不值得用（分阶段实测，含核显对照）
 │  ├─ ab_clone_model.py        # ★ 声线 A/B：精度×步数的客观指标 + 试听 wav
 │  ├─ test_precision.py        # ★ 精度（int8/fp32）与平台降级的离线测试
@@ -1385,11 +1386,22 @@ python scripts/ab_clone_model.py
 | `int8`（默认） | 125 MB | 4.4 s | 当前在用、实测过的那一套 |
 | `fp32` | 600 MB | 8.3 s（慢一倍） | 想排除「动态量化带来的沙沙声」时 |
 
-> ⚠️ **状态：还没被你耳朵确认。** 2026-09-24 的客观测量里，fp32 相对 int8 的
-> 高频噪声只降了约 6%（16.56% → 15.60%），**说明量化不是沙沙声的主因**；
-> 同一批数据里更大的差距来自「微调模型 vs 出厂蒸馏模型」（6.13% vs 16.56%）和步数。
-> 所以 `clone_precision` 默认仍是 `int8`，**等你听完 `sessions/ab_clone/` 再决定**。
-> 完整的指标表和待办清单见 [`docs/ENGINEERING_LOG.md`](docs/ENGINEERING_LOG.md) 第 16 节。
+> ⚠️ **状态：还没被你耳朵确认，而且它的优先级已经降了。** 2026-09-24 下午把整张 A/B
+> 网格（40 个 wav）当数据算了一遍：配对对比下 fp32 **确实**更低（凯尔希长句 4/4 档、
+> 平均 −2.6 个百分点），但**沙沙声的主要来源是素材与参考音频**，不是精度：
+>
+> | 手段 | 效果 | 代价 |
+> | --- | --- | --- |
+> | 换/处理参考音频 | 输出高频 ×1.8~2.5 | 零（改一行配置） |
+> | 换素材重训 | 能压低基线 | 几十分钟训练 |
+> | 换精度 int8 → fp32 | −2~3 个百分点 | 合成时间 ×2 |
+> | 加步数 | **没有可测效果** | ×4~×30 |
+>
+> 根因证据：阿米娅 38 条素材的**安静帧**高频占比（只算停顿/气口，与句子无关）
+> 中位 **34.4%**，凯尔希只有 **7.5%**（4.5 倍）；两个角色的文件格式完全一样。
+> 所以 `clone_precision` 默认仍是 `int8`，**先挑干净的参考**（下表），精度排最后。
+> 完整推导见 [`docs/ENGINEERING_LOG.md`](docs/ENGINEERING_LOG.md) 第 16.7 节；
+> 体检与选参考：`python scripts/pick_voice_ref.py`。
 
 > 手工调参/排障时可以单步跑：`scripts/finetune_zipvoice.py --stage 1..8`（分步版）、
 > `scripts/prepare_tts_dataset.py --dir data/personas/<id> --out data/finetune/<id> --apply`
