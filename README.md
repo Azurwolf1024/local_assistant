@@ -229,6 +229,8 @@ flowchart LR
 │  ├─ ab_clone_model.py        # ★ 声线 A/B：精度×步数的客观指标 + 试听 wav
 │  ├─ test_precision.py        # ★ 精度（int8/fp32）与平台降级的离线测试
 │  ├─ test_refclean.py         # ★ 参考净化 / 输出去嘶 / 电平对齐 / 压长停顿（纯离线）
+│  ├─ test_pitch.py            # ★ 基频跟踪与音区守卫的离线自检（滑音/谐波陷阱/静音，纯离线）
+│  ├─ pitch_report.py          # ★ 音区体检：哪条 wav 整体偏高/偏低，带靶子与「会被重采」标记
 │  ├─ ab_voice.py              # ★ 音质 A/B：沙沙声与语气连贯，配对多遍 + 写试听 wav
 │  ├─ say.py                   # 用扬声器念一句话（不想开口时测唤醒词用）
 │  └─ tts_probe.py             # TTS 调音工具（含语调对比）
@@ -898,6 +900,14 @@ python main.py skills
 > 保语气连贯用 `trim_shrink_pause`（按比例压长停顿，不压成一样长）+ `chunk_level_db`
 > （块间电平对齐）+ `join_pause_comma_ms` / `join_pause_period_ms`（按标点的接缝补白）。
 > 想听出差别：`python scripts/ab_voice.py --hiss` / `--rhythm`，产物在 `sessions/voice_ab2/`。
+>
+> **「语气连贯」还有一半是音高**（用户原话：不要出现异常的高亢和低沉）：
+> ZipVoice 是采样生成，同一句话重采几遍，**整句音区**会在一个全音上下飘（实测阿米娅
+> 240~290 Hz，参考音自己 258 Hz）。新增 `pitch_guard_st` / `pitch_guard_tries`：
+> 合成完先用 YIN 量整句音区，偏离参考音超过 1.5 半音就**丢掉重采**（★只重采，不变调 DSP★）。
+> 代价：触发的那句多花一遍合成时间（实测阿米娅 1/6 的句子）。
+> 量自己的音频：`python scripts/pitch_report.py --ref data/personas/<id>/<参考>.wav sessions\*.wav`；
+> 完整推导见 [`docs/ENGINEERING_LOG.md`](docs/ENGINEERING_LOG.md) 第 19 节。
 
 ## 7. 实测性能（要换机器 / 换模型先看这个）
 
@@ -1454,6 +1464,12 @@ python scripts/ab_clone_model.py
 > （`[tts] out_tilt_hz` / `out_tilt_db`，默认已开 −3 dB@7 kHz：阿米娅整条高频 31.7% → 21.3%，
 > 5 遍配对 5/5 变干净，而且每遍之间的差别也小了）。-6 dB@6 kHz 更明显但齿音更闷，
 > **这一档请自己听一遍**（`sessions/voice_ab2/tilt_*.wav`）。详见工程日志第 18 节。
+>
+> **⚠️ 2026-09-25 更正（音高）**：「语气连贯」的另一半是**音区**，不是停顿。量音高必须先验尺子：
+> 第一版跟踪器（归一化自相关）连**真人参考音**都能量出 150/280 Hz 来回翻的假象——
+> 换成 YIN 之后才看出真相：句内摆幅与真人参考相当（合成 4.4 / 3.3 半音 vs 参考 4.3 / 2.5），
+> 但**每遍的整体音区**会飘 1.7~2.4 半音。所以现在默认开音区守卫（重采，不做变调）。
+> 详见工程日志第 19 节。
 
 > 手工调参/排障时可以单步跑：`scripts/finetune_zipvoice.py --stage 1..8`（分步版）、
 > `scripts/prepare_tts_dataset.py --dir data/personas/<id> --out data/finetune/<id> --apply`

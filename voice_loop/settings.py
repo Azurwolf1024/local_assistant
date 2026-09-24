@@ -199,6 +199,15 @@ class TtsConfig:
     chunk_level_db: float = 0.0       # 块间电平对齐的上限 dB（0 = 关；1.5 = 只修明显的忽大忽小）
     join_pause_comma_ms: int = 0      # 逗号接缝补白（0 = 用 sentence_silence 的老行为）
     join_pause_period_ms: int = 0     # 句号接缝补白（同上）
+    # ---- 音区守卫：治「异常的高亢 / 低沉」（见 voice_loop/tts/pitch.py）----
+    # ★问题★：ZipVoice 是采样生成，同一句话重采几遍，**整体音区**会在一个全音
+    #   上下飘（实测 amiya 252~290Hz、kaltsit 176~195Hz）；连着一问一答时，
+    #   上一句正常、下一句整句拔高，就是耳朵听到的「异常的高亢/低沉」。
+    # ★做法★：每遍合成完，用 YIN 量出整句音区，和**参考音频自己的音区**比；
+    #   偏离超过阈值就**重采一次**（只随机重采，不做变调 DSP——变调会毁音色）。
+    #   引擎里那段音频本来就整块产出（实测 42 字的长句也是 1 块），所以不用攒更多延迟。
+    pitch_guard_st: float = 1.5       # 允许偏离多少半音（0 = 关；1.5≈全音，2.0 更松）
+    pitch_guard_tries: int = 2        # 最多采几遍（含第一遍）；2 = 最多多花一遍的时间
 
 
 @dataclass

@@ -33,6 +33,7 @@ import numpy as np
 
 from ..manifest import manifest_pairs
 from ..settings import Settings
+from . import pitch as pitchkit
 from . import refclean as rc
 from .pacing import LevelMatcher, PacingFixer
 from .precision import (
@@ -49,6 +50,19 @@ LONG_REF_SECONDS = 20.0
 
 # 假名（含半角）——出现它就当日语
 _KANA_RE = re.compile(r"[\u3041-\u309f\u30a0-\u30ff\uff66-\uff9d]")
+
+
+def pitch_guard_verdict(dev_st: float | None, limit_st: float, attempt: int, tries: int) -> bool:
+    """这一遍要不要**丢掉重采**？（纯函数，好单测）
+
+    ``dev_st`` = 整句音区相对靶子差几个半音，``None`` = 没量出来 → 不重采
+    （★宁可放过一遍，也不能因为量错而白重采★）。
+    """
+    if dev_st is None or not (limit_st > 0):
+        return False
+    if attempt + 1 >= max(1, int(tries)):
+        return False
+    return abs(float(dev_st)) > float(limit_st)
 
 
 def _resample(x: np.ndarray, src: int, dst: int) -> np.ndarray:
@@ -163,6 +177,11 @@ class ZipVoiceTts:
         # 没参考音频时退回 Piper 出声（宁可音色不对，也不能把嘴弄哑）
         self._fallback = None
         self._warned_no_ref = False
+
+        # 音区守卫：治「异常的高亢 / 低沉」（见 voice_loop/tts/pitch.py 的开头）
+        self._pitch_guard_st = max(0.0, float(getattr(cfg, "pitch_guard_st", 0.0) or 0.0))
+        self._pitch_guard_tries = max(1, int(getattr(cfg, "pitch_guard_tries", 1) or 1))
+        self._ref_f0: float | None = None
 
         # 参考音频（音色）
         self._ref_audio: np.ndarray | None = None
@@ -289,6 +308,22 @@ class ZipVoiceTts:
         self._ref_rate = int(rate)
         self._ref_text = text
         self._ref_path = path
+        # ★音区靶子 = 参考音频自己的音高★：重采守卫拿它当裁判（跟输出同一套尺子量）
+        self._ref_f0 = None
+        if self._pitch_guard_st > 0:
+            self._ref_f0 = pitchkit.f0_median(self._ref_audio, self._ref_rate)
+            if self._ref_f0 is None:
+                if not quiet:
+                    print(
+                        "[tts] 参考音频量不出音高，音区守卫这一轮不生效（pitch_guard_st）",
+                        file=sys.stderr,
+                    )
+            elif not quiet:
+                print(
+                    f"[tts] 音区靶子 {self._ref_f0:.0f}Hz（= 参考音频自己的音高）："
+                    f"整句偏离 >{self._pitch_guard_st:g} 半音就重采（最多 {self._pitch_guard_tries} 遍）",
+                    flush=True,
+                )
         if not quiet:
             src = "参数" if not ref_text else ("文件" if from_file else "自动转写")
             print(
@@ -491,15 +526,12 @@ class ZipVoiceTts:
             return self._silence
         return np.zeros(int(self._rate * ms / 1000.0), dtype=np.int16)
 
-    def synth(self, text: str) -> Iterator[tuple[int, np.ndarray]]:
-        """边生成边产出：第一个 chunk 出来就交给播放器，不必等整句合成完。"""
-        text = (text or "").strip()
-        if not text:
-            return
-        if self._ref_audio is None:
-            yield from self._speak_without_reference(text)
-            return
-        gen = self._gen_config()
+    def _iter_pieces(self, text: str, gen) -> Iterator[tuple[int, np.ndarray]]:
+        """跑**一次** ``generate``，把 sherpa 的块做完后处理再吐出来（不含接缝补白）。
+
+        ★实测一次 generate 通常只吐 1 块★（42 字的长句也是 1 块），所以「量完整句音区」
+        不用额外攒延迟；就算真给多块也不影响——音区只看第一块。
+        """
         box: queue.Queue = queue.Queue()
         errors: list[BaseException] = []
 
@@ -537,7 +569,50 @@ class ZipVoiceTts:
         if errors:
             raise RuntimeError(f"ZipVoice 合成失败：{errors[0]}")
 
+    def synth(self, text: str) -> Iterator[tuple[int, np.ndarray]]:
+        """边生成边产出：第一个 chunk 出来就交给播放器，不必等整句合成完。
+
+        ★音区守卫★（``pitch_guard_st`` > 0 时）：第一块量出整句音区，偏离参考音频
+        超过阈值就**丢掉重采**（不重采就变成「上一句正常、下一句整句拔高」）。
+        """
+        text = (text or "").strip()
+        if not text:
+            return
+        if self._ref_audio is None:
+            yield from self._speak_without_reference(text)
+            return
+        gen = self._gen_config()
+        tries = self._pitch_guard_tries if (self._pitch_guard_st > 0 and self._ref_f0) else 1
+        dev: float | None = None
+        produced = False
+        for attempt in range(tries):
+            pieces = self._iter_pieces(text, gen)
+            first = next(pieces, None)
+            if first is None:
+                break
+            if tries > 1:
+                dev = pitchkit.register_st(first[1], self._rate, float(self._ref_f0))
+            if pitch_guard_verdict(dev, self._pitch_guard_st, attempt, tries):
+                print(
+                    f"[tts] 这一遍整句音区偏了 {dev:+.1f} 半音（靶子 {self._ref_f0:.0f}Hz），"
+                    f"重采第 {attempt + 2} 遍…",
+                    flush=True,
+                )
+                for _ in pieces:  # ★把这一遍抽干★：同一个引擎上并发跑两次不保险
+                    pass
+                continue
+            yield first
+            produced = True
+            yield from pieces
+            break
+        if not produced:
+            return
         self._synth_calls += 1
+        if dev is not None and abs(dev) > self._pitch_guard_st:
+            print(
+                f"[tts] 音区还是偏 {dev:+.1f} 半音（重采到上限了），先用这一遍出声",
+                flush=True,
+            )
         join = self._pause_after(text)
         if join.size:
             yield self._rate, join
