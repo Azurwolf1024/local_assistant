@@ -204,6 +204,7 @@ flowchart LR
 │  ├─ test_mic_loopback.py     # 麦克风回环诊断（放一段语音，看能不能听到 + 识别）
 │  ├─ clean_junk_data.py       # 清理早期版本写坏的备忘/闹钟
 │  ├─ check_deploy.py          # ★ 搬家/换系统前的只读自检（七类问题 + 怎么办）
+│  ├─ probe_npu.py             # ★ NPU 到底值不值得用（分阶段实测，含核显对照）
 │  ├─ ab_clone_model.py        # ★ 声线 A/B：精度×步数的客观指标 + 试听 wav
 │  ├─ test_precision.py        # ★ 精度（int8/fp32）与平台降级的离线测试
 │  ├─ say.py                   # 用扬声器念一句话（不想开口时测唤醒词用）
@@ -1085,9 +1086,13 @@ python main.py gpu --enable-igpu          # 让 Ollama 用上核显（写环境�
 - **`[asr] whisper_device = "auto"`**：OpenVINO 报出核显就用 GPU，编译失败自动回退 CPU。
   hybrid 模式下超过 `whisper_min_duration`（默认 6 s）的音频会追加 Whisper 校验，
   这一步就是省下来的地方。
-- 想强制：写 `"GPU"` / `"CPU"` / `"NPU"`。**别写 NPU** —— 这个 int8 导出在 NPU 上会让
-  进程直接崩（vpux-compiler 报 `Channels count ... != 128`），不是抛异常、没法回退。
-  `auto` 因此永远不会选它。
+- 想强制：写 `"GPU"` / `"CPU"` / `"NPU"`。**别写 NPU** —— 这份导出是动态形状
+  （`[?,128,3000]`），而 NPU 要求静态 shape，**连编译都过不了**
+  （Level0 `ZE_RESULT_ERROR_INVALID_ARGUMENT`；早先版本是直接 `0xC0000005` 硬崩）。
+  就算把音频一律补齐到 30 秒让它编过，核显也快它 **7.9 倍**（0.168s vs 1.33s），
+  而它编译一次要 **294 秒**。`auto` 因此永远不会选它。
+  附带一条结论：小模型上 NPU 比 CPU 还慢约 9 倍（Silero VAD 0.4ms vs 3.8ms），
+  所以本机三件套（VAD / ASR / TTS）里它没有位置。实测脚本：`python scripts/probe_npu.py`。
 
 ### 让 Ollama 用上核显
 

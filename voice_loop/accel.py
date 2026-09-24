@@ -5,10 +5,24 @@
     Whisper large-v3-turbo int8，同一段 9.6 秒音频
         CPU   热态 3.79s   RTF 0.393
         GPU   热态 1.05s   RTF 0.109   ← 3.6 倍
-        NPU   **进程直接崩**（vpux-compiler: Channels count ... != 128）
+        NPU   **用不了**（详见下）
+
+关于 NPU（Intel(R) AI Boost，2026-09-24 用 `scripts/probe_npu.py` 重测）：
+
+    | 同一份静态 [1,128,3000] encoder | CPU | Arc 核显 | NPU |
+    |---|---|---|---|
+    | 推理（30 秒音频） | 3.4s | **0.168s** | 1.33s |
+    | 编译 | 2.1s | 6.2s | **294s** |
+
+    一是**动态形状根本编译不过**（日常音频长度不固定，NPU 要求静态 shape，
+    报 Level0 `ZE_RESULT_ERROR_INVALID_ARGUMENT`；早先版本更狠，直接 `0xC0000005` 硬崩）；
+    二是就算把音频一律补齐到 30 秒，**核显还快它 7.9 倍**，而编译要等 5 分钟；
+    三是小模型上它比 CPU 还慢约 9 倍（Silero VAD 0.4ms vs 3.8ms）。
+    所以本机三件套（VAD / ASR / TTS）里，NPU 没有任何一个位置能占到便宜。
 
 所以这里有两条硬规矩：
-    1. ``auto`` 只选 GPU，**绝不自动选 NPU**（那个导出在 NPU 上会崩进程，不是抛异常）；
+    1. ``auto`` 只选 GPU，**绝不自动选 NPU**（不是因为「崩了就退出」不好写，
+       而是它本来就更慢）；
        用户明确写 NPU 也允许，但失败顺序里一定带 CPU 兜底。
     2. 报错要能兜住：GPU 编译失败就回退 CPU，不能把整条 ASR 链路弄没了。
 
@@ -248,7 +262,8 @@ def pick_whisper_devices(want: str) -> list[str]:
     """Whisper 要按什么顺序尝试哪些设备。
 
     ``auto`` -> GPU（有的话）然后 CPU；显式写 NPU 也允许，但一定会带 CPU 兜底，
-    因为这个模型在 NPU 上会把进程搞崩（不是异常，是崩）。
+    因为这份导出（动态形状）在 NPU 上连编译都过不了，而就算改成静态形状，
+    核显仍比 NPU 快约 8 倍（实测见 `scripts/probe_npu.py`）。
     """
     want = (want or "auto").strip()
     devs = detect().openvino
@@ -300,7 +315,8 @@ def report(settings: Settings, logger: logging.Logger | None = None) -> list[str
     lines.append(
         "  显卡加速："
         + ("Intel Arc 核显（GPU）√" if acc.has_intel_gpu else "× 没有 Intel 核显")
-        + ("；NPU √（注意：Whisper 在 NPU 上会崩进程，别选）" if acc.has_npu else "")
+        + ("；NPU √（硬件在、能跑，但比核显慢 8 倍，别选——scripts/probe_npu.py 有实测表）"
+           if acc.has_npu else "")
     )
     lines.append(
         "  onnxruntime provider："

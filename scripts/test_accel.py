@@ -1,7 +1,8 @@
 """加速设备选择的离线测试（不加载模型、不跑推理，秒级）。
 
 为什么要测这些：设备选错不是「慢一点」，是**会崩或者悄悄降级**：
-    - Whisper 这个 int8 导出在 NPU 上会让进程崩溃（不是抛异常）→ auto 绝不能选 NPU
+    - Whisper 这个动态形状的导出在 NPU 上连编译都过不了，而且就算固定形状，
+      核显也比它快约 8 倍 → auto 绝不能选 NPU（数字见 scripts/probe_npu.py）
     - INFERENCE_NUM_THREADS 是 CPU 专属属性，塞给 GPU 会让编译失败、整条 Whisper 路径降级
     - 控制台是 cp936：报告里的字符必须能 GBK 编码，否则打印就炸
 """
