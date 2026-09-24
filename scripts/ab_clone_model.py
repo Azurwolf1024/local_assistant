@@ -65,8 +65,44 @@ TEXTS = {
 
 
 # ---------------------------------------------------------------- 客观指标
+# ★沙沙声的真正指纹（2026-09-25 实测）★：自然语音的高频是**一路往下掉**的
+# （真人参考：4-6k -10.7 → 6-8k -11.3 → 8-10k -13.6 → 10-12k -16.0 dB），
+# 而沙沙声是**10~12kHz 那一层掉不下去甚至翘起来**：
+#   微调模型 10-12k 竟是 **-8.0 dB**（比它自己的 8-10k 还高 4.3 dB，比真人高 8 dB）
+#   ⇒ 当前默认的「7 kHz 以上 -3 dB」打偏了：8-10k 被砍了 3 dB，10-12k 只降 3 dB（还高 5 dB）。
+#   换成「>10 kHz -9 dB」：8-10k 基本不动（-12.8 vs 原 -12.3），10-12k 落到 -17.1（真人 -16.0）。
+BAND_EDGES = (3000, 4000, 6000, 8000, 10000, 12000, 24000)
+
+
+def hf_band_profile(pcm: np.ndarray, rate: int,
+                    edges: tuple[int, ...] = BAND_EDGES) -> list[float]:
+    """有声帧里各频段相对 0.3~3kHz 的 dB（最后一个段到 Nyquist）。
+
+    ★比「整条高频占比」准得多★：它只在**有声帧**上算，且看的是**形状**——
+    自然语音是一路滚降，沙沙声是高频那一段平掉/翘起来。
+    """
+    db, _hf, hop = frame_db(pcm, rate)
+    x = _as_float(pcm)
+    n = x.size // hop
+    if n < 2:
+        return [float("nan")] * max(0, len(edges) - 1)
+    frames = x[: n * hop].reshape(n, hop)
+    freqs = np.fft.rfftfreq(hop, 1.0 / rate)
+    spec = np.abs(np.fft.rfft(frames * np.hanning(hop), axis=1)) ** 2
+    speech = float(np.percentile(db, 90))
+    voiced = db > speech - 10.0
+    base = spec[voiced][:, (freqs >= 300) & (freqs < 3000)].mean() + 1e-20
+    base_db = 10 * np.log10(base)
+    out = []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        band = (freqs >= lo) & (freqs < hi)
+        out.append(float(10 * np.log10(spec[voiced][:, band].mean() + 1e-20) - base_db)
+                   if band.any() else float("nan"))
+    return out
+
+
 def hf_ratio(pcm: np.ndarray, rate: int) -> float:
-    """高频（>6 kHz）能量占全带的比 —— 沙沙声的代理指标。"""
+    """整条 >6kHz 能量占比（0~1）。★只当粗筛★：齿音/音色也会影响它。"""
     x = pcm.astype(np.float32) / 32768.0
     spec = np.abs(np.fft.rfft(x * np.hanning(x.size)))
     freqs = np.fft.rfftfreq(x.size, 1.0 / rate)
@@ -300,6 +336,46 @@ def print_summary(rows: list[dict]) -> None:
     print("     得把 --steps 换成同一组多点（例如每个步数跑 3 次），让同一格有真重复。")
 
 
+def profile_report(paths: list[Path]) -> int:
+    """★沙沙声的尺子★：给 wav，打频段表（有声帧里各段相对 0.3~3kHz 的 dB）。
+
+    读法：自然语音的高频**一路滚降**（真人参考 4-6k −10.7 → 6-8k −11.3 → 8-10k −13.6
+    → 10-12k −16.0 dB）；哪一段「掉不下来」或者比上一段还高，那就是沙沙声住的地方。
+    不给文件时，量配置里那条参考音频（当目标值）。
+    """
+    import soundfile as _sf  # noqa: PLC0415 - 只在这个模式下需要
+
+    if not paths:
+        try:
+            from voice_loop.settings import load_settings  # noqa: PLC0415
+            settings = load_settings()
+            ref = str(getattr(settings.tts, "clone_audio", "") or "").strip()
+            paths = [settings.resolve(ref)] if ref else []
+        except Exception:  # noqa: BLE001 - 没配置就只打印用法
+            paths = []
+    if not paths:
+        print("用法：python scripts/ab_clone_model.py --profile <wav...>（不给就量配置里的参考音频）")
+        return 2
+
+    edges = (3000, 4000, 6000, 8000, 10000, 12000, 24000)
+    head = "".join(f"{f'{lo // 1000}-{hi // 1000}k':>10}" for lo, hi in zip(edges[:-1], edges[1:]))
+    print(f"{'文件':<34}{'时长':>7}{'整条高频':>9}{'可闻安静帧':>11}{'停顿':>9}{head}")
+    print("-" * (62 + 10 * (len(edges) - 1)))
+    for path in paths:
+        if not path.is_file():
+            print(f"{path.name:<34} 找不到")
+            continue
+        pcm, rate = _sf.read(str(path), dtype="int16")
+        prof = hf_band_profile(pcm, rate, edges)
+        quiet_hf, _share = audible_quiet_hf(pcm, rate)
+        print(f"{path.name[:33]:<34}{pcm.size / rate:6.2f}s{hf_ratio(pcm, rate) * 100:8.1f}%"
+              f"{quiet_hf:10.2f}%{floor_db(pcm, rate):8.1f}dB"
+              + "".join(f"{v:>10.1f}" for v in prof))
+    print("\n⚠️ 沙沙声看**最后两段**：10-12k 应该是负数且比 8-10k 更低；"
+          "如果它 ≥ 8-10k（或比参考高 5 dB 以上），就是沙。")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="精度 × 步数的 A/B（写出 wav + 客观指标）")
     ap.add_argument("--who", default="kaltsit,amiya", help="逗号分隔的角色 id")
@@ -307,11 +383,16 @@ def main() -> int:
     ap.add_argument("--text", default="short,long", choices=["short", "long", "short,long"])
     ap.add_argument("--precision", default="int8,fp32", help="逗号分隔的精度")
     ap.add_argument("--summary", default="", help="不重新合成，只对已有的 report.csv 出汇总表")
+    ap.add_argument("--profile", nargs="*", default=None,
+                    help="★尺子★：给若干个 wav，打「频段表」——看沙沙声在哪一段（不合成）")
     args = ap.parse_args()
 
     if args.summary:
         print_summary(read_csv(Path(args.summary)))
         return 0
+
+    if args.profile is not None:
+        return profile_report([Path(p) for p in args.profile])
 
 
     whos = [w.strip() for w in args.who.split(",") if w.strip()]

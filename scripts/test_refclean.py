@@ -62,6 +62,16 @@ def db(x: np.ndarray) -> float:
     return float(20 * np.log10(np.sqrt((x.astype(np.float64) ** 2).mean()) + 1e-12))
 
 
+def band_db(x: np.ndarray, lo: float, hi: float, rate: int = RATE) -> float:
+    """[lo, hi) 频段的平均功率（dB）——用来验「只动这一段」。"""
+    spec = np.abs(np.fft.rfft(np.asarray(x, dtype=np.float64) * np.hanning(x.size))) ** 2
+    freqs = np.fft.rfftfreq(x.size, 1.0 / rate)
+    band = (freqs >= lo) & (freqs < hi)
+    if not band.any():
+        return float("nan")
+    return float(10 * np.log10(spec[band].mean() + 1e-20))
+
+
 def main() -> int:
     print("=" * 70)
     print(" 参考音频净化 / 输出塑形 自测（纯离线）")
@@ -109,6 +119,19 @@ def main() -> int:
     check("高频段约 -6 dB", -7.0 < (db(t6[hf]) - db(mix2[hf])) < -5.0, True,
           f"{db(t6[hf]) - db(mix2[hf]):+.2f} dB")
     check("长度不变", t6.size, mix2.size)
+
+    # ★2026-09-25 新增：沙沙声住在 10~12kHz 那一层，所以要能**定向**削它而不动齿音★
+    # （实测：微调模型 10-12k 是 -8.0 dB，比它自己的 8-10k 还高 4.3 dB；真人参考是 -16.0）
+    white = noise(1.0, 0.2)
+    t10 = rc.tilt(white, RATE, 10000.0, -9.0)
+    d10 = band_db(t10, 10000, 12000) - band_db(white, 10000, 12000)
+    check(f"10kHz/-9：10-12k 段降 {d10:+.2f} dB（目标 -9）", -9.8 < d10 < -8.2, True)
+    for lo, hi, name in ((4000, 6000, "4-6k"), (6000, 8000, "6-8k")):
+        d = band_db(t10, lo, hi) - band_db(white, lo, hi)
+        check(f"10kHz/-9：{name} 段（齿音）基本不动 {d:+.2f} dB", abs(d) < 0.5, True)
+    t_hi = rc.tilt(white, RATE, 7000.0, -3.0)
+    d_hf = band_db(t_hi, 8000, 10000) - band_db(white, 8000, 10000)
+    check(f"旧设定 7kHz/-3 就是图上说的「打偏」：8-10k 被砍 {d_hf:+.2f} dB", d_hf < -2.0, True)
 
     print("\n[5] 响度归一：够到目标、且有上限")
     quiet = tone(200, 0.3, 0.01)
