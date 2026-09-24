@@ -1,14 +1,15 @@
 """文本层（voice_loop/event_text.py）的离线测试。
 
 要守住的底线：
-1. **一句话 → 事件字段**：时间、周期、地点、时长、提前量、截止日期都要对得上；
-2. ★闹钟与日程的分界不再是「有没有重复」★——而是「是不是一件占时间的事」，
-   所以「每个工作日八点半叫我起床」必须是**带周期的提醒**（旧代码会把重复踢给日程，
-   然后因为日程不认「工作日」而退化成一次性闹钟）；
-3. ★原因从句要剥掉★：「我工作日九点有课，那就需要定工作日八点半的闹钟」里有两个钟点，
+1. ★**没有「闹钟」和「日程」这两个类型了**★——只有一张可填可不填的表：
+   说了持续时间/重复规则/提前量就填上，没说就用缺省（`duration_minutes=0`、
+   `repeat` 无、`remind_before=[0]`）；
+2. ★**纯闹钟**★：可以完全没有内容（标题空），只负责准时响；
+3. ★**原因从句要剥掉**★：「我工作日九点有课，那就需要定工作日八点半的闹钟」里有两个钟点，
    不剥就会把「九点」当成闹钟时间；
-4. ★提前量不是时长★：「提前半小时」不该变成 30 分钟的会议；
-5. 播报文案分两套口径（闹钟说「时间到了」、日程说「有…」），但共用同一个函数。
+4. ★**提前量不是时长**★：「提前半小时」不该变成 30 分钟；
+5. 播报按**提前量**分口径：准时 →「时间到了，X。」；提前 →「提醒你：十分钟后…」；
+6. 端到端：一句话 → 落库 → 到期 → 播报。
 
     python scripts/test_event_text.py
 """
@@ -16,13 +17,15 @@
 from __future__ import annotations
 
 import sys
-from datetime import datetime
+import tempfile
+from datetime import datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from voice_loop import event_text as et  # noqa: E402
+from voice_loop import events as ev  # noqa: E402
 
 PASS = 0
 FAIL = 0
@@ -49,46 +52,46 @@ def fields(text: str, now: datetime = NOW) -> dict:
     return et.extract(text, now)
 
 
-# --------------------------------------------------------- 1 分界规则
-def test_classify() -> None:
-    print("\n[1] 闹钟还是日程：看「是不是一件占时间的事」")
-    check(et.classify("工作日早上八点半叫我起床"), ("reminder", ""), "只有「叫我」→ 提醒")
-    check(et.classify("每天早上七点提醒我吃药"), ("reminder", ""), "吃药 → 提醒")
-    check(et.classify("每周三上午九点提醒我上课"), ("event", "course"), "上课 → 日程（课程）")
-    check(et.classify("明天下午三点跟导师见面"), ("event", "meeting"), "见面 → 日程（会议）")
-    check(et.classify("后天下午两点的体检"), ("event", "activity"), "体检 → 日程（活动）")
-    check(et.classify("周五交作业"), ("event", "task"), "作业 → 日程（任务）")
-    check(et.classify("提醒我在图书馆还书"), ("event", ""), "有地点 → 日程（但不瞎猜类别）")
-    check(et.classify("周三上午九点到十一点开组会"), ("event", "meeting"), "有区间+会议")
-    check(et.classify("十分钟后提醒我喝水"), ("reminder", ""), "相对时间 → 提醒")
+# --------------------------------------------------------- 1 标签（不是类型）
+def test_category() -> None:
+    print("\n[1] category 只是标签（course/meeting/task/activity），不是类型")
+    check(et.classify("每周三上午九点提醒我上课"), "course", "上课 → course")
+    check(et.classify("明天下午三点跟导师见面"), "meeting", "见面 → meeting")
+    check(et.classify("后天下午两点的体检"), "activity", "体检 → activity")
+    check(et.classify("周五交作业"), "task", "作业 → task")
+    check(et.classify("十天后的考试"), "course", "考试 → course")
+    check(et.classify("工作日早上八点半叫我起床"), "", "认不出就留空，**不猜成 task**")
+    check(et.classify("AIAA3102 机器学习"), "", "认不出就留空")
 
-    check_true(et.looks_like_block("在腾讯会议面试"), "线上地点也算地点")
-    check(et.category_of("AIAA3102 机器学习"), "", "认不出类别就留空，不猜成 task")
+    # ★同一个句子不会因为「有重复」或「有地点」而变成另一种东西★
+    for text in ("每天提醒我吃药", "每天下午三点提醒我吃药", "每天在图书馆提醒我吃药"):
+        check(et.extract(text, NOW)["repeat"], "daily", f"「{text}」都是每天，类型不参与判断")
+    check(et.extract("提醒我在图书馆还书", NOW)["location"], "图书馆", "有地点就填上")
 
 
-# --------------------------------------------------------- 2 时间与周期
-def test_time() -> None:
-    print("\n[2] 时间 / 周期")
+# --------------------------------------------------------- 2 说了就填、没说就缺省
+def test_fields() -> None:
+    print("\n[2] 说了就填，没说就缺省")
     f = fields("十分钟后提醒我喝水")
     check(f["start"].strftime("%H:%M"), "12:10", "「十分钟后」= 现在 + 10 分钟")
-    check(f["repeat"], "once", "没写重复 → 一次性")
-    check(f["remind_before"], [0], "闹钟默认到点提醒")
+    check(f["repeat"], "once", "没说重复 → 一次性")
+    check(f["remind_before"], [0], "★没说提前 → [0]（准时）★")
+    check(f["duration_minutes"], 0, "★没说时长 → 0★")
+    check(f["location"], "", "没说地点 → 空")
+    check(f["category"], "", "认不出标签 → 空")
 
     f = fields("每天早上七点提醒我吃药")
-    check((f["kind"], f["repeat"], f["time"]), ("reminder", "daily", "07:00"), "每天 = 固定钟点")
+    check((f["repeat"], f["time"]), ("daily", "07:00"), "每天 = 固定钟点")
     check(f["start"].strftime("%m-%d %H:%M"), "09-19 07:00", "今天七点已经过了 → 明天")
-
-    f = fields("每天早上七点提醒我吃药，到12月底为止")
-    check(str(f["until"]), "2026-12-31", "「到…为止」→ until")
 
     f = fields("每天提醒我吃药")
     check(f["time"], "09:00", "循环但没说钟点 → 默认 09:00（不能用「现在」，会跟着说话时刻漂）")
 
+    f = fields("每天早上七点提醒我吃药，到12月底为止")
+    check(str(f["until"]), "2026-12-31", "「到…为止」→ until")
+
     f = fields("每周交周报")
     check((f["repeat"], f["weekday"]), ("weekly", 4), "「每周」没写星期几 → 按说话这天（周五）")
-
-    f = fields("每周三上午九点提醒我上课")
-    check((f["repeat"], f["weekday"], f["time"]), ("weekly", 2, "09:00"), "每周三")
 
     f = fields("每两周周三下午两点开组会")
     check((f["repeat"], f["weekday"]), ("biweekly", 2), "每两周")
@@ -103,39 +106,9 @@ def test_time() -> None:
     check(f["duration_minutes"], 90, "3 点到 4 点半 = 90 分钟")
     check(f["start"].strftime("%m-%d %H:%M"), "09-19 15:00", "明天下午三点")
 
-
-# --------------------------------------------------------- 3 用户的真实场景
-def test_recurring_reminder() -> None:
-    print("\n[3] ★闹钟也能重复★（旧设计做不到的那件事）")
-    f = fields("工作日早上八点半叫我起床")
-    check((f["kind"], f["repeat"], f["time"]), ("reminder", "weekdays", "08:30"), "工作日 8:30 的闹钟")
-    check(f["title"], "起床", "标题只留事情本身")
-    check(f["remind_before"], [0], "到点提醒")
-    item = et.to_item(f)
-    check(item["kind"], "reminder", "落库是 reminder")
-    check(item["repeat"], "weekdays", "★重复真的写进去了★")
-    check(et.render_added(item, f["start"], NOW),
-          "好，已记下：每个工作日 08:30，起床。", "确认话术")
-
-    # 原因从句里有两个钟点，必须只用要求那半句的
-    f = fields("我工作日早上9点有课，那就需要定所有工作日早上八点半的闹钟")
-    check(f["time"], "08:30", "★取「闹钟」那半句的钟点，不是「有课」的九点★")
-    check(f["repeat"], "weekdays", "周期还是工作日")
-    check(f["title"], "上课", "没说清干什么 → 用原因从句的「有课」兜底")
-
-    f = fields("每周三上午九点提醒我上课，提前半小时")
-    check(f["remind_before"], [30], "提前半小时 → 提前量")
-    check(f["duration_minutes"], 0, "★提前量不能变成时长★")
-    check(f["start"].strftime("%m-%d %H:%M"), "09-23 09:00", "锚点落在下一个周三")
-
-
-# --------------------------------------------------------- 4 地点 / 备注 / 标题
-def test_extra_fields() -> None:
-    print("\n[4] 地点 / 备注 / 标题")
     f = fields("每周三上午九点有 AIAA3102 机器学习，地点教学楼 A302")
     check(f["location"], "教学楼 A302", "写「地点」就取到")
     check(f["title"], "AIAA3102机器学习", "标题去掉时间与空格")
-    check((f["repeat"], f["weekday"]), ("weekly", 2), "每周三")
 
     f = fields("提醒我在腾讯会议面试")
     check(f["location"], "腾讯会议", "没写「地点」也认得出线上地点")
@@ -146,50 +119,87 @@ def test_extra_fields() -> None:
     f = fields("把后天下午两点的体检记上")
     check((f["title"], f["location"]), ("体检", ""), "「把…记上」不该进标题")
 
+
+# --------------------------------------------------------- 3 重复的闹钟（旧设计做不到）
+def test_recurring_reminder() -> None:
+    print("\n[3] ★闹钟也能重复★（旧设计里这条路径被让位规则堵住了）")
+    f = fields("工作日早上八点半叫我起床")
+    check((f["repeat"], f["time"]), ("weekdays", "08:30"), "工作日 8:30")
+    check(f["title"], "起床", "标题只留事情本身")
+    check(f["remind_before"], [0], "准时")
+    item = et.to_item(f)
+    check(item["repeat"], "weekdays", "★重复真的写进去了★")
+    check_true("kind" not in item, "★落库的条目里没有 kind★")
+    check(et.render_added(item, f["start"], NOW),
+          "好，已记下：每个工作日 08:30，起床。", "确认话术")
+
+    # 原因从句里有两个钟点，必须只用要求那半句的
+    f = fields("我工作日早上9点有课，那就需要定所有工作日早上八点半的闹钟")
+    check(f["time"], "08:30", "★取「闹钟」那半句的钟点，不是「有课」的九点★")
+    check(f["repeat"], "weekdays", "周期还是工作日")
+    check(f["title"], "上课", "没说清干什么 → 用原因从句的「有课」兜底")
+    check(f["category"], "course", "标签也用得上")
+
+    f = fields("每周三上午九点提醒我上课，提前半小时")
+    check(f["remind_before"], [30], "提前半小时 → 提前量")
+    check(f["duration_minutes"], 0, "★提前量不能变成时长★")
+    check(f["start"].strftime("%m-%d %H:%M"), "09-23 09:00", "锚点落在下一个周三")
+
+
+# --------------------------------------------------------- 4 纯闹钟
+def test_pure_alarm() -> None:
+    print("\n[4] ★纯闹钟：没有内容也能用★")
     f = fields("工作日早上八点半的闹钟")
-    check(f["title"], "", "没说干什么 → 标题留空，让 handler 去追问")
-
-
-# --------------------------------------------------------- 5 播报口径
-def test_render() -> None:
-    print("\n[5] 播报文案（同一个函数，两套口径）")
+    check(f["title"], "", "没说干什么 → 标题空着（不是报错）")
+    check((f["repeat"], f["time"]), ("weekdays", "08:30"), "时间和周期照样认得出")
+    item = et.to_item(f)
+    check(ev.title_of(item), "", "落库后真的没有标题")
+    check(ev.display_title(item), "闹钟", "列表里显示「闹钟」")
     start = datetime(2026, 9, 21, 8, 30)
-    reminder = et.to_item(fields("工作日早上八点半叫我起床"))
-    check(et.render_fire(reminder, start, start, 0), "时间到了，起床。", "闹钟到点")
+    check(et.render_fire(item, start, start, 0), "时间到了。", "播报：时间到了。")
+
+    f = fields("一个小时后提醒我")
+    check(f["title"], "", "「提醒我」后面没内容 → 纯闹钟")
+    check(f["start"].strftime("%H:%M"), "13:00", "时间认得出")
+
+    check(ev.needs_confirm(et.to_item(fields("喝水", NOW))), False, "一次性的删改不用确认")
+    check(ev.needs_confirm(et.to_item(fields("每天吃药", NOW))), True, "★重复的删改要确认★")
+
+
+# --------------------------------------------------------- 5 播报
+def test_render() -> None:
+    print("\n[5] 播报按**提前量**分口径（不是按类型）")
+    start = datetime(2026, 9, 21, 8, 30)
+    alarm = et.to_item(fields("工作日早上八点半叫我起床"))
+    check(et.render_fire(alarm, start, start, 0), "时间到了，起床。", "准时（闹钟口径）")
 
     event = et.to_item(fields("每周一上午十点开组会，地点教学楼 A302"))
     now = datetime(2026, 9, 21, 9, 50)
     check(et.render_fire(event, datetime(2026, 9, 21, 10, 0), now, 10),
-          "提醒你：十分钟后，也就是10:00，有开组会，地点教学楼 A302。",
-          "日程提前 10 分钟")
-    check(et.render_fire(event, datetime(2026, 9, 21, 10, 0), datetime(2026, 9, 21, 10, 0), 0),
-          "提醒你：现在就是10:00，有开组会，地点教学楼 A302。", "日程到点")
+          "提醒你：十分钟后，也就是10:00，开组会，地点教学楼 A302。", "提前 10 分钟")
+    ten = datetime(2026, 9, 21, 10, 0)
+    check(et.render_fire(event, ten, ten, 0), "时间到了，开组会，地点教学楼 A302。",
+          "同一件事准时的口径和闹钟一样")
 
     check(et.leads_text([1440, 30]), "我会提前一天和提前三十分钟提醒你。", "多个提前量说人话")
-    check(et.leads_text([0]), "我会到点提醒你。", "只有到点")
-    check(et.when_text(reminder), "每个工作日 08:30", "周期说人话")
+    check(et.leads_text([0]), "我会到点提醒你。", "只有准时")
+    check(et.when_text(alarm), "每个工作日 08:30", "周期说人话")
     check(et.norm_title(" 机器学习_1 "), "机器学习1", "标题归一化")
 
 
+# --------------------------------------------------------- 6 端到端
 def test_end_to_end() -> None:
-    """一句话 → 落库 → 到期 → 播报。这一步是为了在**删掉旧处理器之前**证明新栈是通的。"""
-    import tempfile
-    from datetime import timedelta
-
-    from voice_loop import events as ev
-
+    """一句话 → 落库 → 到期 → 播报。在**删掉旧处理器之前**证明新栈是通的。"""
     print("\n[6] 端到端：一句话 → 落库 → 到期 → 播报")
     with tempfile.TemporaryDirectory() as td:
-        store = ev.EventStore(Path(td) / "events.json", default_lead=10)
+        store = ev.EventStore(Path(td) / "events.json")
 
-        # 用户的原句：工作日 8:30 的起床提醒
         f = et.extract("我工作日早上9点有课，那就需要定所有工作日早上八点半的闹钟", NOW)
         item = store.append(et.to_item(f))
         check(item.get("id"), 1, "落库拿到 id")
-        check((item["kind"], item["repeat"], item["time"], item["title"]),
-              ("reminder", "weekdays", "08:30", "上课"), "库里的样子")
+        check((item["repeat"], item["time"], item["title"]), ("weekdays", "08:30", "上课"),
+              "库里的样子")
 
-        # 周末不响，工作日到点才响
         sat = datetime(2026, 9, 19, 8, 30)      # 星期六
         check(store.due_now(sat), [], "★周六 8:30 不响★")
         mon = datetime(2026, 9, 21, 8, 30)      # 星期一
@@ -201,35 +211,38 @@ def test_end_to_end() -> None:
         check(store.due_now(mon), [], "同一次不会响第二遍")
         check(len(store.due_now(mon + timedelta(days=1))), 1, "周二照响")
 
-        # 日程带提前量：提前 10 分钟先响，到点再响一次
+        # ★关机/服务停了三天后回来★：重复事件只认窗口内那次（下次很快就到），
+        # 一次性事件补报（错过的那件事还是要提)
+        check(store.due_now(mon + timedelta(days=3, hours=1)), [], "重复事件不补报三小时前那次")
+        missed = store.append(et.to_item(et.extract("十分钟后提醒我关火", NOW)))
+        late = NOW + timedelta(hours=5)                     # 17:00，远远错过了 12:10
+        fired = [i["title"] for i, _s, _l in store.due_now(late)]
+        check(fired, ["关火"], "★一次性补报，重复的不补★")
+
+        # 提前量：说了才提前
         g = et.extract("每周一上午十点到十一点半开组会，地点教学楼 A302", NOW)
         event = store.append(et.to_item(g))
         check((event["repeat"], event["weekday"], event["duration_minutes"], event["location"]),
-              ("weekly", 0, 90, "教学楼 A302"), "日程落库")
-        early = store.due_now(datetime(2026, 9, 21, 9, 50))
-        check([(lead, et.render_fire(it, st, datetime(2026, 9, 21, 9, 50), lead))
-               for it, st, lead in early],
-              [(10, "提醒你：十分钟后，也就是10:00，有开组会，地点教学楼 A302。")], "提前 10 分钟那次")
-        check(ev.leads_of(event), [10], "日程默认只提前 10 分钟")
-        check(store.due_now(datetime(2026, 9, 21, 10, 0)), [],
-              "没要「到点」就不在 10:00 再响一次（和旧 due_schedule 一致）")
+              ("weekly", 0, 90, "教学楼 A302"), "日程字段落库")
+        check(ev.leads_of(event), [0], "★没说提前 → 准时★")
+        check(store.due_now(datetime(2026, 10, 5, 9, 50)), [], "9:50 不响（没要提前）")
+        got = store.due_now(datetime(2026, 10, 5, 10, 0))
+        check([(i["title"], et.render_fire(i, s, datetime(2026, 10, 5, 10, 0), lead))
+               for i, s, lead in got],
+              [("开组会", "时间到了，开组会，地点教学楼 A302。")], "10:00 准时响")
 
-        # 说了「到点」才两段都响
         h = et.extract("每周一上午十点开组会，提前10分钟和到点提醒我", NOW)
         item2 = store.append(et.to_item(h))
-        check(ev.leads_of(item2), [10, 0], "要了到点就有两段")
-        # 注意只数「开组会」：闹钟那条会在这里补报错过的 08:30（见 events.due 的策略差异）
-        fired = store.due_now(datetime(2026, 9, 28, 9, 50))
-        check(sum(1 for it, _, _ in fired if it["title"] == "开组会"), 2, "下一周提前 10 分钟响")
-        fired = store.due_now(datetime(2026, 9, 28, 10, 0))
-        check(sum(1 for it, _, _ in fired if it["title"] == "开组会"), 1, "下一周到点响（只有要了到点那条）")
+        check(ev.leads_of(item2), [10, 0], "要了提前就有两段")
+        check(len(store.due_now(datetime(2026, 10, 12, 9, 50))), 1, "下一周提前 10 分钟响（只有要了提前那条）")
+        check(len(store.due_now(datetime(2026, 10, 12, 10, 0))), 2, "下一周准时响（两条都是准时的）")
 
 
 def main() -> int:
-    test_classify()
-    test_time()
+    test_category()
+    test_fields()
     test_recurring_reminder()
-    test_extra_fields()
+    test_pure_alarm()
     test_render()
     test_end_to_end()
     print(f"\n{'=' * 60}\n通过 {PASS}，失败 {FAIL}")

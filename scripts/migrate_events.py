@@ -11,11 +11,15 @@
 2. 旧文件**不删**（过渡期两边都在，出问题可以直接拷回去）；
 3. 写完立刻读回来核对一遍（条数、fired、skipped、链），不一致就报错并**回滚**。
 
-映射规则（新 schema 本来就是旧 schedule 的超集，所以几乎是改个名）：
+映射规则（新 schema 本来就是旧 schedule 的超集，而且**连类型都没有**）：
 
-    alarms.json   {when, what, fired}          → {kind: reminder, title, start, remind_before: [0]}
-    schedule.json {title, kind, _fired, skip}  → {kind: event, category, state: {fired, skipped}}
-    ★「闹钟」就是「提前量 0、没有重复规则的 event」★——见 voice_loop/events.py 的模块说明。
+    alarms.json   {when, what, fired}          → {title, start, remind_before: [0]}   （无 repeat = 只响一次）
+    schedule.json {title, kind, _fired, skip}  → {title, category: <原 kind>, state: {fired, skipped}}
+
+★闹钟和日程不再是两个类型★：一张可填可不填的表，说了重复/时长/提前量就填上，
+没说就用缺省（``duration_minutes=0``、无 ``repeat``、``remind_before=[0]``）。
+旧文件里的 ``kind`` 只剩日程那个能当**标签**用（course/meeting/task）。
+详见 voice_loop/events.py 的模块说明。
 """
 
 from __future__ import annotations
@@ -45,12 +49,12 @@ def _load_raw(path: Path) -> list[dict]:
 
 
 def _fmt(item: dict) -> str:
-    kind = item.get("kind")
     st = item.get("state") or {}
-    bits = [f"#{item.get('id')}", f"{kind:<8}", str(item.get("start"))[:16],
-            str(item.get("title") or "")[:18]]
-    if item.get("repeat"):
-        bits.append(f"repeat={item['repeat']}")
+    tags = [str(item.get("category") or ""), ev.repeat_text(item)]
+    lead = ev.leads_of(item)
+    tags.append("准时" if lead == [0] else "提前" + ",".join(str(x) for x in lead))
+    bits = [f"#{item.get('id')}", f"{'/'.join(t for t in tags if t):<16}",
+            str(item.get("start"))[:16], str(ev.display_title(item))[:18]]
     if st.get("fired"):
         bits.append(f"fired×{len(st['fired'])}")
     if st.get("skipped"):

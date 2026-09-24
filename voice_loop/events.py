@@ -7,30 +7,29 @@
     data/alarms.json    {when, what, fired}                       ← 一次性响一声
     data/schedule.json  {title, repeat, start, time, remind_before, skip, _fired, …}
 
-它们的区别其实只有三处**属性**，不是三种东西：
+先合并成一种事件之后，还剩下一个 `kind` 字段把闹钟/日程贴成两种东西。
+**那一步也去掉了**：它们真正的区别只有三条**可选属性**，而不是三种东西：
 
-| 维度 | 闹钟 | 日程 |
+| 维度 | 缺省（旧叫「闹钟」） | 说了才加上（旧叫「日程」） |
 |---|---|---|
-| 时间 | 一个时刻 | 一个时刻 +（可选）重复规则 |
-| 提醒 | 到点响（= 提前量 0） | 可配多个提前量 `[1440, 30, 0]` |
-| 去重 | `fired` 一维 | `(发生时间, 提前量)` 二维 |
-| 操作 | 只能按序号/时间取消 | 能改、删、跳过一次、按名字找 |
+| 重复 | 无（一次） | `repeat` + `weekday`/`day`/`every_days`… |
+| 时长 | `0`（不占时间） | `duration_minutes` |
+| 提前量 | `[0]`（准时响） | `[1440, 30, 0]`（说了「提前」才有） |
 
-所以现在只有一种 **事件**：
+所以一个事件就是**一张可填可不填的表**：
 
 ```jsonc
 {
   "id": 7,
-  "kind": "event",                  // reminder（叫一声）| event（要占时间的事）
-  "title": "组会",
-  "category": "meeting",            // 可选：course / meeting / task，只影响文案
+  "title": "组会",                 // 可为空 = 纯闹钟（只响，不带内容）
+  "category": "meeting",            // 可选**标签**（course/meeting/task/activity），只用于筛选与文案
   "start": "2026-09-23 15:30:00",   // 一次性时刻（秒级——「十分钟后」也是它）
-  "repeat": "weekly",               // 缺省 = once（= 原来的闹钟）
+  "repeat": "weekly",               // 缺省 = 一次
   "weekday": 2, "day": 5, "month": 3, "every_days": 3, "every_minutes": 30,
-  "time": "09:00",                  // 重复时的钟点
-  "duration_minutes": 0,            // 0 = 不占时间
+  "time": "09:00",                 // 重复时的钟点
+  "duration_minutes": 0,            // 缺省 0
   "location": "", "note": "",
-  "remind_before": [0],            // 提前量数组；闹钟就是 [0]
+  "remind_before": [0],             // 缺省 [0] = 准时响；要提前得说
   "until": "",                      // 截止日期
   "chain": {"after": 3, "on": "done", "then": "notify"},   // 事件链（可选）
   "state": {"fired": [], "done": [], "skipped": []},
@@ -38,9 +37,8 @@
 }
 ```
 
-**「闹钟」= `repeat` 缺省 + `remind_before: [0]` 的 reminder**，
-所以旧的两个文件都能一对一映射过来（见 :func:`migrate_legacy`），
-而「提醒」「日程」「事件链」共用同一个到期引擎 :func:`due`。
+★「闹钟」不存在了★：它是一个 `remind_before: [0]` 且没有 `repeat`/`duration` 的普通事件，
+所以「闹钟」也能重复（每个工作日 8:30 那种），不需要任何特殊分支。
 
 ## 三种状态分开记（这是统一的代价，也是收益）
 
@@ -52,13 +50,10 @@
 但「这一次来没来过」是**条目级**的事实（done/skipped 是**每次**的，但语义不同）。
 混在一个布尔里就会出现「今天的课完成过 → 下周的课不再提醒」这种 bug。
 
-## 兼容窗口
+## 重复事件的删改要确认
 
-`view(kind)` 返回一个**只按 kind 过滤、不改字段名**的视图，`skills.alarms` / `skills.schedule`
-现在还挂在它上面。它**不做任何字段翻译**——因为统一后的 schema 本来就用
-`title` / `start` / `repeat` / `remind_before` 这些旧日程字段名（旧日程那套名字就很好），
-所以唯一变的是「闹钟」那三个名字：`when → start`、`what → title`、`fired → state.fired`。
-新代码一律直接用 `EventStore`，视图只给旧调用点过渡。
+删除或修改一条**带重复**的事件影响的不只是一次（是往后所有次），所以
+:func:`needs_confirm` 给调用方一个明确的判据；纯闹钟（无重复）直接做就行。
 """
 
 from __future__ import annotations
@@ -73,10 +68,9 @@ from .store import JsonStore
 
 # ----------------------------------------------------------------- 常量与归一
 REPEATS = ("once", "daily", "weekdays", "weekly", "biweekly", "monthly", "yearly", "interval")
-KINDS = ("reminder", "event")
-DEFAULT_LEAD = 10          # 没有 remind_before 时的默认提前量（分钟）
+DEFAULT_LEAD = 0           # 默认**准时响**（闹钟的本质）；要提前必须说「提前…」
 FIRED_KEEP = 40            # state.fired 最多留多少条
-LEAD_GRACE = timedelta(minutes=5)   # 「到点那一次」允许迟到多久还算数
+LEAD_GRACE = timedelta(minutes=5)   # 重复事件的「到点那一次」允许迟到多久还算数
 
 _REPEAT_ALIASES = {
     "每周": "weekly", "周": "weekly", "星期": "weekly", "每周重复": "weekly",
@@ -92,19 +86,33 @@ _REPEAT_ALIASES = {
 
 
 def repeat_of(item: dict) -> str:
-    """把各种写法的 repeat 归一成 once / weekly / biweekly / monthly / yearly / interval。"""
+    """把各种写法的 repeat 归一成 once / daily / weekdays / weekly / biweekly / monthly / yearly / interval。"""
     raw = str(item.get("repeat", "once")).strip().lower()
     if raw in REPEATS:
         return raw
     return _REPEAT_ALIASES.get(raw, "once")
 
 
-def kind_of(item: dict) -> str:
-    """``reminder`` = 叫一声；``event`` = 要占时间的事。认不出来就当 event。"""
-    raw = str(item.get("kind", "")).strip().lower()
-    if raw in KINDS:
-        return raw
-    return "reminder" if raw == "alarm" else "event"
+def has_repeat(item: dict) -> bool:
+    return repeat_of(item) != "once"
+
+
+def needs_confirm(item: dict) -> bool:
+    """删改前要不要先问一句——**带重复的事件**影响往后所有次，得确认。
+
+    纯闹钟（一次）直接做：用户说「取消那个闹钟」就是那个闹钟。
+    """
+    return has_repeat(item)
+
+
+def title_of(item: dict) -> str:
+    """内容；**空是合法的**（纯闹钟只负责响，不带内容）。"""
+    return str(item.get("title") or item.get("what") or "").strip()
+
+
+def display_title(item: dict) -> str:
+    """列表/日志里显示的名字（空的就写「闹钟」）。"""
+    return title_of(item) or "闹钟"
 
 
 def parse_dt(value: Any) -> datetime | None:
@@ -130,7 +138,7 @@ def until_of(item: dict) -> date | None:
 
 
 def leads_of(item: dict, default: int = DEFAULT_LEAD) -> list[int]:
-    """提前提醒的分钟数组（0 = 到点）。兼容旧数据的整数写法。"""
+    """提前提醒的分钟数组（0 = 准时）。兼容旧数据的整数写法。"""
     raw = item.get("remind_before", item.get("notify"))
     if raw is None:
         raw = default
@@ -442,13 +450,13 @@ def due(
 ) -> list[tuple[dict, datetime, int]]:
     """到点的 (事件, 发生时间, 提前量)；**会就地写回 state.fired**。
 
-    两种事件共用这一条路径（都是「(发生时间, 提前量) 到点了没播过」），
-    只有两处策略不同，而且都是故意的：
+    一条路径（都是「(发生时间, 提前量) 到点了没播过」），只有**两处策略不同**，
+    而且都是故意的——现在按「一次性 / 重复」分，而不是按闹钟/日程分（没有那个字段了）：
 
-    * ``reminder``（闹钟）：一次性闹钟**没有回看上限**——机器关机、服务没跑时错过的，
-      回来以后仍然该提醒你（原来 ``due_alarms`` 就是这样）；
-    * ``event``（日程）：提前量为 0 的那次只在 :data:`LEAD_GRACE` 内算数——
-      三天前那节课的「开始了」现在再播一遍毫无意义（原来 ``due_schedule`` 就是这样）。
+    * **一次性**（没有重复规则）：无回看上限——就是闹钟的语义，机器关机、服务没跑时
+      错过的，回来以后仍然要响（「两点的会」不能因为电脑睡着了就不提）；
+    * **重复**：提前量为 0 的那次只在 :data:`LEAD_GRACE` 内算数——三天前那节课的
+      「开始了」现在再播一遍毫无意义，而下一次很快就到。
 
     ★看的时间窗是 ``now + 最大提前量`` 而不是 ``now``★：提前 30 分钟的提醒
     必须在「开始时间之前」就发出来，只盯着已经过去的时刻是永远发不出来的。
@@ -458,14 +466,16 @@ def due(
     """
     out: list[tuple[dict, datetime, int]] = []
     for item in items:
-        kind = kind_of(item)
+        recurring = has_repeat(item)
         leads = leads_of(item, default_lead)
         max_lead = max(leads) if leads else 0
-        if kind == "reminder" and repeat_of(item) == "once":
+        if not recurring:
+            # 一次性：直接以锚点为唯一候选，不做回看截断（见上面的策略说明）
             anchor = anchor_of(item)
             candidates = [anchor] if anchor is not None else []
+            lookback = timedelta(0)
         else:
-            lookback = LEAD_GRACE if kind == "event" else timedelta(days=1)
+            lookback = LEAD_GRACE
             candidates = occurrences(item, now - timedelta(minutes=max_lead) - lookback, limit=4)
         horizon = now + timedelta(minutes=max_lead)
         for start in candidates:
@@ -475,8 +485,8 @@ def due(
                 fire_at = start - timedelta(minutes=lead)
                 if fire_at > now:
                     continue
-                if kind == "event" and lead == 0 and now >= start + LEAD_GRACE:
-                    continue   # 迟太久的那次不算（见上面的策略说明）
+                if recurring and lead == 0 and now >= start + LEAD_GRACE:
+                    continue   # 重复事件迟太久的那次不算（见上面的策略说明）
                 if is_fired(item, start, lead):
                     continue
                 if chain_blocked(item, start, items, now):
@@ -539,9 +549,13 @@ class EventStore:
 
     # ------------------------------------------------------------ 字段归一
     def normalize(self, item: dict) -> dict:
-        """补齐默认值、把可省的字段去掉（写进文件的要干净）。"""
+        """补齐默认值、把可省的字段去掉（写进文件的要干净）。
+
+        ★默认提前量是 ``[0]``（准时）★：没有 ``remind_before`` 的事件就是闹钟，
+        不会因为忘了写就变成「提前 10 分钟」那种猜出来的行为。
+        """
         out = {k: v for k, v in item.items() if v not in (None, "", [], {})}
-        out["kind"] = kind_of(item)
+        out.pop("kind", None)                    # 旧字段：现在不区分闹钟/日程
         st = state_of(item)
         if any(st.values()):
             out["state"] = {k: v for k, v in st.items() if v}
@@ -551,19 +565,8 @@ class EventStore:
             out["title"] = item["what"]          # 旧闹钟字段
         if "start" not in out and item.get("when"):
             out["start"] = item["when"]
-        out.setdefault("remind_before", [0] if out["kind"] == "reminder" else [self.default_lead])
+        out.setdefault("remind_before", [DEFAULT_LEAD])
         return out
-
-    # -------------------------------------------------------------- 视图
-    def view(self, kind: str) -> "KindView":
-        """只看某一类事件（``reminder`` / ``event``）的视图，**不改字段名**。"""
-        return KindView(self, kind)
-
-    def reminders(self) -> "KindView":
-        return KindView(self, "reminder")
-
-    def schedules(self) -> "KindView":
-        return KindView(self, "event")
 
     # ------------------------------------------------------------ 到期封装
     def due_now(self, now: datetime) -> list[tuple[dict, datetime, int]]:
@@ -589,12 +592,13 @@ def migrate_legacy(alarm_file: Path, schedule_file: Path) -> tuple[list[dict], d
     """把旧的两个文件读成一套事件。返回 (items, 统计)。
 
     想迁完再去重、而且带备份：落在哪、怎么写由调用方决定（见 scripts/migrate_events.py）。
-    映射规则很简单，因为新 schema 本来就是旧 schedule 的超集：
+    ★旧文件里的 ``kind`` 不再带过来★——新 schema 不区分闹钟/日程，
+    只把日程的 ``kind: course/meeting/task`` 转成**标签** ``category``：
 
         alarms.json   {when, what, fired}
-            → {kind: reminder, title: what, start: when, remind_before: [0], state.fired: […]}
+            → {title: what, start: when, remind_before: [0], state.fired: […]}   （无 repeat = 闹钟）
         schedule.json {title, kind: course/meeting, _fired, skip, …}
-            → {kind: event, category: <原 kind>, …, state: {fired, skipped}}
+            → {title, category: <原 kind>, … , state: {fired, skipped}}
     """
     items: list[dict] = []
     stats = {"alarm": 0, "schedule": 0, "fired": 0, "skipped": 0}
@@ -613,17 +617,18 @@ def migrate_legacy(alarm_file: Path, schedule_file: Path) -> tuple[list[dict], d
         if not when:
             continue
         item: dict = {
-            "kind": "reminder",
-            "title": str(old.get("what") or old.get("title") or "提醒"),
+            # 标题可以是空串（纯闹钟）——旧数据里 what 可能没写
+            "title": str(old.get("what") or old.get("title") or ""),
             "start": when,
             "remind_before": [0],
         }
+        item = {k: v for k, v in item.items() if v not in (None, "", [])}
         for key in ("id", "created_at", "_note"):
             if old.get(key) is not None:
                 item[key] = old[key]
         st: dict[str, list[str]] = {}
         if old.get("fired"):
-            # 旧的一维 fired → 新的二维键（提前量 0 就是那次「到点」）
+            # 旧的一维 fired → 新的二维键（提前量 0 就是那次「准时」）
             dt = parse_dt(when)
             if dt is not None:
                 st["fired"] = [fired_key(dt, 0)]
@@ -640,9 +645,9 @@ def migrate_legacy(alarm_file: Path, schedule_file: Path) -> tuple[list[dict], d
         if not title:
             continue
         item = {k: v for k, v in old.items() if not k.startswith("_") or k == "_note"}
-        item["kind"] = "event"
+        item.pop("kind", None)                   # 旧类型字段不再保留
         cat = str(old.get("kind") or "").strip()
-        if cat in ("course", "meeting", "task"):
+        if cat in ("course", "meeting", "task", "activity"):
             item["category"] = cat
         item.pop("kind_original", None)
         st = {}
@@ -665,75 +670,9 @@ def migrate_legacy(alarm_file: Path, schedule_file: Path) -> tuple[list[dict], d
     return items, stats
 
 
-class KindView:
-    """只看某一类事件的视图——**只过滤，不改字段名**。
-
-    `skills.alarms` / `skills.schedule` 现在还挂在它上面，让旧调用点与那 170 多处断言
-    继续可用，同时保证库里只有一份数据。三条规矩：
-
-    * ``load()`` 返回**库里的原对象**（不是副本）——旧代码有「就地改字段再 save」的写法，
-      返回副本会把改动弄丢；
-    * ``save(items)`` 只替换**这一类**，另一类原样保留（否则闹钟一保存就把日程洗掉）；
-    * ``append`` 强制把 kind 写成这一类（调用方不用记得写）。
-    """
-
-    def __init__(self, store: EventStore, kind: str) -> None:
-        self.store = store
-        self.kind = kind
-
-    @property
-    def path(self) -> Path:
-        return self.store.path
-
-    def _mine(self, item: dict) -> bool:
-        return kind_of(item) == self.kind
-
-    def load(self, force: bool = False) -> list[dict]:
-        return [it for it in self.store.load(force=force) if self._mine(it)]
-
-    def save(self, items: list[dict]) -> None:
-        others = [it for it in self.store.load() if not self._mine(it)]
-        mine = []
-        for item in items:
-            new = dict(item)
-            new["kind"] = self.kind
-            mine.append(self.store.normalize(new))
-        self.store.save(others + mine)
-
-    def append(self, item: dict) -> dict:
-        new = dict(item)
-        new["kind"] = self.kind
-        return self.store.append(new)
-
-    def update(self, index: int, **fields: Any) -> dict | None:
-        """index 是「这一类里的第几个」（和旧代码的语义一致）。"""
-        mine = self.store.find(self._mine)
-        if not (1 <= index <= len(mine)):
-            return None
-        real_index, _item = mine[index - 1]
-        return self.store.update(real_index, **fields)
-
-    def remove_at(self, index: int) -> dict | None:
-        mine = self.store.find(self._mine)
-        if not (1 <= index <= len(mine)):
-            return None
-        return self.store.remove_at(mine[index - 1][0])
-
-    def remove_where(self, predicate) -> list[dict]:
-        return self.store.remove_where(lambda it: self._mine(it) and predicate(it))
-
-    def clear(self) -> int:
-        return len(self.store.remove_where(self._mine))
-
-    def find(self, predicate) -> list[tuple[int, dict]]:
-        """返回 (这一类里的序号, 元素)，序号从 1 开始。"""
-        return [(i, it) for i, it in enumerate(self.load(), start=1) if predicate(it)]
-
-
 def new_event(
-    title: str,
+    title: str = "",
     *,
-    kind: str = "event",
     start: str = "",
     repeat: str = "",
     remind_before: list[int] | None = None,
@@ -745,19 +684,23 @@ def new_event(
     chain: dict | None = None,
     **extra: Any,
 ) -> dict:
-    """建一条事件（只填有用的字段，保持文件干净）。"""
-    item: dict = {"kind": kind, "title": title}
+    """建一条事件（只填有用的字段，保持文件干净）。
+
+    ``title`` 和 ``remind_before`` 都可以省：省掉就是一条纯闹钟
+    （只负责准时响，不带内容）。
+    """
+    item: dict = {}
+    if title:
+        item["title"] = title
     if category:
         item["category"] = category
     if start:
         item["start"] = start
     if repeat and repeat != "once":
         item["repeat"] = repeat
-    # ★闹钟是「提前量 0」的事件★：reminder 一律显式写 [0]，event 用调用方给的（空就交给默认）
+    # 提前量：没写就不写进文件（读的时候用默认值 [0] = 准时）
     if remind_before:
         item["remind_before"] = sorted({int(x) for x in remind_before}, reverse=True)
-    elif kind == "reminder":
-        item["remind_before"] = [0]
     if duration_minutes:
         item["duration_minutes"] = int(duration_minutes)
     if location:
@@ -774,11 +717,13 @@ def new_event(
 
 def describe(item: dict) -> str:
     """一行人类可读的描述（日志、`main.py skills` 用）。"""
-    rep = repeat_of(item)
-    start = item.get("start") or ""
-    when = "一次性" if rep == "once" else f"重复({rep})"
-    extra = f" 链←{item['chain'].get('after')}" if isinstance(item.get("chain"), dict) else ""
-    return f"[{item.get('id')}] {kind_of(item):<8} {when} {start} {item.get('title')}{extra}"
+    when = repeat_text(item) or "一次性"
+    leads = leads_of(item)
+    lead = "准时" if leads == [0] else "提前" + ",".join(str(x) for x in leads)
+    chain = item.get("chain")
+    extra = f" 链←{chain.get('after')}" if isinstance(chain, dict) else ""
+    return (f"[{item.get('id')}] {when} {lead} {item.get('start') or ''} "
+            f"{display_title(item)}{extra}")
 
 
 # 周期 → 人话（列表和回复都用它，别再各写一份）

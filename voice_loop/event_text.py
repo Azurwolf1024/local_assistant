@@ -7,26 +7,27 @@
 后果是「每个工作日八点半叫我起床」这种再普通不过的话被踢到日程那边，而日程只认
 「每周X / 每N天」，最后只能存成一条**不会重复**的闹钟。
 
-现在只有一条规则：
+现在没有「闹钟」和「日程」这两个类型了，只有**一张可填可不填的表**：
 
-    ★kind 不是「有没有重复」决定的★
-    闹钟和日程都能重复、都能有提前量、都能带地点/时长/截止日期；
-    kind 只决定**播报口径**和**默认提前量**：
-        reminder（闹钟）→ 「时间到了，起床。」        默认到点提醒（[0]）
-        event（日程）  → 「提醒你：10 分钟后…有课」  默认提前 10 分钟
+    ★说了就加上，没说就缺省★
 
-    ★分界看「这是不是一件占时间的事」★
-    有事件名词（课/会议/约/活动/考试…）、有地点、有时长、有「A 点到 B 点」
-    → event；只说「提醒我 / 叫我 / 喊我」→ reminder。
+| 字段 | 缺省 | 说了什么才加 |
+|---|---|---|
+| `title` | 空（**纯闹钟**：只负责准时响） | 「提醒我吃药」→ 吃药 |
+| `remind_before` | `[0]`（准时） | 「提前半小时」→ `[30, 0]` 等 |
+| `repeat` + `weekday`/`day`/… | 无（一次） | 「每周三／工作日／每天」 |
+| `duration_minutes` | `0` | 「三点到四点半」→ 90 |
+| `location` / `note` / `until` | 空 | 「地点…」「备注…」「到…为止」 |
 
-这里同时收拢了全部**文本清洗**（时间词、提前量说法、口头填充词、地点、标题归一化、
-「找你说的是哪一条」）。别的模块不要再自己写正则。
+所以「闹钟的关键在于准时响起」这件事不需要一个类型来保证——它就是缺省值。
+``category``（course/meeting/task/activity）只是个**标签**，用来筛选和选词，不是类型。
 
+这里的另一个职责是把**文本**搞清楚，别的模块不要再自己写正则。
 分工：
-    :mod:`voice_loop.nlp_time`  时间词解析（什么时候、多久、重复、提前量、截止）
-    :mod:`voice_loop.events`    事件模型 + 发生时间引擎 + 到期引擎
-    :mod:`voice_loop.event_text`  ← 本模块：一句话 ←→ 事件字段/播报文案
-    :mod:`voice_loop.skills`    意图路由（新增/查/改/删/完成）与播报时机
+    :mod:`voice_loop.nlp_time`   时间词（什么时候、多久、重复、提前量、截止）
+    :mod:`voice_loop.events`     事件模型 + 发生时间引擎 + 到期引擎
+    :mod:`voice_loop.event_text` ← 本模块：一句话 ←→ 事件字段/播报文案
+    :mod:`voice_loop.skills`     意图路由（新增/查/改/删/完成）与播报时机
 """
 
 from __future__ import annotations
@@ -34,7 +35,14 @@ from __future__ import annotations
 import re
 from datetime import date, datetime, time, timedelta
 
-from .events import kind_of, leads_of, new_event, parse_hhmm, repeat_of, until_of
+from .events import (
+    leads_of,
+    new_event,
+    parse_hhmm,
+    repeat_of,
+    title_of,
+    until_of,
+)
 from .nlp_time import (
     _apply_period,
     cn_number,
@@ -53,9 +61,8 @@ from .nlp_time import (
 WEEKDAY_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 # --------------------------------------------------------------------------- #
-# 事件名词 / 类别
+# 标签：course / meeting / task / activity（**不是**类型，只用于筛选与选词）
 # --------------------------------------------------------------------------- #
-# category 用来筛选（「有哪些课」「所有会议」）和决定播报用词，不影响它怎么发生。
 CATEGORY_NOUNS: dict[str, tuple[str, ...]] = {
     "course": ("课", "课程", "上课", "讲座", "考试", "测验", "实验", "辅导", "seminar", "lecture"),
     "meeting": ("会议", "开会", "组会", "例会", "见面", "面谈", "面试", "讨论", "汇报", "答辩", "洽谈", "约"),
@@ -86,10 +93,6 @@ _NUM = r"(?:\d{1,2}|[一二三四五六七八九十两]+)"
 # 否则标题里会残留一个「到有一场造物社的活动」）
 _CLOCK_TOKEN = rf"(?:{_NUM}\s*[点時时](?:半|\s*{_NUM}\s*分)?|\d{{1,2}}\s*[:：]\s*\d{{1,2}})"
 TIME_RANGE = re.compile(rf"({_CLOCK_TOKEN})\s*(?:到|至|~|—|-)\s*({_CLOCK_TOKEN})")
-# 「从现在起持续多久」：2小时15分钟 / 一个半小时 / 45分钟
-DURATION_WORDS = re.compile(
-    rf"{_NUM}?\s*个?\s*半?\s*(?:小时|钟头|分钟|分)(?!钟)|{_NUM}\s*(?:天|周|个月)"
-)
 TIME_WORDS = re.compile(
     r"(?:大后天|后天|明天|明日|今天|今日|今早|明早|今晚|明晚|"
     r"凌晨|早上|早晨|清晨|上午|中午|正午|下午|傍晚|晚上|夜里|夜晚|半夜|"
@@ -305,7 +308,11 @@ _DELAY_SUFFIX = re.compile(r"(?:小时|钟头|分钟|分|天|周|个月)\s*(?:�
 # 分类：闹钟还是日程（唯一的分界规则）
 # --------------------------------------------------------------------------- #
 def category_of(text: str) -> str:
-    """按事件名词判断类别（course / meeting / task / activity），认不出来给空串。"""
+    """按事件名词判断**标签**（course / meeting / task / activity），认不出来给空串。
+
+    ★这只影响筛选和选词，不影响事件怎么发生★——没有「这是日程还是闹钟」的判断了。
+    认不出来就留空，**不要瞎猜成 task**（猜错会让「有哪些课」查不到）。
+    """
     t = text or ""
     best = ""
     best_len = 0
@@ -316,27 +323,13 @@ def category_of(text: str) -> str:
     return best
 
 
-def looks_like_block(text: str) -> bool:
-    """是不是「占一段时间的事」：有地点、有时长、有 A 点到 B 点。"""
-    t = text or ""
-    if LOCATION_RE.search(t) or _IN_PLACE.search(t):
-        return True
-    if TIME_RANGE.search(t):
-        return True
-    return bool(DURATION_WORDS.search(t) and re.search(r"持续|用|开|办|进行|一共|总共", t or ""))
+def classify(text: str) -> str:
+    """一句话 → **标签**（course/meeting/task/activity，或空串）。
 
-
-def classify(text: str) -> tuple[str, str]:
-    """→ (kind, category)。**这是全文唯一的分界规则。**
-
-    旧代码这里是一条让位链（闹钟看不清就踢给日程），现在是「看这件事本身的性质」。
-    category 认不出来就留空——**不要瞎猜成 task**（猜错会让「有哪些课」查不到）。
+    以前这里要回答「是闹钟还是日程」，而且答错了就要靠让位规则补救；
+    现在没有那个问题了——标签只用于筛选与选词。
     """
-    t = text or ""
-    cat = category_of(t)
-    if cat or looks_like_block(t):
-        return "event", cat
-    return "reminder", ""
+    return category_of(text)
 
 
 def payload_clause(text: str) -> str:
@@ -364,17 +357,16 @@ def split_reason(text: str) -> tuple[str, str]:
 # 抽取：一句话 → 事件字段
 # --------------------------------------------------------------------------- #
 def extract(text: str, now: datetime, *, default_lead: int | None = None) -> dict:
-    """把一句话变成 ``to_item()`` 能吃的字段。
+    """把一句话变成 ``to_item()`` 能吃的字段——**说了就填上，没说就缺省**。
 
-    返回：kind / title / start(datetime) / repeat / weekday / time / duration_minutes /
-    location / note / remind_before / until(date) / category / payload / cause / warned。
+    返回：title / start(datetime) / repeat / weekday / time / duration_minutes /
+    location / note / remind_before / until(date) / category / payload / cause。
 
-    ``title`` 可能是空串（用户没说清干什么），由调用方决定怎么追问；
-    ``warned`` 是需要用户确认的疑点。
+    ``title`` 可能是空串：那是一条**纯闹钟**（只负责准时响）——是否追问由调用方决定。
     """
     raw = (text or "").strip()
     cause, payload = split_reason(raw)
-    kind, category = classify(payload)
+    category = category_of(payload)
 
     # ---- 时间 ---------------------------------------------------------
     clock = parse_clock(payload)
@@ -430,17 +422,19 @@ def extract(text: str, now: datetime, *, default_lead: int | None = None) -> dic
     if not is_topic_like(title):
         cat_cause = category_of(hint)
         title = ACTION_BY_CATEGORY.get(cat_cause) or (clean_title(hint) if is_topic_like(hint) else "")
+        if cat_cause and not category:
+            category = cat_cause          # 标题取自原因从句，标签也跟着它
     note_m = NOTE_RE.search(raw)
     note = note_m.group(1).strip() if note_m else ""
 
     # ---- 提前量 / 截止 -------------------------------------------------
+    # ★缺省是 [0]（准时）★：说了「提前…」才加，没说什么都不加。
     leads = parse_reminds(raw)
     if leads is None:
-        leads = [0] if kind == "reminder" else [default_lead if default_lead is not None else 10]
+        leads = [int(default_lead) if default_lead is not None else 0]
     until = parse_until(raw, now)
 
     return {
-        "kind": kind,
         "title": title,
         "start": start,
         "repeat": repeat or "once",
@@ -455,10 +449,9 @@ def extract(text: str, now: datetime, *, default_lead: int | None = None) -> dic
         "note": note,
         "remind_before": leads,
         "until": until,
-        "category": category if kind == "event" else "",
+        "category": category,
         "payload": payload,
         "cause": cause,
-        "warned": [],
     }
 
 
@@ -468,7 +461,6 @@ def to_item(fields: dict) -> dict:
     until = fields.get("until")
     return new_event(
         str(fields.get("title") or ""),
-        kind=str(fields.get("kind") or "event"),
         start=start.strftime("%Y-%m-%d %H:%M:%S") if isinstance(start, datetime) else str(start or ""),
         repeat=str(fields.get("repeat") or ""),
         remind_before=list(fields.get("remind_before") or []),
@@ -567,38 +559,37 @@ def lead_head(start: datetime, now: datetime, lead: int) -> str:
 
 
 def render_fire(item: dict, start: datetime, now: datetime, lead: int = 0) -> str:
-    """播报文案。闹钟和日程用**同一个函数**，差别只在口径：
+    """播报文案。**看提前量，不看类型**（没有类型了）：
 
-    闹钟是「去做某件事」（吃药、起床），所以说「时间到了，吃药。」；
-    日程是「有一件事」，所以说「提醒你：……，有跟导师见面，地点……。」
+    * 准时（``lead <= 0``）→ 闹钟口径「时间到了，吃药。」——这是缺省的那次；
+    * 提前 → 「提醒你：十分钟后，也就是10:00，开组会，地点…。」
+
+    标题可以是空的（纯闹钟）：「时间到了。」
     """
-    title = item.get("title") or "这件事"
+    title = title_of(item)
     where = where_text(str(item.get("location") or ""))
     note = note_text(item)
-    if kind_of(item) == "reminder":
-        if lead <= 0:
-            return f"时间到了，{title}。"
-        head = lead_head(start, now, lead)
-        head = f"{item['remind_text']}，{head}" if item.get("remind_text") else head
-        return f"提醒你：{head}{note}，{title}{where}。"
+    tail = f"，{title}{note}{where}" if title or note or where else ""
     if lead <= 0:
-        return f"提醒你：现在就是{start.strftime('%H:%M')}，有{title}{note}{where}。"
+        return f"时间到了{tail}。"
     head = lead_head(start, now, lead)
-    head = f"{item['remind_text']}，{head}" if item.get("remind_text") else head
-    return f"提醒你：{head}，有{title}{note}{where}。"
+    if item.get("remind_text"):
+        head = f"{item['remind_text']}，{head}"
+    return f"提醒你：{head}{tail}。"
 
 
 def render_added(item: dict, start: datetime, now: datetime, *, changed: bool = False) -> str:
-    """新增/修改后的确认话术。"""
-    title = item.get("title") or "这件事"
+    """新增/修改后的确认话术。
+
+    ``leads == [0]`` 时不说「我会准时提醒你」——那是缺省值，说了反而啰嗦；
+    只有用户特意要了提前量才回报一遍。
+    """
+    title = title_of(item) or "闹钟"
     where = where_text(str(item.get("location") or ""))
     until = until_text(until_of(item))
     leads = leads_of(item)
     when = when_text(item)
     head = f"{when}，{title}{where}" if when else f"{humanize(start, now)}，{title}{where}"
-    if kind_of(item) == "reminder":
-        verb = "已改到" if changed else "已记下"
-    else:
-        verb = "已改到" if changed else "已排入日程"
-    tail = "" if kind_of(item) == "reminder" and leads == [0] else " " + leads_text(leads)
+    verb = "已改到" if changed else "已记下"
+    tail = "" if leads in ([0], []) else " " + leads_text(leads)
     return f"好，{verb}：{head}{until}。{tail}".strip()
