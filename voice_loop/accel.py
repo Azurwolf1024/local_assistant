@@ -20,7 +20,10 @@ Ollama 那一边（LLM / 视觉模型）在 Windows + Intel 核显上仍然是 1
 from __future__ import annotations
 
 import logging
+import os
 import re
+import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -106,9 +109,27 @@ def ollama_usage(cfg: LlmConfig) -> tuple[dict[str, int], bool]:
 
 # --------------------------------------------------------------------------- #
 # Ollama 用不用核显（Windows 上默认**丢掉**核显，要 OLLAMA_IGPU_ENABLE=1）
+#
+# 这块是 **Windows + Intel 核显专属**：
+#   - Windows 的 Ollama 默认把集显当不能用的设备丢掉（要手动开开关）；
+#   - Linux 上 Ollama 会自己枚举 iGPU（走 sycl/rocm），没有这个开关；
+#   - macOS 只有 Metal，也没有这个开关。
+# 所以下面两条先判平台，非 Windows 直接返回一句说明，不做任何事。
 # --------------------------------------------------------------------------- #
-OLLAMA_LOG = Path.home() / "AppData" / "Local" / "Ollama" / "server.log"
 IGPU_ENV = "OLLAMA_IGPU_ENABLE"
+
+
+def ollama_log_path() -> Path:
+    """Ollama 自己的 server 日志在哪（分平台）。"""
+    if os.name == "nt":
+        return Path.home() / "AppData" / "Local" / "Ollama" / "server.log"
+    # Linux: ~/.ollama/logs/server.log；macOS: ~/Library/Logs/Ollama/server.log
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Logs" / "Ollama" / "server.log"
+    return Path.home() / ".ollama" / "logs" / "server.log"
+
+
+OLLAMA_LOG = ollama_log_path()
 
 
 def _ollama_log_files() -> list[Path]:
@@ -171,9 +192,12 @@ def ollama_gpu_state() -> dict:
 def enable_igpu(persist: bool = True) -> list[str]:
     """把 ``OLLAMA_IGPU_ENABLE=1`` 设到用户环境变量（新起的进程才读得到）。
 
+    只有 Windows + Intel 核显需要这步；其它平台直接说明原因。
     不会重启 Ollama —— 托盘程序得由调用方重启（``restart_ollama()``）。
     """
     notes: list[str] = []
+    if os.name != "nt":
+        return ["只有 Windows 上的 Ollama 会丢掉核显（需要这个开关），当前系统跳过"]
     if persist:
         try:
             import winreg  # type: ignore
@@ -190,12 +214,12 @@ def enable_igpu(persist: bool = True) -> list[str]:
 
 
 def restart_ollama() -> list[str]:
-    """重启 Ollama（托盘程序 + 服务），并把 IGPU_ENABLE 注入到新进程里。"""
-    import os
-    import subprocess
+    """重启 Ollama（托盘程序 + 服务），并把 IGPU_ENABLE 注入到新进程里（仅 Windows）。"""
     import time
 
     notes: list[str] = []
+    if os.name != "nt":
+        return ["这是 Windows 专属操作；POSIX 上请自己重启 ollama：sudo systemctl restart ollama"]
     exe = Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama" / "ollama app.exe"
     try:
         subprocess.run(

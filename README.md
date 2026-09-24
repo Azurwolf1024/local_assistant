@@ -175,6 +175,7 @@ flowchart LR
 │  ├─ llm.py                   # Ollama 客户端
 │  ├─ asr/                     # sensevoice / whisper_ov / router
 │  └─ tts/                     # piper_tts.py（快）/ zipvoice_tts.py（音色克隆）/ lazy.py（按需加载）
+│                              # precision.py（int8/fp32 选哪份模型，四个调用方共用）
 ├─ scripts/
 │  ├─ download_models.py       # 一键下载模型
 │  ├─ test_offline.py          # 离线自测（分块/时间/技能/唤醒/生命周期，含 09-19 那次误解析误删的回归）
@@ -202,6 +203,9 @@ flowchart LR
 │  ├─ test_wake_apply.py       # ★ 唤醒词 --apply 写对文件了吗（纯离线，不碰麦克风）
 │  ├─ test_mic_loopback.py     # 麦克风回环诊断（放一段语音，看能不能听到 + 识别）
 │  ├─ clean_junk_data.py       # 清理早期版本写坏的备忘/闹钟
+│  ├─ check_deploy.py          # ★ 搬家/换系统前的只读自检（七类问题 + 怎么办）
+│  ├─ ab_clone_model.py        # ★ 声线 A/B：精度×步数的客观指标 + 试听 wav
+│  ├─ test_precision.py        # ★ 精度（int8/fp32）与平台降级的离线测试
 │  ├─ say.py                   # 用扬声器念一句话（不想开口时测唤醒词用）
 │  └─ tts_probe.py             # TTS 调音工具（含语调对比）
 ├─ docs/
@@ -226,6 +230,17 @@ python main.py selftest               # 10 项检查，全过就能用了
 ```powershell
 pip install pypdf                 # 可选：读 PDF（Word 靠已装的 python-docx）
 ```
+
+> **换了机器 / 换了系统，先跑一遍自检**（只读，几秒）：
+>
+> ```powershell
+> python scripts/check_deploy.py            # 环境/依赖/配置路径/模型/服务/平台能力/磁盘 七项
+> python scripts/check_deploy.py --json     # 给脚本或 CI 看
+> python scripts/check_deploy.py --strict   # 连「警告」也算失败（做部署镜像时用）
+> ```
+>
+> 它会把每个问题连「怎么办」一起说清楚（缺哪个包、哪条路径不对、当前系统会少哪个功能），
+> 而且**只读**：不改配置、不下载、不加载模型。搬家后会坏的东西基本都能在这儿暴露出来。
 
 ---
 
@@ -998,6 +1013,33 @@ Piper 的 `zh_CN-huayan-medium` 是官方唯一的中文女声。调 `noise_w_sc
   （把日语参考文本转罗马字，见第 14 节）。**不需要 torch / CUDA / MNN**；
   `IndexTTS` 那条路暂时走不通——它的中文前端依赖 `pynini`，Python 3.13 没有 wheel（实测）。
 
+### 9.1 换到别的系统（Linux / macOS）跑得怎么样
+
+代码里的平台差异**集中在几处**，其余全是标准库 + 跨平台库。现状：
+
+| 能力 | Windows（开发机，实测过） | Linux | macOS |
+| --- | --- | --- | --- |
+| 语音主流程（VAD→ASR→LLM→TTS） | √ | √ | √ |
+| 唤醒词常驻服务 `listen` | √（`-B` 用 pythonw，无窗口） | √（`-B` 用 `start_new_session`，关终端不会被带走） | √ |
+| 「关屏幕 / 开屏幕」 | √（`SC_MONITORPOWER`） | √ X11（`xset dpms`）；**Wayland 会直说做不到** | √（`pmset` / `caffeinate`） |
+| 底部字幕 | √ 点得穿 + 自动避开任务栏 | 显示正常，但**不会点穿**、位置按屏幕高度估算 | 同 Linux |
+| 截屏看屏幕 | √ | √（自动带 `xdisplay`）；**Wayland 可能全黑** | √ |
+| 读剪贴板图片 | √ | ×（Pillow 没实现，会回一句人话） | √ |
+| 开机自启 | 快捷方式放 `shell:startup` | systemd user unit / `.desktop` | LaunchAgent |
+| Ollama 核显开关 `gpu --enable-igpu` | √（Windows 版会丢核显） | 不适用（自己会枚举） | 不适用（Metal） |
+
+还没做、换系统前要知道的两件事：
+
+1. **找文件的根目录**：`[vision] file_roots = ["桌面", "下载", "文档"]` 是中文目录名
+   （`voice_loop/vision.py` 里有 `桌面→Desktop` 这类别名表，所以英文系统直接可用）。
+   德语/法语等本地化目录名要自己改成实际路径，建议直接写绝对路径。
+2. **依赖轮子**：本项目在 **Python 3.13** 上验证。换系统/换版本时
+   `onnxruntime`、`openvino`、`sherpa-onnx` 的轮子发布节奏会先卡住你——
+   `scripts/check_deploy.py` 的第 2 项会直接把缺的包名和 pip 命令列出来。
+
+一套判断只在 `voice_loop/tts/precision.py` 和 `voice_loop/system_ops.py` 里，
+所以加新平台只需改这两个地方（离线测试 `scripts/test_precision.py` 会守着接口不变）。
+
 ---
 
 ## 10. 隐私说明
@@ -1319,6 +1361,30 @@ python scripts/persona_voice.py --persona kaltsit --dry-run # 只打印会做什
 
 训练规模按「目标 epoch 数」自动换算（`--epochs`，默认 20）：实测 **283 秒素材 ÷ 每批最多 60 秒
 ≈ 4.7 批/epoch**，所以 100 iter ≈ 21 epoch。实测速度见下表。
+
+#### 换精度：int8 / fp32（**待办：需要你听一遍**）
+
+导出那一步（第 7 步）**每次都会同时产出 int8 和 fp32 两份**，装哪份由 `--precision` 决定；
+角色目录里两份可以共存，运行时按 `config.toml` 的 `[tts] clone_precision` 选：
+
+```powershell
+# 两份都装进角色目录（不会删掉已有的那份）
+python scripts/persona_voice.py --persona kaltsit --stage 8 --stop-stage 8 --precision both
+
+# 生成「精度 × 步数」的对比 wav + 客观指标（不需要扬声器，文件摆在 sessions/ab_clone/）
+python scripts/ab_clone_model.py
+```
+
+| 精度 | 体积 | 速度（同一句话，4 步） | 什么时候选它 |
+| --- | --- | --- | --- |
+| `int8`（默认） | 125 MB | 4.4 s | 当前在用、实测过的那一套 |
+| `fp32` | 600 MB | 8.3 s（慢一倍） | 想排除「动态量化带来的沙沙声」时 |
+
+> ⚠️ **状态：还没被你耳朵确认。** 2026-09-24 的客观测量里，fp32 相对 int8 的
+> 高频噪声只降了约 6%（16.56% → 15.60%），**说明量化不是沙沙声的主因**；
+> 同一批数据里更大的差距来自「微调模型 vs 出厂蒸馏模型」（6.13% vs 16.56%）和步数。
+> 所以 `clone_precision` 默认仍是 `int8`，**等你听完 `sessions/ab_clone/` 再决定**。
+> 完整的指标表和待办清单见 [`docs/ENGINEERING_LOG.md`](docs/ENGINEERING_LOG.md) 第 16 节。
 
 > 手工调参/排障时可以单步跑：`scripts/finetune_zipvoice.py --stage 1..8`（分步版）、
 > `scripts/prepare_tts_dataset.py --dir data/personas/<id> --out data/finetune/<id> --apply`

@@ -222,8 +222,15 @@ def cmd_listen(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def _tail_hint(log_file: Path) -> str:
+    """跟着看日志的命令——PowerShell 和 POSIX shell 不是一套。"""
+    if os.name == "nt":
+        return f"Get-Content '{log_file}' -Wait -Encoding UTF8"
+    return f"tail -f '{log_file}'"
+
+
 def _spawn_background(settings: Settings, args: argparse.Namespace, log_file: Path) -> int:
-    """用 pythonw.exe 起一个没有控制台窗口的后台进程。"""
+    """起一个没有控制台/终端绑定的后台进程（Windows 用 pythonw.exe）。"""
     exe = Path(sys.executable)
     pythonw = exe.with_name("pythonw.exe")
     if not pythonw.exists():
@@ -250,9 +257,15 @@ def _spawn_background(settings: Settings, args: argparse.Namespace, log_file: Pa
     if getattr(args, "llm", None):
         cmd += ["--llm", args.llm]
 
+    # ★不要「起个进程就完事」★：
+    #   Windows：DETACHED_PROCESS 让它没有控制台，也不会被关窗口时的 CTRL 事件杀掉；
+    #   POSIX  ：必须 start_new_session（setsid），否则终端一关服务就被 SIGHUP 带走。
     creationflags = 0
+    popen_kwargs: dict = {}
     if os.name == "nt":
         creationflags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_kwargs["start_new_session"] = True
 
     with open(log_file, "ab") as fh:
         proc = subprocess.Popen(
@@ -263,6 +276,7 @@ def _spawn_background(settings: Settings, args: argparse.Namespace, log_file: Pa
             cwd=str(settings.root),
             creationflags=creationflags,
             close_fds=True,
+            **popen_kwargs,
         )
     write_pid(settings, proc.pid)
     print(
@@ -271,7 +285,7 @@ def _spawn_background(settings: Settings, args: argparse.Namespace, log_file: Pa
         f"  日志     : {log_file}\n"
         f"  唤醒词   : {settings.resolve(settings.wake.file)}\n"
         f"  停止服务 : python main.py stop\n"
-        f"  看日志   : Get-Content '{log_file}' -Wait -Encoding UTF8\n"
+        f"  看日志   : {_tail_hint(log_file)}\n"
     )
     return 0
 

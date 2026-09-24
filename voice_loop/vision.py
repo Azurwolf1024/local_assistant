@@ -23,6 +23,7 @@ import io
 import logging
 import os
 import re
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -220,12 +221,22 @@ class Vision:
         顺序试几种抓法：``all_screens`` 在少数环境（远程桌面 / 屏幕锁定 / 奇怪的分辨率）
         上会直接抛 ``screen grab failed``，那就退回只抓主屏。全都不行才报错，
         并且把「屏幕锁了」这个最常见的原因说出来。
+
+        ★Linux 上 Pillow 必须显式带 ``xdisplay``★（它不会自己读 ``$DISPLAY``，
+        不传就直接报「no display name and no $DISPLAY environment variable」）。
+        Wayland 会话里 X11 截图只能拿到黑屏，那时把 ``vision.default_source``
+        改成 ``camera``，或者装 ``gnome-screenshot`` 类工具自己接。
         """
         from PIL import ImageGrab
 
+        if sys.platform.startswith("linux"):
+            xdisplay = os.environ.get("DISPLAY", ":0")
+            attempts = [dict(k, xdisplay=xdisplay) for k in ({"all_screens": True}, {}, {"all_screens": False})]
+        else:
+            attempts = [{"all_screens": True}, {}, {"all_screens": False}]
         img = None
         last_exc: Exception | None = None
-        for kwargs in ({"all_screens": True}, {}, {"all_screens": False}):
+        for kwargs in attempts:
             try:
                 img = ImageGrab.grab(**kwargs)
                 if img is not None:
@@ -245,6 +256,10 @@ class Vision:
         """剪贴板里的图。复制的是文件的话返回 None（交给文件那条路）。"""
         from PIL import ImageGrab
 
+        if os.name != "nt" and sys.platform != "darwin":
+            # Pillow 的 grabclipboard 只实现了 Windows 和 macOS，Linux 上直接抛
+            # 「not implemented」；先给一句人能看懂的话，别让用户去搜异常。
+            raise VisionError("读剪贴板图片是 Windows / macOS 才有的能力；这边请说「看看屏幕」或文件路径。")
         try:
             data = ImageGrab.grabclipboard()
         except Exception as exc:  # noqa: BLE001
