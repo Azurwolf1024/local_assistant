@@ -171,12 +171,67 @@ def test_render() -> None:
     check(et.norm_title(" 机器学习_1 "), "机器学习1", "标题归一化")
 
 
+def test_end_to_end() -> None:
+    """一句话 → 落库 → 到期 → 播报。这一步是为了在**删掉旧处理器之前**证明新栈是通的。"""
+    import tempfile
+    from datetime import timedelta
+
+    from voice_loop import events as ev
+
+    print("\n[6] 端到端：一句话 → 落库 → 到期 → 播报")
+    with tempfile.TemporaryDirectory() as td:
+        store = ev.EventStore(Path(td) / "events.json", default_lead=10)
+
+        # 用户的原句：工作日 8:30 的起床提醒
+        f = et.extract("我工作日早上9点有课，那就需要定所有工作日早上八点半的闹钟", NOW)
+        item = store.append(et.to_item(f))
+        check(item.get("id"), 1, "落库拿到 id")
+        check((item["kind"], item["repeat"], item["time"], item["title"]),
+              ("reminder", "weekdays", "08:30", "上课"), "库里的样子")
+
+        # 周末不响，工作日到点才响
+        sat = datetime(2026, 9, 19, 8, 30)      # 星期六
+        check(store.due_now(sat), [], "★周六 8:30 不响★")
+        mon = datetime(2026, 9, 21, 8, 30)      # 星期一
+        due = store.due_now(mon)
+        check(len(due), 1, "周一 8:30 响一次")
+        got_item, got_start, got_lead = due[0]
+        check(got_start.strftime("%m-%d %H:%M"), "09-21 08:30", "响的是那一次")
+        check(et.render_fire(got_item, got_start, mon, got_lead), "时间到了，上课。", "播报")
+        check(store.due_now(mon), [], "同一次不会响第二遍")
+        check(len(store.due_now(mon + timedelta(days=1))), 1, "周二照响")
+
+        # 日程带提前量：提前 10 分钟先响，到点再响一次
+        g = et.extract("每周一上午十点到十一点半开组会，地点教学楼 A302", NOW)
+        event = store.append(et.to_item(g))
+        check((event["repeat"], event["weekday"], event["duration_minutes"], event["location"]),
+              ("weekly", 0, 90, "教学楼 A302"), "日程落库")
+        early = store.due_now(datetime(2026, 9, 21, 9, 50))
+        check([(lead, et.render_fire(it, st, datetime(2026, 9, 21, 9, 50), lead))
+               for it, st, lead in early],
+              [(10, "提醒你：十分钟后，也就是10:00，有开组会，地点教学楼 A302。")], "提前 10 分钟那次")
+        check(ev.leads_of(event), [10], "日程默认只提前 10 分钟")
+        check(store.due_now(datetime(2026, 9, 21, 10, 0)), [],
+              "没要「到点」就不在 10:00 再响一次（和旧 due_schedule 一致）")
+
+        # 说了「到点」才两段都响
+        h = et.extract("每周一上午十点开组会，提前10分钟和到点提醒我", NOW)
+        item2 = store.append(et.to_item(h))
+        check(ev.leads_of(item2), [10, 0], "要了到点就有两段")
+        # 注意只数「开组会」：闹钟那条会在这里补报错过的 08:30（见 events.due 的策略差异）
+        fired = store.due_now(datetime(2026, 9, 28, 9, 50))
+        check(sum(1 for it, _, _ in fired if it["title"] == "开组会"), 2, "下一周提前 10 分钟响")
+        fired = store.due_now(datetime(2026, 9, 28, 10, 0))
+        check(sum(1 for it, _, _ in fired if it["title"] == "开组会"), 1, "下一周到点响（只有要了到点那条）")
+
+
 def main() -> int:
     test_classify()
     test_time()
     test_recurring_reminder()
     test_extra_fields()
     test_render()
+    test_end_to_end()
     print(f"\n{'=' * 60}\n通过 {PASS}，失败 {FAIL}")
     return 1 if FAIL else 0
 
