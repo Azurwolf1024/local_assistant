@@ -1,13 +1,17 @@
-"""生活实用技能：时间问答、闹钟提醒、备忘、课程/会议日程。
+"""生活实用技能：时间问答、提醒/日程（统一为「事件」）、备忘、看图。
 
 设计原则
-    1. **本地规则优先**：这类指令（几点了 / 十分钟后提醒我 / 记一下…）用正则识别，
+    1. **本地规则优先**：这类指令（几点了 / 十分钟后提醒我 / 记一下…）用规则识别，
        零延迟、零幻觉，比丢给大模型可靠得多。
     2. **数据放在 JSON 里**：`data/*.json` 可以直接用编辑器改，
        程序只在必要时写回，外部修改会自动重新加载。
     3. **没命中就返回 None**，交给 LLM 回答，技能不会抢话。
 
-数据结构见 `data/` 目录下的三个 json 文件（首次运行自动生成）。
+★这里只管「意图路由」与「播报时机」★
+    怎么把一句话变成事件字段 → `voice_loop/event_text.py`
+    事件怎么存、什么时候该响  → `voice_loop/events.py`
+    什么时候算「几点」        → `voice_loop/nlp_time.py`
+不再区分「闹钟」与「日程」：两者是同一种事件的不同可选字段（见 events.py 的模块说明）。
 """
 
 from __future__ import annotations
@@ -19,6 +23,24 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from . import event_text as et
+from .events import (
+    EventStore,
+    _days_in_month,
+    anchor_of,
+    mark_skipped,
+    skipped_of,
+    display_title,
+    has_repeat,
+    is_fired,
+    leads_of,
+    needs_confirm,
+    parse_hhmm,
+    repeat_of,
+    repeat_text,
+    title_of,
+    until_of,
+)
 from .nlp_time import (
     _apply_period,
     clock_text,
@@ -34,6 +56,7 @@ from .nlp_time import (
     parse_reminds,
     parse_repeat,
     parse_until,
+    parse_weekday,
 )
 from .settings import Settings
 from .store import JsonStore
@@ -44,124 +67,7 @@ WEEKDAY_FULL = ["星期一", "星期二", "星期三", "星期四", "星期五",
 _WEEKDAY_CN = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6, "末": 5}
 # 「周五」这种没写「每」的星期（用来判断说的时间是不是已经过去了）
 _WEEKDAY_WORD = re.compile(r"(?:周|星期|礼拜)[一二三四五六日天末]")
-# 「每周三」「每个星期三」→ 固定课表，而不是一次性安排
-_WEEKLY = re.compile(r"每(?:个)?(?:周|星期|礼拜)\s*([一二三四五六日天])")
 
-
-def _weekly_weekday(text: str) -> int | None:
-    """「每周三」返回 2（0=周一）；不是每周重复则返回 None。"""
-    m = _WEEKLY.search(text or "")
-    return _WEEKDAY_CN.get(m.group(1)) if m else None
-
-
-# 在日程列表里找你指的那一条。只把这些真正泛的工具词当停用词，
-# 「组会 / 例会」不算——它们通常就是条目的名字本身。
-_TITLE_STOPWORDS = {
-    "课", "课程", "上课", "会议", "开会", "日程", "安排", "行程",
-    "事情", "提醒", "活动", "一个", "一下",
-}
-
-# 双字匹配时容易撞车的泛词：光靠这些字对上不算「认出来了」
-_GENERIC_BIGRAMS = {
-    "今天", "明天", "后天", "早上", "上午", "中午", "下午", "晚上", "时候", "时间",
-    "什么", "怎么", "这个", "那个", "一下", "不是", "以后", "我要", "我们", "已经",
-    "取消", "删除", "删掉", "去掉", "改到", "改成", "换个", "挪到", "提前", "推迟",
-    "上课", "课程", "会议", "开会", "日程", "安排", "行程", "提醒", "取消", "的课",
-}
-
-
-def _title_tokens(title: str) -> list[str]:
-    if not title:
-        return []
-    toks = re.findall(r"[A-Za-z][A-Za-z0-9\-]{1,}|[\u4e00-\u9fff]{2,}", title)
-    return [t for t in toks if t not in _TITLE_STOPWORDS]
-
-
-def _title_hit(title: str, text: str) -> int:
-    """这句说的是不是这条日程：2 = 名字里的词直接出现，1 = 只沾到两个字，0 = 不像。
-
-    「开组会」对上「删掉组会」这种就得靠双字：名字本身很少被完整念一遍。
-    """
-    if not title:
-        return 0
-    if any(tok in text for tok in _title_tokens(title)):
-        return 2
-    for i in range(len(title) - 1):
-        bg = title[i : i + 2]
-        if bg in _GENERIC_BIGRAMS:
-            continue
-        if re.fullmatch(r"[\u4e00-\u9fff]{2}", bg) and bg in text:
-            return 1
-    return 0
-
-
-def _sched_key(item: dict) -> tuple:
-    """改/删时用它把条目定位回去（比对象身份靠谱，重载缓存也不会错）。"""
-    return (
-        str(item.get("title", "")),
-        str(item.get("repeat", "")),
-        str(item.get("weekday", item.get("start", ""))),
-        str(item.get("time", "")),
-    )
-
-
-def _days_in_month(year: int, month: int) -> int:
-    """每月循环碰上「这个月没有 31 号」时要靠它回退到月末。"""
-    if month == 2:
-        return 29 if (year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)) else 28
-    return (31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)[month - 1]
-
-
-# 新增日程时要把「帮我记录 / 安排 / 有」这类动词去掉，只留事情本身
-_SCHEDULE_VERBS = (
-    "帮我", "麻烦你", "麻烦", "请", "到时候", "记得", "提醒我", "帮我记", "记录一下", "记录",
-    "记一下", "记下来", "记下", "添加", "新增", "创建", "新建", "排入", "安排", "加",
-    "每天", "每", "有个", "有", "我要", "我", "你", "的", "去", "上", "在", "是",
-    # 量词与「把字句」：「有一场造物社的活动」→ 标题不该留「一场」；
-    # 「把后天下午两点的体检记上」→ 标题不该留「把…记上」
-    "一场", "一次", "一门", "一节", "一项", "一个", "把", "将",
-)
-_LOCATION = re.compile(r"(?:地点|教室)\s*[:：]?\s*([^，,。;；]+)")
-# 标题里不该残留周期说法：「每月5号交房租」的标题应该是「交房租」
-_REPEAT_WORDS = re.compile(
-    r"(?:每(?:个)?年\s*(?:\d{1,2}|[一二三四五六七八九十]+)\s*月\s*(?:\d{1,2}|[一二三四五六七八九十]+)\s*[号日]?"
-    r"|每(?:个)?月\s*(?:\d{1,2}|[一二三四五六七八九十]+)\s*[号日]?"
-    r"|每\s*(?:\d{1,3}|[一二三四五六七八九十两]+|半)\s*(?:个)?\s*(?:天|日|小时|钟头|分钟|分)"
-    r"|每\s*(?:\d{1,2}|[一二三四五六七八九十两]+)\s*个?\s*(?:周|星期|礼拜)"   # 每两周
-    r"|每(?:个)?(?:月|年|天))"
-)
-
-
-def _strip_leading(text: str, words: tuple[str, ...]) -> str:
-    """反复剥掉开头的口头语，直到没有可剥的为止。"""
-    t = (text or "").strip(" \u3000，,。:：-—")
-    # 「开组会 / 开例会」的「开」不是名字的一部分（但「开学典礼」不能碰）
-    t = re.sub(r"^开(?=[会组例])", "", t)
-    changed = True
-    while changed and t:
-        changed = False
-        for w in words:
-            if t.startswith(w):
-                t = t[len(w) :].strip(" \u3000，,。:：-—")
-                changed = True
-                break
-    return t
-
-
-def _split_title_location(text: str) -> tuple[str, str]:
-    """从「每周三上午九点有 AIAA3102 机器学习，地点教学楼 A302」里拆出事项和地点。"""
-    loc = ""
-    m = _LOCATION.search(text or "")
-    if m:
-        loc = m.group(1).strip()
-        if loc in ("有", "是", "的"):
-            loc = ""
-    head = re.split(r"[，,。;；]", text or "")[0]
-    head = _TIME_WORDS.sub("", head)
-    head = _WEEKLY.sub("", head)
-    head = _REPEAT_WORDS.sub("", head)
-    head = re.sub(r"\s+", " ", head)
-    return _TAIL_FILLER.sub("", _strip_leading(head, _SCHEDULE_VERBS)), loc
 
 
 # --------------------------------------------------------------------------- #
@@ -179,65 +85,14 @@ class SkillResult:
 
 
 # --------------------------------------------------------------------------- #
-# 时间词清洗（从提醒内容里去掉「明天早上七点」这类表达）
+# 提示词与路由用的触发词
+# ★文本清洗（时间词、填充词、标题归一化）已经全在 voice_loop/event_text.py★
 # --------------------------------------------------------------------------- #
-_NUM = r"(?:\d{1,2}|[一二三四五六七八九十两]+)"
-# 一个钟点（带「到/至/~」的成对写法也算一个整体：「下午3点到4点半」整段剥掉，
-# 否则标题里会残留一个「到有一场造物社的活动」）
-_CLOCK_TOKEN = rf"(?:{_NUM}\s*[点時时](?:半|\s*{_NUM}\s*分)?|\d{{1,2}}\s*[:：]\s*\d{{1,2}})"
-_TIME_RANGE = re.compile(
-    rf"({_CLOCK_TOKEN})\s*(?:到|至|~|—|-)\s*({_CLOCK_TOKEN})"
-)
-
-_TIME_WORDS = re.compile(
-    r"(?:大后天|后天|明天|明日|今天|今日|今早|明早|今晚|明晚|"
-    r"凌晨|早上|早晨|清晨|上午|中午|正午|下午|傍晚|晚上|夜里|夜晚|半夜|"
-    r"(?:下{1,2}个?|上个?|这|本)?(?:周|星期|礼拜)[一二三四五六日天末]|"
-    rf"{_CLOCK_TOKEN}\s*(?:到|至|~|—|-)\s*{_CLOCK_TOKEN}|"    # 3点到4点半：整体
-    rf"{_NUM}\s*月\s*{_NUM}\s*[号日]?|"                       # 9月23号
-    rf"{_NUM}\s*[号日](?![一二三四五六七八九十])|"              # 23号
-    rf"{_NUM}\s*[点時时](?:半|{_NUM}\s*分)?|"
-    r"\d{1,2}\s*[:：]\s*\d{1,2}|"
-    rf"{_NUM}?个?半?(?:小时|钟头|分钟|分|秒)|"
-    r"(?:以后|之后|过后|后|过)"
-    r")"
-)
+CREATE_ALARM_HINTS = ("提醒", "闹钟", "叫醒", "叫我", "喊我", "定时", "叫一下")
 
 
-def parse_clock_range(text: str, now: datetime | None = None) -> tuple[tuple[int, int], tuple[int, int]] | None:
-    """「下午3点到4点半」→ ((15, 0), (16, 30))；没有区间就返回 None。
-
-    为什么要它：① 标题里不该残留「到4点半」；② 记下时长，下一项/提醒才不会把
-    一个 90 分钟的活动当成一小时。时段词（下午）对**两端都生效**，这一点交给
-    :func:`_apply_period`，不然「到四点半」会被算成上午 4:30。
-    """
-    m = _TIME_RANGE.search(text or "")
-    if m is None:
-        return None
-    c1 = parse_clock(m.group(1))
-    c2 = parse_clock(m.group(2))
-    if c1 is None or c2 is None:
-        return None
-    h1 = _apply_period(c1[0], text, c1[1], now)
-    h2 = _apply_period(c2[0], text, c2[1], now)
-    return (h1, c1[1]), (h2, c2[1])
 
 
-_FILLER = re.compile(
-    # 长词必须放在前面：正则的 | 是「先匹配到就用」，
-    # 否则「我说我…」会被先匹配掉开头的「我」，剩下「说我有跆拳道课」这种怪句子
-    r"^(?:麻烦你|帮我|我说我|我说|到时候|别忘了|别忘|一定|记得|记着|给我|"
-    r"请|你|我|要|去|来|有|一下|一个|一场|一次|一门|一节|一项|个|的|把|给|向|从|和|跟)+"
-)
-_TAIL_FILLER = re.compile(
-    r"(?:这件事|这个事情|记录一下|记下来|记一下|记上|记下|一下|到时候|记得|提醒我|叫我"
-    r"|这个|那个|吧|哦|啊|呀|呢|了|的|吗)+" + r"$"
-)
-# 只剩这些词就说明用户没说具体要干什么
-_NOT_A_TOPIC = {
-    "", "我", "你", "他", "她", "它", "我们", "你们", "这个", "那个",
-    "一下", "一个", "事情", "东西", "时候", "时间", "的", "了",
-}
 
 CREATE_ALARM_HINTS = ("提醒", "闹钟", "叫醒", "叫我", "喊我", "定时", "叫一下")
 MEMO_HINTS = ("记一下", "记下", "记住", "记下来", "帮我记", "备忘", "记录一下", "提醒我记")
@@ -297,14 +152,7 @@ TRIGGER_MEMO_ADD = re.compile(
     re.S,
 )
 
-# 提醒内容里只剩这些词，说明用户没说具体要提醒什么。
-# 注意：「起床」是真实会用的内容（「明天七点叫我起床」），不能放进来。
-_ACTION_ONLY = re.compile(
-    r"^(?:闹钟|闹中|提醒|定时|叫醒|叫我|喊我|喊一下|定在|设在|设成|定成|设为|设置|"
-    r"定|设|来|要|有|我|你|一|下|个|把|给|时间|到|了|吧|啊|呀|一个|的|把它|"
-    r"给我|提醒我)+" + r"$"
-)
-DEFAULT_REMINDER_WHAT = "时间到了"
+
 
 # 判断句子里是否真的包含一个「时刻」表达。
 # 不能只依赖 parse_datetime：它把「明天」这种光有日期的说法默认成 09:00，
@@ -319,6 +167,11 @@ CLOCK_EXPR = re.compile(
 
 def has_clock_expr(text: str) -> bool:
     return bool(CLOCK_EXPR.search(text or ""))
+
+
+# 判断句子里是否真的包含一个「时刻」表达。
+# 不能只依赖 parse_datetime：它把「明天」这种光有日期的说法默认成 09:00，
+# 于是「提醒我明天有什么课」会被误当成定时提醒。
 
 
 # 只有时段没有钟点：「明天中午和导师吃饭」「晚上开会」
@@ -358,67 +211,13 @@ def _period_hour(text: str) -> int | None:
     return _PERIOD_HOUR.get(m.group(1)) if m else None
 
 
-def _extract_alarm_what(text: str) -> str:
-    """从「提醒我xxx」「闹钟定在…」里抽取出真正要提醒的内容。
+def _key_of(item: dict) -> Any:
+    """改/删时用它把条目定位回去：**用 id**。
 
-    中文既会说「提醒我喝水」（内容在后），也会说
-    「我晚上七点有跆拳道课，到时候记得提醒我」（内容在前），
-    所以两边都要试，并且把「我」这种纯代词当作无效内容。
+    旧代码用的是「标题 + 周期 + 星期 + 钟点」四元组，两个同名的例子（比如两条
+    「喝水」）就会一起被改掉；id 是唯一的，也不会被重载缓存搞错。
     """
-    trigger = ("提醒我", "提醒一下", "提醒", "叫醒我", "叫醒", "叫我", "喊我", "叫一下", "喊一下", "闹钟", "闹中", "定时")
-    for kw in trigger:
-        idx = text.rfind(kw)
-        if idx < 0:
-            continue
-        tail = _clean_content(text[idx + len(kw) :])
-        if _is_topic(tail):
-            return tail
-        head = _clean_content(text[:idx])
-        if _is_topic(head):
-            return head
-    whole = _clean_content(text)
-    return whole if _is_topic(whole) else ""
-
-
-def _is_topic(text: str) -> bool:
-    """判断抽出来的内容是不是真的有信息量（不是「我」「一下」这种）。"""
-    t = (text or "").strip()
-    if len(t) < 2 or t in _NOT_A_TOPIC:
-        return False
-    return not _ACTION_ONLY.match(t)
-
-
-def _clean_content(text: str) -> str:
-    t = _TIME_WORDS.sub("", text or "")
-    t = re.sub(r"^[，。、,.\s:：]+", "", t)
-    t = _FILLER.sub("", t)
-    # ★先去掉标点、再削尾巴★：「有社团活动，到时候记得提醒我。」句末那个句号
-    # 会让锚在 $ 的 _TAIL_FILLER 对不上，标题里就留下「到时候记得提醒我」。
-    t = re.sub(r"[，。、,.\s:：]+", "", t)
-    t = _TAIL_FILLER.sub("", t)
-    return t.strip()
-
-
-def _clean_memo_content(text: str) -> str:
-    """备忘是**纯文本**，时间词要留着：
-
-    「记一下明天带伞」存成「带伞」就把最关键的信息丢了（备忘没有时间字段）。
-    闹钟/日程那边有时间字段，才需要 _clean_content 把时间词从内容里剥掉。
-    """
-    t = re.sub(r"^[，。、,.\s:：]+", "", text or "")
-    t = _FILLER.sub("", t)
-    t = _TAIL_FILLER.sub("", t)
-    t = re.sub(r"[，。、,.\s:：]+", "", t)
-    return t.strip()
-
-
-_TITLE_NORM_DUP = None
-_NORM_STRIP = re.compile(r"[\s_\-—·．.，,。:：、'\"“”‘’()（）\[\]【】]+")
-
-
-def _norm_title(text: str) -> str:
-    """标题归一化：去掉空格标点、统一小写，用来判断「是不是同一条」。"""
-    return _NORM_STRIP.sub("", (text or "").strip().lower())
+    return item.get("id")
 
 
 def _extract_after(text: str, keywords: tuple[str, ...]) -> str:
@@ -443,34 +242,24 @@ class Skills:
         self.data_dir = settings.resolve(cfg.data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
-        self.alarms = JsonStore(settings.resolve(cfg.alarm_file), default=[])
-        self.memos = JsonStore(settings.resolve(cfg.memo_file), default=[])
-        self.schedule = JsonStore(
-            settings.resolve(cfg.schedule_file),
-            default=[
-                {
-                    "title": "AIAA3102 机器学习",
-                    "kind": "course",
-                    "repeat": "weekly",
-                    "weekday": 3,
-                    "time": "09:00",
-                    "duration_minutes": 90,
-                    "location": "教学楼 A302",
-                    "remind_before": 15,
-                    "note": "weekday: 0=周一 … 6=周日；这是示例条目，可直接删除",
-                }
-            ],
+        # ★一个文件装全部事件★（提醒 + 日程 + 事件链），不再分两个文件两套字段
+        self.store = EventStore(
+            settings.resolve(cfg.event_file),
+            default_lead=int(cfg.default_remind_before),
         )
-        for store in (self.alarms, self.memos, self.schedule):
+        self.memos = JsonStore(settings.resolve(cfg.memo_file), default=[])
+        for store in (self.store, self.memos):
             store.ensure()
 
         # 最近的对话（你说 + 助手答），用来解析「它 / 那个 / 刚才那条」指谁。
         # 由 pipeline 每轮传进来；单独跑 skills 时就是空的。
         self.dialog: list[str] = []
-        # 刚记下的那一条（闹钟/日程），用来处理「我说今天晚上8点45」这种**随即修正**。
+        # 刚记下的那一条（事件），用来处理「我说今天晚上8点45」这种**随即修正**。
         # 实测：用户说完一句时间说错了，下一句「我说是今晚8点45」以前会被当成新请求
         # 交给大模型，而大模型只会嘴上说「已更正」——**其实什么也没改**。
         self._last_add: dict | None = None
+        # 等着用户确认的那次删改（带重复的事件才需要确认）
+        self._pending_change: dict | None = None
 
         # 看图（摄像头 / 屏幕 / 剪贴板 / 文件）
         vcfg = settings.vision
@@ -501,13 +290,13 @@ class Skills:
         now = now or datetime.now()
         for fn in (
             self._handle_vision_reply,   # 先接「是 / 第一个」这种确认，别被别的技能抢走
+            self._handle_event_confirm,  # 「确定」——上一轮问过「要取消吗」
             self._handle_help,
             self._handle_screen,
             self._handle_clock,
-            self._handle_vision,         # 看图（带时间词的会让给日程）
+            self._handle_vision,         # 看图（带时间词的会让给事件）
             self._handle_correction,     # 「我说是今晚8点45」——改刚才那一条，别新建
-            self._handle_alarm,
-            self._handle_schedule,
+            self._handle_event,          # 提醒/日程统一入口（没有两个处理器了）
             self._handle_memo,
         ):
             try:
@@ -553,224 +342,305 @@ class Skills:
         return SkillResult(reply="，".join(parts) + "。", action="clock")
 
     # ======================================================================
-    # 闹钟 / 定时提醒
+    # 事件（提醒 / 日程统一入口）
     # ======================================================================
-    _ALARM_LIST_Q = re.compile(
-        r"(有哪些|有什么|还有|看看|查一下|列出|列表|几个|多少)?\s*(提醒|闹钟|定时|定时器)\s*(有哪些|有什么|列表|是什么|吗|呢)*\s*[?？]?$"
+    # ★没有「闹钟分支」和「日程分支」了★
+    # 旧代码有两个处理器，中间靠三条让位规则互相踢球（说了重复 / 说了多个提前量 /
+    # 说了日期+钟点还带事件名词 → 从闹钟踢给日程），于是「每个工作日八点半叫我起床」
+    # 被踢到只认「每周X / 每N天」的日程那边，最后只能存成一条不会重复的闹钟。
+    # 现在只有一个入口，顺序固定：**按时间的取消 → 改/删/跳过 → 列出 → 新增 → 查询**。
+    # 顺序不能乱：改/删要先判，否则「取消周三的组会」会掉进新增分支。
+    _LIST_Q = re.compile(
+        r"(有哪些|有什么|还有|看看|查一下|列出|列表|几个|多少)?\s*"
+        r"(提醒|闹钟|定时|定时器|事件)\s*"
+        r"(有哪些|有什么|列表|是什么|吗|呢)*\s*[?？]?$"
     )
-    _ALARM_CANCEL = re.compile(
+    _EVENT_CANCEL = re.compile(
         r"(?:取消|删除|去掉|关掉|清除|清空|不要|别再)\s*"
         r"(?:第\s*(?P<idx>\d+|[一二三四五六七八九十]+)\s*[个条])?\s*"
         r"(?P<all>所有|全部|这些|所有的)?\s*"
-        r"(?:提醒|闹钟|定时)"
+        r"(?:提醒|闹钟|定时|事件)"
     )
-
-    # 「取消明天早上的安排」这类：句子里有时间、没名字，也可能指的是**闹钟**。
-    # 实测踩坑：「取消明天早上的安排」被日程分支接住，从上一轮助手自己念过的话里
-    # 「指代」到了 9月23日的「跟导师见面」并把它删了——而用户指的是 08:00 的练琴闹钟。
     _CANCEL_WORD = re.compile(r"取消|删掉|删除|去掉|不要了|别提醒|不用提醒|关掉|清掉")
 
+    def _handle_event(self, text: str, now: datetime) -> SkillResult | None:
+        """提醒/日程的唯一入口。"""
+        by_index = self._cancel_by_index(text)
+        if by_index is not None:
+            return by_index
+        by_time = self._cancel_by_time(text, now)
+        if by_time is not None:
+            return by_time
+        changed = self._handle_schedule_change(text, now)
+        if changed is not None:
+            return changed
+        # ★说了「取消…提醒/闹钟」却没对上任何一条：绝不能往下掉进「新增」★
+        # 实测踩到：说「取消今晚十点的闹钟」时库里没有那条，旧代码一路走到新建，
+        # 结果多出一条 what=「取消」的闹钟——用户以为删了，反而多了一条。
+        if self._CANCEL_WORD.search(text) and TRIGGER_ALARM.search(text):
+            return SkillResult(
+                reply="我没找到要取消的那条——说个时间或者第几个，比如「取消明天早上的闹钟」。",
+                action="event_cancel_miss",
+            )
+        for fn in (self._event_list, self._event_add, self._handle_schedule_query):
+            got = fn(text, now)
+            if got is not None:
+                return got
+        return None
+
+    def _cancel_by_index(self, text: str) -> SkillResult | None:
+        """「取消第2个」「清空所有提醒」——按序号 / 全部。"""
+        m = self._EVENT_CANCEL.search(text)
+        if not m:
+            return None
+        idx_raw, all_raw = m.group("idx"), m.group("all")
+        items = self.store.load()
+        if all_raw:
+            n = self.store.clear()
+            return SkillResult(reply=f"已清空全部 {n} 条。", action="event_clear")
+        idx = cn2num(idx_raw) if idx_raw else None
+        if not idx:
+            return None          # 「取消提醒」但没说是哪一条 → 交给后面的分支
+        if not (1 <= int(idx) <= len(items)):
+            return SkillResult(reply=f"没有第{cn_number(int(idx))}条。", action="event_cancel")
+        removed = self.store.remove_at(int(idx))
+        if removed is None:
+            return None
+        return SkillResult(
+            reply=f"已撤销第{cn_number(int(idx))}条：{display_title(removed)}。",
+            action="event_cancel",
+        )
+
     def _cancel_by_time(self, text: str, now: datetime) -> SkillResult | None:
-        """按句中的时间来取消一条提醒（闹钟）。
+        """按句中的时间取消一条事件（不要求说序号）。
 
-        只在「句子里有明确时间、且说的不是课/会议这类明确的日程名词」时生效；
-        找不到对应的就返回 None，让后面日程分支去处理。
-
-        ★为什么不再拿 TRIGGER_SCHEDULE 当闸门★：「安排」这个词既是日程词、
-        也是用户平时说闹钟的说法。实测用户说「取消明天早上的安排」时，
-        就因为句子里有「安排」被整个绕过闹钟分支、转去删日程，
-        结果把四天后的「跟导师见面」删了（不可逆），而那条 08:00 的闹钟还在。
-        现在只认「课/会议/组会…」这类**明确日程名词**，且句子里没提提醒/闹钟。
+        ★为什么不能拿 TRIGGER_SCHEDULE 当闸门★：「安排」这个词既是日程词，
+        也是用户平时说提醒的说法。实测用户说「取消明天早上的安排」时，
+        就因为句子里有「安排」被整个绕过，转去删掉了四天后的「跟导师见面」（不可逆），
+        而那条 08:00 的提醒还在。现在只认「课/会议/组会…」这类**明确名词**，
+        且句子里没提提醒/闹钟。
         """
         if not self._CANCEL_WORD.search(text):
             return None
         if _SCHEDULE_NOUN.search(text) and not TRIGGER_ALARM.search(text):
-            return None                      # 「取消明天早上的课」→ 那是日程的事
+            return None                      # 「取消明天早上的课」→ 交给按名字那条路
         day = parse_date_hint(text, now)
         clock = _clock_with_period(text, now)
         if day is None and clock is None:
             return None
-        hits: list[tuple[int, dict]] = []
-        for idx, item in enumerate(self.alarms.load(), start=1):
-            try:
-                when = datetime.fromisoformat(str(item.get("when")))
-            except (TypeError, ValueError):
+        hits: list[tuple[dict, datetime]] = []
+        for item in self.store.load():
+            when = self._next_of(item, now)
+            if when is None:
                 continue
             if day is not None and when.date() != day:
                 continue
             if clock is not None and (when.hour, when.minute) != clock:
                 continue
-            hits.append((idx, item))
-        if not hits:
-            return None
-        # 只说了时段（「明天早上」）而当天有多条时，用时段再收一次
+            hits.append((item, when))
         if len(hits) > 1:
+            # 只说了时段（「明天早上」）而当天有多条时，用时段再收一次
             period = _DAY_PERIOD.search(text)
             window = _PERIOD_RANGE.get(period.group(1)) if period else None
             if window:
-                narrowed = [
-                    (i, it) for i, it in hits
-                    if window[0] <= datetime.fromisoformat(str(it.get("when"))).hour < window[1]
-                ]
+                narrowed = [h for h in hits if window[0] <= h[1].hour < window[1]]
                 if narrowed:
                     hits = narrowed
         if not hits:
             return None
         if len(hits) > 1:
-            names = "、".join(
-                f"{humanize(datetime.fromisoformat(str(it.get('when'))), now)}"
-                f"{it.get('what', '')}" for _i, it in hits[:4]
-            )
+            names = "、".join(f"{humanize(when, now)}{display_title(it)}" for it, when in hits[:4])
             return SkillResult(
-                reply=f"{cn_quantity(len(hits))}条提醒都对得上（{names}），你说是哪一条？",
-                action="alarm_cancel_unsure",
+                reply=f"{cn_quantity(len(hits))}条都对得上（{names}），你说是哪一条？",
+                action="event_cancel_unsure",
             )
-        idx, item = hits[0]
-        when = datetime.fromisoformat(str(item.get("when")))
-        what = str(item.get("what") or "")
-        self.alarms.remove_at(idx)
+        item, when = hits[0]
+        if not self._confirm_repeat(item, when, "取消"):
+            return self._ask_confirm(item, when, "取消")
+        self.store.remove_where(lambda it: it.get("id") == item.get("id"))
         return SkillResult(
-            reply=f"已取消{humanize(when, now)}的提醒：{what}。",
-            action="alarm_cancel",
+            reply=f"已取消{humanize(when, now)}的{display_title(item)}。",
+            action="event_cancel",
         )
 
-    def _handle_alarm(self, text: str, now: datetime) -> SkillResult | None:
-        # --- 取消（按时间找，不要求说序号） ---
-        by_time = self._cancel_by_time(text, now)
-        if by_time is not None:
-            return by_time
-
-        # --- 取消（按序号 / 全部） ---
-        m = self._ALARM_CANCEL.search(text)
-        if m:
-            idx_raw, all_raw = m.group("idx"), m.group("all")
-            if all_raw and not idx_raw:
-                n = self.alarms.clear()
-                return SkillResult(reply=f"已清空全部 {n} 条提醒。", action="alarm_clear")
-            if all_raw and idx_raw:
-                # 「取消所有第1个」这种说法，按“取消所有”处理
-                n = self.alarms.clear()
-                return SkillResult(reply=f"已清空全部 {n} 条提醒。", action="alarm_clear")
-            idx = cn2num(idx_raw) if idx_raw else None
-            if not idx:
-                return None          # 「取消提醒」但没说是哪一条 -> 交给下游或让用户说清楚
-            removed = self.alarms.remove_at(idx)
-            if removed:
-                when = humanize(datetime.fromisoformat(removed["when"]), now)
-                return SkillResult(
-                    reply=f"已撤销第{cn_number(idx)}条提醒：{when}{removed.get('what', '')}。",
-                    action="alarm_cancel",
-                )
-            return SkillResult(reply=f"没有第{cn_number(idx)}条提醒。", action="alarm_cancel")
-
-        # --- 查询 ---
-        # 注意：「提醒我明天有什么课」里的「提醒」不是查提醒列表，
-        # 所以要求查询词紧跟在提醒/闹钟之后，并且句子里没有日程关键词。
+    def _event_list(self, text: str, now: datetime) -> SkillResult | None:
+        """「有哪些提醒 / 我的闹钟」——一个列表，不再分两个。"""
         has_hint = bool(TRIGGER_ALARM.search(text))
-        is_list_q = bool(self._ALARM_LIST_Q.search(text)) or (
+        is_list_q = bool(self._LIST_Q.search(text)) or (
             has_hint
             and not TRIGGER_SCHEDULE.search(text)
             and bool(re.search(r"(提醒|闹钟|定时)\s*我?\s*(有哪些|有什么|还有|看看|列出|几个|多少)", text))
         )
-        if is_list_q and not self._looks_like_create(text):
-            return self._list_alarms(now)
-
-        if not has_hint:
-            return None
-
-        # ★说「取消」却没对上任何一条：绝不能往下掉进「新建」★
-        # 实测踩到：说「取消今晚十点的闹钟」时库里没有那条，代码一路走到新建，
-        # 结果多出一条 what=「取消」的闹钟——用户以为删了，反而多了一条。
-        #
-        # 只截「确实在说提醒/闹钟」的那些（has_hint）；
-        # 「取消所有会议」「删掉跟导师见面」这类没有提醒词，照旧交给日程分支。
-        if self._CANCEL_WORD.search(text) and not _SCHEDULE_NOUN.search(text):
-            return SkillResult(
-                reply="我没找到要取消的那条提醒——你说个时间或者第几个，"
-                      "比如「取消明天早上的闹钟」。",
-                action="alarm_cancel_miss",
-            )
-
-        # 「每周三…提前一天和半小时提醒我」「每2小时提醒我喝水」这种带重复周期、
-        # 或者要好几次提前提醒的，属于日程（日程能存周期和多个提前量），
-        # 闹钟只管一次性。
-        if (parse_repeat(text) or {}).get("repeat", "once") != "once":
-            return None
-        if len(parse_reminds(text) or []) > 1:
-            return None
-        # 「下周三下午三点半提醒我跟导师见面」这种**约会**也走日程，不走闹钟：
-        # 日程能按名字查（「这周有什么安排」能看见它）、能改能删、能设多个提前量，
-        # 闹钟只是一次性响一声，说完就找不着了。
-        # 判据是「约会词 + 明确时刻 + 明确日期」——「十分钟后提醒我跟导师打电话」
-        # 没有日期，仍然是闹钟。
-        # ★活动类也算★（2026-09-20）：「下周三下午3点，我有社团活动，到时候记得提醒我。」
-        # 本来是件要记下来的事，以前被闹钟分支抢走，日程里什么都没有。
-        # ★带课/会议/安排这类词的也算★（同一天发现）：
-        # 「明天下午三点安排项目评审会，提前30分钟提醒我」被闹钟抢走，日程里同样什么都没有。
-        if (
-            (TRIGGER_APPOINT.search(text) or ACTIVITY_NOUN.search(text)
-             or TRIGGER_SCHEDULE.search(text))
-            and has_clock_expr(text)
-            and parse_date_hint(text, now) is not None
-        ):
-            return None
-
-        # --- 新建 ---
-        if not has_clock_expr(text):
-            # 「提醒我买牛奶」没说时间：不是定时提醒，交给后面的技能或 LLM
-            return None
-        when = parse_datetime(text, now)
-        if when is None:
-            return None
-
-        # 「今天早上八点半」在已经十点的时候说，是倒不回过去的：
-        # 顺延到明天同一时刻，并且明确告诉用户，免得他以为设错了。
-        rolled = False
-        if (when - now).total_seconds() < -60:
-            when = when + timedelta(days=1)
-            rolled = True
-
-        what = _extract_alarm_what(text)
-        delta = (when - now).total_seconds()
-        when_text = humanize(when, now)
-        prefix = "那个时间今天已经过了，" if rolled else ""
-
-        if not what:
-            # 只说「定个八点半的闹钟」没说干什么：别再鹦鹉学舌地把命令念回去
-            what = DEFAULT_REMINDER_WHAT
-            item = self.alarms.append(
-                {
-                    "when": when.strftime("%Y-%m-%d %H:%M:%S"),
-                    "what": what,
-                    "fired": False,
-                    "kind": "alarm",
-                }
-            )
-            self._remember_add("alarm", idx=len(self.alarms.load()))
-            return SkillResult(
-                reply=f"{prefix}闹钟已定：{when_text}，{humanize_delta(delta)}后。",
-                action="alarm_add",
-                data=item,
-            )
-
-        item = self.alarms.append(
-            {
-                # 用秒级时间戳，「十分钟后」这种才不会被截断到整分钟
-                "when": when.strftime("%Y-%m-%d %H:%M:%S"),
-                "what": what,
-                "fired": False,
-                "kind": "alarm",
-            }
-        )
-        self._remember_add("alarm", idx=len(self.alarms.load()))
+        if not is_list_q or has_clock_expr(text):
+            return None                      # 「八点半定个闹钟」是新增，不是查询
+        upcoming: list[tuple[datetime, dict]] = []
+        for item in self.store.load():
+            when = self._next_of(item, now)
+            if when is None and not has_repeat(item):
+                # 一次性、时间已经过了、但一次都还没响过 → 还是待办（补响前不能被藏起来）
+                start = anchor_of(item)
+                if start is not None and not any(
+                    is_fired(item, start, lead) for lead in leads_of(item)
+                ):
+                    when = start
+            if when is not None:
+                upcoming.append((when, item))
+        upcoming.sort(key=lambda p: p[0])
+        if not upcoming:
+            return SkillResult(reply="当前没有待办的事件。", action="event_list")
+        lines = [
+            f"第{cn_number(i)}条，{humanize(when, now)}，{display_title(it)}"
+            for i, (when, it) in enumerate(upcoming[:5], 1)
+        ]
+        tail = "" if len(upcoming) <= 5 else f"，还有{len(upcoming) - 5}条"
         return SkillResult(
-            reply=f"{prefix}已记录。{when_text}，也就是{humanize_delta(delta)}后，我会提醒你{what}。",
-            action="alarm_add",
+            reply=f"待办事件{cn_quantity(len(upcoming))}条。" + "；".join(lines) + tail + "。",
+            action="event_list",
+        )
+
+    def _next_of(self, item: dict, since: datetime) -> datetime | None:
+        """这条从 ``since`` 起（含）下一次什么时候发生。"""
+        from .events import occurrences
+
+        got = occurrences(item, since, limit=1)
+        return got[0] if got else None
+
+    def _ask_confirm(self, item: dict, when: datetime, verb: str) -> SkillResult:
+        """带重复的事件：删/改之前先问一句（影响的是往后所有次）。"""
+        self._pending_change = {"id": item.get("id"), "verb": verb}
+        return SkillResult(
+            reply=(
+                f"「{display_title(item)}」是{repeat_text(item)}的，"
+                f"以后每次都会跟着{verb}。确定要{verb}吗？说「确定」我就动手。"
+            ),
+            action="event_confirm",
+        )
+
+    def _confirm_repeat(self, item: dict, when: datetime, verb: str) -> bool:
+        """带重复的事件需要一句确认；一次性的直接做。"""
+        if not needs_confirm(item):
+            return True
+        pending = self._pending_change
+        return bool(
+            pending
+            and pending.get("id") == item.get("id")
+            and pending.get("verb") == verb
+        )
+
+    def _handle_event_confirm(self, text: str, now: datetime) -> SkillResult | None:
+        """接「确定 / 好 / 对」+ 上一轮问过的那个确认。"""
+        pending = self._pending_change
+        if not pending:
+            return None
+        if not re.search(r"^(确定|确认|好的?|嗯|对|是|可以|继续|就这么)|确定|确认", text or ""):
+            return None
+        self._pending_change = None
+        item = self.store.by_id(pending.get("id"))
+        if item is None:
+            return SkillResult(reply="那条已经不在了。", action="event_confirm")
+        if str(pending.get("verb") or "") in ("取消", "删除"):
+            self.store.remove_where(lambda it: it.get("id") == item.get("id"))
+            return SkillResult(
+                reply=f"好，{display_title(item)}已经删除，以后不会再提醒了。",
+                action="event_delete",
+            )
+        return SkillResult(reply="好，那就按刚才说的改。", action="event_confirm")
+
+    def _looks_like_add(self, text: str, now: datetime) -> bool:
+        """这句话像不像「新增一条」。
+
+        ★这个判据必须「新增」和「改/删」共用★：以前改/删那侧只看
+        `_SCHEDULE_ADD / ACTIVITY_NOUN / TRIGGER_APPOINT`，于是
+        「每周三九点提醒我上课，提前半小时」（里面有「提前」会撞 `_SCHEDULE_EDIT`）
+        被回一句「日程里现在还是空的，没什么可以改的」——明明是要新增。
+        """
+        m = self._SCHEDULE_ADD.search(text)
+        rule = parse_repeat(text)
+        if m is not None and TRIGGER_SCHEDULE.search(text):
+            return True
+        if rule is not None:
+            return True
+        if bool(TRIGGER_APPOINT.search(text)) and (
+            has_clock_expr(text) or _DAY_PERIOD.search(text) is not None
+        ):
+            return True
+        if bool(PLAN_VERB.search(text)) and has_clock_expr(text) and parse_date_hint(text, now):
+            return True
+        if bool(ACTIVITY_NOUN.search(text)) and has_clock_expr(text) and parse_date_hint(text, now):
+            return True
+        # 带「提醒/闹钟」+ 明确时刻的也算（以前这种会掉到闹钟处理器，现在同一条路）
+        return bool(TRIGGER_ALARM.search(text)) and has_clock_expr(text)
+
+    def _event_add(self, text: str, now: datetime) -> SkillResult | None:
+        """新增一条事件：**说什么就填什么**（时长/重复/地点/提前量/截止）。
+
+        旧代码在这里分了两条路（「每周三…」手拼一个课表条目，其余手拼一个日程条目），
+        两边各自猜默认值。现在只有 :func:`event_text.extract` 一条路：
+        没说时长就是 0、没说提前量就是准时、没说重复就是一次。
+        """
+        if self._SCHEDULE_ASK.search(text) or not self._looks_like_add(text, now):
+            return None                      # 问句不是新增；不像是新增就交给别人
+
+        fields = et.extract(text, now)
+        start: datetime = fields["start"]
+        rolled = ""
+        if start < now - timedelta(seconds=60):
+            wd_hint = parse_weekday(text)
+            if has_repeat(fields):
+                # 重复的：引擎会自己往后滚（时间字段里的钟点才是基准）
+                rolled = "这周那个时间已经过了。"
+            elif wd_hint is not None:
+                # 说了星期几：这周那个点已经过了 → 指的一定是下一个
+                days = (wd_hint - now.weekday()) % 7 or 7
+                start = datetime.combine(now.date() + timedelta(days=days), start.time())
+                fields["start"] = start
+                rolled = "这周那个时间已经过了，我按下一个算。"
+            else:
+                start += timedelta(days=1)
+                fields["start"] = start
+                rolled = "那个时间今天已经过了，我按明天算。"
+        if has_repeat(fields):
+            fields["time"] = f"{start.hour:02d}:{start.minute:02d}"
+        item = et.to_item(fields)
+        if not title_of(item) and not has_clock_expr(text):
+            return None                      # 连时间都没说清，别硬存
+        dup = self._find_duplicate(item, now, start)
+        if dup is not None:
+            return SkillResult(
+                reply=(
+                    f"这条已经有了：{self._when_of(dup, now)}，{display_title(dup)}。"
+                    f"要改就说「把{display_title(dup)}挪到…」。"
+                ),
+                action="event_exists",
+            )
+        item = self.store.append(item)
+        self._remember_add(item.get("id"))
+        return SkillResult(
+            reply=et.render_added(item, start, now) + (" " + rolled if rolled else ""),
+            action="event_add",
             data=item,
         )
 
-    def _looks_like_create(self, text: str) -> bool:
-        return has_clock_expr(text)
+    def _when_of(self, item: dict, now: datetime) -> str:
+        """说清楚一条事件「什么时候」：重复的说周期+钟点，一次性的说日期时刻。"""
+        text = et.when_text(item)
+        if text:
+            return text
+        anchor = anchor_of(item)
+        return humanize(anchor, now) if anchor else "时间未定"
+
+    def _handle_schedule_query(self, text: str, now: datetime) -> SkillResult | None:
+        """「下一项是什么」「这周有什么安排」「周三有什么课」。"""
+        if self._SCHEDULE_NEXT.search(text):
+            return self._next_item(now)
+        listed = self._list_scope(text, now)
+        if listed is not None:
+            return listed
+        if self._SCHEDULE_Q.search(text) or self._RANGE_ASK.search(text):
+            if not self._NOT_SCHEDULE_Q.search(text):
+                return self._day_items(text, now)
+            return None          # 「今天天气怎么样」交给模型去答
+        return None
 
     # ======================================================================
     # 随即修正：「我说是今晚8点45」「不对，是明天上午」——改刚才那一条
@@ -834,43 +704,27 @@ class Skills:
         if when <= now:
             when = when + timedelta(days=1)
 
-        kind = self._last_add.get("kind")
-        if kind == "alarm":
-            idx = int(self._last_add.get("idx") or 0)
-            items = self.alarms.load()
-            if not (1 <= idx <= len(items)):
-                return None
-            what = str(items[idx - 1].get("what") or DEFAULT_REMINDER_WHAT)
-            self.alarms.update(idx, when=when.strftime("%Y-%m-%d %H:%M:%S"), fired=False)
-            when_text = humanize(when, now)
-            self._last_add = {"kind": "alarm", "idx": idx, "at": time.monotonic()}
-            return SkillResult(
-                reply=f"改好了：{when_text}提醒你{what}。",
-                action="alarm_reschedule",
-                data={"when": when.isoformat(), "what": what},
-            )
+        item = self.store.by_id(self._last_add.get("id"))
+        if item is None:
+            return None
+        eid = item.get("id")
+        title = title_of(item) or "闹钟"
+        if has_repeat(item):
+            # 重复事件只改「那一个钟点」——课表还在
+            fields: dict[str, Any] = {"time": when.strftime("%H:%M")}
+        else:
+            fields = {"start": when.strftime("%Y-%m-%d %H:%M:%S"), "state": None}
+        self._update_event(eid, **fields)
+        self._last_add = {"id": eid, "at": time.monotonic()}
+        return SkillResult(
+            reply=f"改好了：{title}改到{humanize(when, now)}。",
+            action="event_reschedule",
+            data={"start": when.isoformat(), "title": title},
+        )
 
-        if kind == "schedule":
-            key = tuple(self._last_add.get("key") or ())
-            items = self.schedule.load()
-            hit = next((it for it in items if _sched_key(it) == key), None)
-            if hit is None:
-                return None
-            title = str(hit.get("title") or "安排")
-            if self._repeat_of(hit) in ("weekly", "biweekly"):
-                self._update_schedule_item(key, time=when.strftime("%H:%M"))
-            else:
-                self._update_schedule_item(key, start=when.strftime("%Y-%m-%d %H:%M"))
-            self._last_add = {"kind": "schedule", "key": key, "at": time.monotonic()}
-            return SkillResult(
-                reply=f"改好了：{title}改到{humanize(when, now)}。",
-                action="schedule_reschedule",
-            )
-        return None
-
-    def _remember_add(self, kind: str, **info: Any) -> None:
+    def _remember_add(self, event_id: Any) -> None:
         """记下「刚刚新增的那一条」，供随即修正使用。"""
-        self._last_add = {"kind": kind, "at": time.monotonic(), **info}
+        self._last_add = {"id": event_id, "at": time.monotonic()}
 
     # ======================================================================
     # 「这句话要不要先让确定性层看一眼」
@@ -905,24 +759,6 @@ class Skills:
         if self.recent_add():
             return True
         return bool(self._ROUTE_WORDS.search(text or ""))
-
-    def _list_alarms(self, now: datetime) -> SkillResult:
-        items = [it for it in self.alarms.load() if not it.get("fired")]
-        items.sort(key=lambda x: x.get("when", ""))
-        if not items:
-            return SkillResult(reply="当前没有待处理的提醒。", action="alarm_list")
-        lines = []
-        for i, it in enumerate(items[:5], 1):
-            try:
-                when = datetime.fromisoformat(it["when"])
-            except Exception:  # noqa: BLE001
-                continue
-            lines.append(f"第{cn_number(i)}条，{humanize(when, now)}，{it.get('what', '')}")
-        tail = "" if len(items) <= 5 else f"，还有{len(items) - 5}条"
-        return SkillResult(
-            reply=f"待处理提醒{cn_quantity(len(items))}条。" + "；".join(lines) + tail + "。",
-            action="alarm_list",
-        )
 
     # ======================================================================
     # 备忘
@@ -962,31 +798,29 @@ class Skills:
         m = self._MEMO_ADD.search(text)
         if m:
             raw = m.group("content")
-            content = _clean_content(raw)              # 顺带存闹钟时当 what 用
-            memo_text = _clean_memo_content(raw)       # 备忘本身要留住时间词
+            content = et.clean_content(raw)              # 顺带存闹钟时当 what 用
+            memo_text = et.clean_memo_content(raw)       # 备忘本身要留住时间词
             if not memo_text and not content:
                 return None
             self.memos.append({"content": memo_text or content, "done": False})
-            # 「记一下明天要买牛奶」这类带时间的，顺带提醒一下
+            # 「记一下明天要买牛奶」这类带时间的，顺带提醒一下——存成一条普通事件
             when = parse_datetime(text, now)
             if when is not None and TRIGGER_ALARM.search(text):
-                self.alarms.append(
-                    {
-                        "when": when.strftime("%Y-%m-%d %H:%M:%S"),
-                        "what": content or memo_text,
-                        "fired": False,
-                        "kind": "alarm",
-                    }
-                )
+                fields = et.extract(content or memo_text, now)
+                fields["title"] = content or memo_text
+                fields["start"] = when
+                fields["repeat"] = "once"
+                item = self.store.append(et.to_item(fields))
+                self._remember_add(item.get("id"))
                 return SkillResult(
                     reply=f"已归档：{memo_text or content}。{humanize(when, now)}我会提醒你。",
-                    action="memo_add_alarm",
+                    action="memo_add_event",
                 )
             return SkillResult(reply=f"已归档：{memo_text or content}。", action="memo_add")
 
         # 「提醒我买牛奶」这类没时间的 -> 存成备忘
         if TRIGGER_ALARM.search(text) and not has_clock_expr(text):
-            content = _clean_content(_extract_after(text, ("提醒我", "提醒", "叫我")))
+            content = et.clean_content(_extract_after(text, ("提醒我", "提醒", "叫我")))
             if content:
                 self.memos.append({"content": content, "done": False})
                 return SkillResult(
@@ -1078,7 +912,7 @@ class Skills:
         # 「看看今天的日程」「念一下明天的安排」是在问日程，不是在读文件：
         # 带时间词 + 日程词的一律让给日程技能（它在后面）
         if self._RANGE_WORD.search(text) and (
-            TRIGGER_SCHEDULE.search(text) or _weekly_weekday(text) is not None
+            TRIGGER_SCHEDULE.search(text) or parse_weekday(text) is not None
         ):
             return None
         source = self._vision_source(text, read=read)
@@ -1319,194 +1153,18 @@ class Skills:
         re.S,
     )
 
-    def _handle_schedule(self, text: str, now: datetime) -> SkillResult | None:
-        # 改 / 删 / 跳过 先判，别让它们掉进新增分支
-        change = self._handle_schedule_change(text, now)
-        if change is not None:
-            return change
-
-        # 先判新增。「每周三上午九点有 AIAA3102」这种既没有「记录/安排」动词、
-        # 也没有「课/会议」字眼，所以带「每周/每月/每年/每N天」+ 时刻的描述要单独放行，
-        # 否则会被 _SCHEDULE_Q 之类的查询规则抢走。
-        m = self._SCHEDULE_ADD.search(text)
-        rule = parse_repeat(text)
-        wd = int(rule["weekday"]) if rule and rule.get("weekday") is not None else _weekly_weekday(text)
-        is_query = bool(self._SCHEDULE_ASK.search(text))
-        # 约会类（见面/面试/答辩…）带明确时刻时也算新增，否则只能掉给大模型。
-        # 只说了时段（「大后天中午吃饭」）也算——给它一个合理钟点，不会停到早上九点。
-        appoint = bool(TRIGGER_APPOINT.search(text)) and (
-            has_clock_expr(text) or _DAY_PERIOD.search(text) is not None
-        )
-        # 「我周三下午三点半要去见导师」：只是动词 + 时间，不是「安排/记录」这种命令式，
-        # 以前也认不出来（大模型选对了 add_schedule，技能层反而不认，就白搭了）
-        plan = (
-            bool(PLAN_VERB.search(text))
-            and has_clock_expr(text)
-            and parse_date_hint(text, now) is not None
-        )
-        # 活动类：「下周三下午3点有社团活动」「9月23号下午3点到4点半，有一场造物社的活动」
-        # 同样要求日期 + 时刻，光说「今天有活动」不会当成新增
-        activity = (
-            bool(ACTIVITY_NOUN.search(text))
-            and has_clock_expr(text)
-            and parse_date_hint(text, now) is not None
-        )
-        looks_add = (
-            (m is not None and TRIGGER_SCHEDULE.search(text))
-            or rule is not None
-            or appoint
-            or plan
-            or activity
-        )
-        if not is_query and looks_add and (
-            has_clock_expr(text) or rule is not None or appoint or plan
-        ):
-            first = parse_datetime(text, now)
-            if first is None:
-                # 只说了周期没说时刻（「每天提醒我吃药」）→ 默认上午九点
-                first = datetime.combine(now.date(), datetime.min.time()).replace(hour=9, minute=0)
-            if appoint and not has_clock_expr(text):
-                # 「大后天中午和导师吃饭」：parse_datetime 会默默给 9 点，中午得纠正成 12 点
-                ph = _period_hour(text)
-                if ph is not None:
-                    first = first.replace(hour=ph, minute=0)
-            # 「周五上午十点答辩」在周五晚上说：这个时刻今天已经过了。
-            # 句子带星期（不管有没有「每」）就往后推一周（说的是下周五），
-            # 否则顺延一天并说明白——不然会默默存一条已经过去的日程（存进去再也不响）。
-            rolled = ""
-            if first < now:
-                if wd is not None or _WEEKDAY_WORD.search(text):
-                    first = first + timedelta(days=7)
-                    rolled = "这周那个时间已经过了，我按下一个算："
-                else:
-                    first = first + timedelta(days=1)
-                    rolled = "那个时间今天已经过了，"
-            title, location = _split_title_location(text)
-            if not _is_topic(title):
-                title = _clean_content(m.group("content")) if m else ""
-            if not _is_topic(title):
-                title = _clean_content(text)
-            if not _is_topic(title):
-                title = "日程"
-            # 多个提前提醒：「提前一天和半小时提醒我」→ [1440, 30]
-            leads = parse_reminds(text) or [int(self.settings.skills.default_remind_before)]
-            until = parse_until(text, now)
-            note = self._note_of(text)
-            repeat = (rule or {}).get("repeat", "once")
-            # 「下午3点到4点半」→ 时长 90 分钟（存下来，下一项/提醒才不会当成一小时）
-            span = parse_clock_range(text, now)
-            duration = 0
-            if span is not None:
-                start_min = span[0][0] * 60 + span[0][1]
-                end_min = span[1][0] * 60 + span[1][1]
-                if end_min <= start_min:
-                    end_min += 24 * 60
-                if 0 < end_min - start_min <= 12 * 60:
-                    duration = end_min - start_min
-
-            if wd is not None and repeat in ("weekly", "biweekly"):
-                item: dict = {
-                    "title": title,
-                    "kind": "course",
-                    "repeat": repeat,
-                    "weekday": wd,
-                    "time": f"{first.hour:02d}:{first.minute:02d}",
-                    "duration_minutes": 90,
-                    "remind_before": leads,
-                }
-                if repeat == "biweekly":
-                    item["start"] = first.strftime("%Y-%m-%d %H:%M")   # 双周要有锚点才知道相位
-                self._finish_item(item, location, until, note)
-                dup = self._find_duplicate(item, now, first)
-                if dup is not None:
-                    return SkillResult(
-                        reply=f"这条日程已经有了：{self._repeat_text(dup)}{dup.get('title')}。",
-                        action="schedule_exist",
-                    )
-                self.schedule.append(item)
-                self._remember_add("schedule", key=_sched_key(item))
-                return SkillResult(
-                    reply=(
-                        f"已排入课表：{self._repeat_text(item)}，{title}{self._where_text(location)}。"
-                        f"最近一次是{humanize(first, now)}，{self._remind_text_of(leads)}"
-                        f"{self._until_text(until)}"
-                    ),
-                    action="schedule_add_weekly",
-                )
-
-            kind = "meeting" if repeat == "once" else ("course" if repeat in ("weekly", "biweekly") else "task")
-            item = {
-                "title": title,
-                "kind": kind,
-                "repeat": repeat,
-                "start": first.strftime("%Y-%m-%d %H:%M"),
-                "time": f"{first.hour:02d}:{first.minute:02d}",
-                "remind_before": leads,
-            }
-            if duration:
-                item["duration_minutes"] = duration
-            if repeat == "interval":
-                # 「每 3 天一次」不默认占时长，周期就是「结束后 N 天」里的 N
-                item["duration_minutes"] = 0
-            for key in ("weekday", "day", "month", "every_days", "every_minutes"):
-                if rule and rule.get(key) is not None:
-                    item[key] = rule[key]
-            if rule and rule.get("weekday") is not None and "weekday" not in item:
-                item["weekday"] = rule["weekday"]
-            self._finish_item(item, location, until, note)
-            # 说的是「每月5号」时 first 可能只是「今天九点」，真正第一次要按规则算
-            real_first = next(iter(self._starts_from(item, now)), first)
-            dup = self._find_duplicate(item, now, real_first)
-            if dup is not None:
-                return SkillResult(
-                    reply=(
-                        f"这条日程已经有了：{self._repeat_text(dup)}{dup.get('title')}，"
-                        f"{humanize(real_first, now)}。要改就说「把{dup.get('title')}挪到…」。"
-                    ),
-                    action="schedule_exist",
-                )
-            self.schedule.append(item)
-            self._remember_add("schedule", key=_sched_key(item))
-            head = (
-                f"已排入日程：{self._repeat_text(item)}"
-                if repeat != "once"
-                else f"已排入日程：{humanize(real_first, now)}"
-            )
-            return SkillResult(
-                reply=(
-                    f"{rolled}{head}，{title}{self._where_text(location)}。"
-                    f"第一次是{humanize(real_first, now)}，{self._remind_text_of(leads)}"
-                    f"{self._until_text(until)}"
-                ),
-                action="schedule_add",
-            )
-
-        if self._SCHEDULE_NEXT.search(text):
-            return self._next_item(now)
-
-        listed = self._list_scope(text, now)
-        if listed is not None:
-            return listed
-
-        if self._SCHEDULE_Q.search(text) or self._RANGE_ASK.search(text):
-            if not self._NOT_SCHEDULE_Q.search(text):
-                return self._day_items(text, now)
-            return None          # 「今天天气怎么样」交给模型去答
-
-        return None
-
     # ------------------------------------------------------------ 日程改 / 删 / 跳过
     def _find_duplicate(self, item: dict, now: datetime, first: datetime) -> dict | None:
         """同名字 + 同一次时间就当成重复：语音里同一句话说两遍太常见了，
         以前会存成两条，第二遍提醒又响一次。"""
-        want = _norm_title(str(item.get("title") or ""))
+        want = et.norm_title(str(item.get("title") or ""))
         if not want:
             return None
-        rep = self._repeat_of(item)
-        for it in self.schedule.load():
-            if _norm_title(str(it.get("title") or "")) != want:
+        rep = repeat_of(item)
+        for it in self.store.load():
+            if et.norm_title(str(it.get("title") or "")) != want:
                 continue
-            if self._repeat_of(it) != rep:
+            if repeat_of(it) != rep:
                 continue
             if rep == "once":
                 if str(it.get("start") or "")[:16] == first.strftime("%Y-%m-%d %H:%M"):
@@ -1540,28 +1198,30 @@ class Skills:
             return None
         if self._SCHEDULE_QUESTION.search(text):
             return None                     # 「今天的课不上吗？」是问句，别真去取消
-        items = self.schedule.load()
+        # 批量说法（「所有课程…」）永远不是「新增一条」
+        pred, scope = self._scope_filter(text)
+        # ★没说要删、又像新增的，让给新增分支★
+        # 「明天下午三点安排项目评审会，提前30分钟提醒我」里的「提前」撞上
+        # _SCHEDULE_EDIT，结果被当成「改哪一条」去反问用户（实测）。
+        if not drop and pred is None and self._looks_like_add(text, now):
+            return None
+        items = self.store.load()
         if not items:
-            # ★日程空的时候，别把「要新增」的句子拦下来★
+            # ★店空的时候，别把「要新增」的句子拦下来★
             # 「明天下午三点安排项目评审会，提前30分钟提醒我」里的「提前」会撞上
-            # _SCHEDULE_EDIT，于是空日程时回一句「没什么可以改的」，明明是要新增却排不上
-            # （实测 2026-09-20，全新数据目录时必现）。
-            if (
-                self._SCHEDULE_ADD.search(text)
-                or ACTIVITY_NOUN.search(text)
-                or TRIGGER_APPOINT.search(text)
-            ):
+            # _SCHEDULE_EDIT，于是空库时回一句「没什么可以改的」，明明是要新增却排不上
+            # （实测 2026-09-20，全新数据目录时必现）。判据与新增分支共用。
+            if self._looks_like_add(text, now):
                 return None
             return SkillResult(
-                reply="日程里现在还是空的，没什么可以改的。", action="schedule_change"
+                reply="现在还是空的，没什么可以改的。", action="event_change"
             )
 
         # --- 批量：所有课程 / 所有会议 / 所有日程 ---
-        pred, scope = self._scope_filter(text)
         if pred is not None:
             targets = [it for it in items if pred(it)]
             if not targets:
-                return SkillResult(reply=f"日程里没有{scope}可以改。", action="schedule_change")
+                return SkillResult(reply=f"日程里没有{scope}可以改。", action="event_change")
             if edit:
                 return self._batch_edit(targets, scope, text, now)
             return self._batch_drop(targets, scope, text, now)
@@ -1576,19 +1236,19 @@ class Skills:
                 names = "、".join(f"「{it.get('title', '安排')}」" for it in refs[:4])
                 return SkillResult(
                     reply=f"你说的「它」是指哪一条？（{names}）说个名字我就动手。",
-                    action="schedule_change",
+                    action="event_change",
                 )
             elif self._REFER_WORDS.search(text):
                 return SkillResult(
                     reply="我这边没有可以指代的日程——先说一句「今天有什么课」，或者把名字说清楚？",
-                    action="schedule_change_miss",
+                    action="event_change_miss",
                 )
         if not hits:
             # 听着像在说日程，但库里找不到对应条目：说清楚比乱改好
-            if drop and (TRIGGER_SCHEDULE.search(text) or _weekly_weekday(text) is not None):
+            if drop and (TRIGGER_SCHEDULE.search(text) or parse_weekday(text) is not None):
                 return SkillResult(
                     reply="没找到你说的那条日程。先问一句「今天有什么课」，或者把名字说清楚一点？",
-                    action="schedule_change_miss",
+                    action="event_change_miss",
                 )
             return None
 
@@ -1598,7 +1258,7 @@ class Skills:
             names = "、".join(f"「{it.get('title', '安排')}」" for _s, it in hits[:4])
             return SkillResult(
                 reply=f"我不太确定你说的是哪一条（可能是{names}）。说清楚名字、或者带上星期几试试？",
-                action="schedule_change_unsure",
+                action="event_change_unsure",
             )
 
         same = [it for s, it in hits if s == top]
@@ -1606,14 +1266,14 @@ class Skills:
             names = "、".join(f"「{it.get('title', '安排')}」" for it in same[:4])
             return SkillResult(
                 reply=f"有 {len(same)} 条都对得上（{names}），你说是哪一条？",
-                action="schedule_change",
+                action="event_change",
             )
 
         item = same[0]
-        title = str(item.get("title") or "安排")
-        key = _sched_key(item)
-        rep = self._repeat_of(item)
-        weekly = rep in ("weekly", "biweekly")
+        title = display_title(item)
+        eid = _key_of(item)
+        rep = repeat_of(item)
+        recurring = has_repeat(item)
 
         # ★删之前必须核对时间★（这一步是拿真数据换来的）：
         # 实测「取消明天早上的安排」被接成「删日程」，而且是从上一轮助手自己念过的
@@ -1622,20 +1282,26 @@ class Skills:
         if drop:
             mismatch = self._drop_time_mismatch(text, item, rep, now)
             if mismatch:
-                return SkillResult(reply=mismatch, action="schedule_change_unsure")
+                return SkillResult(reply=mismatch, action="event_change_unsure")
 
-        # --- 删：以后都不上了 ---
-        if drop and not weekly:
-            self.schedule.remove_where(lambda it: _sched_key(it) == key)
-            return SkillResult(reply=f"已删除日程：{title}。", action="schedule_delete")
-        if drop and self._SCHEDULE_FOREVER.search(text):
-            self.schedule.remove_where(lambda it: _sched_key(it) == key)
+        # --- 删：整条不要了 ---
+        # 一次性的直接删；带重复的**要先问一句**（影响的是往后所有次）。
+        # 但「取消X」默认**只跳过最近这一次**——带重复的不轻易删（删除不可逆），
+        # 只有说了「以后都不上」这类永久说法才删，删之前还要确认一次。
+        if drop and not recurring:
+            self.store.remove_where(lambda it: _key_of(it) == eid)
+            return SkillResult(reply=f"已删除：{title}。", action="event_delete")
+        if drop and recurring and self._SCHEDULE_FOREVER.search(text):
+            when = self._next_of(item, now) or now
+            if not self._confirm_repeat(item, when, "删除"):
+                return self._ask_confirm(item, when, "删除")
+            self.store.remove_where(lambda it: _key_of(it) == eid)
             return SkillResult(
-                reply=f"已删除日程：{title}，以后不会再提醒了。", action="schedule_delete"
+                reply=f"已删除：{title}，以后不会再提醒了。", action="event_delete"
             )
 
         # --- 跳过：只取消最近这一次，课表本身留着 ---
-        if drop and weekly:
+        if drop and recurring:
             day = self._skip_day(text, item, now)
             if day < now.date():
                 # 「这周三」在周五说已经是过去了：不猜，问清楚（取消是不可逆的）
@@ -1644,23 +1310,23 @@ class Skills:
                         f"{day.month}月{day.day}日（{WEEKDAY_NAMES[day.weekday()]}）已经过去了。"
                         f"你是想取消下一次吗？说「下次的{title}不上了」就行。"
                     ),
-                    action="schedule_change_miss",
+                    action="event_change_miss",
                 )
-            skips = [str(d) for d in (item.get("skip") or []) if d]
+            skips = skipped_of(item)
             if str(day) in skips:
                 return SkillResult(
-                    reply=f"{day.month}月{day.day}日的{title}本来就没安排。", action="schedule_skip"
+                    reply=f"{day.month}月{day.day}日的{title}本来就没安排。", action="event_skip"
                 )
             skips.append(str(day))
-            self._update_schedule_item(key, skip=skips)
+            self._mark_skipped(item, day)
             return SkillResult(
                 reply=f"好，{humanize(self._at(item, day), now)}的{title}不提醒了，下周照常。",
-                action="schedule_skip",
+                action="event_skip",
             )
 
         if drop:
-            self.schedule.remove_where(lambda it: _sched_key(it) == key)
-            return SkillResult(reply=f"已删除日程：{title}。", action="schedule_delete")
+            self.store.remove_where(lambda it: _key_of(it) == eid)
+            return SkillResult(reply=f"已删除日程：{title}。", action="event_delete")
 
         # --- 改：时间 / 星期 / 地点 ---
         day = parse_date_hint(text, now)
@@ -1679,15 +1345,15 @@ class Skills:
                 if new_rule.get(keep) is not None:
                     fields[keep] = new_rule[keep]
 
-        if weekly or fields.get("repeat") in ("weekly", "biweekly"):
-            hh, mm = (when.hour, when.minute) if when is not None else self._parse_hhmm(item.get("time", "09:00"))
+        if rep in ("weekly", "biweekly") or fields.get("repeat") in ("weekly", "biweekly"):
+            hh, mm = (when.hour, when.minute) if when is not None else parse_hhmm(item.get("time", "09:00"))
             wd = day.weekday() if day is not None else int(item.get("weekday", 0) or 0)
-            fields.update(weekday=wd, time=f"{hh:02d}:{mm:02d}", skip=[])
+            fields.update(weekday=wd, time=f"{hh:02d}:{mm:02d}", state=None)
         else:
             if when is None and fields.get("repeat") is None:
                 return SkillResult(
                     reply=f"想把{title}改到什么时候？比如「挪到明天下午三点」。",
-                    action="schedule_edit",
+                    action="event_change",
                 )
             if when is not None:
                 fields["start"] = when.strftime("%Y-%m-%d %H:%M")
@@ -1698,10 +1364,10 @@ class Skills:
                         fields.setdefault("month", when.month)
         if new_leads is not None:
             fields["remind_before"] = new_leads
-        note = self._note_of(text)
+        note = et.note_of(text)
         if note:
             fields["note"] = note
-        _, loc = _split_title_location(text)
+        _, loc = et.split_title_location(text)
         if loc:
             fields["location"] = loc
 
@@ -1710,104 +1376,27 @@ class Skills:
             fields.pop(k)
         if clear:
             # 有字段要消失（比如从「每周三」改成「每月5号」），删掉旧的再写新的
-            items_now = self.schedule.load()
+            items_now = self.store.load()
             for it in items_now:
-                if _sched_key(it) == key:
+                if _key_of(it) == eid:
                     for k in clear:
                         it.pop(k, None)
                     it.update(fields)
                     break
-            self.schedule.save(items_now)
+            self.store.save(items_now)
         else:
-            self._update_schedule_item(key, **fields)
+            self._update_event(eid, **fields)
 
         where = f"，地点{loc}" if loc else ""
-        cur = next((it for it in self.schedule.load() if it.get("title") == title), item)
-        if self._repeat_of(cur) != "once" and (weekly or fields.get("repeat") is not None):
-            reply = f"已改：{title} 现在是{self._repeat_text(cur)}{where}。"
+        cur = next((it for it in self.store.load() if it.get("title") == title), item)
+        if rep != "once" and (rep in ("weekly", "biweekly") or fields.get("repeat") is not None):
+            reply = f"已改：{title} 现在是{self._when_of(cur, now)}{where}。"
         else:
             reply = f"已改：{title} 改到 {cur.get('start', '')}{where}。"
         if new_leads is not None:
-            reply += self._remind_text_of(new_leads)
-        return SkillResult(reply=reply, action="schedule_edit")
+            reply += et.leads_text(new_leads)
+        return SkillResult(reply=reply, action="event_change")
 
-    # ------------------------------------------------------------ 日程字段工具
-    @staticmethod
-    def _note_of(text: str) -> str:
-        """「备注带实验报告」→ 带实验报告（跟着提醒一起念/显示）。"""
-        m = re.search(r"备注\s*[:：]?\s*([^，,。;；]+)", text or "")
-        return m.group(1).strip() if m else ""
-
-    def _finish_item(self, item: dict, location: str, until: date | None, note: str = "") -> None:
-        if location:
-            item["location"] = location
-        if until is not None:
-            item["until"] = until.isoformat()
-        if note:
-            item["note"] = note
-
-    @staticmethod
-    def _where_text(location: str) -> str:
-        return f"，地点{location}" if location else ""
-
-    @staticmethod
-    def _until_text(until: date | None) -> str:
-        return f"（到{until.month}月{until.day}日为止）" if until is not None else ""
-
-    @staticmethod
-    def _span_text(item: dict) -> str:
-        if item.get("every_days"):
-            days = int(item["every_days"])
-            return "天" if days == 1 else f"{cn_number(days)}天"
-        if item.get("every_minutes"):
-            mins = int(item["every_minutes"])
-            if mins == 60:
-                return "小时"
-            if mins % 1440 == 0:
-                return f"{cn_number(mins // 1440)}天"
-            if mins % 60 == 0:
-                return f"{cn_number(mins // 60)}小时"
-            return f"{cn_number(mins)}分钟"
-        return "天"
-
-    def _repeat_text(self, item: dict) -> str:
-        """把重复规则说成人话（用于播报）。"""
-        rep = self._repeat_of(item)
-        hh, mm = self._parse_hhmm(item.get("time", "09:00"))
-        if rep == "weekly":
-            return f"每{WEEKDAY_NAMES[int(item.get('weekday', 0))]} {hh:02d}:{mm:02d}"
-        if rep == "biweekly":
-            return f"每两周{WEEKDAY_NAMES[int(item.get('weekday', 0))]} {hh:02d}:{mm:02d}"
-        if rep == "monthly":
-            return f"每月{cn_number(int(item.get('day') or 1))}号 {hh:02d}:{mm:02d}"
-        if rep == "yearly":
-            return (
-                f"每年{cn_number(int(item.get('month') or 1))}月"
-                f"{cn_number(int(item.get('day') or 1))}日 {hh:02d}:{mm:02d}"
-            )
-        if rep == "interval":
-            tail = "（结束后再排下一次）" if int(item.get("duration_minutes", 0) or 0) else ""
-            return f"每{self._span_text(item)}一次{tail}"
-        return "一次性"
-
-    def _remind_text_of(self, leads: list[int]) -> str:
-        parts = []
-        for lead in leads:
-            if lead <= 0:
-                parts.append("到点")
-            elif lead % 1440 == 0:
-                parts.append(f"提前{cn_number(lead // 1440)}天")
-            elif lead % 60 == 0:
-                parts.append(f"提前{cn_number(lead // 60)}小时")
-            else:
-                parts.append(f"提前{cn_number(lead)}分钟")
-        if not parts:
-            return "我会到点提醒你。"
-        if len(parts) == 1:
-            return f"我会{parts[0]}提醒你。"
-        return "我会" + "、".join(parts[:-1]) + "和" + parts[-1] + "提醒你。"
-
-    # ------------------------------------------------------------ 批量 / 指代
     def _scope_filter(self, text: str, allow_partial: bool = False):
         """「所有课程 / 全部会议 / 所有日程」→ (过滤函数, 说法)。
 
@@ -1818,24 +1407,24 @@ class Skills:
             return None, ""
         if self._SCOPE_COURSE.search(t):
             return (
-                lambda it: str(it.get("kind")) == "course"
-                or self._repeat_of(it) in ("weekly", "biweekly"),
+                lambda it: it.get("category") == "course"
+                or repeat_of(it) in ("weekly", "biweekly"),
                 "课程",
             )
         if self._SCOPE_MEETING.search(t):
             return (
-                lambda it: str(it.get("kind")) == "meeting" or "会" in str(it.get("title", "")),
+                lambda it: it.get("category") == "meeting" or "会" in str(it.get("title", "")),
                 "会议",
             )
         if self._SCOPE_TASK.search(t):
-            return lambda it: str(it.get("kind")) == "task", "任务"
+            return lambda it: it.get("category") == "task", "任务"
         if self._SCOPE_ANY.search(t):
             return lambda it: True, "日程"
         return None, ""
 
     def _batch_drop(self, targets: list[dict], scope: str, text: str, now: datetime) -> SkillResult:
         """批量取消：一次性的直接删；每周重复的要么「以后都不上」，要么逐条只跳过下一次。"""
-        weekly = [it for it in targets if self._repeat_of(it) in ("weekly", "biweekly")]
+        weekly = [it for it in targets if repeat_of(it) in ("weekly", "biweekly")]
         once = [it for it in targets if it not in weekly]
         forever = bool(self._FOREVER_WORDS.search(text))
 
@@ -1848,38 +1437,36 @@ class Skills:
                     f"是要以后都不上（彻底删掉），还是只取消这周这一次？"
                     f"说「以后都不上」或者「这周不上」就行。"
                 ),
-                action="schedule_change",
+                action="event_change",
             )
 
         if forever or once and not weekly:
-            keys = {_sched_key(it) for it in targets}
-            removed = self.schedule.remove_where(lambda it: _sched_key(it) in keys)
+            ids = {it.get("id") for it in targets}
+            removed = self.store.remove_where(lambda it: it.get("id") in ids)
             names = "、".join(str(it.get("title", "安排")) for it in removed[:6])
             tail = "等" if len(removed) > 6 else ""
             return SkillResult(
                 reply=f"已删除{cn_quantity(len(removed))}条{scope}：{names}{tail}。",
-                action="schedule_delete",
+                action="event_delete",
             )
 
         # 只跳过下一次
         if not weekly:
-            return SkillResult(reply=f"{scope}里没有可以取消的。", action="schedule_change")
+            return SkillResult(reply=f"{scope}里没有可以取消的。", action="event_change")
         day = parse_date_hint(text, now)
         done: list[str] = []
         for it in weekly:
             target_day = day if day is not None else self._skip_day("", it, now)
             if target_day < now.date():
                 target_day = self._skip_day("", it, now)
-            skips = [str(d) for d in (it.get("skip") or []) if d]
-            if str(target_day) in skips:
+            if str(target_day) in skipped_of(it):
                 continue
-            skips.append(str(target_day))
-            self._update_schedule_item(_sched_key(it), skip=skips)
-            done.append(str(it.get("title", "课")))
+            mark_skipped(it, target_day)
+            done.append(f"{target_day.month}月{target_day.day}日的{display_title(it)}")
         if not done:
-            return SkillResult(reply=f"{scope}这次本来就没安排。", action="schedule_skip")
+            return SkillResult(reply=f"{scope}这次本来就没安排。", action="event_skip")
         return SkillResult(
-            reply=f"好，这次的{'、'.join(done)}都不提醒了，下次照常。", action="schedule_skip"
+            reply=f"好，这次{'、'.join(done)}都不提醒了，下次照常。", action="event_skip"
         )
 
     def _batch_edit(self, targets: list[dict], scope: str, text: str, now: datetime) -> SkillResult:
@@ -1887,16 +1474,16 @@ class Skills:
         when = parse_datetime(text, now)
         leads = parse_reminds(text)
         rule = parse_repeat(text)
-        wd = _weekly_weekday(text)
-        _, loc = _split_title_location(text)
-        note = self._note_of(text)
+        wd = parse_weekday(text)
+        _, loc = et.split_title_location(text)
+        note = et.note_of(text)
         changed: list[str] = []
         for it in targets:
             fields: dict[str, Any] = {}
-            weekly = self._repeat_of(it) in ("weekly", "biweekly")
+            weekly = repeat_of(it) in ("weekly", "biweekly")
             if wd is not None and weekly:
                 fields["weekday"] = wd
-                fields["skip"] = []          # 换了星期，之前跳过的那些天就不算数了
+                fields["state"] = None       # 换了星期，之前跳过的那些天就不算数了
             if when is not None:
                 if weekly:
                     fields["time"] = f"{when.hour:02d}:{when.minute:02d}"
@@ -1918,17 +1505,17 @@ class Skills:
             if note:
                 fields["note"] = note
             if fields:
-                self._update_schedule_item(_sched_key(it), **fields)
+                self._update_event(it.get("id"), **fields)
                 changed.append(str(it.get("title", "安排")))
         if not changed:
             return SkillResult(
                 reply=f"要{scope}都改什么？可以说「都改到下午三点」或者「都提前半小时提醒」。",
-                action="schedule_edit",
+                action="event_change",
             )
         names = "、".join(changed[:6])
         return SkillResult(
             reply=f"已改{cn_quantity(len(changed))}条{scope}：{names}{'等' if len(changed) > 6 else ''}。",
-            action="schedule_edit",
+            action="event_change",
         )
 
     def _referenced_items(self, text: str, now: datetime) -> list[dict]:
@@ -1939,7 +1526,7 @@ class Skills:
         hay = "\n".join(self.dialog[-8:])
         if not hay.strip():
             return []
-        items = self.schedule.load()
+        items = self.store.load()
         hits = self._score_items(hay, items, now)
         return [it for s, it in hits if s >= 2]     # 至少要有名字或时间对得上
 
@@ -1950,22 +1537,22 @@ class Skills:
             return None
         # 「每周五有什么课」「9月20日有哪些课」是在问某一天，别按全体列表回答
         if (self._RANGE_WORD.search(text)
-                or _weekly_weekday(text) is not None
+                or parse_weekday(text) is not None
                 or parse_date_hint(text, now) is not None):
             return None
-        targets = [it for it in self.schedule.load() if pred(it)]
+        targets = [it for it in self.store.load() if pred(it)]
         if not targets:
-            return SkillResult(reply=f"日程里还没有{scope}。", action="schedule_list")
+            return SkillResult(reply=f"日程里还没有{scope}。", action="event_list")
         parts = []
         for it in targets:
-            nxt = self.next_occurrence(it, now)
+            nxt = self._next_of(it, now)
             when = f"下一次{nxt.strftime('%m-%d %H:%M')}" if nxt else "已经过期"
             title = str(it.get("title") or "安排")
-            parts.append(f"{title}（{when}）" if self._repeat_of(it) == "once"
-                         else f"{self._repeat_text(it)} {title}，{when}")
+            parts.append(f"{title}（{when}）" if repeat_of(it) == "once"
+                         else f"{et.when_text(it)} {title}，{when}")
         return SkillResult(
             reply=f"一共{cn_quantity(len(targets))}条{scope}：" + "；".join(parts) + "。",
-            action="schedule_list",
+            action="event_list",
         )
 
     def _match_schedule_items(self, text: str, items: list[dict], now: datetime) -> list[tuple[int, dict]]:
@@ -1982,8 +1569,8 @@ class Skills:
         clock = parse_clock(hay)
         hits: list[tuple[int, dict]] = []
         for it in items:
-            score = 2 * _title_hit(str(it.get("title", "")), hay)
-            rep = self._repeat_of(it)
+            score = 2 * et.title_hit(str(it.get("title", "")), hay)
+            rep = repeat_of(it)
             same_clock = bool(clock) and str(it.get("time", "")) == f"{clock[0]:02d}:{clock[1]:02d}"
             if rep in ("weekly", "biweekly"):
                 if day is not None and int(it.get("weekday", -1)) == day.weekday():
@@ -2027,16 +1614,16 @@ class Skills:
         if rep in ("weekly", "biweekly"):
             if day is not None and int(item.get("weekday", -1)) != day.weekday():
                 return (
-                    f"「{title}」是{self._repeat_text(item)}"
+                    f"「{title}」是{self._when_of(item, now)}"
                     f"，不是{self._day_label(day, now, True)}——要删它就说「删掉{title}」。"
                 )
             if clock is not None and str(item.get("time", "")) != f"{clock[0]:02d}:{clock[1]:02d}":
                 return (
-                    f"「{title}」是{self._repeat_text(item)}开始的"
+                    f"「{title}」是{self._when_of(item, now)}开始的"
                     f"，跟你说的时间对不上——要删它就说「删掉{title}」。"
                 )
             return None
-        nxt = self.next_occurrence(item, now - timedelta(seconds=1))
+        nxt = self._next_of(item, now - timedelta(seconds=1))
         if nxt is None:
             return f"「{title}」算不出下一次时间，我不删——你说清楚名字再试。"
         when_text = humanize(nxt, now)
@@ -2058,17 +1645,23 @@ class Skills:
         day = parse_date_hint(text, now)
         if day is not None:
             return day
-        nxt = self.next_occurrence(item, now - timedelta(seconds=1))
+        nxt = self._next_of(item, now - timedelta(seconds=1))
         return nxt.date() if nxt is not None else now.date()
 
     def _at(self, item: dict, day: date) -> datetime:
-        hh, mm = self._parse_hhmm(item.get("time", "09:00"))
+        hh, mm = parse_hhmm(item.get("time", "09:00"))
         return datetime.combine(day, datetime.min.time()).replace(hour=hh, minute=mm)
 
-    def _update_schedule_item(self, key: tuple, **fields: Any) -> None:
-        for i, it in enumerate(self.schedule.load(), start=1):
-            if _sched_key(it) == key:
-                self.schedule.update(i, **fields)
+    def _mark_skipped(self, item: dict, day: date) -> None:
+        """跳过一次（记进 state.skipped）并落盘：课表本身留着。"""
+        mark_skipped(item, day)
+        self.store.save(self.store.load())
+
+    def _update_event(self, event_id: Any, **fields: Any) -> None:
+        """按 id 改一条（字段就地在库里改，不动别条）。"""
+        for i, it in enumerate(self.store.load(), start=1):
+            if _key_of(it) == event_id:
+                self.store.update(i, **fields)
                 return
 
     # ---------------------------------------------------------------- 日程查询
@@ -2241,11 +1834,30 @@ class Skills:
             or parse_datetime(t) is not None
         )
 
+    def _on_day(self, day: date, now: datetime) -> list[tuple[datetime, dict]]:
+        """某一天里所有会发生的事件（重复规则由 :func:`events.occurrences` 展开）。
+
+        ★不再按「闹钟/日程」筛★：没有那个区分了——今天要吃药和今天要上课一样都是
+        「今天的事」。真要看某一类，用 category 筛（「有哪些课」走 _scope_filter）。
+        """
+        from .events import occurrences
+
+        start = datetime.combine(day, datetime.min.time())
+        end = start + timedelta(days=1)
+        out: list[tuple[datetime, dict]] = []
+        for item in self.store.load():
+            for when in occurrences(item, start, limit=4):
+                if when >= end:
+                    break
+                out.append((when, item))
+        out.sort(key=lambda pair: pair[0])
+        return out
+
     def _range_items(
         self, start: date, end: date, label: str, now: datetime,
         period: tuple[int, int] | None = None,
     ) -> SkillResult:
-        """把一段时间里的安排按天列出来（重复规则由 _occurrences_on 展开）。
+        """把一段时间里的安排按天列出来（重复规则由 events.occurrences 展开）。
 
         ``period``：只看这个时段（左闭右开小时区间），用于「下周三下午」这类问法。
         """
@@ -2256,7 +1868,7 @@ class Skills:
         total = 0
         day = start
         while day <= end:
-            items = self._occurrences_on(day, ignore_reminder=True, now=now)
+            items = self._on_day(day, now)
             if period is not None:
                 items = [(w, i) for w, i in items if period[0] <= w.hour < period[1]]
             if items:
@@ -2270,11 +1882,11 @@ class Skills:
             day += timedelta(days=1)
 
         if not found:
-            return SkillResult(reply=f"{label}没有课程或会议安排。", action="schedule_query")
+            return SkillResult(reply=f"{label}没有课程或会议安排。", action="event_query")
         if start == end:
             return SkillResult(
                 reply=f"{label}有{cn_quantity(total)}项安排：" + "；".join(d for _day, d in found) + "。",
-                action="schedule_query",
+                action="event_query",
             )
         span = f"{label}（{start.month}月{start.day}日到{end.month}月{end.day}日）"
         # 跨度大了就得把日期写出来，不然「周三」分不清是哪一周
@@ -2282,222 +1894,32 @@ class Skills:
         detail = "；".join(f"{self._day_label(d, now, with_date)}{txt}" for d, txt in found)
         return SkillResult(
             reply=f"{span}有{cn_quantity(total)}项安排：{detail}。",
-            action="schedule_query",
+            action="event_query",
         )
 
     def _next_item(self, now: datetime) -> SkillResult:
         best: tuple[datetime, dict] | None = None
         for offset in range(0, 15):
             day = now.date() + timedelta(days=offset)
-            for when, item in self._occurrences_on(day, ignore_reminder=True, now=now):
+            for when, item in self._on_day(day, now):
                 end = when + timedelta(minutes=int(item.get("duration_minutes", 60) or 60))
                 if end <= now:
                     continue
                 if best is None or when < best[0]:
                     best = (when, item)
         if best is None:
-            return SkillResult(reply="未来两周内没有安排。", action="schedule_next")
+            return SkillResult(reply="未来两周内没有安排。", action="event_next")
         when, item = best
         delta = (when - now).total_seconds()
         where = f"，地点{item['location']}" if item.get("location") else ""
         if delta <= 0:
-            return SkillResult(reply=f"你正在进行：{item.get('title', '')}{where}。", action="schedule_next")
+            return SkillResult(reply=f"你正在进行：{item.get('title', '')}{where}。", action="event_next")
         return SkillResult(
             reply=f"下一项是{humanize(when, now)}的{item.get('title', '安排')}{where}，还有{humanize_delta(delta)}。",
-            action="schedule_next",
+            action="event_next",
         )
-    # ---------------------------------------------------------------- 日程展开
-    @staticmethod
-    def _repeat_of(item: dict) -> str:
-        """把各种写法的 repeat 归一成 once / weekly / biweekly / monthly / yearly / interval。"""
-        raw = str(item.get("repeat", "once")).strip().lower()
-        if raw in ("once", "weekly", "biweekly", "monthly", "yearly", "interval"):
-            return raw
-        return {
-            "每周": "weekly", "周": "weekly", "星期": "weekly", "每周重复": "weekly",
-            "每两周": "biweekly", "双周": "biweekly", "两周一": "biweekly",
-            "每月": "monthly", "每个月": "monthly", "月": "monthly",
-            "每年": "yearly", "年": "yearly", "每年重复": "yearly",
-            "间隔": "interval", "after_end": "interval", "每天": "interval",
-            "一次": "once", "一次性": "once", "none": "once", "": "once",
-        }.get(raw, "once")
-
-    def _anchor_of(self, item: dict) -> datetime | None:
-        raw = item.get("start") or item.get("when")
-        if not raw:
-            return None
-        try:
-            return datetime.fromisoformat(str(raw).replace("/", "-"))
-        except ValueError:
-            return None
-
-    def _until_of(self, item: dict) -> date | None:
-        raw = item.get("until")
-        if not raw:
-            return None
-        try:
-            return datetime.fromisoformat(str(raw).replace("/", "-")).date()
-        except ValueError:
-            return None
-
-    def _interval_delta(self, item: dict) -> timedelta:
-        """间隔循环的周期 = **这次结束** + 间隔（「结束后 N 天再排一次」）。"""
-        dur = max(0, int(item.get("duration_minutes", 0) or 0))
-        if item.get("every_minutes"):
-            gap = int(item["every_minutes"])
-        elif item.get("every_hours"):
-            gap = int(item["every_hours"]) * 60
-        elif item.get("every_days"):
-            gap = int(item["every_days"]) * 24 * 60
-        else:
-            gap = 24 * 60
-        return timedelta(minutes=max(1, dur + gap))
-
-    def _leads_of(self, item: dict) -> list[int]:
-        """提前提醒的分钟数组（0 = 到点）；兼容旧数据的整数写法。"""
-        raw = item.get("remind_before")
-        if raw is None:
-            raw = self.settings.skills.default_remind_before
-        if isinstance(raw, (int, float, str)):
-            try:
-                return [max(0, int(raw))]
-            except (TypeError, ValueError):
-                return [10]
-        out = []
-        for v in raw:
-            try:
-                out.append(max(0, int(v)))
-            except (TypeError, ValueError):
-                continue
-        return sorted(set(out), reverse=True) or [10]
-
-    def _starts_from(self, item: dict, since: datetime, limit: int = 16) -> list[datetime]:
-        """since（含）往后最多 limit 个开始时间；跳过 skip 里的日子、到 until 为止。"""
-        rep = self._repeat_of(item)
-        skip = {str(d) for d in (item.get("skip") or [])}
-        until = self._until_of(item)
-        anchor = self._anchor_of(item)
-        hh, mm = self._parse_hhmm(item.get("time", "09:00"))
-        out: list[datetime] = []
-
-        def usable(cand: datetime) -> bool:
-            if until is not None and cand.date() > until:
-                return False
-            return str(cand.date()) not in skip
-
-        if rep in ("weekly", "biweekly"):
-            weekday = int(item.get("weekday", -1))
-            if not 0 <= weekday <= 6:
-                return []
-            period = timedelta(days=7 if rep == "weekly" else 14)
-            base = anchor or datetime.combine(
-                since.date() + timedelta(days=(weekday - since.weekday()) % 7), datetime.min.time()
-            ).replace(hour=hh, minute=mm)
-            if base < since:
-                steps = (since - base) // period
-                base = base + period * max(0, int(steps))
-            k = 0
-            while len(out) < limit and k <= limit + 6:
-                cand = base + period * k
-                k += 1
-                if until is not None and cand.date() > until:
-                    break
-                if cand < since or not usable(cand):
-                    continue
-                out.append(cand)
-        elif rep == "monthly":
-            day_ = int(item.get("day") or (anchor.day if anchor else since.day))
-            first = (anchor or since).replace(day=1, hour=hh, minute=mm)
-            if first < since.replace(day=1, hour=hh, minute=mm):
-                first = since.replace(day=1, hour=hh, minute=mm)
-            k = 0
-            while len(out) < limit and k <= limit + 4:
-                y = first.year + (first.month - 1 + k) // 12
-                mo = (first.month - 1 + k) % 12 + 1
-                # 这个月没有这一天就挪到当月最后一天（比如每月 31 号 → 2 月 28/29 号）
-                d = min(day_, _days_in_month(y, mo))
-                cand = datetime(y, mo, d, hh, mm)
-                k += 1
-                if cand < since:
-                    continue
-                if until is not None and cand.date() > until:
-                    break
-                if not usable(cand):
-                    continue
-                out.append(cand)
-        elif rep == "yearly":
-            month = int(item.get("month") or (anchor.month if anchor else since.month))
-            day_ = int(item.get("day") or (anchor.day if anchor else since.day))
-            year = max((anchor or since).year, since.year)
-            k = 0
-            while len(out) < limit and k <= limit + 2:
-                y = year + k
-                d = min(day_, _days_in_month(y, month))   # 2/29 在平年落到 2/28
-                cand = datetime(y, month, d, hh, mm)
-                k += 1
-                if cand < since:
-                    continue
-                if until is not None and cand.date() > until:
-                    break
-                if not usable(cand):
-                    continue
-                out.append(cand)
-        else:                                   # once / interval
-            base = anchor or since
-            if rep != "interval":
-                if base >= since and usable(base):
-                    out.append(base)
-            else:
-                period = self._interval_delta(item)
-                steps = 0 if base >= since else max(0, int((since - base) // period))
-                k = steps
-                while len(out) < limit and k <= steps + limit + 6:
-                    cand = base + period * k
-                    k += 1
-                    if cand < since:
-                        continue
-                    if until is not None and cand.date() > until:
-                        break
-                    if not usable(cand):
-                        continue
-                    out.append(cand)
-        return out
-
-    def _occurrences_on(
-        self, day: date, ignore_reminder: bool = False, now: datetime | None = None
-    ) -> list[tuple[datetime, dict]]:
-        """返回某天所有日程的 (开始时间, 条目) 列表。"""
-        day_start = datetime.combine(day, datetime.min.time())
-        now = now or datetime.now()
-        out: list[tuple[datetime, dict]] = []
-        for item in self.schedule.load():
-            for cand in self._starts_from(item, day_start, limit=4):
-                if cand.date() != day:
-                    continue
-                if not ignore_reminder and cand < now:
-                    continue
-                out.append((cand, item))
-                break
-        out.sort(key=lambda x: x[0])
-        return out
-
-    def next_occurrence(self, item: dict, now: datetime) -> datetime | None:
-        """给调度器用：算出这个日程的下一次开始时间（跳过被单独取消的那几天）。"""
-        for cand in self._starts_from(item, now - timedelta(seconds=1)):
-            if cand > now:
-                return cand
-        return None
-
-    @staticmethod
-    def _parse_hhmm(value: Any) -> tuple[int, int]:
-        try:
-            h, m = str(value).split(":")
-            return int(h), int(m)
-        except Exception:  # noqa: BLE001
-            return 9, 0
-
     # ======================================================================
-    # 显示器开关
+    # 显示开关
     # ======================================================================
     _SCREEN_OFF_WORDS = (
         "关屏幕", "关闭屏幕", "关掉屏幕", "关一下屏幕", "把屏幕关", "屏幕关掉", "屏幕关了",
@@ -2565,78 +1987,12 @@ class Skills:
     # ======================================================================
     # 供调度器使用
     # ======================================================================
-    def due_alarms(self, now: datetime) -> list[dict]:
-        """返回到点且尚未播报的闹钟，并标记为已播报。"""
-        due = []
-        for it in self.alarms.load():
-            if it.get("fired"):
-                continue
-            try:
-                when = datetime.fromisoformat(it["when"])
-            except Exception:  # noqa: BLE001
-                continue
-            if when <= now:
-                due.append(it)
-        for it in due:
-            it["fired"] = True
-            it["fired_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
-        if due:
-            self.alarms.save(self.alarms.load())
-        return due
-
-    def due_schedule(self, now: datetime) -> list[tuple[dict, str]]:
-        """返回该提醒的日程：(条目, 提醒文案)。
-
-        每条日程可以配多个提前量（``remind_before: [60, 10, 0]``），
-        每个「第几次提醒」只播一次，记在 ``_fired`` 里。
-        """
-        out: list[tuple[dict, str]] = []
-        changed = False
-        for item in self.schedule.load():
-            start = self.next_occurrence(item, now - timedelta(seconds=1))
-            if start is None:
-                continue
-            fired = {str(k) for k in (item.get("_fired") or [])}
-            for lead in self._leads_of(item):
-                fire_at = start - timedelta(minutes=lead)
-                # 提前量大的先响；到点那一次（lead=0）允许「刚过开始时刻」还算数
-                late = timedelta(minutes=5) if lead == 0 else timedelta(0)
-                if not (fire_at <= now < start + late):
-                    continue
-                key = f"{start.isoformat()}|{lead}"
-                if key in fired:
-                    continue
-                fired.add(key)
-                item["_fired"] = sorted(fired)[-40:]
-                changed = True
-                out.append((item, self._reminder_text(item, start, now, lead)))
-        if changed:
-            self.schedule.save(self.schedule.load())
-        return out
-
-    def _reminder_text(self, item: dict, start: datetime, now: datetime, lead: int) -> str:
-        """拼提醒文案：多个提前量各自说清楚「还有多久」。"""
-        where = f"，地点{item['location']}" if item.get("location") else ""
-        clock = start.strftime("%H:%M")
-        if lead <= 0:
-            head = f"现在就是{clock}"
-        else:
-            minutes = max(0, int((start - now).total_seconds() // 60))
-            if minutes <= 1:
-                head = f"马上就到{clock}了"
-            elif minutes <= 60:
-                head = f"{cn_number(minutes)}分钟后，也就是{clock}"
-            elif lead >= 1440:
-                head = f"{humanize(start, now)}"
-            else:
-                head = f"{humanize_delta((start - now).total_seconds())}后，也就是{clock}"
-        note = f"（{item['note']}）" if item.get("note") else ""
-        head = f"{item['remind_text']}，" + head if item.get("remind_text") else head
-        return f"提醒你：{head}，有{item.get('title', '安排')}{note}{where}。"
+    def due_events(self, now: datetime) -> list[tuple[dict, datetime, int]]:
+        """到点的事件（条目, 发生时间, 提前量）；会就地写回 state.fired。"""
+        return self.store.due_now(now)
 
     def stats(self) -> str:
-        alarms = [a for a in self.alarms.load() if not a.get("fired")]
-        return (
-            f"提醒 {len(alarms)} 条 / 备忘 {len(self.memos.load())} 条 / "
-            f"日程 {len(self.schedule.load())} 条  ({self.data_dir})"
-        )
+        items = self.store.load()
+        repeat = sum(1 for it in items if has_repeat(it))
+        return (f"事件 {len(items)} 条（其中重复 {repeat} 条）/ "
+                f"备忘 {len(self.memos.load())} 条  ({self.data_dir})")

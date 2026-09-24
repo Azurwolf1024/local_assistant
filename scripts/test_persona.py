@@ -196,9 +196,8 @@ def test_pipeline(tmp: Path) -> None:
         encoding="utf-8",
     )
     settings.skills.data_dir = str(tmp)
-    settings.skills.alarm_file = str(tmp / "a.json")
+    settings.skills.event_file = str(tmp / "events.json")
     settings.skills.memo_file = str(tmp / "m.json")
-    settings.skills.schedule_file = str(tmp / "s.json")
 
     from voice_loop.pipeline import VoiceLoop
 

@@ -1,8 +1,7 @@
-"""后台提醒调度器：到点播报闹钟与会议/课程提醒。
+"""后台提醒调度器：到点播报事件（提醒 / 课程 / 会议都是同一种东西）。
 
-只做两件事：
-    1. 每 ``check_interval`` 秒检查一次 data/alarms.json 里到点的闹钟
-    2. 检查 data/schedule.json 里即将开始的会议/课程，按 ``remind_before`` 提前播报
+只做一件事：每 ``check_interval`` 秒问一次 ``data/events.json`` 里有没有到点的，
+有就按 ``remind_before`` 播报（准时和提前两种口径由 :func:`event_text.render_fire` 决定）。
 
 播报动作通过回调交给 VoiceLoop，这样调度器不需要知道 TTS 的实现。
 """
@@ -14,6 +13,8 @@ import threading
 from collections.abc import Callable
 from datetime import datetime
 
+from . import event_text as et
+from .events import display_title
 from .settings import Settings
 from .skills import Skills
 
@@ -66,19 +67,17 @@ class ReminderScheduler:
                 self.log.warning(f"调度器出错（已忽略）：{exc}")
 
     def tick(self, now: datetime | None = None) -> int:
-        """检查一次；返回本次新播报的条数（也便于单元测试手动调用）。"""
+        """检查一次；返回本次新播报的条数（也便于单元测试手动调用）。
+
+        ★只有一条路径★：`Skills.due_events()` → `EventStore.due_now()`，
+        文案交给 `event_text.render_fire()`（准时和提前两种口径）。
+        旧代码这里是两个循环（先 due_alarms，再 due_schedule）。
+        """
         now = now or datetime.now()
         fired = 0
-
-        for item in self.skills.due_alarms(now):
-            what = item.get("what") or "时间到了"
-            self._announce(f"时间到了，{what}。")
+        for item, start, lead in self.skills.due_events(now):
+            self._announce(et.render_fire(item, start, now, lead))
             fired += 1
-
-        for item, text in self.skills.due_schedule(now):
-            self._announce(text)
-            fired += 1
-
         return fired
 
     def _announce(self, text: str) -> None:
@@ -94,16 +93,13 @@ class ReminderScheduler:
         """返回最近一条待提醒 (描述, 剩余秒数)，用于状态展示。"""
         now = datetime.now()
         best: tuple[str, float] | None = None
-        for item in self.skills.alarms.load():
-            if item.get("fired"):
-                continue
-            try:
-                when = datetime.fromisoformat(item["when"])
-            except Exception:  # noqa: BLE001
+        for item in self.skills.store.load():
+            when = self.skills._next_of(item, now)
+            if when is None:
                 continue
             delta = (when - now).total_seconds()
             if delta < 0:
                 continue
             if best is None or delta < best[1]:
-                best = (f"{item.get('what', '提醒')}（{when.strftime('%m-%d %H:%M')}）", delta)
+                best = (f"{display_title(item)}（{when.strftime('%m-%d %H:%M')}）", delta)
         return best

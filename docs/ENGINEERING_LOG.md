@@ -1020,8 +1020,9 @@ chain_blocked(item, start, all_items, now)
 | 2 | 迁移工具 `scripts/migrate_events.py`（默认试运行、写前备份、写后核对） | **已完成**（真实数据试运行已核对） |
 | 2b | 文本层 `event_text.py` + `nlp_time` 的 `工作日`/`daily` + `test_event_text.py` | **已完成**，见 17.7 |
 | 2c | **去掉 `kind`**：一张可填可不填的表 + 纯闹钟 + `needs_confirm()`；删掉 `KindView` 兼容层 | **已完成**，见 17.8 |
-| 3 | `Skills` / `scheduler` / `tools` 切到事件层；两个处理器合成一个；**删掉旧的让位规则**；落地删改确认 | 下一步 |
-| 4 | 工具面 11 → 8（合并成事件的一套） | 下一步 |
+| 3 | `Skills` / `scheduler` / `tools` 切到事件层；两个处理器合成一个；**删掉旧的让位规则**；落地删改确认 | **已完成**，见 17.9 |
+| 4 | 工具面 11 → 8（合并成事件的一套） | **已完成**（`list_events`/`next_event`/`add_event`/`change_event`） |
+| 5 | 真实数据迁移落地（`migrate_events.py --apply`）+ 旧文件退役 | **已完成**（6 条，见 17.10） |
 
 ★为什么链要先问再写★：`then` 到底该做什么、A 什么时候算「完成」，都有两种读法，
 做错了就是白写。确认结果见 17.4——而且第二个答案（**按结束时间自动算完成**）
@@ -1148,6 +1149,98 @@ chain_blocked(item, start, all_items, now)
 
 ★纯闹钟★的连带有：`title_of()` / `display_title()`（空标题显示成「闹钟」）、
 `new_event()` 的 `title` 变成可选、迁移时 `what` 缺失不再硬塞「提醒」。
+
+### 17.9 处理器合并：两个入口变成一个（这一轮真正动刀的地方）
+
+17.7 / 17.8 都发生在**新增的层**里，旧的两个处理器（`_handle_alarm` / `_handle_schedule`）
+一直在原地跑，靠 `KindView` 兼容。这一步把它们换成**一个** `_handle_event`，顺序是：
+
+    _cancel_by_index   「取消第2个」/「清空所有」
+      → _cancel_by_time   句子里有时间：按天+钟点找，找不到不删
+        → _handle_schedule_change  改 / 删 / 只跳过这一次 / 批量
+          → 取消未命中的守卫       带「取消类」词却一条都对不上 → 回「没找到」，绝不落到新增
+            → _event_list / _event_add / _handle_schedule_query
+
+删掉的东西（旧的两套并行实现，一共约 1200 行）：
+
+| 删掉的 | 现在是谁 |
+|---|---|
+| `_handle_alarm` / `_handle_schedule` | `_handle_event`（一个） |
+| `_add_alarm` / `_list_alarms` / `_cancel_alarm` | `_event_add` / `_event_list` / `_cancel_by_*` |
+| `_repeat_of` / `_leads_of` / `_starts_from` / `_occurrences_on` / `next_occurrence` / `_parse_hhmm` / `_interval_delta` / `_anchor_of` / `_until_of` | `events.py` 里同名的一份（**唯一实现**） |
+| `_span_text` / `_repeat_text` / `_remind_text_of` / `_where_text` / `_until_text` / `_note_of` / `_finish_item` | `event_text.py`（唯一的文字层） |
+| `_clean_content` / `_clean_memo_content` / `_is_topic` / `_norm_title` / `_title_hit` / `_split_title_location` / `_weekly_weekday` / `_strip_leading` / `parse_clock_range` / `_extract_alarm_what` | `event_text.py` 的标题链 |
+| `_TITLE_STOPWORDS` / `_GENERIC_BIGRAMS` / `_SCHEDULE_VERBS` / `_LOCATION` / `_REPEAT_WORDS` / `_TIME_WORDS` / `_FILLER` / `_TAIL_FILLER` / `_NOT_A_TOPIC` / `_ACTION_ONLY` / `DEFAULT_REMINDER_WHAT` | 同上（收拢成 `clean_content` / `clean_title` / `is_topic_like`） |
+
+`tools.py`：`add_schedule`/`add_alarm` → `add_event`；`change_schedule`/`cancel_alarm` → `change_event`；
+`list_schedule`/`list_alarms` → `list_events`（★现在**可以不带参数**★：合并前的 `list_alarms`
+本来就不用带，「有哪些提醒」要能直接说）。**工具 11 → 8**。
+
+`scheduler.py`：主循环只剩一条路径 `Skills.due_events()` → `render_fire()`；
+`next_reminder()` 原来读 `skills.alarms`（已被删掉），改成读 `skills.store`。
+
+#### 换血时踩到的坑（都补了测试）
+
+1. `due()` 的策略原来按 `kind` 分 → 改成按「一次性 / 重复」分（一次性补报不设上限）；
+2. `extract(default_lead=10)` 这个参数会让**每个**新建事件都变成「提前 10 分钟」——
+   删掉参数，默认 `[0]`（准时）；
+3. ★原因从句必须剥★：用户那句里有两个钟点，不剥就取到「九点」；
+4. ★提前量不是时长★：「提前半小时」被当成 `duration_minutes`，条目凭空多 30 分钟尾巴；
+5. 标题链的顺序有讲究：**先摘时间、再摘动词**，反了会留下「提醒我上课」；
+6. `SCHEDULE_VERBS` 里的「上」把「上课」吃成「课」（只剩一个字就不像话题了）——
+   删掉 上/去/在/是 四个字；「跟/和」也不是填充词；
+7. ★命令残渣★：「需要定所有工作日的闹钟」里没有任何内容，不能当标题——
+   `is_command_residue()` 命中就退回原因从句（→「上课」）；
+8. ★`EventStore.save()` 不给缺 id 的条目补 id★：一批没 id 的条目在 `by_id(None)` 眼里
+   **是同一条**，「所有课程以后都不上了」一次删了 5 条。现在保存时补 id；
+9. `_looks_like_add()` 守卫必须**先算批量范围**再判断，否则批量改会被它拦下来
+   （「每周三九点提醒我上课，提前半小时」会被答成「没什么可以改的」）；
+10. 批量跳过那段的循环变量写错（`skipped_of(item)` 里没有 `item`）+ 重复 `append`；
+11. `_update_event(event_id, ...)` 里写成了 `eid` → `NameError`；
+12. 编辑分支和回话里还留着两个 `weekly` 变量名（同 11，被 `handle()` 的 try/except 吞掉，
+    表现是「改了但像没改」）——★`handle()` 吞异常，NameError 看起来就像「没找到」★，
+    排查时先把 handler 单独调一次；
+13. `_next_of()` 里有个 `-1min` 的容差，破坏了「严格在之后」的语义；
+14. ★滚动的方向★：周五晚上说「周五上午十点」必须滚到**下**周五（说了星期几就 +7），
+    不带星期几才 +1 天；
+15. `_event_list` 只看「下一次发生」→ 已经过点但**一次都没响过**的一次性事件被藏起来了
+    （补报之前它在列表里应该看得见）；现在按 `is_fired` 兜底；
+16. 测试里 `store.save([])` 的写法在**单库**下会把别的条目一起洗掉——
+    三个测试文件的失败都是这一条引起的，不是功能坏了。
+
+#### 测试
+
+    18 个离线脚本全绿（cmd /c sessions\run_tests.cmd）
+    test_events.py        107 条
+    test_event_text.py     78 条
+    test_offline.py       173 处断言（含上面那张坑表里的每一条）
+    test_route.py / test_tools.py / test_skills_route.py / test_mcp.py …
+
+### 17.10 真实数据迁移（落地）
+
+`data/alarms.json`（2 条）+ `data/schedule.json`（2 条）→ `data/events.json`，共 6 条：
+
+| # | 内容 | 备注 |
+|---|---|---|
+| 1 | 乐队排练 09-20 17:00 | 已播报过（`state.fired`） |
+| 2 | 跟导师见面 09-23 15:30 | 过时的一次性 → 标 `state.done`，不再补报 |
+| 3 | 社团活动 09-23 15:00 | 同上 |
+| 4 | 跆拳道课 09-24 19:30 | 还有效 |
+| 5 | （无标题）09-25 08:30 | **纯闹钟**，展示成「闹钟」 |
+| 6 | 起床 09-25 07:00 | 还有效 |
+
+两条被丢掉的：
+
+* 闹钟里的「约导师见面」——和日程里的「跟导师见面」是同一场（两个文件的 `_note` 都写着
+  「当双保险」）。统一模型下这是同一条事件响两次，只留日程那条；
+* 早期解析 bug 写出来的「说我有跆拳道课」——真身是「跆拳道课」。
+
+★写法上的一个坑★：`state.done` / `state.fired` 里的时间戳用的是 **`datetime.isoformat()`**
+（`2026-09-23T15:30:00`），不是 `str(datetime)` 也不是 `str(date)`——手写迁移脚本时格式对不上，
+`is_done()` 就永远为假，表现为「明明标了完成，开机还是补报一遍」。用 `mark_done()` / `mark_fired()` 写。
+
+三个原文件各留了一份 `.bak`（`*.bak` 已被 `.gitignore` 挡住）；`data/alarms.json` 与
+`data/schedule.json` 从此只当历史存档，代码不再读。
 
 
 

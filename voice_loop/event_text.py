@@ -80,6 +80,9 @@ _NOT_A_TOPIC = {
     "一下", "一个", "事情", "东西", "时候", "时间", "的", "了",
     "闹钟", "提醒", "日程", "安排", "备忘", "事项", "活动", "任务",
 }
+# ★命令残留★：清洗后还带着「定/设/提醒/闹钟」这类字样的，不是内容，是没洗干净的
+# 命令（「需要定所有工作日的闹钟」）。遇到它宁可回头用原因从句/类别名。
+_COMMAND_RESIDUE = re.compile(r"提醒|闹钟|闹中|定时|设置|设定|定个|定一个|订个|安排|记录")
 _ACTION_ONLY = re.compile(
     r"^(?:帮我|给我|替我|麻烦你?|请|要|再|又|去|把|将|和|跟|记得|到时候|提醒我|叫我|喊我)+$"
 )
@@ -116,12 +119,14 @@ _TAIL_FILLER = re.compile(
     r"(?:这件事|这个事情|记录一下|记下来|记一下|记上|记下|一下|到时候|记得|提醒我|叫我"
     r"|这个|那个|吧|哦|啊|呀|呢|了|的|吗)+$"
 )
-# 新增事件时要把「帮我记录 / 安排 / 有」这类动词去掉，只留事情本身
+# 新增事件时要把「帮我记录 / 安排 / 有」这类动词去掉，只留事情本身。
+# ★「上 / 去 / 在 / 是」不在表里★：它们会把「上课」咬成「课」（1 个字就不算内容了）。
+# 真正需要剥这类的场合由 :func:`clean_title_loose` 兜底。
 SCHEDULE_VERBS = (
     "帮我", "麻烦你", "麻烦", "请", "到时候", "记得", "提醒我", "叫醒我", "叫我", "喊我",
     "帮我记", "记录一下", "记录",
     "记一下", "记下来", "记下", "添加", "新增", "创建", "新建", "排入", "安排", "加",
-    "每天", "每", "有个", "有", "我要", "我", "你", "的", "去", "上", "在", "是",
+    "每天", "每", "有个", "有", "我要", "我", "你", "的",
     # 量词与「把字句」：「有一场造物社的活动」→ 标题不该留「一场」；
     # 「把后天下午两点的体检记上」→ 标题不该留「把…记上」
     "一场", "一次", "一门", "一节", "一项", "一个", "把", "将",
@@ -203,12 +208,27 @@ def clean_title(text: str) -> str:
     return clean_content(LEAD_WORDS.sub("", text or ""))
 
 
+def clean_title_loose(text: str) -> str:
+    """更狠一点的标题清洗：去时间、去提前量、去口头语，**再去开头动词**。
+
+    用在「分句标题不可用」的兜底上。★顺序很重要★：先清时间再剥动词——
+    反过来的话「每周三上午九点提醒我上课」剥完「每」就停在「周三」上，
+    时间还在、动词也剥不掉，最后得到「提醒我上课」（看着像内容，其实是命令残留）。
+    """
+    return strip_leading(clean_content(LEAD_WORDS.sub("", text or "")))
+
+
 def is_topic_like(text: str) -> bool:
     """这句话到底有没有说「要干什么」——只有动作词就不算。"""
     t = (text or "").strip()
     if len(t) < 2 or t in _NOT_A_TOPIC:
         return False
     return not _ACTION_ONLY.match(t)
+
+
+def is_command_residue(text: str) -> bool:
+    """清洗后还残留命令词（「需要定所有工作日的闹钟」）→ 它说的不是内容。"""
+    return bool(_COMMAND_RESIDUE.search(text or ""))
 
 
 # --------------------------------------------------------------------------- #
@@ -356,13 +376,14 @@ def split_reason(text: str) -> tuple[str, str]:
 # --------------------------------------------------------------------------- #
 # 抽取：一句话 → 事件字段
 # --------------------------------------------------------------------------- #
-def extract(text: str, now: datetime, *, default_lead: int | None = None) -> dict:
+def extract(text: str, now: datetime) -> dict:
     """把一句话变成 ``to_item()`` 能吃的字段——**说了就填上，没说就缺省**。
 
     返回：title / start(datetime) / repeat / weekday / time / duration_minutes /
     location / note / remind_before / until(date) / category / payload / cause。
 
-    ``title`` 可能是空串：那是一条**纯闹钟**（只负责准时响）——是否追问由调用方决定。
+    ★缺省提前量永远是 ``[0]``（准时）★——不提供「默认提前几分钟」的旋钮，
+    因为那是“猜”出来的行为；要提前就得说「提前…」。
     """
     raw = (text or "").strip()
     cause, payload = split_reason(raw)
@@ -415,13 +436,27 @@ def extract(text: str, now: datetime, *, default_lead: int | None = None) -> dic
 
     # ---- 标题 / 地点 / 备注 -------------------------------------------
     head, location = split_title_location(payload)
-    title = clean_title(head)
-    # 原因从句里往往才是「为什么」——**只有真的剥过原因从句时才拿它兜底**，
-    # 否则「工作日八点半的闹钟」这种没主题的话会被兜成「工作日的闹钟」。
-    hint = cause if cause and cause != payload else ""
-    if not is_topic_like(title):
-        cat_cause = category_of(hint)
-        title = ACTION_BY_CATEGORY.get(cat_cause) or (clean_title(hint) if is_topic_like(hint) else "")
+    # ★三条路依次试，因为「剥动词」和「剥口头语」的副作用不同★：
+    #   ① 分句（strip_leading）：会剥「每/上…」这类开头动词，但不碰 _FILLER 里的「跟/和」
+    #      ——「跟导师见面」要保持完整；
+    #   ② clean_title（_FILLER）：会剥「跟/和」，但不碰「上」——「上课」要保持完整；
+    #   ③ 两个都剥：只剩下「定一个的闹钟」这种命令残留时才走到这里。
+    title = re.sub(r"[，。、,.\s:：]+", "", head)     # 内部空格/标点也去掉（「AIAA3102 机器学习」）
+    if not is_topic_like(title) or is_command_residue(title):
+        title = clean_title(payload)
+    if not is_topic_like(title) or is_command_residue(title):
+        title = clean_title_loose(payload)
+    if not is_topic_like(title) or is_command_residue(title):
+        title = ""                          # 只剩命令词 → 当作没说内容
+    # 原因从句里往往才是「为什么」，而且比命令残留更像内容：
+    # 「我工作日九点有课，那就需要定工作日八点半的闹钟」→ 标题取「上课」而不是
+    #「需要定所有工作日的闹钟」。
+    if not title and cause and cause != payload:
+        cat_cause = category_of(cause)
+        title = ACTION_BY_CATEGORY.get(cat_cause) or ""
+        if not title:
+            loose = clean_title_loose(cause)
+            title = loose if (is_topic_like(loose) and not is_command_residue(loose)) else ""
         if cat_cause and not category:
             category = cat_cause          # 标题取自原因从句，标签也跟着它
     note_m = NOTE_RE.search(raw)
@@ -429,9 +464,7 @@ def extract(text: str, now: datetime, *, default_lead: int | None = None) -> dic
 
     # ---- 提前量 / 截止 -------------------------------------------------
     # ★缺省是 [0]（准时）★：说了「提前…」才加，没说什么都不加。
-    leads = parse_reminds(raw)
-    if leads is None:
-        leads = [int(default_lead) if default_lead is not None else 0]
+    leads = parse_reminds(raw) or [0]
     until = parse_until(raw, now)
 
     return {
@@ -481,6 +514,12 @@ def to_item(fields: dict) -> dict:
 # --------------------------------------------------------------------------- #
 # 说回人话
 # --------------------------------------------------------------------------- #
+def note_of(text: str) -> str:
+    """「备注带实验报告」→ 带实验报告（跟着提醒一起念/显示）。"""
+    m = NOTE_RE.search(text or "")
+    return m.group(1).strip() if m else ""
+
+
 def where_text(location: str) -> str:
     return f"，地点{location}" if location else ""
 

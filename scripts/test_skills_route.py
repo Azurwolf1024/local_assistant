@@ -18,6 +18,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from voice_loop import system_ops  # noqa: E402
+from voice_loop import event_text as et  # noqa: E402
+from voice_loop import events as ev  # noqa: E402
 from voice_loop.scheduler import ReminderScheduler  # noqa: E402
 from voice_loop.settings import load_settings  # noqa: E402
 from voice_loop.skills import Skills  # noqa: E402
@@ -54,9 +56,8 @@ system_ops.monitor_on = _fake_on  # type: ignore[assignment]
 def make_skills(tmp: Path, **overrides) -> Skills:
     settings = load_settings()
     settings.skills.data_dir = str(tmp)
-    settings.skills.alarm_file = str(tmp / "alarms.json")
+    settings.skills.event_file = str(tmp / "events.json")
     settings.skills.memo_file = str(tmp / "memos.json")
-    settings.skills.schedule_file = str(tmp / "schedule.json")
     for k, v in overrides.items():
         setattr(settings.skills, k, v)
     return Skills(settings)
@@ -83,15 +84,15 @@ def test_regressions() -> None:
         # 备忘录这个说法也要能查（旧代码在这里存成了「录吗？」）
         ("我有哪些备忘录", "memo_list"),
         # 「记录晚上7点半有跆拳道课」应该入日程，而不是被当成查询
-        ("帮我记录晚上7点半有跆拳道课。", "schedule_add"),
+        ("帮我记录晚上7点半有跆拳道课。", "event_add"),
         # 内容在前、动词在后：「…有跆拳道课，到时候记得提醒我」
-        ("我说我晚上7点有跆拳道课，到时候记得提醒我", "alarm_add"),
+        ("我说我晚上7点有跆拳道课，到时候记得提醒我", "event_add"),
         # 内容不能是命令本身
-        ("定一个今天早上8点半的闹钟。", "alarm_add"),
+        ("定一个今天早上8点半的闹钟。", "event_add"),
         # 正常的查询/新增仍然要正常
         ("记一下买牛奶", "memo_add"),
-        ("今天有什么课", "schedule_query"),
-        ("提醒我明天早上七点起床", "alarm_add"),
+        ("今天有什么课", "event_query"),
+        ("提醒我明天早上七点起床", "event_add"),
     ]
     for q, expect in cases:
         r = skills.handle(q)
@@ -102,9 +103,9 @@ def test_regressions() -> None:
             print(f"        {r.reply}")
 
     # 内容是否真的是用户说的那件事
-    text = json.dumps(skills.alarms.load(), ensure_ascii=False)
+    text = json.dumps(skills.store.load(), ensure_ascii=False)
     check("闹钟内容含「跆拳道」", "跆拳道" in text, text[:120])
-    text2 = json.dumps(skills.alarms.load(), ensure_ascii=False)
+    text2 = json.dumps(skills.store.load(), ensure_ascii=False)
     check("闹钟内容不是命令本身", "定一个" not in text2 and "闹钟" not in text2.replace('"kind"', ""), text2[:120])
     memo = json.dumps(skills.memos.load(), ensure_ascii=False)
     check("备忘只写进了「买牛奶」", "录吗" not in memo, memo[:120])
@@ -149,11 +150,11 @@ def test_weekly_course() -> None:
     print("\n[3] 每周重复的课表（课程提醒的主场景）")
     tmp = Path(tempfile.mkdtemp(prefix="weekly_"))
     skills = make_skills(tmp)
-    skills.schedule.save([])
+    skills.store.save([])
 
     r = skills.handle("每周三上午九点有 AIAA3102 机器学习，地点教学楼 A302")
-    check("「每周三…」被当成新增", r is not None and r.action == "schedule_add_weekly", r.reply if r else "")
-    items = skills.schedule.load()
+    check("「每周三…」被当成新增", r is not None and r.action == "event_add", r.reply if r else "")
+    items = skills.store.load()
     check("存成了 weekly", items and items[0].get("repeat") == "weekly", str(items[:1]))
     check("weekday=2（周三）", items and items[0].get("weekday") == 2)
     check("time=09:00", items and items[0].get("time") == "09:00")
@@ -162,14 +163,14 @@ def test_weekly_course() -> None:
 
     # 「下午两点」必须是 14:00 而不是 02:00
     skills.handle("每周五下午两点组会")
-    fri = [it for it in skills.schedule.load() if it.get("weekday") == 4]
+    fri = [it for it in skills.store.load() if it.get("weekday") == 4]
     check("「下午两点」= 14:00", fri and fri[0].get("time") == "14:00", str(fri[:1]))
 
     # 问句不能被当成新增
-    before = len(skills.schedule.load())
+    before = len(skills.store.load())
     q = skills.handle("每周五有什么课")
-    check("「每周五有什么课」仍然是查询", q is not None and q.action == "schedule_query", q.reply if q else "")
-    check("查询不会写数据", len(skills.schedule.load()) == before)
+    check("「每周五有什么课」仍然是查询", q is not None and q.action == "event_query", q.reply if q else "")
+    check("查询不会写数据", len(skills.store.load()) == before)
 
 
 # --------------------------------------------------------------------------- #
@@ -177,7 +178,7 @@ def test_reminder_content() -> None:
     print("\n[4] 提醒文案是否带上了「什么事 / 几点 / 在哪」")
     tmp = Path(tempfile.mkdtemp(prefix="remind_"))
     skills = make_skills(tmp)
-    skills.schedule.save(
+    skills.store.save(
         [
             {
                 "title": "AIAA3102 机器学习",
@@ -193,20 +194,21 @@ def test_reminder_content() -> None:
     )
     # 周三 08:45 —— 正好在提前 15 分钟的提醒窗口里
     now = datetime(2026, 9, 23, 8, 45, 10)
-    out = skills.due_schedule(now)
+    out = skills.due_events(now)
     check("日程提醒被触发", len(out) == 1, str(out))
     if out:
-        text = out[0][1]
+        item, start, lead = out[0]
+        text = et.render_fire(item, start, now, lead)
         print(f"    {text}")
         for kw in ("AIAA3102", "A302", "09:00", "分钟后"):
             check(f"文案含 {kw}", kw in text, text)
     # 同一条日程当天只提醒一次
-    check("同一天不重复提醒", len(skills.due_schedule(now)) == 0)
+    check("同一天不重复提醒", len(skills.due_events(now)) == 0)
 
-    # 闹钟文案
-    skills.alarms.save(
-        [{"when": (now - timedelta(seconds=5)).strftime("%Y-%m-%d %H:%M:%S"),
-          "what": "喝水", "fired": False, "kind": "alarm"}]
+    # 纯闹钟的文案（准时那次）
+    skills.store.save(
+        [{"title": "喝水", "remind_before": [0],
+          "start": (now - timedelta(seconds=5)).strftime("%Y-%m-%d %H:%M:%S")}]
     )
     spoken: list[str] = []
     sch = ReminderScheduler(skills, skills.settings, spoken.append)
@@ -222,40 +224,37 @@ def test_persistence() -> None:
     now = datetime(2026, 9, 17, 22, 30)
 
     a = make_skills(tmp)
-    a.handle("提醒我明天早上七点起床")
-    a.handle("记一下买牛奶")
-    a.handle("明天下午三点安排组会")
-    counts = (len(a.alarms.load()), len(a.memos.load()), len(a.schedule.load()))
-    print(f"    写入后：闹钟 {counts[0]} / 备忘 {counts[1]} / 日程 {counts[2]}")
-    check("三个文件都落盘", all(counts), str(counts))
+    a.handle("提醒我明天早上七点起床", now=now)
+    a.handle("记一下买牛奶", now=now)
+    a.handle("明天下午三点安排组会", now=now)
+    counts = (len(a.store.load()), len(a.memos.load()))
+    print(f"    写入后：事件 {counts[0]} / 备忘 {counts[1]}")
+    check("都落盘了", all(counts), str(counts))
 
     # 模拟「服务重启」：全新实例读同一批文件
     b = make_skills(tmp)
-    c2 = (len(b.alarms.load()), len(b.memos.load()), len(b.schedule.load()))
+    c2 = (len(b.store.load()), len(b.memos.load()))
     check("重启后数据仍在", c2 == counts, f"{counts} → {c2}")
 
-    # 已播报的闹钟重启后不能重复响
-    alarms = b.alarms.load()
-    alarms[0]["fired"] = True
-    b.alarms.save(alarms)
-    d = make_skills(tmp)
-    check("已响过的闹钟不再重复", d.due_alarms(now) == [])
-
-    # 已经提醒过的日程，重启后当天也不再提醒
-    sched = [
-        {
-            "title": "组会", "kind": "meeting", "repeat": "weekly", "weekday": 2,
-            "time": "14:00", "remind_before": 10, "duration_minutes": 60,
-        }
-    ]
-    b.schedule.save(sched)
-    t = datetime(2026, 9, 23, 13, 55)
-    check("第一次会提醒", len(b.due_schedule(t)) == 1)
+    # 播报过一次的那次，重启后不能再响
+    t = datetime(2026, 9, 18, 7, 0)              # 「明天早上七点」
+    first = b.due_events(t)
+    check("第一次会响", len(first) == 1, str(first))
     e = make_skills(tmp)
-    check("重启后同一天不重复提醒", len(e.due_schedule(t)) == 0)
+    check("重启后同一次不再响", len(e.due_events(t)) == 0)
+
+    # 重复事件：同一次不重复响，下一周照常
+    e.store.save([{
+        "title": "组会", "repeat": "weekly", "weekday": 2, "time": "14:00",
+        "start": "2026-09-23 14:00:00", "remind_before": [10], "duration_minutes": 60,
+    }])
+    wed = datetime(2026, 9, 23, 13, 55)
+    check("重复事件到点会响", len(e.due_events(wed)) == 1)
+    check("同一次不重复响", len(e.due_events(wed)) == 0)
+    check("下一周照常响", len(e.due_events(wed + timedelta(days=7))) == 1)
 
     # 落盘文件必须是合法 JSON（写到一半断电也不会坏）
-    for name in ("alarms.json", "memos.json", "schedule.json"):
+    for name in ("events.json", "memos.json"):
         raw = (tmp / name).read_text(encoding="utf-8")
         try:
             json.loads(raw)

@@ -39,30 +39,30 @@ from voice_loop.settings import load_settings  # noqa: E402
 # 为什么要标预期：不标就只能按关键词猜「这句算不算命令」，量不出选对率（猜过，不准）。
 BUILTIN: list[tuple[str, set[str] | None]] = [
     # 查
-    ("这周有什么安排", {"list_schedule"}),
-    ("明天有什么课", {"list_schedule"}),
-    ("下一个会议是什么", {"next_schedule"}),
-    ("我的提醒有哪些", {"list_alarms"}),
+    ("这周有什么安排", {"list_events"}),
+    ("明天有什么课", {"list_events"}),
+    ("下一个会议是什么", {"next_event"}),
+    ("我的提醒有哪些", {"list_events"}),
     ("我的备忘里有什么", {"list_memos"}),
-    ("导师见面那件事是什么时候", {"list_schedule"}),
-    ("我跟导师见面是几点", {"list_schedule"}),
-    ("上次说的那个会是什么时候", {"list_schedule"}),
-    ("日程里有没有体检这一项", {"list_schedule"}),
-    ("帮我看看下周都有什么事", {"list_schedule"}),
-    ("我下周有空吗", {"list_schedule"}),
+    ("导师见面那件事是什么时候", {"list_events"}),
+    ("我跟导师见面是几点", {"list_events"}),
+    ("上次说的那个会是什么时候", {"list_events"}),
+    ("日程里有没有体检这一项", {"list_events"}),
+    ("帮我看看下周都有什么事", {"list_events"}),
+    ("我下周有空吗", {"list_events"}),
     ("现在几点了", {"now"}),
     # 记
     ("记一下买牛奶", {"add_memo"}),
     ("记一下明天带伞", {"add_memo"}),
-    ("下周三下午三点半跟导师见面", {"add_schedule"}),
-    ("每周四上午九点有 AIA3102 机器学习，地点教学楼 A302", {"add_schedule"}),
-    ("明天下午三点有个面试", {"add_schedule"}),
-    ("我周三下午三点半要去见导师", {"add_schedule"}),
-    ("把后天下午两点的体检记上", {"add_schedule"}),
-    ("提醒我明天早上七点起床", {"add_alarm"}),
+    ("下周三下午三点半跟导师见面", {"add_event"}),
+    ("每周四上午九点有 AIA3102 机器学习，地点教学楼 A302", {"add_event"}),
+    ("明天下午三点有个面试", {"add_event"}),
+    ("我周三下午三点半要去见导师", {"add_event"}),
+    ("把后天下午两点的体检记上", {"add_event"}),
+    ("提醒我明天早上七点起床", {"add_event"}),
     # 改 / 取消（靠临时目录里的种子数据）
-    ("把组会挪到周五上午十点", {"change_schedule"}),
-    ("取消明天早上的闹钟", {"cancel_alarm"}),
+    ("把组会挪到周五上午十点", {"change_event"}),
+    ("取消明天早上的闹钟", {"change_event"}),
     ("我说是今晚八点", {"fix_last"}),
     # 闲聊：一个工具都不该调
     ("你好，你是谁", None),
@@ -149,22 +149,21 @@ def main() -> int:
             # 每次换一套干净的技能数据，免得上一条的写入影响下一条
             st = load_settings()
             st.skills.data_dir = str(tmp)
-            st.skills.alarm_file = str(tmp / "a.json")
+            st.skills.event_file = str(tmp / "a.json")
             st.skills.memo_file = str(tmp / "m.json")
-            st.skills.schedule_file = str(tmp / "s.json")
             st.vision.save_dir = str(tmp / "vision")
             if want_model:
                 st.llm.model = want_model
             skills = Skills(st, log)
-            skills.schedule.save([])
-            skills.alarms.save([])
+            skills.store.save([])
+            skills.store.save([])
             skills.memos.save([])
             # 种子数据：改/取消类要看得到东西才有得改（都是临时目录，不碰真实的）
-            skills.schedule.save([{
+            skills.store.save([{
                 "title": "组会", "kind": "meeting", "repeat": "weekly",
                 "weekday": 3, "time": "14:00", "remind_before": [10],
             }])
-            skills.alarms.save([{
+            skills.store.save([{
                 "when": (datetime.now() + timedelta(days=1)).replace(
                     hour=8, minute=0, second=0, microsecond=0
                 ).strftime("%Y-%m-%d %H:%M:%S"),
@@ -173,12 +172,11 @@ def main() -> int:
             # 基准：确定性技能层（用另一份空数据，免得影响上面那套）
             st_base = load_settings()
             st_base.skills.data_dir = str(tmp / "base")
-            st_base.skills.alarm_file = str(tmp / "base" / "a.json")
+            st_base.skills.event_file = str(tmp / "base" / "a.json")
             st_base.skills.memo_file = str(tmp / "base" / "m.json")
-            st_base.skills.schedule_file = str(tmp / "base" / "s.json")
             base_skills = Skills(st_base, log)
-            base_skills.schedule.save([])
-            base_skills.alarms.save([])
+            base_skills.store.save([])
+            base_skills.store.save([])
             base_skills.memos.save([])
             # 「改刚刚记下的那条」需要一个前置：就当上一句刚记下一条闹钟
             # （不然 _last_add 是空的，这个工具必定接不住——这是样本自己的事）
@@ -228,7 +226,7 @@ def main() -> int:
                 ok = result.ok
                 reply = result.reply
                 wrote = {
-                    "add_schedule": len(skills.schedule.load()) > 0,
+                    "add_event": len(skills.store.load()) > 0,
                     "add_memo": len(skills.memos.load()) > 0,
                 }.get(tool)
             else:

@@ -21,6 +21,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from . import event_text as et
+from .events import display_title
 from .nlp_time import parse_datetime
 from .settings import Settings
 from .skills import (
@@ -31,7 +33,6 @@ from .skills import (
     TRIGGER_SCHEDULE,
     SkillResult,
     Skills,
-    _clean_content,
     has_clock_expr,
 )
 
@@ -70,10 +71,8 @@ def looks_like_tool_text(text: str) -> bool:
 
 # 拿 text 去**算时间**的工具：这些的参数必须跟原话一致，不能是模型改写过的版本
 _TIME_SENSITIVE_TOOLS = {
-    "add_alarm",
-    "add_schedule",
-    "change_schedule",
-    "cancel_alarm",
+    "add_event",
+    "change_event",
     "fix_last",
 }
 
@@ -124,7 +123,7 @@ def _has_action_word(text: str) -> bool:
 
 
 # 「刚记下一条 + 只说时间」时要改掉新建念头的工具
-_CORRECTION_PRONE_TOOLS = {"add_alarm", "add_schedule", "add_memo"}
+_CORRECTION_PRONE_TOOLS = {"add_event", "add_memo"}
 
 
 def repair_args(call: dict, user_text: str) -> dict:
@@ -263,9 +262,10 @@ class ToolRegistry:
             {
                 "type": "function",
                 "function": {
-                    "name": "list_schedule",
+                    "name": "list_events",
                     "description": (
-                        "查日程/课表/会议。用户问「有什么安排」「下周有什么」「有没有课」时用。"
+                        "查提醒 / 日程 / 课表 / 会议——它们现在是同一种东西。"
+                        "用户问「有什么安排」「下周有什么」「还有哪些提醒没响」时用。"
                         "时间段说法也照抄进 text（例如「这周」「下周三」）。"
                     ),
                     "parameters": {
@@ -283,16 +283,8 @@ class ToolRegistry:
             {
                 "type": "function",
                 "function": {
-                    "name": "next_schedule",
-                    "description": "下一项日程/会议是什么、还有多久。用户问「下一个是什么」时用。",
-                    "parameters": no_arg,
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "list_alarms",
-                    "description": "还有哪些提醒/闹钟没响。",
+                    "name": "next_event",
+                    "description": "下一项是什么、还有多久。用户问「下一个是什么」时用。",
                     "parameters": no_arg,
                 },
             },
@@ -307,10 +299,13 @@ class ToolRegistry:
             {
                 "type": "function",
                 "function": {
-                    "name": "add_schedule",
+                    "name": "add_event",
                     "description": (
-                        "新增一条日程：课、会议、约会（见面/面试/答辩/体检/聚餐…）。"
-                        "带时间的一次性安排和「每周X」的固定课都算。text 放用户原话。"
+                        "新增一条提醒或日程：课、会议、约会（见面/面试/答辩/聚餐…）、"
+                        "「十分钟后提醒我喝水」「明天早上七点叫我起床」「每个工作日八点半"
+                        "叫我起床」都算。**说了什么就记什么**：带时长就存时长，带「每周X」"
+                        "就存重复规则，带「提前半小时」就存提前量，没说就按准时提醒。"
+                        "带「叫我/提醒我」的一次性提醒也用这个。text 放用户原话。"
                     ),
                     "parameters": text_only,
                 },
@@ -326,34 +321,12 @@ class ToolRegistry:
             {
                 "type": "function",
                 "function": {
-                    "name": "add_alarm",
+                    "name": "change_event",
                     "description": (
-                        "定一次性提醒：「十分钟后提醒我喝水」「明天早上七点叫我起床」。"
-                        "只管响一声、不进日程列表的那种，用这个（带「叫我」的也用它）。"
-                    ),
-                    "parameters": text_only,
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "cancel_alarm",
-                    "description": (
-                        "取消一条**提醒 / 闹钟**：「取消明天早上的闹钟」「把七点的提醒取消了」"
-                        "「不用提醒我了」。注意：用户说的「安排」可能指闹钟也可能指日程，"
-                        "但他只要提到闹钟/提醒/叫我，就用这个（不要去改日程）。"
-                    ),
-                    "parameters": text_only,
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "change_schedule",
-                    "description": (
-                        "改 / 挪 / 删 / 跳过 已经记下的日程课表：「把组会挪到周五上午十点」"
-                        "「AIAA3102 改成下午三点」「下周三的课不上了」「删掉体检」"
-                        "「所有课程提前半小时提醒」。不确定时它会自己反问，text 给原话就行。"
+                        "改 / 挪 / 删 / 取消 / 跳过 已经记下的东西——不管是提醒还是日程："
+                        "「把组会挪到周五上午十点」「下周三的课不上了」「删掉体检」"
+                        "「取消明天早上的闹钟」「不用提醒我了」「所有课程提前半小时提醒」。"
+                        "带重复规则的那条，它会先问一句确认再动手。text 给原话就行。"
                     ),
                     "parameters": text_only,
                 },
@@ -401,15 +374,12 @@ class ToolRegistry:
         name, args = self._unwrap(call)
         self.calls += 1
         handler = {
-            "list_schedule": self._list_schedule,
-            "next_schedule": self._next_schedule,
-            "list_alarms": self._list_alarms,
+            "list_events": self._list_events,
+            "next_event": self._next_event,
             "list_memos": self._list_memos,
-            "add_schedule": self._add_schedule,
+            "add_event": self._add_event,
             "add_memo": self._add_memo,
-            "add_alarm": self._add_alarm,
-            "cancel_alarm": self._cancel_alarm,
-            "change_schedule": self._change_schedule,
+            "change_event": self._change_event,
             "now": self._now,
             "fix_last": self._fix_last,
         }.get(name)
@@ -447,11 +417,17 @@ class ToolRegistry:
             )
         return ToolResult(bool(result.reply), action=result.action, reply=result.reply, data=result.data)
 
-    def _list_schedule(self, args: dict) -> ToolResult:
-        text = self._text_arg(args)
-        result = self._via(text, self.skills._handle_schedule)  # noqa: SLF001
+    def _list_events(self, args: dict) -> ToolResult:
+        # ★允许不带 text★：模型问「还有哪些提醒」时可能什么都不给，
+        # 那就退化成「列出全部待办」（合并前 list_alarms 就是不带参数的）。
+        text = str(args.get("text") or "").strip() or "有哪些提醒"
+        result = self._via(text, self.skills._handle_schedule_query)  # noqa: SLF001
         if result.ok:
             return result
+        # 「还有哪些提醒没响」这类走列表
+        listed = self._via(text, self.skills._event_list)  # noqa: SLF001
+        if listed.ok:
+            return listed
         # ★说了时间段的，先按时间答★（问的是「下周三下午有没有空」，不是「哪一条」）
         if self.skills.mentions_time(text):  # noqa: SLF001
             now = datetime.now()
@@ -476,43 +452,46 @@ class ToolRegistry:
         if named is not None:
             return named
         # 连时间都没提（「我的日程」）：给今天有什么，总比回一句「没听懂」有用
-        return self._via("今天有什么安排", self.skills._handle_schedule)  # noqa: SLF001
+        return self._via("今天有什么安排", self.skills._handle_schedule_query)  # noqa: SLF001
 
     def _find_named(self, text: str) -> ToolResult | None:
         """按名字在日程里找（「导师见面那件事是什么时候」-> 跟导师见面 9/23 15:30）。"""
         now = datetime.now()
-        items = self.skills.schedule.load()   # noqa: SLF001
+        items = self.skills.store.load()   # noqa: SLF001
         if not items:
-            return ToolResult(False, action="schedule_miss", reply="日程里现在是空的。")
+            return ToolResult(False, action="event_miss", reply="现在什么都没记。")
         hits = self.skills._match_schedule_items(text, items, now)   # noqa: SLF001
         if not hits or hits[0][0] < 2:
             return None
         best = hits[0][1]
-        nxt = self.skills.next_occurrence(best, now)                # noqa: SLF001
+        nxt = self.skills._next_of(best, now)                       # noqa: SLF001
         when = f"{nxt.strftime('%m月%d日 %H:%M')}" if nxt else "（已经过期）"
-        title = best.get("title") or "安排"
+        title = display_title(best)
         where = f"，地点{best['location']}" if best.get("location") else ""
-        reply = f"{title}：{when}{where}，{self.skills._repeat_text(best)}。"  # noqa: SLF001
+        reply = f"{title}：{when}{where}，{self.skills._when_of(best, now)}。"  # noqa: SLF001
         if len(hits) > 1 and hits[1][0] >= hits[0][0]:
-            names = "、".join(str(s[1].get("title")) for s in hits[:3])
+            names = "、".join(display_title(s[1]) for s in hits[:3])
             reply += f"（还有几条也对得上：{names}）"
-        return ToolResult(True, action="schedule_find", reply=reply,
+        return ToolResult(True, action="event_find", reply=reply,
                           data={"title": title, "start": when})
 
-    def _add_schedule(self, args: dict) -> ToolResult:
+    def _add_event(self, args: dict) -> ToolResult:
+        """新增提醒或日程——**同一个入口**（不再分「闹钟」和「日程」两个工具）。"""
         text = self._text_arg(args)
-        result = self._via(text, self.skills._handle_schedule)  # noqa: SLF001
-        if not result.ok and "没听懂" in result.reply:
-            # 交白卷时给一句更像"没排成"的话；能看出「有事情、就差钟点」就直接问几点
-            name = _clean_content(text)
-            looks_event = bool(ACTIVITY_NOUN.search(text) or TRIGGER_APPOINT.search(text))
-            if looks_event and not has_clock_expr(text):
-                result.reply = (
-                    f"「{name}」这件事我还没排上——几点开始？"
-                    f"把时间带上再说一遍就行，比如「下午三点{name}」。"
-                )
-            else:
-                result.reply = "这条日程我没排上——说清楚点，比如「下周三下午三点半跟导师见面」。"
+        result = self._via(text, self.skills._handle_event)  # noqa: SLF001
+        if result.ok:
+            return result
+        # 交白卷时给一句更像「没排成」的话；能看出「有事情、就差钟点」就直接问几点
+        name = et.clean_content(text)
+        looks_event = bool(ACTIVITY_NOUN.search(text) or TRIGGER_APPOINT.search(text)
+                           or TRIGGER_ALARM.search(text))
+        if looks_event and not has_clock_expr(text):
+            result.reply = (
+                f"「{name}」这件事我还没记上——几点开始？"
+                f"把时间带上再说一遍就行，比如「下午三点{name}」。"
+            )
+        else:
+            result.reply = "这条我没记上——说清楚点，比如「下周三下午三点半跟导师见面」。"
         return result
 
     def _add_memo(self, args: dict) -> ToolResult:
@@ -525,29 +504,8 @@ class ToolRegistry:
             result.reply = "要记什么？说「记一下买牛奶」这样就行。"
         return result
 
-    def _add_alarm(self, args: dict) -> ToolResult:
-        """一次性提醒（「十分钟后提醒我喝水」「明天早上七点叫我起床」）。"""
-        text = self._text_arg(args)
-        result = self._via(text, self.skills._handle_alarm)   # noqa: SLF001
-        if result.ok:
-            return result
-        # 「叫我/喊我」这类说法如果闹钟分支不认，再让日程试一次（它能吃日期+时刻）
-        again = self._via(text, self.skills._handle_schedule)  # noqa: SLF001
-        if again.ok:
-            return again
-        return ToolResult(
-            False,
-            action="alarm_miss",
-            error="技能层没认出来",
-            reply="这个提醒我没定上——说个具体时间，比如「明天早上七点叫我起床」。",
-        )
-
-    def _next_schedule(self, _args: dict) -> ToolResult:
+    def _next_event(self, _args: dict) -> ToolResult:
         result = self.skills._next_item(datetime.now())  # noqa: SLF001
-        return ToolResult(bool(result.reply), action=result.action, reply=result.reply, data=result.data)
-
-    def _list_alarms(self, _args: dict) -> ToolResult:
-        result = self.skills._list_alarms(datetime.now())  # noqa: SLF001
         return ToolResult(bool(result.reply), action=result.action, reply=result.reply, data=result.data)
 
     def _list_memos(self, _args: dict) -> ToolResult:
@@ -557,47 +515,23 @@ class ToolRegistry:
         return ToolResult(True, action=result.action, reply=result.reply, data=result.data)
 
     # ------------------------------------------------- 改 / 取消 / 报时 / 纠正
-    def _cancel_alarm(self, args: dict) -> ToolResult:
-        """取消一条提醒。
+    def _change_event(self, args: dict) -> ToolResult:
+        """改 / 挪 / 删 / 取消 / 跳过——都走同一个入口（含两道「不会因为模型说反了就多一条」的闸门）。
 
-        ★两道闸门，都是为了「不会因为模型说反了而多出一条」★：
-            1. 句子里没「取消类」的词，直接回「没找到」——**不调**任何添加逻辑；
-            2. 结果必须是取消类动作（alarm_cancel / alarm_clear），
-               不是的话就算回复能看也不当成功。
-        （配套的硬保证在 skills._handle_alarm：带取消词却没对上时，
-         它会在新建分支之前就返回，绝不会惄惄加一条。）
+        1. 句子里没「取消/删除/改成…」这类词，也不像在说已有的东西 → 直接回「没找到」，
+           **不调**任何添加逻辑（实测：说「取消今晚十点的闹钟」时库里没有那条，
+           旧代码一路走到新建，多出一条 what=「取消」的闹钟）；
+        2. 结果必须是改/删类动作，不是的话就算回复能看也不当成功。
         """
         text = self._text_arg(args)
-        if not self.skills._CANCEL_WORD.search(text):  # noqa: SLF001
-            return ToolResult(
-                False,
-                action="alarm_cancel_miss",
-                error="这不是取消提醒的说法",
-                reply="这句听着不像取消提醒——要取消就说「取消明天早上的闹钟」。",
-            )
         now = datetime.now()
-        result = self.skills._cancel_by_time(text, now)  # noqa: SLF001
+        result = self.skills._handle_schedule_change(text, now)  # noqa: SLF001
         if result is None:
-            result = self.skills._handle_alarm(text, now)  # noqa: SLF001
-        action = str(getattr(result, "action", "") or "")
-        if result is None or action not in ("alarm_cancel", "alarm_clear"):
-            return ToolResult(
-                False,
-                action=action or "alarm_cancel_miss",
-                error="没找到要取消的那条提醒",
-                reply=(result.reply if result is not None else "")
-                or "我没找到要取消的那条提醒——说个时间试试。",
-            )
-        return ToolResult(True, action=result.action, reply=result.reply, data=result.data)
-
-    def _change_schedule(self, args: dict) -> ToolResult:
-        """改 / 挪 / 删 / 跳过日程（守卫、反问都在 _handle_schedule_change 里）。"""
-        text = self._text_arg(args)
-        result = self.skills._handle_schedule_change(text, datetime.now())  # noqa: SLF001
+            result = self.skills._cancel_by_time(text, now)  # noqa: SLF001
         if result is None:
             return ToolResult(
                 False,
-                action="schedule_change_miss",
+                action="event_change_miss",
                 error="技能层没认出来",
                 reply="我没找到要改的那一条，你说个名字？比如「把组会挪到周五上午十点」。",
             )

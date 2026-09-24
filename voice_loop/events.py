@@ -178,6 +178,20 @@ def interval_delta(item: dict) -> timedelta:
     return timedelta(minutes=max(1, dur + gap))
 
 
+def skipped_of(item: dict) -> list[str]:
+    """被单独跳过的日期（ISO 字符串）。"""
+    return [str(d) for d in (state_of(item).get("skipped") or []) if str(d).strip()]
+
+
+def mark_skipped(item: dict, day: Any) -> list[str]:
+    """把某一天从这条事件里跳过（课表本身留着）。返回新的跳过日期。"""
+    st = state_of(item)
+    got = {str(d) for d in st.get("skipped") or []}
+    got.add(str(day)[:10])
+    st["skipped"] = sorted(got)
+    return st["skipped"]
+
+
 def state_of(item: dict) -> dict:
     """保证 item 里有 state 这个 dict（旧数据没有就现建）。"""
     st = item.get("state")
@@ -513,12 +527,31 @@ class EventStore:
     def path(self) -> Path:
         return self._store.path
 
+    def ensure(self) -> None:
+        """确保文件存在（首次运行生成一个空数组）。"""
+        self._store.ensure()
+
     # 透传基本操作（id/created_at 由 JsonStore.append 负责）
     def load(self, force: bool = False) -> list[dict]:
         return self._store.load(force=force)
 
     def save(self, items: list[dict]) -> None:
-        self._store.save(items)
+        """整表保存。
+
+        ★缺 id 的会补上 id★：外部手写的测试数据/手工编辑过的 JSON 也得能被
+        「按 id 改/删」找到——实测跳过这一步时，一批没 id 的条目会被当成「同一个"
+        None"」，一条指令就把整片删了。
+        """
+        used = [int(it["id"]) for it in items if str(it.get("id") or "").isdigit()]
+        nxt = max(used or [0]) + 1
+        out: list[dict] = []
+        for item in items:
+            item = self.normalize(item)
+            if item.get("id") is None:
+                item["id"] = nxt
+                nxt += 1
+            out.append(item)
+        self._store.save(out)
 
     def append(self, item: dict) -> dict:
         return self._store.append(self.normalize(item))
@@ -540,6 +573,13 @@ class EventStore:
 
     def next_id(self) -> int:
         return max([int(it.get("id") or 0) for it in self.load()] or [0]) + 1
+
+    def update_by_id(self, eid: Any, **fields: Any) -> dict | None:
+        """按 id 改一条（id 是唯一的，比「序号」稳）。"""
+        for index, item in enumerate(self.load(), start=1):
+            if str(item.get("id")) == str(eid):
+                return self.update(index, **fields)
+        return None
 
     def by_id(self, eid: Any) -> dict | None:
         return next((it for it in self.load() if str(it.get("id")) == str(eid)), None)

@@ -46,13 +46,12 @@ def build(tmp: Path):
 
     settings = load_settings()
     settings.skills.data_dir = str(tmp)
-    settings.skills.alarm_file = str(tmp / "alarms.json")
+    settings.skills.event_file = str(tmp / "events.json")
     settings.skills.memo_file = str(tmp / "memos.json")
-    settings.skills.schedule_file = str(tmp / "schedule.json")
     log = logging.getLogger("voice_loop")
     skills = Skills(settings, log)
-    skills.schedule.save([])
-    skills.alarms.save([])
+    skills.store.save([])
+    skills.store.save([])
     skills.memos.save([])
     return settings, skills, ToolRegistry(settings, skills, log)
 
@@ -63,22 +62,21 @@ def test_specs() -> None:
     _settings, _skills, reg = build(tmp)
     specs = reg.specs()
     names = [s["function"]["name"] for s in specs]
-    check("十一个工具都在", sorted(names),
-          ["add_alarm", "add_memo", "add_schedule", "cancel_alarm", "change_schedule",
-           "fix_last", "list_alarms", "list_memos", "list_schedule", "next_schedule",
-           "now"])
+    check("八个工具都在", sorted(names),
+          ["add_event", "add_memo", "change_event", "fix_last",
+           "list_events", "list_memos", "next_event", "now"])
     check("每个都有 description", all(s["function"].get("description") for s in specs), True)
     check("每个都有 parameters", all(s["function"].get("parameters") for s in specs), True)
-    add = next(s for s in specs if s["function"]["name"] == "add_schedule")
-    check("add_schedule 只收原话 text（不让模型算日期）",
+    add = next(s for s in specs if s["function"]["name"] == "add_event")
+    check("add_event 只收原话 text（不让模型算日期）",
           list(add["function"]["parameters"]["properties"].keys()), ["text"])
-    check("add_schedule 的 text 是必填",
+    check("add_event 的 text 是必填",
           add["function"]["parameters"].get("required"), ["text"])
-    check("list_schedule 也收原话（时间说法照抄）",
-          list(next(s for s in specs if s["function"]["name"] == "list_schedule")
+    check("list_events 也收原话（时间说法照抄）",
+          list(next(s for s in specs if s["function"]["name"] == "list_events")
                ["function"]["parameters"]["properties"].keys()), ["text"])
-    check("next_schedule 不需要参数",
-          next(s for s in specs if s["function"]["name"] == "next_schedule")
+    check("next_event 不需要参数",
+          next(s for s in specs if s["function"]["name"] == "next_event")
           ["function"]["parameters"]["properties"], {})
     import shutil
 
@@ -86,18 +84,18 @@ def test_specs() -> None:
 
 
 def test_add_schedule() -> None:
-    print("\n[2] add_schedule：模型给原话，日期由 nlp_time 算")
+    print("\n[2] add_event：模型给原话，日期由 nlp_time 算")
     tmp = Path(tempfile.mkdtemp(prefix="voicelool_tool_"))
     _settings, skills, reg = build(tmp)
 
-    r = reg.call(tool_call("add_schedule", text="下周三下午三点半跟导师见面"))
+    r = reg.call(tool_call("add_event", text="下周三下午三点半跟导师见面"))
     print(f"        {r.reply}")
     check("排进日程了", r.ok, True)
-    check("动作是新增", r.action, "schedule_add")
-    item = skills.schedule.load()[0]
+    check("动作是新增", r.action, "event_add")
+    item = skills.store.load()[0]
     # ★别写死日期★：「下周三」是相对真实日期算的，真实日期一变就不是 9/23 了
     #（实测：2026-09-21 周一跑到这里，下周三已经变成 9/30）。改成日期无关的断言。
-    start = datetime.strptime(str(item.get("start")), "%Y-%m-%d %H:%M")
+    start = datetime.fromisoformat(str(item.get("start")))
     check("时间对", start.strftime("%H:%M"), "15:30")
     check("是周三（周一=0）", start.weekday(), 2)
     nxt_monday = datetime.now().date() + timedelta(days=7 - datetime.now().weekday())
@@ -105,18 +103,18 @@ def test_add_schedule() -> None:
           nxt_monday <= start.date() <= nxt_monday + timedelta(days=6), True)
     check("标题干净", item.get("title"), "跟导师见面")
 
-    r = reg.call(tool_call("add_schedule", text="下周三下午三点半跟导师见面"))
-    check("再说一遍不重复存", r.action, "schedule_exist")
-    check("库里还是一条", len(skills.schedule.load()), 1)
+    r = reg.call(tool_call("add_event", text="下周三下午三点半跟导师见面"))
+    check("再说一遍不重复存", r.action, "event_exists")
+    check("库里还是一条", len(skills.store.load()), 1)
 
-    r = reg.call(tool_call("add_schedule", text="每周四上午九点有 AIA3102 机器学习"))
-    check("每周重复也认（模型会漏 repeat，这里不会）", skills.schedule.load()[-1].get("repeat"), "weekly")
-    check("星期几也对", skills.schedule.load()[-1].get("weekday"), 3)
+    r = reg.call(tool_call("add_event", text="每周四上午九点有 AIA3102 机器学习"))
+    check("每周重复也认（模型会漏 repeat，这里不会）", skills.store.load()[-1].get("repeat"), "weekly")
+    check("星期几也对", skills.store.load()[-1].get("weekday"), 3)
 
-    r = reg.call(tool_call("add_schedule", text="你好"))
+    r = reg.call(tool_call("add_event", text="你好"))
     check("听不懂时不假装记下了", r.ok, False)
-    check("还给了个说法", "没排上" in r.reply or "没听懂" in r.reply, True)
-    check("而且真的没写进去", len(skills.schedule.load()), 2)
+    check("还给了个说法", "没记上" in r.reply or "没听懂" in r.reply, True)
+    check("而且真的没写进去", len(skills.store.load()), 2)
     import shutil
 
     shutil.rmtree(tmp, ignore_errors=True)
@@ -141,15 +139,15 @@ def test_alarm() -> None:
     print("\n[3b] add_alarm：一次性提醒不能塞进日程")
     tmp = Path(tempfile.mkdtemp(prefix="voiceloop_tool_"))
     _s, skills, reg = build(tmp)
-    r = reg.call(tool_call("add_alarm", text="明天早上七点叫我起床"))
+    r = reg.call(tool_call("add_event", text="明天早上七点叫我起床"))
     print(f"        {r.reply}")
-    check("走的是闹钟", r.action, "alarm_add")
-    check("闹钟建了", len(skills.alarms.load()), 1)
-    check("内容对", skills.alarms.load()[0].get("what"), "起床")
-    check("没被塞进日程", len(skills.schedule.load()), 0)
-    r = reg.call(tool_call("add_alarm", text="十分钟后提醒我喝水"))
-    check("相对时间也认", r.action, "alarm_add")
-    r = reg.call(tool_call("add_alarm", text="随便说点什么"))
+    check("记下来了", r.action, "event_add")
+    check("库里一条", len(skills.store.load()), 1)
+    check("内容对", skills.store.load()[0].get("title"), "起床")
+    check("是准时提醒（没说提前）", skills.store.load()[0].get("remind_before"), [0])
+    r = reg.call(tool_call("add_event", text="十分钟后提醒我喝水"))
+    check("相对时间也认", r.action, "event_add")
+    r = reg.call(tool_call("add_event", text="随便说点什么"))
     check("听不懂时不假装定了", r.ok, False)
     import shutil
 
@@ -163,37 +161,37 @@ def test_reads() -> None:
     # 下次见面排到「下周的周三」——动态算，才能保证「下周」一定含它
     monday = datetime.now().date() - timedelta(days=datetime.now().weekday())
     next_wed = monday + timedelta(days=9)
-    skills.schedule.save([
-        {"title": "AIAA3102 机器学习", "kind": "course", "repeat": "weekly", "weekday": 2,
+    skills.store.save([
+        {"title": "AIAA3102 机器学习", "category": "course", "repeat": "weekly", "weekday": 2,
          "time": "09:00", "location": "教学楼 A302", "remind_before": [15]},
-        {"title": "跟导师见面", "kind": "meeting", "repeat": "once", "start": f"{next_wed} 15:30",
+        {"title": "跟导师见面", "category": "meeting", "repeat": "once", "start": f"{next_wed} 15:30",
          "time": "15:30", "remind_before": [10]},
+        {"title": "起床", "start": "2026-09-19 07:00:00", "remind_before": [0]},
     ])
-    skills.alarms.save([{"when": "2026-09-19 07:00:00", "what": "起床", "fired": False}])
     skills.memos.save([{"content": "买牛奶", "done": False}])
 
-    r = reg.call(tool_call("list_schedule", text="下周有什么安排"))
+    r = reg.call(tool_call("list_events", text="下周有什么安排"))
     print(f"        {r.reply}")
     check("查下周两个都能查到（周三的课 + 9/23 见面）",
           ("AIAA3102" in r.reply and "见面" in r.reply), True)
-    r = reg.call(tool_call("list_schedule", text="今天有什么安排"))
+    r = reg.call(tool_call("list_events", text="今天有什么安排"))
     check("查今天不报错", r.ok, True)
-    r = reg.call(tool_call("list_schedule", text="随便说点什么"))
+    r = reg.call(tool_call("list_events", text="随便说点什么"))
     check("模型传了句废话也不会崩，退回今天", r.ok, True)
 
     # ★别把时间段悄悄换成「今天」★：以前解析不出来就退到「今天」，
     # 「下周三下午」会被答成「今天没有安排」，模型拿这句当依据去下结论（实测踩过）。
-    r = reg.call(tool_call("list_schedule", text="下周三下午"))
+    r = reg.call(tool_call("list_events", text="下周三下午"))
     print(f"        {r.reply}")
     check("「下周三下午」答的是下周三（不是今天）", "下周三" in r.reply, True)
-    r = reg.call(tool_call("list_schedule", text="这两周有安排吗"))
+    r = reg.call(tool_call("list_events", text="这两周有安排吗"))
     check("时间段解析不出来时，如实说没听懂而不是编今天", "今天" in r.reply, False)
 
-    r = reg.call(tool_call("next_schedule"))
+    r = reg.call(tool_call("next_event"))
     print(f"        {r.reply}")
     check("下一项查得到", ("AIAA3102" in r.reply or "见面" in r.reply), True)
 
-    r = reg.call(tool_call("list_alarms"))
+    r = reg.call(tool_call("list_events"))
     check("提醒查得到", ("起床" in r.reply), True)
     r = reg.call(tool_call("list_memos"))
     check("备忘查得到", ("买牛奶" in r.reply), True)
@@ -257,12 +255,12 @@ def test_live() -> None:
     from voice_loop.tools import TOOL_HINT
 
     cases = [
-        ("这周有什么安排", "list_schedule"),
-        ("下周三下午三点半跟导师见面", "add_schedule"),
+        ("这周有什么安排", "list_events"),
+        ("下周三下午三点半跟导师见面", "add_event"),
         ("记一下买牛奶", "add_memo"),
-        ("明天早上七点叫我起床", "add_alarm"),
+        ("明天早上七点叫我起床", "add_event"),
         ("我的备忘里有什么", "list_memos"),
-        ("下一个会议是什么", "next_schedule"),
+        ("下一个会议是什么", "next_event"),
         ("你好，你是谁", None),          # 闲聊不该调工具
         ("讲一下插头DP", None),
     ]

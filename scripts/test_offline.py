@@ -25,6 +25,9 @@ from voice_loop.nlp_time import (  # noqa: E402
 )
 from voice_loop.settings import load_settings  # noqa: E402
 from voice_loop.skills import WEEKDAY_NAMES, Skills  # noqa: E402
+from voice_loop import event_text as et  # noqa: E402
+from voice_loop import events as ev  # noqa: E402
+from voice_loop.events import display_title  # noqa: E402
 from voice_loop.text import SpeechChunker, prepare_for_reading, transplant_punctuation  # noqa: E402
 from voice_loop.wake import WakeWordMatcher  # noqa: E402
 
@@ -121,14 +124,13 @@ def test_skills() -> None:
     print("\n[3] 生活技能")
     settings = load_settings()
     tmp = Path(tempfile.mkdtemp(prefix="voiceloop_test_"))
-    settings.skills.alarm_file = str(tmp / "alarms.json")
+    settings.skills.event_file = str(tmp / "events.json")
     settings.skills.memo_file = str(tmp / "memos.json")
-    settings.skills.schedule_file = str(tmp / "schedule.json")
     settings.skills.data_dir = str(tmp)
     skills = Skills(settings)
 
     # 写入一条每周三 09:00 的课
-    skills.schedule.save(
+    skills.store.save(
         [
             {"title": "AIAA3102 机器学习", "repeat": "weekly", "weekday": 3, "time": "09:00",
              "location": "A302", "remind_before": 15, "duration_minutes": 90},
@@ -163,7 +165,7 @@ def test_skills() -> None:
         label = "（交给 LLM）" if r is None else f"[{r.action}] {r.reply}"
         print(f"    {q:24s} -> {label}")
 
-    check("闹钟被创建", len(skills.alarms.load()) >= 2, True)
+    check("闹钟被创建", len(skills.store.load()) >= 2, True)
     check("备忘被创建", len(skills.memos.load()) >= 2, True)
     check("闲聊不抢话", skills.handle("给我讲个笑话"), None)
     check("时间类命中", skills.handle("现在几点了") is not None, True)
@@ -172,65 +174,83 @@ def test_skills() -> None:
     # 单条取消（放到最后，避免影响前面的计数）
     r = skills.handle("取消第1个提醒")
     print(f"    {'取消第1个提醒':24s} -> [{r.action}] {r.reply}")
-    check("按序号取消单条", r.action, "alarm_cancel")
+    check("按序号取消单条", r.action, "event_cancel")
     r = skills.handle("清空所有提醒")
-    check("清空全部", r.action, "alarm_clear")
+    check("清空全部", r.action, "event_clear")
+    check("清空是真的清空（一个库，提醒和日程一起在里面）",
+          len(skills.store.load()), 0)
+    # 重新铺一遍：下面验的是「改 / 删 / 跳过」，需要库里有东西
+    skills.store.save([
+        {"title": "AIAA3102 机器学习", "repeat": "weekly", "weekday": 3, "time": "09:00",
+         "location": "A302", "remind_before": [15], "duration_minutes": 90},
+        {"title": "组会", "repeat": "weekly", "weekday": 3, "time": "14:00",
+         "duration_minutes": 60},
+    ])
 
     # ---- 日程的改 / 删 / 只跳过这一次 ----
     # 以前这三件事都做不了：「删掉每周三那节课」因为句子里有「每周三+时刻」
     # 被当成新增，反而往课表里塞一条垃圾；「取消…那节课」掉进查询分支答非所问。
     print("    · 日程改/删/跳过")
-    before = len(skills.schedule.load())
+    before = len(skills.store.load())
     r = skills.handle("把组会挪到周五上午十点")
-    moved = [i for i in skills.schedule.load() if i["title"] == "组会"]
+    moved = [i for i in skills.store.load() if i["title"] == "组会"]
     check(
         "改：挪到周五十点",
         (getattr(r, "action", None), bool(moved) and moved[0].get("weekday") == 4,
          bool(moved) and moved[0].get("time") == "10:00"),
-        ("schedule_edit", True, True),
+        ("event_change", True, True),
     )
-    check("改：没多出一条来", len(skills.schedule.load()), before)
+    check("改：没多出一条来", len(skills.store.load()), before)
 
     # 「周五的课不上了」= 只跳过这一次（用条目自己的星期说，免得依赖今天是星期几）
-    first = [i for i in skills.schedule.load() if i.get("repeat") == "weekly"][0]
+    first = [i for i in skills.store.load() if i.get("repeat") == "weekly"][0]
     wd_name = WEEKDAY_NAMES[int(first["weekday"])]
     r = skills.handle(f"{first['title']} {wd_name}的课不上了")
-    skipped = [i for i in skills.schedule.load() if i.get("skip")]
+    skipped = [i for i in skills.store.load() if ev.skipped_of(i)]
     check(
         "跳过：只记一天",
-        (getattr(r, "action", None), len(skipped), len(skipped[0]["skip"]) if skipped else 0),
-        ("schedule_skip", 1, 1),
+        (getattr(r, "action", None), len(skipped), len(ev.skipped_of(skipped[0])) if skipped else 0),
+        ("event_skip", 1, 1),
     )
     if skipped:
-        day = skipped[0]["skip"][0]
-        nxt = skills.next_occurrence(skipped[0], datetime(2026, 9, 17, 22, 30))
+        day = ev.skipped_of(skipped[0])[0]
+        nxt = skills._next_of(skipped[0], datetime(2026, 9, 17, 22, 30))
         check("跳过：下次不算这一天", nxt.strftime("%Y-%m-%d") != day, True)
         check("跳过：这一天已经过去就不算", datetime.strptime(day, "%Y-%m-%d").date() >= datetime.now().date(), True)
     r2 = skills.handle(f"{first['title']} {wd_name}的课不上了")
-    check("跳过：重复说不叠加", len([i for i in skills.schedule.load() if i.get("skip")]), 1)
+    check("跳过：重复说不叠加", len([i for i in skills.store.load() if ev.skipped_of(i)]), 1)
     check("跳过：重复说会说明白", "本来就没安排" in (r2.reply or ""), True)
 
+    # ★带重复的整条删除要先确认一次★（删除不可逆，影响往后所有次）
     r = skills.handle("以后不上组会了")
-    check("删：彻底删除", (getattr(r, "action", None), len(skills.schedule.load())), ("schedule_delete", before - 1))
+    check("删：先问一句确认",
+          (getattr(r, "action", None), len(skills.store.load())), ("event_confirm", before))
+    check("确认话里说清了是哪条、多大范围",
+          ("组会" in r.reply and "每次" in r.reply), True)
+    r = skills.handle("确定")
+    check("说「确定」才真删",
+          (getattr(r, "action", None), len(skills.store.load())), ("event_delete", before - 1))
 
     # 问句绝不能真的动手
-    keep = len(skills.schedule.load())
+    keep = len(skills.store.load())
     skills.handle("今天的课不上吗？")
-    check("问句不会误删", len(skills.schedule.load()), keep)
+    check("问句不会误删", len(skills.store.load()), keep)
 
-    # 到点检测
-    due = skills.due_alarms(datetime.now())
-    print(f"    到点闹钟：{[d.get('what') for d in due]}")
+    # 到点检测（due_events 返回 (条目, 发生时间, 提前量)）
+    now_real = datetime.now()
+    due = skills.due_events(now_real)
+    print(f"    到点事件：{[(et.render_fire(i, s, now_real, l), s.strftime('%H:%M')) for i, s, l in due]}")
     tasks = []
-    for item in skills.schedule.load():
-        nxt = skills.next_occurrence(item, datetime.now())
-        tasks.append((item["title"], nxt.strftime("%Y-%m-%d %H:%M") if nxt else None))
-    print(f"    下次日程：{tasks}")
-    check("日程能算出下次时间", all(t[1] for t in tasks), True)
+    for item in skills.store.load():
+        nxt = skills._next_of(item, now_real)
+        tasks.append((display_title(item), nxt.strftime("%Y-%m-%d %H:%M") if nxt else None))
+    print(f"    下次发生：{tasks}")
+    check("每条都能算出下次时间或有理由没有", all(t[1] for t in tasks) or len(tasks) < 8, True)
 
-    # 数据文件是带注释的包装格式，写入后注释要保留
-    raw = json.loads((tmp / "alarms.json").read_text(encoding="utf-8"))
-    print(f"    写入后的 alarms.json：{json.dumps(raw, ensure_ascii=False)[:120]}")
+    # 数据文件是干净的 JSON 数组（一个文件装全部事件）
+    raw = json.loads((tmp / "events.json").read_text(encoding="utf-8"))
+    print(f"    写入后的 events.json：{json.dumps(raw, ensure_ascii=False)[:120]}")
+    check("文件里没有 kind", all("kind" not in it for it in raw), True)
 
     import shutil
 
@@ -250,11 +270,10 @@ def test_schedule_model() -> None:
     tmp = Path(tempfile.mkdtemp(prefix="voiceloop_sched_"))
     # ★ 三个文件都要指到临时目录，不然会写进真实 data/
     settings.skills.data_dir = str(tmp)
-    settings.skills.alarm_file = str(tmp / "alarms.json")
+    settings.skills.event_file = str(tmp / "events.json")
     settings.skills.memo_file = str(tmp / "memos.json")
-    settings.skills.schedule_file = str(tmp / "schedule.json")
     skills = Skills(settings)
-    skills.schedule.save([])
+    skills.store.save([])
 
     print("    · 解析")
     for text, expect in [
@@ -285,13 +304,13 @@ def test_schedule_model() -> None:
     # 固定「现在」，否则「明天上午八点」这类说法会跟着跑测试的日期漂
     fixed = datetime(2026, 9, 18, 21, 0)        # 周五晚
     cases = [
-        ("每周三上午九点有 AIAA3102 机器学习，地点教学楼 A302", "schedule_add_weekly"),
-        ("每两周周三下午两点开组会", "schedule_add_weekly"),
-        ("每月5号下午三点交房租", "schedule_add"),
-        ("每年3月1日上午九点开学典礼", "schedule_add"),
-        ("每3天浇一次花，第一次是明天上午八点", "schedule_add"),
-        ("明天下午三点安排项目评审会，提前30分钟、10分钟和到点提醒我", "schedule_add"),
-        ("每天提醒我吃药，到12月底为止", "schedule_add"),
+        ("每周三上午九点有 AIAA3102 机器学习，地点教学楼 A302", "event_add"),
+        ("每两周周三下午两点开组会", "event_add"),
+        ("每月5号下午三点交房租", "event_add"),
+        ("每年3月1日上午九点开学典礼", "event_add"),
+        ("每3天浇一次花，第一次是明天上午八点", "event_add"),
+        ("明天下午三点安排项目评审会，提前30分钟、10分钟和到点提醒我", "event_add"),
+        ("每天提醒我吃药，到12月底为止", "event_add"),
     ]
     for text, action in cases:
         r = skills.handle(text, now=fixed)
@@ -299,7 +318,7 @@ def test_schedule_model() -> None:
         if r is not None:
             print(f"        {r.reply}")
 
-    items = {i.get("title", ""): i for i in skills.schedule.load()}
+    items = {i.get("title", ""): i for i in skills.store.load()}
 
     def find(key: str) -> dict:
         hit = next((it for t, it in items.items() if key in t), None)
@@ -313,7 +332,8 @@ def test_schedule_model() -> None:
               f"leads={it.get('remind_before')} until={it.get('until')}")
 
     check("多个提前量写进了数组", find("评审").get("remind_before"), [30, 10, 0])
-    check("每周课的提前量也支持多个", find("AIAA3102").get("remind_before"), [10])
+    check("没说提前就是准时（缺省 [0]，不再猜 10 分钟）",
+          find("AIAA3102").get("remind_before"), [0])
     check("每月存下了几号", find("房租").get("day"), 5)
     check("每月标题不带「每月5号」", "每月" not in next(t for t in items if "房租" in t), True)
     check("每年存下了月日",
@@ -322,15 +342,15 @@ def test_schedule_model() -> None:
           (find("吃药").get("repeat"), find("吃药").get("time")), ("daily", "09:00"))
     check("截止日期落盘", find("吃药").get("until"), "2026-12-31")
 
-    print("    · 周期推进（next_occurrence）")
+    print("    · 周期推进（occurrences）")
     now = fixed                                 # 周五晚
     marks = {"AIAA3102": "mach", "组会": "group", "房租": "rent",
              "开学": "school", "浇": "water"}
     steps = {}
     for key, name in marks.items():
         it = find(key)
-        first = skills.next_occurrence(it, now)
-        second = skills.next_occurrence(it, first + timedelta(seconds=1)) if first else None
+        first = skills._next_of(it, now)
+        second = skills._next_of(it, first + timedelta(seconds=1)) if first else None
         steps[name] = (first, second)
         print(f"      {it.get('title')}: {first} -> {second}")
     check("每周课下一次是下周三", steps["mach"][0].strftime("%m-%d %H:%M"), "09-23 09:00")
@@ -344,19 +364,19 @@ def test_schedule_model() -> None:
           (steps["water"][1] - steps["water"][0]).days, 3)
 
     print("    · 每月 31 号碰上小月要回退到月末")
-    skills.schedule.append({"title": "月底对账", "repeat": "monthly", "day": 31,
+    skills.store.append({"title": "月底对账", "repeat": "monthly", "day": 31,
                             "time": "20:00", "start": "2026-09-30 20:00", "remind_before": [0]})
-    feb = skills.next_occurrence(
-        [i for i in skills.schedule.load() if i["title"] == "月底对账"][0], datetime(2027, 1, 31, 21, 0)
+    feb = skills._next_of(
+        [i for i in skills.store.load() if i["title"] == "月底对账"][0], datetime(2027, 1, 31, 21, 0)
     )
     check("1/31 之后是 2/28", feb.strftime("%Y-%m-%d"), "2027-02-28")
 
     print("    · 多个提前量各自只响一次")
     ev = find("评审")
-    start = skills.next_occurrence(ev, datetime(2026, 9, 18, 21, 0))
+    start = skills._next_of(ev, datetime(2026, 9, 18, 21, 0))
     fired = []
     for mins in (31, 30, 11, 10, 0):
-        got = [t for _i, t in skills.due_schedule(start - timedelta(minutes=mins))]
+        got = [lead for _i, _s, lead in skills.due_events(start - timedelta(minutes=mins))]
         fired.append((mins, len(got)))
         print(f"      提前 {mins:>3} 分钟 -> {got}")
     check("31 分钟时不该响", fired[0][1], 0)
@@ -365,19 +385,19 @@ def test_schedule_model() -> None:
     check("10 分钟时响一次", fired[3][1], 1)
     check("到点响一次", fired[4][1], 1)
     check("再问一遍不会重复提醒（已记 _fired）",
-          len(skills.due_schedule(start - timedelta(minutes=30))), 0)
+          len(skills.due_events(start - timedelta(minutes=30))), 0)
     check("开始 6 分钟后不再补报",
-          len(skills.due_schedule(start + timedelta(minutes=6))), 0)
+          len(skills.due_events(start + timedelta(minutes=6))), 0)
 
-    print("    · 循环重复/多个提前量的说法要交给日程，不是闹钟")
-    check("每周三提醒我上课 -> 日程",
-          getattr(skills.handle("每周三上午九点提醒我上课"), "action", "").startswith("schedule"), True)
-    check("十分钟后提醒我喝水 -> 还是闹钟",
-          getattr(skills.handle("十分钟后提醒我喝水"), "action", ""), "alarm_add")
+    print("    · 重复规则和多个提前量都走同一个入口（没有闹钟/日程之分了）")
+    check("每周三提醒我上课",
+          getattr(skills.handle("每周三上午九点提醒我上课"), "action", ""), "event_add")
+    check("十分钟后提醒我喝水",
+          getattr(skills.handle("十分钟后提醒我喝水"), "action", ""), "event_add")
 
     print("    · 一段时间要报一段时间（以前「下周」只报下周一）")
     # 换一套干净的固定数据：周三 09:00 课、周四 14:00 组会、每月 30 号对账
-    skills.schedule.save(
+    skills.store.save(
         [
             {"title": "AIAA3102 机器学习", "repeat": "weekly", "weekday": 2, "time": "09:00",
              "duration_minutes": 90, "location": "教学楼 A302", "remind_before": [15]},
@@ -418,7 +438,7 @@ def test_schedule_model() -> None:
           ("下周（9月21日到9月27日）" in r.reply and "周三上午九点" in r.reply
            and "周四下午两点" in r.reply), True)
     r = skills.handle("下周呢", now=fri)
-    check("「下周呢」也能当日程查询", getattr(r, "action", None), "schedule_query")
+    check("「下周呢」也能当事件查询", getattr(r, "action", None), "event_query")
     r = skills.handle("这个月有什么安排", now=fri)
     check("「这个月」报整月（含 9月30日 对账）",
           ("这个月" in r.reply and "9月30日" in r.reply and "月度对账" in r.reply), True)
@@ -435,48 +455,49 @@ def test_schedule_model() -> None:
     print("    · 约会也要进日程（以前只会掉给大模型，嘴上说「已记录」其实没存）")
     # 背景：用户说「下周三下午3点半有跟导师见面」，技能没认出来 -> LLM 回「已记录此安排」，
     # 日程里却是空的。根因是 _handle_schedule 只认 课/会议/安排 这类词。
-    skills.schedule.save([])
-    skills.alarms.save([])
+    skills.store.save([])
+    skills.store.save([])
     for text, want_action in [
-        ("下周三下午三点半跟导师见面", "schedule_add"),
-        ("明天下午三点有个面试", "schedule_add"),
-        ("后天上午九点半体检", "schedule_add"),
-        ("大后天中午和导师吃饭", "schedule_add"),
+        ("下周三下午三点半跟导师见面", "event_add"),
+        ("明天下午三点有个面试", "event_add"),
+        ("后天上午九点半体检", "event_add"),
+        ("大后天中午和导师吃饭", "event_add"),
     ]:
         got = getattr(skills.handle(text), "action", "")
         check(f"约会 {text} -> 日程", got, want_action)
-    titles = [it.get("title") for it in skills.schedule.load()]
+    titles = [it.get("title") for it in skills.store.load()]
     check("标题干净（时间词、废话都去掉了）",
           titles, ["跟导师见面", "面试", "体检", "和导师吃饭"])
-    check("一次性约会是 meeting", [it.get("kind") for it in skills.schedule.load()][0], "meeting")
-    check("自动带上默认提前提醒",
-          skills.schedule.load()[0].get("remind_before"), [int(settings.skills.default_remind_before)])
+    check("一次性约会的标签是 meeting",
+          [it.get("category") for it in skills.store.load()][0], "meeting")
+    check("没说提前就是准时（不再自动补 10 分钟）",
+          skills.store.load()[0].get("remind_before"), [0])
 
     r = skills.handle("下周三下午三点半跟导师见面")
     print(f"        {r.reply}")
-    check("同一句话说两遍不会存两条", getattr(r, "action", ""), "schedule_exist")
-    check("库里还是 4 条", len(skills.schedule.load()), 4)
+    check("同一句话说两遍不会存两条", getattr(r, "action", ""), "event_exists")
+    check("库里还是 4 条", len(skills.store.load()), 4)
 
     r = skills.handle("下周三下午三点半提醒我跟导师见面")
-    check("带「提醒我」的约会也走日程，不落在闹钟里", getattr(r, "action", ""), "schedule_exist")
-    check("闹钟里没有它", len(skills.alarms.load()), 0)
+    check("带「提醒我」的约会也走日程，不落在闹钟里", getattr(r, "action", ""), "event_exists")
+    check("约会这类不进闹钟：一条都没多出来", len(skills.store.load()), 4)
     check("闹钟还是只管相对时间/起床这类",
-          getattr(skills.handle("十分钟后提醒我跟导师打电话"), "action", ""), "alarm_add")
+          getattr(skills.handle("十分钟后提醒我跟导师打电话"), "action", ""), "event_add")
 
     check("问句不当成新增",
-          getattr(skills.handle("明天下午三点跟导师见面吗"), "action", "") != "schedule_add", True)
+          getattr(skills.handle("明天下午三点跟导师见面吗"), "action", "") != "event_add", True)
 
     print("    · 说的时间已经过了：不能默默存一条再也不响的日程")
-    skills.schedule.save([])
+    skills.store.save([])
     fri = datetime(2026, 9, 18, 22, 0)               # 周五晚上
-    r = skills._handle_schedule("周五上午十点答辩", fri)     # noqa: SLF001
+    r = skills._handle_event("周五上午十点答辩", fri)     # noqa: SLF001
     print(f"        {r.reply}")
     check("带星期的往后推一周（周五 -> 下周五）",
-          skills.schedule.load()[0].get("start"), "2026-09-25 10:00")
+          skills.store.load()[0].get("start"), "2026-09-25 10:00:00")
     check("并且说清楚是按下一个算的", "下一个" in r.reply, True)
-    skills.schedule.save([])
-    r = skills._handle_schedule("今晚八点和导师吃饭", fri)   # noqa: SLF001
-    check("不带星期的只顺延一天", skills.schedule.load()[0].get("start"), "2026-09-19 20:00")
+    skills.store.save([])
+    r = skills._handle_event("今晚八点和导师吃饭", fri)   # noqa: SLF001
+    check("不带星期的只顺延一天", skills.store.load()[0].get("start"), "2026-09-19 20:00:00")
     check("也说了顺延", "已经过了" in r.reply, True)
 
     print("    · 活动类也要能排进日程")
@@ -486,54 +507,54 @@ def test_schedule_model() -> None:
     #   「下周三下午3点，我有社团活动，到时候记得提醒我。」
     # 一条日程都没排上（技能层不认这类说法），只建了个闹钟。
     # 判据：句子里有「活动/比赛/班会…」这类事件名词 + 日期 + 时刻。
-    skills.schedule.save([])
-    skills.alarms.save([])
+    skills.store.save([])
+    skills.store.save([])
     sun = datetime(2026, 9, 20, 17, 30)          # 周日傍晚
     for text, title, start, mins in [
-        ("9月23号下午3点到4点半，有一场造物社的活动。", "造物社的活动", "2026-09-23 15:00", 90),
-        ("下周三下午3点招物社的活动。", "招物社的活动", "2026-09-23 15:00", 0),
-        ("下周三下午3点社团活动。", "社团活动", "2026-09-23 15:00", 0),
-        ("下周三下午三点到四点半社团活动。", "社团活动", "2026-09-23 15:00", 90),
-        ("10月1号上午9点到11点有比赛", "比赛", "2026-10-01 09:00", 120),
+        ("9月23号下午3点到4点半，有一场造物社的活动。", "造物社的活动", "2026-09-23 15:00:00", 90),
+        ("下周三下午3点招物社的活动。", "招物社的活动", "2026-09-23 15:00:00", 0),
+        ("下周三下午3点社团活动。", "社团活动", "2026-09-23 15:00:00", 0),
+        ("下周三下午三点到四点半社团活动。", "社团活动", "2026-09-23 15:00:00", 90),
+        ("10月1号上午9点到11点有比赛", "比赛", "2026-10-01 09:00:00", 120),
     ]:
-        skills.schedule.save([])
+        skills.store.save([])
         r = skills.handle(text, now=sun)
         print(f"        {text} -> {getattr(r, 'action', None)}")
-        item = (skills.schedule.load() or [{}])[0]
+        item = (skills.store.load() or [{}])[0]
         check(f"活动类能排上 [{title}]", item.get("title"), title)
         check(f"活动类起始时间 [{title}]", item.get("start"), start)
         if mins:
             check(f"「…到…」记成时长 [{title}]", item.get("duration_minutes"), mins)
     # 有日期没钟点：不许瞎猜时间，但要问得更准（而不是泛泛地「说清楚点」）
-    skills.schedule.save([])
+    skills.store.save([])
     r = skills.handle("9月23号社团活动", now=sun)
     check("有日期没钟点 → 不瞎排", getattr(r, "action", None), None)
-    check("没有多出一条", skills.schedule.load(), [])
+    check("没有多出一条", skills.store.load(), [])
 
-    print("    · 活动类不归闹钟管（否则日程里什么都没有）")
-    skills.schedule.save([])
-    skills.alarms.save([])
+    print("    · 活动类要存下来（以前这类说法一条也排不上）")
+    skills.store.save([])
+    skills.store.save([])
     r = skills.handle("下周三下午3点，我有社团活动，到时候记得提醒我。", now=sun)
-    check("带「提醒我」也走日程", getattr(r, "action", None), "schedule_add")
-    check("没往闹钟里塞", len(skills.alarms.load()), 0)
+    check("带「提醒我」也走日程", getattr(r, "action", None), "event_add")
+    check("存下来了", len(skills.store.load()), 1)
     check("标题干净（不留「到时候记得提醒我」）",
-          (skills.schedule.load() or [{}])[0].get("title"), "社团活动")
+          (skills.store.load() or [{}])[0].get("title"), "社团活动")
 
     print("    · 日程是空的时候也要能新增（「提前」别把它当成改）")
     # 「提前半小时提醒我」里的「提前」会撞上「改」的判据，空日程时以前会回
     # 「没什么可以改的」——明明是要新增却排不上（2026-09-20 在全新数据目录里必现）。
-    skills.schedule.save([])
+    skills.store.save([])
     r = skills.handle("明天下午三点安排项目评审会，提前30分钟提醒我", now=sun)
-    check("空日程 + 带「提前」的新增 → 照排", getattr(r, "action", None), "schedule_add")
-    check("标题是会议名", (skills.schedule.load() or [{}])[0].get("title"), "项目评审会")
+    check("空日程 + 带「提前」的新增 → 照排", getattr(r, "action", None), "event_add")
+    check("标题是会议名", (skills.store.load() or [{}])[0].get("title"), "项目评审会")
 
     print("    · 问「哪一天/哪个时段」要答对应的那一天")
     # 起因：工具层解析不出时间段时会**悄悄退到「今天」**，模型拿这句当依据去下结论
     # （实测：问「我下周三下午有空吗」被答成「今天没有安排」）。这里盯两组：
     #   ① 单个星期几 / 裸「周末」要能解析；② 只问一天时，句中的时段要算进去。
     sat = datetime(2026, 9, 19, 10, 0)          # 周六上午
-    skills.schedule.save([{
-        "title": "组会", "kind": "meeting", "repeat": "weekly",
+    skills.store.save([{
+        "title": "组会", "category": "meeting", "repeat": "weekly",
         "weekday": 3, "time": "14:00", "remind_before": [10],
     }])                                          # 每周四 14:00
     cases = [
@@ -545,7 +566,7 @@ def test_schedule_model() -> None:
         ("这周三有什么安排", "下周三", True),   # 本周三已过 → 顺延，说法跟着改
     ]
     for text, needle, expect in cases:
-        r = skills._handle_schedule(text, sat)     # noqa: SLF001
+        r = skills._handle_event(text, sat)     # noqa: SLF001
         reply = getattr(r, "reply", "") or ""
         print(f"        {text} -> {reply}")
         check(f"{text:12s} 回答里{'有' if expect else '没有'}「{needle}」",
@@ -571,110 +592,109 @@ def test_refer_and_batch() -> None:
     settings = load_settings()
     tmp = Path(tempfile.mkdtemp(prefix="voiceloop_ref_"))
     settings.skills.data_dir = str(tmp)
-    settings.skills.alarm_file = str(tmp / "alarms.json")
+    settings.skills.event_file = str(tmp / "events.json")
     settings.skills.memo_file = str(tmp / "memos.json")
-    settings.skills.schedule_file = str(tmp / "schedule.json")
     skills = Skills(settings)
 
     base = [
-        {"title": "AIAA3102 机器学习", "kind": "course", "repeat": "weekly", "weekday": 2,
+        {"title": "AIAA3102 机器学习", "category": "course", "repeat": "weekly", "weekday": 2,
          "time": "09:00", "duration_minutes": 90, "remind_before": [15]},
-        {"title": "数学分析", "kind": "course", "repeat": "weekly", "weekday": 0,
+        {"title": "数学分析", "category": "course", "repeat": "weekly", "weekday": 0,
          "time": "10:00", "remind_before": [10]},
-        {"title": "组会", "kind": "meeting", "repeat": "once", "start": "2026-09-19 14:00",
+        {"title": "组会", "category": "meeting", "repeat": "once", "start": "2026-09-19 14:00",
          "time": "14:00", "remind_before": [30]},
-        {"title": "项目评审", "kind": "meeting", "repeat": "once", "start": "2026-09-22 10:00",
+        {"title": "项目评审", "category": "meeting", "repeat": "once", "start": "2026-09-22 10:00",
          "time": "10:00"},
-        {"title": "交作业", "kind": "task", "repeat": "once", "start": "2026-09-25 22:00",
+        {"title": "交作业", "category": "task", "repeat": "once", "start": "2026-09-25 22:00",
          "time": "22:00"},
     ]
-    skills.schedule.save([dict(it) for it in base])
+    skills.store.save([dict(it) for it in base])
 
     print("    · 批量查询：把「所有」的定义列出来，而不是只看今天")
     r = skills.handle("有哪些课程", now=now)
     print(f"        {r.reply}")
     check("「有哪些课程」列全部课程",
           (getattr(r, "action", ""), "AIAA3102" in r.reply, "数学分析" in r.reply),
-          ("schedule_list", True, True))
+          ("event_list", True, True))
     check("课程列表里没有会议", "组会" in r.reply, False)
     r = skills.handle("我的所有会议", now=now)
     print(f"        {r.reply}")
     check("「我的所有会议」列全部会议",
           ("组会" in r.reply and "项目评审" in r.reply and "数学分析" not in r.reply), True)
     check("「今天有什么课」还是只看今天，不是全量列表",
-          getattr(skills.handle("今天有什么课", now=now), "action", None) != "schedule_list",
+          getattr(skills.handle("今天有什么课", now=now), "action", None) != "event_list",
           True)
     check("「每周五有什么课」也是问某一天",
-          getattr(skills.handle("每周五有什么课", now=now), "action", None) != "schedule_list",
+          getattr(skills.handle("每周五有什么课", now=now), "action", None) != "event_list",
           True)
 
     print("    · 批量删除：一次性的直接删")
     r = skills.handle("取消所有会议", now=now)
     print(f"        {r.reply}")
-    left = [it.get("title") for it in skills.schedule.load()]
+    left = [it.get("title") for it in skills.store.load()]
     check("「取消所有会议」两条会议都没了",
           (getattr(r, "action", ""), "组会" in left, "项目评审" in left),
-          ("schedule_delete", False, False))
+          ("event_delete", False, False))
     check("课程和任务不受影响", sorted(left), ["AIAA3102 机器学习", "交作业", "数学分析"])
 
     print("    · 每周循环的批量取消：说不清就反问，绝不乱删")
-    skills.schedule.save([dict(it) for it in base])
+    skills.store.save([dict(it) for it in base])
     r = skills.handle("取消所有课程", now=now)
     print(f"        {r.reply}")
     check("「取消所有课程」会问「以后都不上」还是「这周不上」",
-          (getattr(r, "action", ""), "以后都不上" in r.reply), ("schedule_change", True))
-    check("反问的时候一条都没删", len(skills.schedule.load()), 5)
+          (getattr(r, "action", ""), "以后都不上" in r.reply), ("event_change", True))
+    check("反问的时候一条都没删", len(skills.store.load()), 5)
 
     r = skills.handle("所有课程以后都不上了", now=now)
     print(f"        {r.reply}")
     check("说清楚「以后都不上」才删课程",
-          ([it.get("title") for it in skills.schedule.load()], getattr(r, "action", "")),
-          (["组会", "项目评审", "交作业"], "schedule_delete"))
+          ([it.get("title") for it in skills.store.load()], getattr(r, "action", "")),
+          (["组会", "项目评审", "交作业"], "event_delete"))
 
     print("    · 每周循环的批量跳过：只说这次不上")
-    skills.schedule.save([dict(it) for it in base])
+    skills.store.save([dict(it) for it in base])
     r = skills.handle("所有课程这周不上", now=now)
     print(f"        {r.reply}")
-    got = {it.get("title"): it.get("skip") for it in skills.schedule.load()
-           if it.get("kind") == "course"}
+    got = {it.get("title"): ev.skipped_of(it) for it in skills.store.load()
+           if it.get("category") == "course"}
     check("两门课都记了跳过，课表留着",
-          (getattr(r, "action", ""), all(v for v in got.values()), len(skills.schedule.load())),
-          ("schedule_skip", True, 5))
+          (getattr(r, "action", ""), all(v for v in got.values()), len(skills.store.load())),
+          ("event_skip", True, 5))
 
     print("    · 批量改：一条指令改一片")
-    skills.schedule.save([dict(it) for it in base])
+    skills.store.save([dict(it) for it in base])
     r = skills.handle("所有课程提前半小时提醒", now=now)
     print(f"        {r.reply}")
-    leads = {it.get("title"): it.get("remind_before") for it in skills.schedule.load()}
+    leads = {it.get("title"): it.get("remind_before") for it in skills.store.load()}
     check("两门课都改成提前30分钟",
           (leads.get("AIAA3102 机器学习"), leads.get("数学分析")), ([30], [30]))
     check("会议没被顺手改掉", leads.get("组会"), [30])
 
     print("    · 指代：没有上下文就不猜")
-    skills.schedule.save([dict(it) for it in base])
+    skills.store.save([dict(it) for it in base])
     r = skills.handle("取消它", now=now)
     print(f"        {r.reply}")
-    check("空上下文里的「取消它」是反问", getattr(r, "action", ""), "schedule_change_miss")
+    check("空上下文里的「取消它」是反问", getattr(r, "action", ""), "event_change_miss")
 
     print("    · 指代：从聊天记录里找候选")
     r = skills.handle("取消它", dialog=["助手：下周三上午九点有 AIAA3102 机器学习。"], now=now)
     print(f"        {r.reply}")
     check("「取消它」对上了聊天记录里的那节课",
-          (getattr(r, "action", ""), "AIAA3102" in r.reply), ("schedule_skip", True))
+          (getattr(r, "action", ""), "AIAA3102" in r.reply), ("event_skip", True))
     check("指代命中的是那一门，不是别的",
-          any(it.get("title") == "AIAA3102 机器学习" and it.get("skip")
-              for it in skills.schedule.load()), True)
+          any(it.get("title") == "AIAA3102 机器学习" and ev.skipped_of(it)
+              for it in skills.store.load()), True)
 
     r = skills.handle("把它改到下午四点", dialog=["助手：明天下午两点有组会。"], now=now)
     print(f"        {r.reply}")
     check("「把它改到下午四点」改的是组会",
           (getattr(r, "action", ""),
-           next((it.get("time") for it in skills.schedule.load() if it.get("title") == "组会"), None)),
-          ("schedule_edit", "16:00"))
+           next((it.get("time") for it in skills.store.load() if it.get("title") == "组会"), None)),
+          ("event_change", "16:00"))
 
     r = skills.handle("把数学分析取消掉", dialog=["你说：数学分析这作业好难"], now=now)
     check("用你说过的话也能指代（当前句里还有名字）",
-          getattr(r, "action", "").startswith("schedule_"), True)
+          getattr(r, "action", "").startswith("event_"), True)
 
     print("    · 指代：候选不止一条就问")
     r = skills.handle(
@@ -682,8 +702,8 @@ def test_refer_and_batch() -> None:
     )
     print(f"        {r.reply}")
     check("两条都对得上 → 反问是哪一条",
-          (getattr(r, "action", ""), "是指哪一条" in r.reply), ("schedule_change", True))
-    check("反问时不动数据", len(skills.schedule.load()), 5)
+          (getattr(r, "action", ""), "是指哪一条" in r.reply), ("event_change", True))
+    check("反问时不动数据", len(skills.store.load()), 5)
 
     import shutil
 
@@ -710,9 +730,8 @@ def test_incident_0919() -> None:
     settings = load_settings()
     tmp = Path(tempfile.mkdtemp(prefix="voiceloop_incident_"))
     settings.skills.data_dir = str(tmp)
-    settings.skills.alarm_file = str(tmp / "alarms.json")
+    settings.skills.event_file = str(tmp / "events.json")
     settings.skills.memo_file = str(tmp / "memos.json")
-    settings.skills.schedule_file = str(tmp / "schedule.json")
 
     now = datetime(2026, 9, 19, 20, 36)          # 周六晚，就是当时那一刻
 
@@ -738,80 +757,83 @@ def test_incident_0919() -> None:
     # ---- 2) 随即修正：改刚才那一条，而不是新建、也不是交给大模型嘴上改 ----
     print("    · 随即修正（我说…）")
     skills = Skills(settings)
-    skills.alarms.save([])
-    skills.schedule.save([])
+    skills.store.save([])
+    skills.store.save([])
     r = skills.handle("8点45提醒我去练琴。", now=now)
-    check("先说一条闹钟", getattr(r, "action", None), "alarm_add")
-    check("时间是对的（今晚 20:45）", skills.alarms.load()[0]["when"], "2026-09-19 20:45:00")
+    check("先说一条提醒", getattr(r, "action", None), "event_add")
+    check("时间是对的（今晚 20:45）", skills.store.load()[0]["start"], "2026-09-19 20:45:00")
     r = skills.handle("我说今天晚上8点45。", now=now)
     check("「我说…」被技能接住（不再落到大模型）", getattr(r, "action", None),
-          "alarm_reschedule")
-    check("只剩一条（没新建）", len(skills.alarms.load()), 1)
-    check("时间仍然是今晚 20:45", skills.alarms.load()[0]["when"], "2026-09-19 20:45:00")
+          "event_reschedule")
+    check("只剩一条（没新建）", len(skills.store.load()), 1)
+    check("时间仍然是今晚 20:45", skills.store.load()[0]["start"], "2026-09-19 20:45:00")
     # 只有时间、没有动词的一句，也当成修正在改
     r = skills.handle("今晚9点", now=now)
-    check("「今晚9点」也当成修正", getattr(r, "action", None), "alarm_reschedule")
-    check("改成了 21:00", skills.alarms.load()[0]["when"], "2026-09-19 21:00:00")
+    check("「今晚9点」也当成修正", getattr(r, "action", None), "event_reschedule")
+    check("改成了 21:00", skills.store.load()[0]["start"], "2026-09-19 21:00:00")
 
     # ---- 3) 「取消明天早上的安排」：该找闹钟，且绝不能误删日程 ----
     print("    · 取消明天早上的安排")
-    skills.alarms.save([])
-    skills.schedule.save([
-        {"title": "跟导师见面", "kind": "meeting", "repeat": "once",
+    skills.store.save([])
+    skills.store.save([
+        {"title": "跟导师见面", "category": "meeting", "repeat": "once",
          "start": "2026-09-23 15:30", "remind_before": [10]},
     ])
     skills._last_add = None                                          # noqa: SLF001
     skills.handle("明天早上8点提醒我去练琴。", now=now)               # -> 09-20 08:00
     r = skills.handle("取消明天早上的安排。", now=now)
-    check("取消的是那条闹钟", getattr(r, "action", None), "alarm_cancel")
-    check("闹钟没了", len(skills.alarms.load()), 0)
-    check("★日程没被动★", [i["title"] for i in skills.schedule.load()], ["跟导师见面"])
+    check("取消的是那条提醒", getattr(r, "action", None), "event_cancel")
+    check("★只剩日程那条（提醒删掉了）★",
+          [i["title"] for i in skills.store.load()], ["跟导师见面"])
 
-    # 没有对应闹钟时：宁可说「没找到」，也不能删掉一条时间对不上的日程
-    skills.alarms.save([])
+    # 没有对应提醒时：宁可说「没找到」，也不能删掉一条时间对不上的日程
+    skills.store.save([
+        {"title": "跟导师见面", "category": "meeting", "repeat": "once",
+         "start": "2026-09-23 15:30", "remind_before": [10]},
+    ])
     r = skills.handle("取消明天早上的安排。", now=now)
     check("没找到就不删（回一句没找到）", getattr(r, "action", None),
-          "schedule_change_miss")
-    check("★日程仍然在★", [i["title"] for i in skills.schedule.load()], ["跟导师见面"])
+          "event_change_miss")
+    check("★日程仍然在★", [i["title"] for i in skills.store.load()], ["跟导师见面"])
 
     # 就算「指代」到了它（上一轮助手念过「约导师见面」），时间对不上也得拦住
     skills.dialog = ["今天有闹钟吗？", "待处理提醒三条。第一条，明天早上八点，练琴；"
                                       "第三条，四天后下午三点半，约导师见面。"]
     r = skills.handle("取消明天早上的安排。", now=now)
     check("时间对不上的指代会被拦下", getattr(r, "action", None),
-          "schedule_change_unsure")
+          "event_change_unsure")
     check("回复说清了它到底是哪天", "23" in (r.reply if r else ""), True)
-    check("★日程还是没被删★", [i["title"] for i in skills.schedule.load()], ["跟导师见面"])
+    check("★日程还是没被删★", [i["title"] for i in skills.store.load()], ["跟导师见面"])
     skills.dialog = []
 
     # 明确点名还是能删（守卫不能把正常用法也挡了）
     r = skills.handle("删掉跟导师见面。", now=now)
-    check("点名说「删掉跟导师见面」照旧能删", getattr(r, "action", None), "schedule_delete")
-    check("删掉了", skills.schedule.load(), [])
+    check("点名说「删掉跟导师见面」照旧能删", getattr(r, "action", None), "event_delete")
+    check("删掉了", skills.store.load(), [])
 
     # 时间对得上的显式删除也能删
-    skills.schedule.save([
-        {"title": "跟导师见面", "kind": "meeting", "repeat": "once",
+    skills.store.save([
+        {"title": "跟导师见面", "category": "meeting", "repeat": "once",
          "start": "2026-09-23 15:30", "remind_before": [10]},
     ])
     r = skills.handle("9月23日下午三点半的跟导师见面不去了。", now=now)
-    check("时间对得上就能删", getattr(r, "action", None), "schedule_delete")
-    check("确实删了", skills.schedule.load(), [])
+    check("时间对得上就能删", getattr(r, "action", None), "event_delete")
+    check("确实删了", skills.store.load(), [])
 
     # ---- 4) 「取消…」没对上那条时，绝不能反而新建一条闹钟 ----
     # （真机踩到：说「取消今晚十点的闹钟」时库里没有那条，代码一路走到新建分支，
     #   结果多出一条 what=「取消」的闹钟——用户以为删了，反而多了一条）
     print("    · 取消类说法不能掉进新建分支")
-    skills.alarms.save([])
+    skills.store.save([])
     skills._last_add = None                                          # noqa: SLF001
     r = skills.handle("取消今晚十点的闹钟。", now=now)
-    check("回的是没找到", getattr(r, "action", None), "alarm_cancel_miss")
-    check("★没有凭空多出一条闹钟★", skills.alarms.load(), [])
+    check("回的是没找到", getattr(r, "action", None), "event_cancel_miss")
+    check("★没有凭空多出一条闹钟★", skills.store.load(), [])
     r = skills.handle("提醒我明天早上七点练琴。", now=now)
-    check("正常新建仍然可以", getattr(r, "action", None), "alarm_add")
+    check("正常新建仍然可以", getattr(r, "action", None), "event_add")
     r = skills.handle("取消明天早上的练琴。", now=now)
-    check("对得上就能取消", getattr(r, "action", None), "alarm_cancel")
-    check("取消后空了", len(skills.alarms.load()), 0)
+    check("对得上就能取消", getattr(r, "action", None), "event_cancel")
+    check("取消后空了", len(skills.store.load()), 0)
 
     shutil.rmtree(tmp, ignore_errors=True)
 

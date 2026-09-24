@@ -95,15 +95,14 @@ def make_loop(tmp: Path, route: str = "model"):
     settings.subtitle.enabled = False
     settings.skills.visual_alert = False
     settings.skills.data_dir = str(tmp)
-    settings.skills.alarm_file = str(tmp / "alarms.json")
+    settings.skills.event_file = str(tmp / "events.json")
     settings.skills.memo_file = str(tmp / "memos.json")
-    settings.skills.schedule_file = str(tmp / "schedule.json")
     settings.llm.route = route
     loop = VoiceLoop(settings, enable_listening=False, lazy_whisper=True)
     loop.tts_enabled = False          # 不真的出声
-    loop.skills.alarms.save([])
+    loop.skills.store.save([])
     loop.skills.memos.save([])
-    loop.skills.schedule.save([])
+    loop.skills.store.save([])
     return loop
 
 
@@ -116,11 +115,10 @@ def test_gate() -> None:
     with tempfile.TemporaryDirectory(prefix="route_gate_") as td:
         settings = load_settings()
         settings.skills.data_dir = td
-        settings.skills.alarm_file = str(Path(td) / "a.json")
+        settings.skills.event_file = str(Path(td) / "a.json")
         settings.skills.memo_file = str(Path(td) / "m.json")
-        settings.skills.schedule_file = str(Path(td) / "s.json")
         sk = Skills(settings)
-        sk.alarms.save([])
+        sk.store.save([])
         for text, expect in [
             ("这周有什么安排", True),
             ("我的备忘里有什么", True),
@@ -135,7 +133,7 @@ def test_gate() -> None:
             check(f"{text:16s} {'要看技能层' if expect else '不用'}", sk.needs_attention(text), expect)
 
         # 刚记下一条 → 后面那句（哪怕是句闲聊）也要攒着，好接「我说是今晚8点45」
-        sk._remember_add("alarm", idx=1)  # noqa: SLF001
+        sk._remember_add(1)  # noqa: SLF001
         check("刚记下一条之后，下一句也攒着", sk.needs_attention("你好"), True)
         sk._last_add["at"] -= 200.0  # noqa: SLF001
         check("超过 3 分钟就不再攒", sk.needs_attention("你好"), False)
@@ -150,26 +148,26 @@ def test_model_first() -> None:
 
         # --- 2.1 模型调了工具：一趟就完事，技能层不参与 ---
         loop = make_loop(tmp)
-        loop.llm = FakeLLM("tool", [call("list_schedule", text="这周有什么安排")])
+        loop.llm = FakeLLM("tool", [call("list_events", text="这周有什么安排")])
         stats = loop.respond("这周有什么安排")
         check("模型调工具：路由标记", stats.extra.get("route"), "model")
-        check("工具名记进了统计", "list_schedule" in str(stats.extra.get("tool")), True)
+        check("工具名记进了统计", "list_events" in str(stats.extra.get("tool")), True)
         check("没有落在技能路径上", stats.extra.get("skill"), None)
         check("只问了一次模型（没有多余往返）", loop.llm.turns, 1)
-        check("模型确实拿到了工具清单", len(loop.llm.last_tools or []), 11)
+        check("模型确实拿到了工具清单", len(loop.llm.last_tools or []), 8)
         check("答话来自工具（不是模型自己编）", "没" in stats.answer or "安排" in stats.answer, True)
         loop.close()
 
         # --- 2.2 模型没调工具，只说了句废话 → 技能层兜住，模型的话不念 ---
         loop = make_loop(tmp)
-        loop.skills.schedule.save([{
+        loop.skills.store.save([{
             "title": "跟导师见面", "kind": "meeting", "repeat": "once",
             "start": "2026-09-23 15:30", "time": "15:30", "remind_before": [10],
         }])
         loop.llm = FakeLLM("text", "我不知道，你查查日历吧。")
         stats = loop.respond("这周有什么安排")
         check("模型漏了：路由标记改成兜底", stats.extra.get("route"), "model→skills")
-        check("答话来自技能层", stats.extra.get("skill"), "schedule_query")
+        check("答话来自技能层", stats.extra.get("skill"), "event_query")
         check("★模型那句没被念出来★", "你查查日历吧" in stats.answer, False)
         check("技能层的话进了回答", "安排" in stats.answer, True)
         loop.close()
@@ -247,39 +245,39 @@ def test_new_tools() -> None:
         loop = make_loop(tmp)
         reg = loop.tools
         assert reg is not None
-        check("工具总数", len(reg.specs()), 11)
+        check("工具总数", len(reg.specs()), 8)
 
         got = reg.call(call("now", text="现在几点"))
         check("now → 报时", got.ok and "点" in got.reply, True)
 
-        got = reg.call(call("add_alarm", text=f"{(datetime.now() + timedelta(hours=3)).strftime('%H:%M')}提醒我喝水"))
-        check("add_alarm → 建了一条", got.ok, True)
-        check("闹钟里有 1 条", len(loop.skills.alarms.load()), 1)
+        got = reg.call(call("add_event", text=f"{(datetime.now() + timedelta(hours=3)).strftime('%H:%M')}提醒我喝水"))
+        check("add_event → 建了一条", got.ok, True)
+        check("库里 1 条", len(loop.skills.store.load()), 1)
 
         # ★这个工具必须只做取消★：模型把「提醒我」递进来时，不能反而多一条
-        got = reg.call(call("cancel_alarm", text="提醒我喝水"))
-        check("cancel_alarm 不会新建提醒", got.ok, False)
-        check("闹钟还是 1 条", len(loop.skills.alarms.load()), 1)
+        got = reg.call(call("change_event", text="提醒我喝水"))
+        check("change_event 不会新建提醒", got.ok, False)
+        check("库里还是 1 条", len(loop.skills.store.load()), 1)
 
         when = (datetime.now() + timedelta(hours=2)).strftime("%H:%M")
-        got = reg.call(call("add_alarm", text=f"{when}提醒我练琴"))
+        got = reg.call(call("add_event", text=f"{when}提醒我练琴"))
         check("先建一条用来改", got.ok, True)
         got = reg.call(call("fix_last", text=f"{when}"))
         check("fix_last → 改了刚记下的那条", got.ok, True)
-        check("没有多出一条", len(loop.skills.alarms.load()), 2)
+        check("没有多出一条", len(loop.skills.store.load()), 2)
 
-        got = reg.call(call("cancel_alarm", text=f"取消{when}的闹钟"))
-        check("cancel_alarm → 取消了", got.ok and got.action.startswith("alarm_cancel"), True)
+        got = reg.call(call("change_event", text=f"取消{when}的闹钟"))
+        check("change_event → 取消了", got.ok and got.action.startswith("event_cancel"), True)
 
-        loop.skills.schedule.save([{
-            "title": "组会", "kind": "meeting", "repeat": "weekly",
+        loop.skills.store.save([{
+            "title": "组会", "category": "meeting", "repeat": "weekly",
             "weekday": 4, "time": "14:00", "remind_before": [10],
         }])
-        got = reg.call(call("change_schedule", text="删掉组会"))
-        check("change_schedule → 走到了日程修改分支", got.ok and got.action.startswith("schedule_"),
-              True)
-        check("日程动了（删或跳过其中一种）",
-              bool(loop.skills.schedule.load()) is False or "skip" in got.action, True)
+        got = reg.call(call("change_event", text="删掉组会"))
+        check("change_event → 走到了删/跳过的分支",
+              got.ok and got.action.startswith("event_"), True)
+        check("重复的那条默认只跳过一次（不轻易删）",
+              len(loop.skills.store.load()) == 1 and "event_skip" == got.action, True)
         loop.close()
 
 
@@ -289,19 +287,19 @@ def test_repair_args() -> None:
     from voice_loop.tools import repair_args
 
     user = "下周三下午三点半跟导师见面"
-    stripped = call("add_schedule", text="跟导师见面")
+    stripped = call("add_event", text="跟导师见面")
     fixed = repair_args(stripped, user)
     check("丢时间 → 换回原话",
           fixed["function"]["arguments"]["text"], user)
 
-    same = call("add_schedule", text=user)
+    same = call("add_event", text=user)
     check("本来就是原话 → 不动", repair_args(same, user) is same, True)
 
-    other = call("add_schedule", text="明天上午十点跟导师见面")
+    other = call("add_event", text="明天上午十点跟导师见面")
     check("模型自己填了别的时间 → 不动（可能是在纠正听错）",
           repair_args(other, user) is other, True)
 
-    q = call("list_schedule", text="下周")
+    q = call("list_events", text="下周")
     check("查询类不改（模型缩小范围是合理的）",
           repair_args(q, "帮我看看下周都有什么事") is q, True)
 
@@ -317,12 +315,12 @@ def test_repair_args() -> None:
           "我说是今晚十点")
 
     # 动词被吞掉也要换回原话：时间还在，但技能层认不出是要新建提醒
-    verb_gone = call("add_alarm", text="明天早上七点练琴")
+    verb_gone = call("add_event", text="明天早上七点练琴")
     check("动词被吞掉 → 换回原话",
           repair_args(verb_gone, "提醒我明天早上七点练琴")["function"]["arguments"]["text"],
           "提醒我明天早上七点练琴")
     check("模型自己补上了动词 → 就用它的",
-          repair_args(call("add_alarm", text="明天早上七点叫我起床"),
+          repair_args(call("add_event", text="明天早上七点叫我起床"),
                       "提醒我明天早上七点起床")["function"]["arguments"]["text"],
           "明天早上七点叫我起床")
 
@@ -336,14 +334,13 @@ def test_reroute_correction() -> None:
     with tempfile.TemporaryDirectory(prefix="route_reroute_") as td:
         settings = load_settings()
         settings.skills.data_dir = td
-        settings.skills.alarm_file = str(Path(td) / "a.json")
+        settings.skills.event_file = str(Path(td) / "a.json")
         settings.skills.memo_file = str(Path(td) / "m.json")
-        settings.skills.schedule_file = str(Path(td) / "s.json")
         from voice_loop.skills import Skills
 
         sk = Skills(settings)
-        sk.alarms.save([])
-        add = call("add_alarm", text="今晚十点提醒我练琴")
+        sk.store.save([])
+        add = call("add_event", text="今晚十点提醒我练琴")
 
         check("还没记过东西时不掰（第一次说就是新建）",
               reroute_correction(add, "我说是今晚十点", sk), add)
@@ -356,12 +353,12 @@ def test_reroute_correction() -> None:
               (got["function"]["arguments"])["text"], "我说是今晚十点")
 
         check("带别的内容就不掰（「九点提醒我写作业」是新的一条）",
-              reroute_correction(call("add_alarm", text="九点提醒我写作业"),
+              reroute_correction(call("add_event", text="九点提醒我写作业"),
                                  "九点提醒我写作业", sk).get("function", {}).get("name"),
-              "add_alarm")
+              "add_event")
         check("查询类不碰",
-              reroute_correction(call("list_alarms"), "今晚有什么提醒", sk).get(
-                  "function", {}).get("name"), "list_alarms")
+              reroute_correction(call("list_events"), "今晚有什么提醒", sk).get(
+                  "function", {}).get("name"), "list_events")
 
 
 # --------------------------------------------------------------------------- #
@@ -372,27 +369,26 @@ def test_no_double_reminder() -> None:
     模型同时调 add_schedule 与 add_alarm，text 一模一样——日程本身带提前提醒，
     再来个闹钟就是同一件事响两次。
     """
-    print("\n[7] 同一句话不重复提醒（日程 + 闹钟）")
+    print("\n[7] 同一句话不重复记（同一工具被连着调两次）")
     with tempfile.TemporaryDirectory(prefix="route_dedup_") as td:
         tmp = Path(td)
         text = "下周三下午3点，我有社团活动，到时候记得提醒我。"
         loop = make_loop(tmp)
-        loop.llm = FakeLLM("tool", [call("add_schedule", text=text),
-                                    call("add_alarm", text=text)])
+        loop.llm = FakeLLM("tool", [call("add_event", text=text),
+                                    call("add_event", text=text)])
         stats = loop.respond(text)
-        check("日程排上了", len(loop.skills.schedule.load()), 1)
-        check("★没有多定一个重复的闹钟★", loop.skills.alarms.load(), [])
-        check("念的是日程那句", "排入日程" in stats.answer, True)
+        check("记上了", len(loop.skills.store.load()), 1)
+        check("★第二遍没再多一条★", len(loop.skills.store.load()), 1)
+        check("念的是「已记下」那句", "已记下" in stats.answer, True)
         loop.close()
 
         # 日程没排成时，闹钟照旧要定（不能因为「可能重复」就把事丢了）
         text2 = "明天早上七点叫我起床"
         loop = make_loop(tmp)
-        loop.llm = FakeLLM("tool", [call("add_schedule", text=text2),
-                                    call("add_alarm", text=text2)])
+        loop.llm = FakeLLM("tool", [call("add_event", text=text2),
+                                    call("add_event", text=text2)])
         stats = loop.respond(text2)
-        check("日程那条排不上（本来就不是日程）", loop.skills.schedule.load(), [])
-        check("闹钟仍然定了", len(loop.skills.alarms.load()), 1)
+        check("照样只记一条（提醒也有去重）", len(loop.skills.store.load()), 1)
         loop.close()
 
 

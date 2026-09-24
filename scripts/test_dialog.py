@@ -69,9 +69,8 @@ def main() -> int:
 
         tmp_dir = Path(tempfile.mkdtemp(prefix="voiceloop_dialog_"))
         settings.skills.data_dir = str(tmp_dir)
-        settings.skills.alarm_file = str(tmp_dir / "alarms.json")
+        settings.skills.event_file = str(tmp_dir / "events.json")
         settings.skills.memo_file = str(tmp_dir / "memos.json")
-        settings.skills.schedule_file = str(tmp_dir / "schedule.json")
 
     prompts = args.text or DEFAULT_PROMPTS
     loop = VoiceLoop(settings, enable_listening=False)

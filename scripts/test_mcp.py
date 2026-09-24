@@ -59,12 +59,11 @@ def skills_server_for(tmp: Path) -> MCPServer:
 
     settings = load_settings()
     settings.skills.data_dir = str(tmp)
-    settings.skills.alarm_file = str(tmp / "a.json")
+    settings.skills.event_file = str(tmp / "events.json")
     settings.skills.memo_file = str(tmp / "m.json")
-    settings.skills.schedule_file = str(tmp / "s.json")
     skills = Skills(settings, quiet_log())
-    skills.schedule.save([])
-    skills.alarms.save([])
+    skills.store.save([])
+    skills.store.save([])
     skills.memos.save([])
     return build_server(settings=settings, skills=skills, logger=quiet_log())
 
@@ -162,7 +161,7 @@ def test_inproc(tmp: Path) -> None:
     check("inproc 握手几乎不花时间", handshake < 0.2, f"{handshake * 1000:.0f} ms")
 
     tools = {t.name for t in client.list_tools()}
-    check("列出技能工具", {"list_schedule", "add_memo", "add_alarm", "list_memos"} <= tools,
+    check("列出技能工具", {"list_events", "add_memo", "add_event", "list_memos"} <= tools,
           str(sorted(tools)))
 
     ok, text = client.call("add_memo", {"text": "记一下买牛奶"})
@@ -193,7 +192,7 @@ def test_stdio(tmp: Path) -> None:
         boot = time.perf_counter() - t0
         check("子进程握手成功", bool(client.protocol_version), f"{boot:.2f}s")
         tools = {t.name for t in client.list_tools()}
-        check("列工具（真管道）", "list_schedule" in tools and len(tools) >= 7, f"{len(tools)} 个")
+        check("列工具（真管道）", "list_events" in tools and len(tools) >= 7, f"{len(tools)} 个")
         ok, text = client.call("list_memos", {})
         check("调用成功且中文没烂码", ok and "备忘" in text, text[:50])
         # 一条中文进、一条中文出，最能暴露编码问题
@@ -209,13 +208,12 @@ def test_host(tmp: Path) -> None:
     print("\n[5] 宿主：白名单 / 命名空间 / 路由 / 崩了重启")
     settings = load_settings()
     settings.skills.data_dir = str(tmp)
-    settings.skills.alarm_file = str(tmp / "a.json")
+    settings.skills.event_file = str(tmp / "events.json")
     settings.skills.memo_file = str(tmp / "m.json")
-    settings.skills.schedule_file = str(tmp / "s.json")
     from voice_loop.skills import Skills
 
     skills = Skills(settings, quiet_log())
-    skills.schedule.save([])
+    skills.store.save([])
     skills.memos.save([])
 
     cfg = McpConfig(
@@ -227,7 +225,7 @@ def test_host(tmp: Path) -> None:
             # 同一个服务器再挂一遍，这次带前缀 + 白名单只放只读的两个
             McpServerConfig(name="ro", transport="inproc",
                             module="voice_loop.mcp.servers.skills",
-                            tools=["list_memos", "list_schedule"]),
+                            tools=["list_memos", "list_events"]),
         ],
     )
     host = MCPHost(cfg, quiet_log(), deps={"settings": settings, "skills": skills,
@@ -238,7 +236,7 @@ def test_host(tmp: Path) -> None:
         check("外来/第二个服务器带 mcp__ 前缀", "mcp__ro__list_memos" in names)
         check("★白名单挡掉了写操作★", "mcp__ro__add_memo" not in names
               and "mcp__ro__add_alarm" not in names, str(sorted(names))[:90])
-        check("模型看到的工具数 = 11 + 2", len(host.specs()) == 13, f"{len(host.specs())} 个")
+        check("模型看到的工具数 = 8 + 2", len(host.specs()) == 10, f"{len(host.specs())} 个")
         check("specs 是 Ollama 形状", host.specs()[0]["type"] == "function"
               and "parameters" in host.specs()[0]["function"])
 
@@ -272,9 +270,8 @@ def test_pipeline(tmp: Path) -> None:
     print("\n[6] 接进 pipeline：工具清单与调用都走 MCP")
     settings = load_settings()
     settings.skills.data_dir = str(tmp)
-    settings.skills.alarm_file = str(tmp / "a.json")
+    settings.skills.event_file = str(tmp / "events.json")
     settings.skills.memo_file = str(tmp / "m.json")
-    settings.skills.schedule_file = str(tmp / "s.json")
     settings.subtitle.enabled = False
     settings.skills.visual_alert = False
 
@@ -285,8 +282,8 @@ def test_pipeline(tmp: Path) -> None:
         check("pipeline 里挂了 MCP 宿主", loop.mcp is not None)
         specs = loop._tool_specs() or []  # noqa: SLF001
         names = {s["function"]["name"] for s in specs}
-        check("工具清单来自宿主", {"list_schedule", "add_memo", "add_alarm"} <= names
-              and len(names) == 11, f"{len(names)} 个")
+        check("工具清单来自宿主", {"list_events", "add_memo", "add_event"} <= names
+              and len(names) == 8, f"{len(names)} 个")
         check("TOOL_HINT 会一起给（老行为没变）", bool(names))
 
         ok, text = loop._call_tool({"function": {"name": "add_memo",            # noqa: SLF001

@@ -47,9 +47,8 @@ def check(name: str, got, expect=None, contains: str | None = None) -> None:
 def make_settings(tmp: Path):
     settings = load_settings()
     settings.skills.data_dir = str(tmp)
-    settings.skills.alarm_file = str(tmp / "alarms.json")
+    settings.skills.event_file = str(tmp / "events.json")
     settings.skills.memo_file = str(tmp / "memos.json")
-    settings.skills.schedule_file = str(tmp / "schedule.json")
     settings.vision.save_dir = str(tmp / "shots")
     settings.vision.file_roots = [str(tmp / "roots")]
     return settings
