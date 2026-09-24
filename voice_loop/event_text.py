@@ -150,6 +150,21 @@ LEAD_WORDS = re.compile(
     r"(?:提前|预先|事先)\s*(?:\d+|半|[一二三四五六七八九十两]+)?\s*(?:天|日|小时|钟头|分钟|分|刻)"
     r"\s*(?:和|、|还有|以及)?"
 )
+# ★提前量的**列表**写法★：「提前一天和半小时提醒我」「提前30分钟、10分钟和到点提醒我」
+# 单个 LEAD_WORDS 只吃得下第一段（后面那几段没有「提前」二字），剩下那段会被当成
+# 标题（「提前一天和」）和时长（凭空多出 30 分钟）。所以列表形式要一次吃完。
+_LEAD_UNIT = r"(?:\d+|半|[一二三四五六七八九十两]+)?\s*(?:天|日|小时|钟头|分钟|分|刻|点)"
+LEAD_LIST = re.compile(
+    rf"(?:提前|预先|事先)\s*{_LEAD_UNIT}"
+    rf"(?:\s*(?:和|、|还有|以及|跟|,|，)\s*{_LEAD_UNIT})+"
+)
+
+
+def strip_leads(text: str) -> str:
+    """把提前量说法整段剥掉（含列表形式、含「到点/准时」）。"""
+    t = LEAD_LIST.sub("", text or "")
+    t = LEAD_WORDS.sub("", t)
+    return re.sub(r"(?:到点|准时|正点|提前|预先|事先)", "", t)
 LOCATION_RE = re.compile(r"(?:地点|教室)\s*[:：]?\s*([^，,。;；]+)")
 # 「在新体育馆」「在腾讯会议」这种没写「地点」但明显是地点的说法。
 # 前缀可以是 0 字符（「在腾讯会议」本身就是完整地点），否则会漏掉这类说法。
@@ -205,7 +220,7 @@ def clean_content(text: str) -> str:
 
 def clean_title(text: str) -> str:
     """标题清洗 = 去时间词 + 去提前量说法 + 去口头语。"""
-    return clean_content(LEAD_WORDS.sub("", text or ""))
+    return clean_content(strip_leads(text))
 
 
 def clean_title_loose(text: str) -> str:
@@ -215,7 +230,7 @@ def clean_title_loose(text: str) -> str:
     反过来的话「每周三上午九点提醒我上课」剥完「每」就停在「周三」上，
     时间还在、动词也剥不掉，最后得到「提醒我上课」（看着像内容，其实是命令残留）。
     """
-    return strip_leading(clean_content(LEAD_WORDS.sub("", text or "")))
+    return strip_leading(clean_content(strip_leads(text)))
 
 
 def is_topic_like(text: str) -> bool:
@@ -223,7 +238,15 @@ def is_topic_like(text: str) -> bool:
     t = (text or "").strip()
     if len(t) < 2 or t in _NOT_A_TOPIC:
         return False
-    return not _ACTION_ONLY.match(t)
+    if _ACTION_ONLY.match(t):
+        return False
+    # ★只剩周期 / 提前量 / 钟点的说法不是内容★：
+    #   「每个工作日」「提前一天和」「到点」以前会被当成标题存进去。
+    rest = re.sub(r"[\s，。、,.：:]+", "", strip_leads(REPEAT_WORDS.sub("", t)))
+    # 只削**尾巴**上的连接词（列表写法会留下一个「和」）；
+    # ★不能削开头★——「和面」这种词的开头也是「和」。
+    rest = re.sub(r"(?:和|跟|与|及|、|,|，)+$", "", rest)
+    return len(rest) >= 2
 
 
 def is_command_residue(text: str) -> bool:
@@ -425,7 +448,7 @@ def extract(text: str, now: datetime) -> dict:
     # ★提前量不是时长★：「每周三九点上课，提前半小时」的半小时属于 remind_before，
     # 被当成 duration 会让条目凭空长出一个 30 分钟的尾巴。
     duration = 0
-    body = LEAD_WORDS.sub("", payload)
+    body = strip_leads(payload)
     rng = parse_clock_range(body, now)
     if rng is not None:
         (h1, m1), (h2, m2) = rng

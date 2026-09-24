@@ -12,7 +12,7 @@
 ## 这份 README 里有什么
 
 **这里只讲怎么装、怎么用。** 所有「为什么这么设计」「实测多少」「踩过什么坑」
-都在 [`docs/ENGINEERING_LOG.md`](docs/ENGINEERING_LOG.md)（工程日志，1300+ 行实测记录）。
+都在 [`docs/ENGINEERING_LOG.md`](docs/ENGINEERING_LOG.md)（工程日志，1200+ 行实测记录）。
 
 | 想干什么 | 去哪看 |
 | --- | --- |
@@ -139,8 +139,10 @@ flowchart LR
 
 ```
 <项目目录>\
-├─ main.py                     # 入口：listen / chat / text / ask / skills / asr / tts / selftest
+├─ main.py                     # 入口：listen / stop / chat / text / ask / see / skills / asr / tts
+│                              #       / devices / gpu / persona / mcp / selftest
 ├─ config.toml                 # 全部可调参数
+├─ requirements.txt            # 依赖（Python 3.13）
 ├─ data/                       # ← 可以直接用编辑器改
 │  ├─ characters.json          #   ★角色索引★：挂上谁（= 谁可被唤醒）+ 默认角色
 │  ├─ personas/                #   ★独立人格文件★：一个角色一个 json（没挂上的不会被唤醒）
@@ -153,6 +155,8 @@ flowchart LR
 │  ├─ events.py                # ★事件层★：一条事件的模型、发生时间引擎、到点判定、去重
 │  ├─ event_text.py            # ★文字层★：一句人话 ↔ 一条事件（全项目只在这里写正则）
 │  ├─ skills.py                # 生活技能：时间 / 事件 / 备忘 / 查询
+│  ├─ settings.py              # config.toml → dataclass（含启动时校验与路径解析）
+│  ├─ vision.py                # 看图：截屏 / 摄像头 / 剪贴板 / 找文件并抽取文本
 │  ├─ persona.py               # ★角色设定：名字/背景/称呼/风格/示例台词 → system prompt
 │  ├─ tools.py                 # 工具层：技能包成模型能调的工具（现在是 MCP 的一个服务器）
 │  ├─ mcp/                     # ★ 自己搭的 MCP 架构（协议 / 服务器 / 客户端 / 宿主）
@@ -170,13 +174,17 @@ flowchart LR
 │  ├─ toast.py                 # 右下角可视提醒弹窗
 │  ├─ ui.py                    # Tk 窗口宿主（一个进程只能有一个 Tk 解释器）
 │  ├─ nlp_time.py              # 中文时间解析（明天早上七点 / 十分钟后 / 下周三）
-│  ├─ store.py                 # JSON 存储（保留注释、外部改动自动重载）
+│  ├─ store.py                 # JSON 存储（外部改动自动重载、原子写入）
+│  ├─ manifest.py              # 模型清单：该下哪些文件、对不对（download/check 共用）
 │  ├─ text.py                  # LLM 输出清洗 + 流式分块 + 标点移植
 │  ├─ audio.py                 # 麦克风、VAD、播放器
-│  ├─ llm.py                   # Ollama 客户端
-│  ├─ asr/                     # sensevoice / whisper_ov / router
-│  └─ tts/                     # piper_tts.py（快）/ zipvoice_tts.py（音色克隆）/ lazy.py（按需加载）
-│                              # precision.py（int8/fp32 选哪份模型，四个调用方共用）
+│  ├─ llm.py                   # Ollama 客户端（流式 + 工具 + 看图）
+│  ├─ accel.py                 # 加速设备选择（核显 / NPU / CUDA → 每段用什么）
+│  ├─ names.py                 # ★ 数值朗读：把 3810 念成「三千八百一十」
+│  ├─ voice_data.py            # 角色声线素材：够不够、缺什么（persona_voice 用）
+│  ├─ asr/                     # base.py（接口）/ sensevoice.py（快）/ whisper_ov.py（准）/ router.py
+│  └─ tts/                     # base.py（接口）/ piper_tts.py（快）/ zipvoice_tts.py（音色克隆）
+│                              # lazy.py（按需加载）/ pacing.py（停顿与断句）/ precision.py（int8/fp32）
 ├─ scripts/
 │  ├─ download_models.py       # 一键下载模型
 │  ├─ test_offline.py          # 离线自测（分块/时间/技能/唤醒/生命周期，含 09-19 那次误解析误删的回归）
@@ -184,12 +192,19 @@ flowchart LR
 │  ├─ test_tts_clone.py        # ★ 克隆后端测试（--full 会真的加载模型跑一句）
 │  ├─ import_lines.py          # ★ 把「名字+文本」清单导进角色的 lines（只添加，不替换）
 │  ├─ test_import_lines.py     # ★ 导入程序测试（两种排版 / 去重 / 过滤 / 自动找 json / 备份）
+│  ├─ prepare_tts_dataset.py   # ★ 素材 → 训练数据集（24 kHz + TSV）
+│  ├─ test_prepare_dataset.py  # ★ 数据集那一步的测试（切分 / 音量 / 文本清洗 …）
+│  ├─ finetune_zipvoice.py     # ★ 分步微调（--stage 1..8）：数据 → 训练 → 导出 → 安装 → 写 voice_model
+│  ├─ persona_voice.py         # ★ 一条龙：--list/--dry-run/--verify，把上面几步串起来
+│  ├─ test_voice_model.py      # ★ 角色语音模型的选择与降级（按角色 / 按精度 / 缺了就回退）
 │  ├─ test_skills_route.py     # 技能路由 + 关屏 + 课表 + 提醒文案 + 重启不丢数据
 │  ├─ test_bargein.py          # ★ 打断：合成对照 + 真机回声自测（--echo）/ 回环（--live）
 │  ├─ test_hotkey.py           # ★ 按 Esc 打断：只在说话时读、丢掉积压按键、不吞 Ctrl+C
 │  ├─ test_wake_cycle.py       # ★ 待机→唤醒→空闲回收→再次唤醒（含 Whisper 竞态）
 │  ├─ test_subtitle.py         # ★ 字幕：可见性 / 居中 / 点得穿 / 说话期间不隐藏 / 自动隐藏（--check）
 │  ├─ test_subtitle_sync.py    # ★ 字幕与语音同步：只显示念到的部分、段内插值不越界
+│  ├─ test_trim_pacing.py      # ★ 停顿裁剪与断句节奏（模拟 + 离线，不出声）
+│  ├─ test_names.py            # ★ 数值/符号念法（3810 → 三千八百一十，版本号、百分比…）
 │  ├─ test_toast.py            # 看一眼右下角可视提醒长什么样
 │  ├─ test_dialog.py           # 对话链路自测（不用麦克风）
 │  ├─ bench_llm.py             # ★ 换模型前的体检（延迟 / 是否思考 / 看图识字）
@@ -203,11 +218,12 @@ flowchart LR
 │  ├─ test_wake.py             # ★ 唤醒词实测与调优（打印听到的内容 / --apply 写进对应角色）
 │  ├─ test_wake_apply.py       # ★ 唤醒词 --apply 写对文件了吗（纯离线，不碰麦克风）
 │  ├─ test_mic_loopback.py     # 麦克风回环诊断（放一段语音，看能不能听到 + 识别）
-│  ├─ clean_junk_data.py       # 清理早期版本写坏的备忘/闹钟
+│  ├─ clean_junk_data.py       # 清理早期版本写坏的数据（备忘「录吗？」、事件标题「我」这类）
 │  ├─ check_deploy.py          # ★ 搬家/换系统前的只读自检（七类问题 + 怎么办）
 │  ├─ pick_voice_ref.py        # ★ 声线体检：毛不毛先看参考/素材，附参考候选与 2×2 交叉
-│  ├─ migrate_events.py        # ★ 闹钟+日程 → 统一事件表 events.json（默认试运行）
+│  ├─ migrate_events.py        # ★ 把旧的 alarms+schedule 迁成统一事件表（**已迁完**，留着给历史数据）
 │  ├─ test_events.py           # ★ 事件层测试（发生时间 / 二维去重 / 到期 / 事件链 / 迁移）
+│  ├─ test_event_text.py       # ★ 文字层测试（一句话 ↔ 一条事件：标题 / 提前量 / 工作日 / 纯闹钟）
 │  ├─ probe_npu.py             # ★ NPU 到底值不值得用（分阶段实测，含核显对照）
 │  ├─ ab_clone_model.py        # ★ 声线 A/B：精度×步数的客观指标 + 试听 wav
 │  ├─ test_precision.py        # ★ 精度（int8/fp32）与平台降级的离线测试
@@ -226,9 +242,22 @@ flowchart LR
 cd <项目目录>
 pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 python scripts/download_models.py     # 补上 SenseVoice / Silero VAD / Piper 中文女声（约 300 MB）
+python scripts/download_models.py --only zipvoice   # 可选：ZipVoice 音色克隆（约 156 MB；不装就退回 Piper）
 ollama pull qwen3.5:4b                # 主模型：文本 + 看图 + 工具（3.4 GB）
 python main.py selftest               # 10 项检查，全过就能用了
 ```
+
+> **Whisper（高精度 ASR）的权重是导出来的，不是下载的**——`download_models.py` 不管它。
+> 想让 `[asr] strategy = "hybrid"` 真的能复核，按下面这条导出一次（约 930 MB，要装
+> `optimum-intel[openvino]`，`requirements.txt` 里已经有了）：
+>
+> ```powershell
+> optimum-cli export openvino --trust-remote-code --model openai/whisper-large-v3-turbo `
+>     --weight-format int8 --disable-stateful models/asr/whisper-large-v3-turbo-int8-ov
+> ```
+>
+> 没导出也能跑：`selftest` 会提示缺哪个文件，运行时会一直用 SenseVoice 那条快路径
+> （中文短句够用）。各模型分别多大见 [`models/README.md`](models/README.md)。
 
 想让它能**读文件**（PDF），再补一行：
 
@@ -257,7 +286,7 @@ python main.py listen -B     # 唤醒词服务（后台，无窗口，日志写 
 python main.py stop          # 停止后台服务（先发信号优雅退出，超时才强杀）
 python main.py chat          # 普通对话，听到说话就回答（不认唤醒词）
 python main.py text          # 打字调试：完整技能 + LLM + 语音播报，不用麦克风
-python main.py skills        # 查看闹钟 / 备忘 / 日程
+python main.py skills        # 查看事件（提醒/闹钟/日程）+ 备忘，以及下一次是什么时候
 python main.py skills "十分钟后提醒我喝水"   # 测试某句话会命中哪个技能
 python main.py ask "介绍一下杭州"            # 单次提问 + 播报
 python main.py see --screen                  # 看图：截屏让模型描述
@@ -466,16 +495,17 @@ python scripts/test_toast.py           # 看一眼右下角可视提醒长什么
 python scripts/test_dialog.py --no-tts # 13 轮对话，只看文本与耗时
 python scripts/test_wake.py --rounds 5 # ★ 拿真实嗓音试唤醒词，看被听成什么
 python scripts/tts_probe.py --compare  # 生成语调对比音频
-python scripts/tts_clone_probe.py --ref data/personas/kalsit/任命助理.wav --compare   # 音色克隆试听 + 与 Piper 比延迟
+python scripts/tts_clone_probe.py --ref data/personas/kaltsit/任命助理.wav --compare   # 音色克隆试听 + 与 Piper 比延迟
 python scripts/test_tts_clone.py       # 克隆后端（默认不加载模型，秒级；--full 才真跑）
 python scripts/test_import_lines.py    # 台词导入：只添加不替换、两种清单排版、过滤、备份
 python scripts/test_mic_loopback.py    # 扬声器放一句、麦克风收，诊断麦克风
 python scripts/say.py "凯尔希，现在几点了"   # 不想开口时，让电脑替你喊唤醒词
-python scripts/clean_junk_data.py --apply    # 清理早期版本写坏的备忘/闹钟（先备份）
+python scripts/clean_junk_data.py --apply    # 清理早期版本写坏的数据（备忘 / 事件标题，默认只看不删）
 ```
 
 > 想在不碰真实数据的前提下试「写入」（新建 / 取消 / 改）：把 `config.toml` 复制一份，
-> 把 `[skills]` 的 `data_dir` 与三个文件名指到临时目录（顺手把 `visual_alert` 关掉），
+> 把 `[skills]` 的 `data_dir`（以及 `event_file` / `memo_file` 两个路径）指到临时目录
+> （顺手把 `visual_alert` 关掉），
 > 然后带 `-c` 跑那份配置：
 > ```powershell
 > python main.py -c "$env:TEMP\ai_smoke\config.toml" ask "三小时后提醒我倒垃圾" --no-tts
@@ -590,9 +620,14 @@ python main.py see --fix --screen              # 只做本地部分，不调模�
   "ack": "在的",
   "idle_timeout": 180,
   "min_silence": 0.3,
-  "fuzzy_ratio": 0.75
+  "fuzzy_ratio": 0.75,
+  "session_fuzzy_ratio": 0.7
 }
 ```
+
+（`session_fuzzy_ratio` 是**已经在对话里**时用的阈值，比 `fuzzy_ratio` 宽松：
+待唤醒时宁可漏听也不能被杂音叫醒，对话中上下文已经确定了，认出来更划算。
+文件里还带 `_说明` / `_字段说明` 两个给自己看的字段——程序只读认识的那几个，不认识的键原样留着。）
 
 - **保存即生效**，前台/后台都会在几秒内自动重新加载，不用重启。
 - ⚠️ **多角色时这里的 `words`/`aliases` 只是兜底**：只要 `data/characters.json` 里有**一个**可用角色，
@@ -677,8 +712,10 @@ standby_reply = "好，随时叫我。"   # 收回时的应答语；留空则只
 
 ### 5.2 事件表 `data/events.json`
 
-★**闹钟和日程是同一种东西**★（v1.1.0 起合并）：一条事件就是「一个时间 + 可选的一堆字段」。
+★**闹钟和日程是同一种东西**★（2026-09-24 合并）：一条事件就是「一个时间 + 可选的一堆字段」。
 说了时长、重复规则就存上，没说就按默认来——**没有「类型」这个字段**，也就没有「闹钟不能重复」这种事。
+
+这个文件就是**一个 JSON 数组**（不是 `{"items": [...]}`，也没有 `_说明` / `_格式` 这类注释字段）：
 
 ```json
 [
@@ -700,7 +737,7 @@ standby_reply = "好，随时叫我。"   # 收回时的应答语；留空则只
 ```
 
 第二条 `title` 是空的——那就是一条**纯闹钟**（只响一声，不用说什么事），
-念的时候会说「闹钟」两字兜底，不是靠某个 `kind` 认出来的。
+念的时候会用「闹钟」两字兜底——**不靠任何类型字段**认出来的。
 
 到点时的播报（准时和提前是两种口径，都由 `remind_before` 里的数字决定）：
 
@@ -726,7 +763,7 @@ standby_reply = "好，随时叫我。"   # 收回时的应答语；留空则只
 | `duration_minutes` | 时长，用来算结束时刻；`interval` 默认 0 |
 | `remind_before` | **提前提醒的分钟数组**，可以多个：`[1440, 30, 0]` = 提前一天、提前半小时、到点各提醒一次；不写 = `[0]`（只到点响）。**每个数各响一次，互不影响** |
 | `until` | 循环到这个日期为止，如 `"2026-12-31"` |
-| `chain` | 事件链（一件事做完接着做下一件），见第 5.4 节；**目前只存不执行** |
+| `chain` | 事件链（一件事做完接着做下一件），设计取舍见 [`ENGINEERING_LOG.md` 第 17.4 节](docs/ENGINEERING_LOG.md)；**目前只存不执行** |
 | `state` | 程序自己记的：`fired`（每次×每个提前量只播一次）、`done`（标记过完成）、`skipped`（跳过的日期） |
 | `id` / `created_at` | 程序自动写（**保存时缺 id 会补上**：早期发生过「一批没 id 的条目被当成同一条，清空命令一次删了 5 条」） |
 
@@ -767,8 +804,8 @@ standby_reply = "好，随时叫我。"   # 收回时的应答语；留空则只
 > **「有…活动 / 比赛 / 班会」也算日程**（2026-09-20 修）：以前这类说法技能层不认，
 > 用户连说四遍都没排上（只建了个闹钟）；现在「活动/比赛/演出/演练/班会…」+ 日期 + 时刻
 > 就算一条日程，说「9月23号下午3点到4点半」还会把 **90 分钟时长**一起存下来。
-> 同一句话里模型既排日程又定闹钟时，会**跳过那个重复的闹钟**（日程本身带提前提醒，
-> 不然同一件事响两次）；日程没排成时闹钟照旧定。
+> **同一句话里模型把同一个工具调两遍不会存两条**：按（标题, 时间）去重，第二遍会回你
+> 「这条已经有了：9月25日上午九点，组会。」。
 > **那天顺带修的两个坑**：① 日程是空的时候，「明天下午三点安排项目评审会，提前半小时提醒我」
 > 里的「提前」会撞上「改」的判据 → 回一句「没什么可以改的」，**新增直接排不上**；
 > ② 带「会议/课/安排」的活动类说法以前会被闹钟分支抢走 → 日程里什么都没有。
@@ -785,7 +822,7 @@ standby_reply = "好，随时叫我。"   # 收回时的应答语；留空则只
 > 整句话被绕过闹钟分支丢给了日程。现在「安排」不再当日程名词（「课/会议/组会…」才算）。
 > **约会也算日程**：说「下周三下午三点半跟导师见面」会直接排进日程（不是只在闹钟里响一声）——
 > 这样「下周有什么安排」能看见它，也能按名字改/删。只说了时段（「大后天中午吃饭」）会给个合理钟点（中午=12:00）。
-> **同一句话再说一遍不会存两条**，会回你「这条日程已经有了」。
+> **同一句话再说一遍不会存两条**，会回你「这条已经有了：〈时间〉，〈内容〉。」。
 > **说的时间已经过了不会默默存进去**：带星期的往后推一周（周五晚上说「周五上午十点」→ 下周五），
 > 不带星期的顺延一天，而且会告诉你一声。
 > **批量必须有「所有 / 全部」**：只说「课程」不会当成清空；
@@ -797,7 +834,7 @@ standby_reply = "好，随时叫我。"   # 收回时的应答语；留空则只
 > `repeat: weekdays` 的事件，说「提前半小时」就写进 `remind_before`——合并前这种话走的是「日程」那条路，
 > 一次性的话走「闹钟」那条路，两套代码两套文案，现在是同一条。
 > 顺带一格：**「下周三」是下一周的周三**、**「这周三/本周三」是本周（可能已经过去）** ——
-> 以前 (target-today)%7 之后又 +7，周五说「下周三」会算成 9/30 而不是 9/23，已经在 v1.0.0 后修掉。
+> 以前 (target-today)%7 之后又 +7，周五说「下周三」会算成 9/30 而不是 9/23，已经修掉。
 
 ### 问一段时间
 
@@ -828,21 +865,21 @@ standby_reply = "好，随时叫我。"   # 收回时的应答语；留空则只
 下周（9月21日到9月27日）有2项安排：周三上午九点AIAA3102 机器学习（地点教学楼 A302）；周四下午两点组会。
 ```
 
-到点前会这样播报（语音 + 右下角弹窗同时出现），`[1440, 30, 0]` 会分别说：
+到点前会这样播报（语音 + 右下角弹窗同时出现），`[1440, 30, 0]` 分别说（**准时**和**提前**是两种口径）：
 
 ```
-提醒你：明天上午九点，有 AIAA3102 机器学习，地点教学楼 A302。
-提醒你：二十九分钟后，也就是 09:00，有 AIAA3102 机器学习，地点教学楼 A302。
-提醒你：现在就是 09:00，有 AIAA3102 机器学习，地点教学楼 A302。
+提醒你：明天上午九点，AIAA3102 机器学习，地点教学楼 A302。
+提醒你：三十分钟后，也就是09:00，AIAA3102 机器学习，地点教学楼 A302。
+时间到了，AIAA3102 机器学习，地点教学楼 A302。
 ```
+
+纯闹钟（没有内容）就一句「时间到了。」；到点那次不说「提醒你」——**因为到点就该直接说事**。
 
 命令行查看下一次时间 / 规则 / 提前提醒：
 
 ```powershell
 python main.py skills
 ```
-
-> 文件里的 `_说明` / `_格式` 字段是给你看的注释，程序写回数据时会**保留**它们。
 
 ---
 
@@ -956,9 +993,9 @@ CPU、服务、提醒调度器都照常跑，闹钟到点仍然会响。敲一�
 不开工具时它还干过这种事——问「这周有什么安排」，它**自己编**了一句
 「这周我有常规的诊所和研究会议」。所以模型要么给工具，要么别让它答这类问题。
 
-**Q：重启服务会不会丢日程和闹钟**
-不会。闹钟 / 备忘 / 日程都在 `data/*.json` 里，重启只是重新读一遍文件：
-已响过的闹钟（`fired: true`）不会重复响，已经提醒过的日程当天也不会重复提醒，
+**Q：重启服务会不会丢事件和备忘**
+不会。事件 / 备忘都在 `data/*.json` 里，重启只是重新读一遍文件：
+播报过的那一次（记在 `state.fired`）不会重复响，跳过过的日子也不会再来一遍；
 写入用的是「临时文件 + 替换」的原子写法，不会写到一半变成坏 JSON。
 
 **Q：它说「已记录此安排」，可是日程里根本没有（「跟导师见面」就是这么丢的）**
@@ -967,7 +1004,7 @@ CPU、服务、提醒调度器都照常跑，闹钟到点仍然会响。敲一�
 大模型很客气地回一句「已记录此安排」——**其实什么都没存**。
 现在「见面 / 面试 / 答辩 / 体检 / 聚餐 / 讲座…」这类**约会**只要有时间就自动进日程
 （`skills.py` 里的 `TRIGGER_APPOINT`）。判断自己有没有被坑：`python main.py skills`
-看一眼日程列表。顺带还把「同一句话说两遍存两条」和「存进一条已经过去的日程」一起修了。
+看一眼事件列表。顺带还把「同一句话说两遍存两条」和「存进一条已经过去的时间」一起修了。
 
 **Q：字幕挡住东西 / 点不动下面的按钮**
 不会。字幕窗口带 `WS_EX_TRANSPARENT`，鼠标事件完全穿透，点它盖住的地方和没盖一样。
@@ -1044,7 +1081,7 @@ Piper 的 `zh_CN-huayan-medium` 是官方唯一的中文女声。调 `noise_w_sc
 
 ## 10. 隐私说明
 
-麦克风音频、识别文本、模型推理全部在项目目录本地完成（包括闹钟、备忘、日程，
+麦克风音频、识别文本、模型推理全部在项目目录本地完成（提醒、课表、备忘
 都只是本机 json 文件）。唯一的外部依赖是 `http://127.0.0.1:11434`（本机 Ollama）。
 断网可正常使用。
 
@@ -1157,7 +1194,7 @@ pipeline（会话编排）
 | `mcp/server.py` | 一个能力域 = 一个服务器；`initialize` / `tools/list` / `tools/call` / `ping` |
 | `mcp/client.py` | 两种传输走**同一套消息**：inproc（不起进程，5 ms 握手）/ stdio（起子进程） |
 | `mcp/host.py` | 聚合工具清单、白名单、路由、服务器崩了自动重启 |
-| `mcp/servers/skills.py` | 第一个服务器：把现成的 `ToolRegistry`（日程/备忘/提醒）挂到协议后面 |
+| `mcp/servers/skills.py` | 第一个服务器：把现成的 `ToolRegistry`（事件/提醒/备忘）挂到协议后面 |
 
 第一条命令：
 
@@ -1404,7 +1441,7 @@ python scripts/ab_clone_model.py
 > 手工调参/排障时可以单步跑：`scripts/finetune_zipvoice.py --stage 1..8`（分步版）、
 > `scripts/prepare_tts_dataset.py --dir data/personas/<id> --out data/finetune/<id> --apply`
 > （只产数据集，`python scripts/test_prepare_dataset.py` 有 24 条测试）、
-> `--no-wire` 则只训练不动人格文件。
+> `scripts/persona_voice.py --no-wire` 则跑完不自动写 `voice_model`（只训练，不动人格文件）。
 
 ### 从清单文件导入台词（只添加，不替换）
 

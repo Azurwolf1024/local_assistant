@@ -165,6 +165,19 @@ def test_pure_alarm() -> None:
     check(ev.needs_confirm(et.to_item(fields("喝水", NOW))), False, "一次性的删改不用确认")
     check(ev.needs_confirm(et.to_item(fields("每天吃药", NOW))), True, "★重复的删改要确认★")
 
+    # ★周期 / 提前量本身不是内容★（2026-09-24 修）：
+    # 以前这几句的标题会是「每个工作日」「提前一天和」「到点」这种残渣，
+    # 而且「提前一天和半小时」还会被当成 30 分钟时长。
+    for text in ("每个工作日早上八点半提醒我", "到点提醒我",
+                 "提前一天和半小时提醒我", "提前30分钟、10分钟和到点提醒我"):
+        g = fields(text)
+        check(g["title"], "", f"「{text}」没有内容 → 标题空着")
+        check(g["duration_minutes"], 0, f"「{text}」提前量不是时长")
+    check(fields("提前一天和半小时提醒我")["remind_before"], [1440, 30], "列表写法：两个提前量都认")
+    check(fields("提前30分钟、10分钟和到点提醒我")["remind_before"], [30, 10, 0], "枚举写法也认")
+    check(fields("提前一天和半小时提醒我吃药")["title"], "吃药", "有内容时照常取内容")
+    check(fields("和面")["title"], "和面", "★不能把内容开头的「和」削掉★")
+
 
 # --------------------------------------------------------- 5 播报
 def test_render() -> None:
