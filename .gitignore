@@ -48,6 +48,14 @@ data/vision/          # 截图/摄像头抓拍（含隐私，且是运行产物�
 *.lock
 *.json.tmp
 
+# 个人数据（日程 / 备忘 / 旧版闹钟与课程表）：这是真实生活安排，只留本地，永不入库。
+# 已从全部 git 历史里剔除（见 docs/ENGINEERING_LOG.md），别再用 git add 加回来。
+data/events.json
+data/memos.json
+data/alarms.json
+data/schedule.json
+data/*.bak            # 迁移时旧文件的改名备份，内容同样是个人日程
+
 # 训练用的外部仓库与独立环境（小则几十 MB，大则几个 GB）
 .venv-zipvoice/
 .venv-piper/
