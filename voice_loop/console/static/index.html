@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>本地语音助手 · 控制台</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <!-- 顶栏：服务状态 + 邮箱/实时连接指示灯 -->
+  <header class="top">
+    <div class="brand">
+      <span class="dot" id="link-dot" title="实时连接"></span>
+      <strong>本地语音助手</strong>
+      <span class="muted" id="meta-root"></span>
+    </div>
+    <div class="svc">
+      <span class="pill" id="svc-pill">服务状态…</span>
+      <button class="btn small" id="svc-start">启动服务</button>
+      <button class="btn small danger" id="svc-stop">停止服务</button>
+    </div>
+  </header>
+
+  <!-- 横幅：错误 / 提示 -->
+  <div id="banner" class="banner hidden"></div>
+
+  <div class="layout">
+    <!-- 标签栏：内容来自 /api/panels，所以加面板不用改这里 -->
+    <nav class="tabs" id="tabs"></nav>
+    <main id="view" class="view">
+      <p class="muted">正在加载…</p>
+    </main>
+  </div>
+
+  <footer class="foot">
+    <span class="muted" id="foot-left"></span>
+    <span class="muted" id="foot-right"></span>
+  </footer>
+
+  <script src="/ui.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

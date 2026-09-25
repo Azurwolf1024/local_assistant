@@ -24,6 +24,7 @@ import numpy as np
 from .asr import AsrResult, AsrRouter
 from .audio import BaseSegmenter, MicReader, MicRecorder, Speaker, make_segmenter, save_wav
 from .bargein import BargeInDetector
+from .control import ControlChannel, reap as reap_control, serve_once as serve_control_once
 from .llm import OllamaClient, OllamaError
 from .mcp import MCPHost
 from .names import NameCorrector
@@ -243,6 +244,9 @@ class VoiceLoop:
         self._followup_window = float(settings.wake.followup_window)
         self.session = WakeSession(self._idle_timeout)
         self._stop_file = settings.resolve(settings.wake.stop_file)
+        # ★控制台信箱★：网页 UI 是另一个进程，靠这个目录让服务念一句 / 切角色 / 回答
+        # （见 voice_loop/control.py 的协议说明；只在常驻服务模式下轮询）
+        self.control = ControlChannel(settings.resolve(settings.app.console_dir))
         self._pid_file = settings.resolve(settings.wake.pid_file)
         self._active = False          # 重型模型是否已加载
         self._warm_thread: threading.Thread | None = None
@@ -1036,6 +1040,18 @@ class VoiceLoop:
         except OSError:
             pass
         return False
+
+    def _serve_console(self, limit: int = 4) -> int:
+        """把控制台投过来的命令做掉（念一句 / 切角色 / 文字问答）。返回处理条数。
+
+        ★绝不能醒着失败把服务弄挂★：这里抓所有异常只记日志。命令的实现见
+        ``voice_loop/control.py`` 的 ``execute``（协议与命令表放一起，免得加了命令忘了登记）。
+        """
+        try:
+            return serve_control_once(self, self.control, limit=limit)
+        except Exception as exc:  # noqa: BLE001 - 控制台坏了不能连累语音
+            self.log.warning(f"处理控制台命令失败（已忽略）：{exc}")
+            return 0
 
     # ======================================================================
     # 应答
@@ -1862,6 +1878,14 @@ class VoiceLoop:
         self.mic.open()
         # 常驻服务没有「按回车录音」这回事，所以直接用裸按键（Esc）
         self._start_interrupt_watcher()
+        # 上一次服务如果是崩在半路的，信箱里会留着「已认领没回执」的请求：
+        # 先给它们判失败，不然控制台会一直等下去（见 control.reap）。
+        try:
+            stale = reap_control(self.control)
+            if stale:
+                self.log.info(f"控制台信箱：{stale} 条上次没做完的请求已判为失败")
+        except Exception as exc:  # noqa: BLE001
+            self.log.warning(f"清理控制台信箱失败（忽略）：{exc}")
         if self.scheduler:
             self.scheduler.start()
         if not self.lazy:
@@ -1873,6 +1897,8 @@ class VoiceLoop:
             while not self._stop.is_set():
                 if self._check_stop_file():
                     break
+                # 控制台（网页 UI）的命令：最多 5 秒内被响应（本循环每轮也会被 listen_once 上限带走）
+                self._serve_console()
                 try:
                     if self.wake.maybe_reload():
                         self._idle_timeout = float(

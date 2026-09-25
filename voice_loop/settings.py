@@ -17,6 +17,9 @@ class AppConfig:
     sessions_dir: str = "sessions"
     log_level: str = "info"
     save_audio: bool = False
+    # 控制台 UI（`python main.py ui`）与服务之间的**信箱目录**（见 voice_loop/control.py）。
+    # 两边读同一个值，所以改这一处就行。
+    console_dir: str = "sessions/console"
 
 
 @dataclass

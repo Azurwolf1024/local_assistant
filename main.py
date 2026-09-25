@@ -162,6 +162,29 @@ def cmd_chat(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ui(settings: Settings, args: argparse.Namespace) -> int:
+    """可视化控制台（独立进程，只监听回环地址）。
+
+    ★不需要麦克风、不需要加载模型★：它靠读同一批数据文件 + 往服务信箱投命令
+    来工作（见 voice_loop/console/__init__.py 的说明）。
+    """
+    try:
+        from voice_loop.console import serve as console_serve
+    except ImportError as exc:  # 缺 fastapi/uvicorn
+        raise SystemExit(
+            "控制台需要两个额外依赖：\n"
+            "    pip install fastapi uvicorn\n"
+            f"（导入失败：{exc}）"
+        ) from exc
+    return console_serve(
+        settings,
+        host=args.host,
+        port=int(args.port),
+        open_browser=not args.no_browser,
+        logger=logging.getLogger("voice_loop.console"),
+    )
+
+
 def cmd_listen(settings: Settings, args: argparse.Namespace) -> int:
     """唤醒词服务。默认前台运行；``--background`` 则转到无窗口的后台进程。"""
     require_models(settings)
@@ -1268,6 +1291,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--serve", default=None, metavar="服务器",
                    help="把某个服务器挂到 stdio（skills / vision…），给 Copilot / Claude Code 用")
     p.set_defaults(func=cmd_mcp)
+
+    p = sub.add_parser("ui", help="可视化控制台（网页：日程/闹钟、备忘、日志、声线、对话）")
+    p.add_argument("--host", default="127.0.0.1",
+                   help="监听地址，默认只给本机；填 0.0.0.0 会让同局域网的人也能进来（能改你的日程，慎用）")
+    p.add_argument("--port", type=int, default=8765, help="端口，默认 8765")
+    p.add_argument("--no-browser", action="store_true", help="不要自动开浏览器")
+    p.set_defaults(func=cmd_ui)
 
     return ap
 

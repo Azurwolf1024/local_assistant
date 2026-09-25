@@ -9,6 +9,10 @@ project_root = "."
 sessions_dir = "sessions"     # 会话日志 / 录音保存目录
 log_level = "info"
 save_audio = false            # 是否把每轮用户录音存成 wav
+# 控制台 UI（`python main.py ui`）与唤醒服务之间的**信箱目录**：
+# 里面有 inbox/ busy/ done/ 三个子目录（请求、认领、回执），服务每轮扫一次。
+# 想手动看“控制台让服务做了什么”就直接进去看 json，不用猜。
+console_dir = "sessions/console"
 
 # ── 麦克风 / 扬声器 ─────────────────────────────────────────────────────────
 [audio]

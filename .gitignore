@@ -43,6 +43,10 @@ data/backup/
 data/ref_cache/       # 净化后的参考音频（从 data/personas 里的 wav 生成，能删）
 data/vision/          # 截图/摄像头抓拍（含隐私，且是运行产物，别进 git）
 *.log
+# 跨进程锁（voice_loop/store.py 会在 data/*.json 旁边建 x.json.lock）与原子写的临时文件：
+# 它们是运行时状态，谁都不该提交（提交了反而让下一个人以为文件被锁着）。
+*.lock
+*.json.tmp
 
 # 训练用的外部仓库与独立环境（小则几十 MB，大则几个 GB）
 .venv-zipvoice/
