@@ -266,6 +266,9 @@ def create_app(settings: Settings, logger: logging.Logger | None = None):
 
     @app.on_event("shutdown")
     async def on_shutdown():
+        # ★顺序有讲究：先停跟随线程，再关订阅者★
+        # 关订阅者会把挂着 SSE 的网页叫醒收尾；不做的话 uvicorn 会一直等那条
+        # 永远不结束的响应（用户在终端 Ctrl+C 就退不出来了）。
         watcher.stop()
         bus.close()
         log.info("控制台已退出")
@@ -314,5 +317,32 @@ def serve(
 
         threading.Thread(target=_open, name="console-open", daemon=True).start()
 
-    uvicorn.run(app, host=host, port=int(port), log_level="warning", access_log=False)
+    print("（网页开着的时候，在终端里按 Ctrl+C 也能退出）\n", flush=True)
+
+    # ★为什么要自己接一层 Server★：uvicorn 的关闭顺序是
+    #   ① 停止收新连接 → ② **等活跃连接自己结束** → ③ 跑 lifespan shutdown。
+    # 而 SSE 是「永不结束的响应」，② 会一直等下去；等轮不到 ③ 里的 `bus.close()`
+    # 叫醒订阅者，结果就是用户看到的「终端 Ctrl+C 退不出、只能关网页」。
+    # 所以在 ① 之前就先叫醒订阅者，让 SSE 干净收尾（timeout_graceful_shutdown 只当兵底）。
+    class ConsoleServer(uvicorn.Server):
+        async def shutdown(self, sockets=None):
+            try:
+                app.state.ctx.bus.close()
+            except Exception as exc:  # noqa: BLE001 - 关不掉也得让它继续退
+                log.warning(f"关闭实时通道失败（继续退出）：{exc}")
+            await super().shutdown(sockets)
+
+    config = uvicorn.Config(
+        app,
+        host=host,
+        port=int(port),
+        log_level="warning",
+        access_log=False,
+        timeout_graceful_shutdown=3.0,
+    )
+    try:
+        ConsoleServer(config).run()
+    except KeyboardInterrupt:      # 有些终端下 Ctrl+C 会直接抛到这里
+        pass
+    print("\n控制台已退出（语音服务不受影响，要停服务用 python main.py stop）")
     return 0

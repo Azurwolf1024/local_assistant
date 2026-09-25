@@ -46,9 +46,27 @@ class EventBus:
         self._loop = loop
 
     def close(self) -> None:
+        """收摊：先叫醒所有订阅者，再置关闭位。
+
+        ★为什么必须叫醒它们★（用户报的「终端里 Ctrl+C 退不出、只能关网页」就是这个）：
+        SSE 是**永不结束的响应**，而 uvicorn 优雅退出会等活跃请求跑完——
+        订阅者一直卡在 ``await q.get()`` 上，服务就一直退不了，直到浏览器关掉页面、
+        连接断开为止。所以这里主动往每个订阅者的队列里塞一条 ``bye``，
+        让它们马上从 await 里醒过来收尾。
+        """
         self._dead.set()
+        loop = self._loop
         with self._lock:
-            self._subs.clear()
+            subs = list(self._subs)
+        if loop is None or loop.is_closed():
+            return
+        for q in subs:
+            try:
+                loop.call_soon_threadsafe(
+                    q.put_nowait, {"kind": "bye", "at": time.time(), "data": None}
+                )
+            except (RuntimeError, asyncio.QueueFull):
+                pass
 
     @property
     def subscribers(self) -> int:
@@ -58,6 +76,8 @@ class EventBus:
     # ------------------------------------------------------------------ 发布
     def publish(self, kind: str, data: Any = None, *, echo: bool = True) -> None:
         """发一条事件。**可以在任何线程调**（日志线程会调）。"""
+        if self._dead.is_set():
+            return                      # 已经在收摊了，别再往关闭中的循环里塞东西
         event = {"kind": kind, "at": time.time(), "data": data}
         if echo:
             self._recent.append(event)
@@ -96,8 +116,16 @@ class EventBus:
             for event in list(self._recent):
                 if kinds is None or event["kind"] in kinds:
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-            while True:
-                event = await q.get()
+            # ★不要无限 await q.get()★：每 0.5 秒回来看一眼是不是要收摊了，
+            # 否则关闭时这个生成器不会结束，uvicorn 就一直等（→ 终端里退不出）。
+            while not self._dead.is_set():
+                try:
+                    event = await asyncio.wait_for(q.get(), timeout=0.5)
+                except (asyncio.TimeoutError, TimeoutError):
+                    continue
+                if event.get("kind") == "bye":
+                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                    break
                 if kinds is not None and event["kind"] not in kinds:
                     continue
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"

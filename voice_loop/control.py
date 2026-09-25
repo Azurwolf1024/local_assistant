@@ -309,6 +309,26 @@ def execute(loop: Any, req: Request) -> Reply:
     """执行一条命令。★永不抛异常★：服务侧炸了要变成一张失败回执，不能带崩语音服务。"""
     cmd, args = req.cmd, dict(req.args or {})
     t0 = time.time()
+
+    def switch_if_asked() -> Reply | None:
+        """``character`` 参数：先用这个角色，再干活。
+
+        ★为什么要做成一个参数而不是「控制台先切再发」★：分两次的话，中间那一刻
+        别人（语音唤醒/另一个页面）可能把角色换走，就会出现「界面选的是阿米娅、
+        回答却是凯尔希」。放在同一条命令里就只有一个事实。
+        没给这个参数就完全不碰角色——保持「服务当前是谁就是谁」的语义。
+        """
+        cid = str(args.get("character") or "").strip()
+        if not cid:
+            return None
+        switch = getattr(loop, "_switch_character", None)
+        if not callable(switch):
+            return Reply(id=req.id, ok=False, error="这个服务实例不支持切角色", at=t0)
+        char = switch(cid)
+        if char is None:
+            return Reply(id=req.id, ok=False, error=f"没有角色 {cid!r}", at=t0)
+        return None
+
     try:
         if cmd == "ping":
             return Reply(id=req.id, ok=True, text="pong", data=_describe(loop), at=t0)
@@ -317,6 +337,8 @@ def execute(loop: Any, req: Request) -> Reply:
             text = str(args.get("text") or "").strip()
             if not text:
                 return Reply(id=req.id, ok=False, error="say 少了 text", at=t0)
+            if (problem := switch_if_asked()) is not None:
+                return problem
             spoken = float(loop.speak_text(text, wait=True, fresh=True))
             return Reply(
                 id=req.id, ok=True, text=text, at=t0,
@@ -328,6 +350,8 @@ def execute(loop: Any, req: Request) -> Reply:
             text = str(args.get("text") or "").strip()
             if not text:
                 return Reply(id=req.id, ok=False, error="ask 少了 text", at=t0)
+            if (problem := switch_if_asked()) is not None:
+                return problem
             stats = loop.respond(text)
             answer = str(getattr(stats, "answer", "") or "").strip()
             return Reply(

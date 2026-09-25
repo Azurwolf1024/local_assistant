@@ -229,6 +229,16 @@ def section_misc(base: str, tmp: Path) -> None:
     check("健康检查 200", code, 200)
     check("面板清单一致", len(health["panels"]), 6)
 
+    code, chars = request(base, "GET", "/api/chat/characters")
+    check("聊天角色列表 200", code, 200)
+    check("列表里有角色", [c["id"] for c in chars["items"]], ["amiya"])
+    check("报告了服务未运行", chars["service_running"], False)
+
+    code, chat = request(base, "POST", "/api/chat/ask", {"text": "在吗", "character": "amiya"})
+    check("指定角色发问不会当成参数错", code, 200)
+    check("服务没跑时如实报（不是假装成功）", "服务没在跑" in (chat.get("error") or ""), True,
+          detail=str(chat.get("error")))
+
 
 def section_sse(base: str, tmp: Path) -> None:
     print("\n[6] ★实时通道★：往日志写一行 → 浏览器那侧收到（走 follow→bus→SSE 全链路）")

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from ...service_ctl import status as service_status
 from ..registry import Panel
 
 PANEL = Panel(
@@ -34,6 +35,29 @@ def register(app, ctx) -> None:
 
     history: list[dict] = ctx.cache.setdefault("chat_history", [])
 
+    @app.get("/api/chat/characters")
+    def api_characters():
+        """给「用哪个角色回答」的下拉框用（顺带把服务当前是谁也报一下）。"""
+        rows = []
+        error = ""
+        try:
+            for char in ctx.characters().all():
+                rows.append({
+                    "id": char.id,
+                    "name": char.name,
+                    "title": char.title or "",
+                    "enabled": bool(char.enabled),
+                })
+        except Exception as exc:  # noqa: BLE001 - 角色文件坏了也不该让聊天页打不开
+            error = f"{type(exc).__name__}: {exc}"
+        live = ctx.channel.status()
+        return {
+            "items": rows,
+            "error": error,
+            "service_running": service_status(ctx.settings).running,
+            "mailbox": live,
+        }
+
     @app.get("/api/chat/history")
     def api_history():
         return {"items": history[-MAX_HISTORY:], "count": len(history)}
@@ -41,15 +65,22 @@ def register(app, ctx) -> None:
     @app.post("/api/chat/say")
     def api_say(payload: dict = Body(default={})):
         """只念不回答（短句确认用，比 ask 快得多，也不会消耗 LLM）。"""
-        text = str((payload or {}).get("text") or "").strip()
+        body = payload or {}
+        text = str(body.get("text") or "").strip()
         if not text:
             raise HTTPException(status_code=400, detail="缺少 text")
-        reply = ctx.call_service("say", timeout=float((payload or {}).get("timeout") or 30.0), text=text)
+        reply = ctx.call_service(
+            "say",
+            timeout=float(body.get("timeout") or 60.0),
+            text=text,
+            character=str(body.get("character") or ""),
+        )
         entry = {
             "at": datetime.now().strftime("%H:%M:%S"),
             "role": "me" if reply.ok else "error",
             "text": text if reply.ok else f"没念成：{reply.error}",
             "seconds": round(reply.seconds, 2),
+            "character": reply.data.get("character_name") if reply.data else "",
         }
         history.append(entry)
         return {"ok": reply.ok, "error": reply.error, "seconds": round(reply.seconds, 2), "entry": entry}
@@ -62,18 +93,23 @@ def register(app, ctx) -> None:
         if not text:
             raise HTTPException(status_code=400, detail="缺少 text")
         timeout = float(body.get("timeout") or 90.0)
+        who = str(body.get("character") or "").strip()
         history.append({
             "at": datetime.now().strftime("%H:%M:%S"),
             "role": "me",
             "text": text,
+            "character": who,
             "seconds": None,
         })
-        reply = ctx.call_service("ask", timeout=timeout, text=text)
+        # ★角色跟这句话一起发过去★（在同一条命令里切），而不是「先切再问」
+        # ——分两次的话中间可能被语音唤醒/另一个页面换走（见 control.execute 的说明）。
+        reply = ctx.call_service("ask", timeout=timeout, text=text, character=who)
         if reply.ok:
             entry = {
                 "at": datetime.now().strftime("%H:%M:%S"),
                 "role": "bot",
                 "text": reply.text or "（她没说话）",
+                "character": reply.data.get("character_name") or "",
                 "seconds": round(reply.seconds, 2),
                 "detail": {
                     "total_seconds": reply.data.get("total_seconds"),
@@ -87,7 +123,7 @@ def register(app, ctx) -> None:
             entry = {
                 "at": datetime.now().strftime("%H:%M:%S"),
                 "role": "error",
-                "text": f"没有回执：{reply.error}",
+                "text": ("没切成角色：" if "没有角色" in (reply.error or "") else "没有回执：") + (reply.error or ""),
                 "seconds": round(reply.seconds, 2),
             }
         history.append(entry)

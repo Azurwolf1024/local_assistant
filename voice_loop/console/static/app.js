@@ -74,6 +74,15 @@ window.Console = (function () {
     eventSource.onmessage = (msg) => {
       let ev;
       try { ev = JSON.parse(msg.data); } catch (_e) { return; }
+      // ★控制台自己退出了★（终端里按了 Ctrl+C）：主动断开、不再重连，
+      // 并告诉用户「页面还在但后端没了」——否则 EventSource 会一直重连失败。
+      if (ev.kind === "bye") {
+        dot.classList.remove("on");
+        eventSource.close();
+        eventSource = null;
+        toast("控制台已在终端退出（页面可以关了）——语音服务不受影响", "warn", 60000);
+        return;
+      }
       if (ev.kind === "status") applyStatus(ev.data);
       if (current && panels.has(current)) {
         const def = panels.get(current);
