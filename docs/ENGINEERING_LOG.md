@@ -2603,3 +2603,62 @@ RuntimeError: [enforce fail at inline_container.cc:672] . unexpected pos 6511459
 3. **我自己造出的伪相关**：「≥2.0 秒能训」验证了三次都成立，于是我把它写成了结论 ——
    其实两边跑的时候机器负载不同。**验证一个规律时，必须让"其他条件"真的保持不变**，
    否则三次"验证成功"也可能只是三次碰巧。
+
+## 31. 隐私事故：个人日程被推到了公开仓库，连历史一起清掉（2026-09-25 用户问「是不是没推送成功」）
+
+**起因**：用户发现 GitHub 上的提交停在 9/24 的 `eadc5a4`，问是不是没推上去。
+查下来是**我这几轮只 `git commit` 没 `git push`**（本地领先 28 个提交）。但在推之前做安全检查时发现两件事：
+
+1. 仓库是**公开**的（`private: false`，0 star / 0 fork）。
+2. `data/events.json`（乐队排练、跟导师见面、社团活动、跆拳道课、起床…）和 `data/memos.json`
+   **是被跟踪的文件**，这 28 个提交正好改了它们。而且同类的旧数据（`data/alarms.json`、
+   `data/schedule.json`、`data/memos.json`）**9/24 就已经在公开仓库上了** ——
+   不是"即将泄漏"，是"已经有一份在上面，现在还要再来一份更新版"。
+
+**先扫了一遍**：凭据零命中（`sk-` / `ghp_` / `AIza` / 私钥 / 密码赋值 / `Bearer` 全 0 命中）；
+`data/vision/` 的运行截图**从未进过任何历史**（当初的 .gitignore 生效了 ✓）；
+远程树里没有图片 / 音频 / 模型文件。
+
+**用户选择**：C —— 连历史一起清，再强推。
+
+**做法**（全库 87 个提交，其中 9 个碰过这 4 个文件）：
+
+1. 先打整库备份包，放在项目外：`git bundle create D:\local_assistant_backup_pre-rewrite.bundle --all`（1.0 MB）。
+2. `git filter-branch --force --index-filter "git rm -r --cached --ignore-unmatch <4 个文件>" --prune-empty --tag-name-filter cat -- --all` → 87 → 85 个提交。
+3. `.gitignore` 补规则（4 个文件名 + `data/*.bak`，迁移时改名的旧文件内容同样是日程），提交。
+4. 清本地旧对象：删 `refs/original` → `git reflog expire --expire=now --all` → `git gc --prune=now`。
+5. `git push --force-with-lease=main:eadc5a4… origin main`。
+
+**踩到的 4 个坑**（都值得记）：
+
+1. ★**`filter-branch` 会把工作区同步成新的 HEAD** → 那 4 个文件**从磁盘上一起消失了**。
+   `--index-filter` 名义上"只动索引"，但收尾时 filter-branch 会 reset + checkout，
+   被剔除的文件在磁盘上也没了。**救命的是 `refs/original/refs/heads/main`**（重写前的指针，
+   只要还没删就能捞回来）：
+   `git checkout refs/original/refs/heads/main -- data/events.json data/memos.json` → `git reset`，
+   再用 `git hash-object` 和 `git rev-parse <tree>:<path>` 比对，**blob 哈希一致 ✓**（内容无损）。
+   → **教训：重写历史前，先确认"个人数据在工作区之外另有副本"，或者干脆先复制一份出来。**
+2. `git checkout <tree-ish> -- a b c d` 里**只要有一个 pathspec 不存在，整条命令一个文件都不写**
+   （`alarms.json` / `schedule.json` 早已被应用改名成 `.bak`，于是连 `events.json` 都没还原成功，
+   还看不出来）。→ **先 `git ls-tree -r <tree> --name-only` 确认哪些路径真的在，再 checkout。**
+3. **`--force-with-lease` 在 `reflog expire` 之后会以 "stale info" 失败**（它靠 reflog 判断
+   "你上次 fetch 到的是什么"，reflog 被清就失去依据）。另外 `filter-branch -- --all`
+   **会把 `refs/remotes/*` 也一起重写**，本地 `origin/main` 已经不是远程的真实值。
+   → 用显式期望值：`git push --force-with-lease=main:<远程当前 SHA> origin main`。
+4. PS 5.1 的 `Invoke-WebRequest` 会**弹"是否要解析网页脚本"的确认框**，把循环里的判断全污染了
+   （一度看错，以为旧路径也 404）。→ **验 HTTP 状态用 `curl.exe -s -o NUL -w "%{http_code}"`**。
+   （另外 PS 5.1 读 UTF-8 的 json 会显示成乱码，那是显示问题，别当成文件坏了 —— 用 Python 读。）
+
+**结果**：`main` 由 `eadc5a4` → `4f69632`（forced update）✓；远程历史与远程树里这 4 个文件**零残留** ✓；
+`raw.githubusercontent.com/.../main/data/{events,memos}.json` 都是 **404** ✓。
+
+**残留风险（如实记，别以为"重写历史 = 什么都没发生"）**：
+
+- 旧提交 `eadc5a4` 在 GitHub 上**仍可通过 SHA 直接访问**（不可达对象，GitHub 还没 GC 掉）：
+  `.../eadc5a4/data/memos.json`、`alarms.json`、`schedule.json` → **HTTP 200 仍能抓到**；
+  `events.json` 是 404（那个提交里它还不存在，一致）。
+- 没有 ref 指向它，网页历史里看不到，但"知道 SHA 就能取"。要彻底清得**给 GitHub Support 发工单**
+  （他们能强制回收不可达对象），否则只能等它自己被 GC。
+- 9/24 那份已经公开了约 5 天：搜索引擎、缓存、别人的 clone 都管不着。
+  → **重写历史不能"召回"已经泄漏的内容，只能阻止它继续存在。**
+
