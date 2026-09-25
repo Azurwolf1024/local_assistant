@@ -86,9 +86,10 @@ window.Console = (function () {
 
   // ------------------------------------------------------------------ 服务状态条
   function applyStatus(status) {
+    if (!status) return;
     lastStatus = status;
     const pill = $("#svc-pill");
-    if (!status || status.error) {
+    if (status.error) {
       pill.className = "pill warn";
       pill.textContent = "服务状态读不到";
       return;
@@ -98,18 +99,25 @@ window.Console = (function () {
       const age = status.log_age_seconds;
       const quiet = age !== null && age > 60 ? "（日志已静默 " + Math.round(age) + "s）" : "";
       pill.textContent = "服务运行中 · PID " + status.pid + quiet;
-    } else if (status.pid_stale) {
+      pill.title = status.pid_source === "log" ? "PID 是从日志里恢复的（pid 文件被删了）" : "";
+    } else if (status.leftovers || status.pid_stale || status.log_pending_stop) {
       pill.className = "pill warn";
-      pill.textContent = "服务没在跑（pid 文件是旧进程 " + status.pid + "）";
-    } else if (status.log_pending_stop) {
-      pill.className = "pill warn";
-      pill.textContent = "服务没在跑（有未处理的停止信号）";
+      pill.textContent = "服务没在跑（有上次的残留文件）";
+      pill.title = "点「启动服务」会先把残留文件清掉再启动";
     } else {
       pill.className = "pill off";
       pill.textContent = "服务未启动";
+      pill.title = "";
     }
+    // 停止按钮：只要还有残留可清（或真在跑）就能点
     $("#svc-start").disabled = !!status.running;
-    $("#svc-stop").disabled = !status.running && !status.pid_stale;
+    $("#svc-stop").disabled = !status.running && !status.pid_stale && !status.log_pending_stop;
+  }
+
+  async function refreshStatus() {
+    try {
+      applyStatus(await api.get("/api/service"));
+    } catch (_e) { /* 状态读不到就保持原样，别扰动界面 */ }
   }
 
   function status() { return lastStatus; }
@@ -183,6 +191,7 @@ window.Console = (function () {
       }
       const want = (location.hash || "").replace("#", "") || (info.panels[0] || {}).id;
       await show(want);
+      refreshStatus();          // 先把状态条填上，别等 SSE 那一轮
     } catch (err) {
       toast("控制台启动失败：" + err.message, "err", 15000);
     }
@@ -190,20 +199,30 @@ window.Console = (function () {
   }
 
   $("#svc-start").onclick = () => api.safe(async () => {
+    const btn = $("#svc-start");
+    btn.disabled = true;
+    toast("正在启动服务（最长等 25 秒）…", "warn", 25000);
     const r = await api.post("/api/service/start");
-    toast(r.message || "已发出启动命令", r.started ? "ok" : "warn");
+    applyStatus(r.status);
+    btn.disabled = false;
+    toast(r.message || (r.started ? "已启动" : "没起来"), r.started ? "ok" : "err", r.started ? 6000 : 20000);
     return r;
   });
   $("#svc-stop").onclick = () => api.safe(async () => {
+    const btn = $("#svc-stop");
+    btn.disabled = true;
+    toast("正在停止服务…", "warn", 20000);
     const r = await api.post("/api/service/stop");
-    toast(r.message || "已发出停止命令", r.stopped ? "ok" : "warn");
+    applyStatus(r.status);
+    btn.disabled = false;
+    toast(r.message || (r.stopped ? "已停止" : "没停成"), r.stopped ? "ok" : "err", r.stopped ? 6000 : 20000);
     return r;
   });
 
   return {
     /** 面板脚本用它注册自己 */
     register(id, def) { panels.set(id, def); },
-    show, api, toast, status, $,
+    show, api, toast, status, refreshStatus, $,
     get meta() { return meta; },
     /** 当前标签 id（hashchange 处理要用） */
     current: () => current,

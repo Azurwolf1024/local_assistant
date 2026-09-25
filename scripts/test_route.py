@@ -209,6 +209,17 @@ def test_model_first() -> None:
             stats.extra["route"] = "model→skills"
             return stats
 
+        # ★不要让这一步去真的截图/开摄像头★：以前这里直接走真实技能，
+        # 一旦采图当场失败（屏幕锁着、被别的程序占着…），得到的是 `vision_error`
+        # 而不是 `vision`，测试就**偶发变红**（实测遇到过）。这里把技能层换成
+        # 确定的假结果——这个用例要验的是**路由**，不是摄像头能不能开。
+        from voice_loop.skills import SkillResult  # noqa: PLC0415
+
+        loop.skills.handle = lambda *a, **k: SkillResult(  # type: ignore[assignment]
+            reply="",
+            action="vision",
+            data={"images": [], "what": "画面", "shot": "（测试用假画面，不截图）"},
+        )
         loop._respond_vision = fake_vision  # noqa: SLF001
         stats = loop.respond("看看桌面上有什么")
         check("看图交给技能层", called, ["vision"])

@@ -20,7 +20,7 @@
               e.target.disabled = true;
               const r = await ctx.api.safe(() => ctx.api.post("/api/overview/audition", { text: audition.value }));
               e.target.disabled = false;
-              if (r) ctx.toast(r.ok ? "服务已念出（服务侧耗时 " + secs(r.seconds) + "）" : "没念成：" + r.error, r.ok ? "ok" : "err");
+              if (r) ctx.toast(r.ok ? "服务已念出（服务侧耗时 " + secs(r.seconds) + "）" : "没念成：" + r.error, r.ok ? "ok" : "err", 12000);
             },
           }),
           h("button", {
@@ -55,9 +55,10 @@
           [{ key: "k", label: "项目", cls: "num" }, { key: "v", label: "值" }],
           [
             { k: "服务进程", v: data.service.running
-                ? h("span", { class: "tag ok", text: "运行中 · PID " + data.service.pid })
-                : h("span", { class: "tag warn", text: data.service.pid_stale
-                    ? "没在跑（pid 文件里是旧进程 " + data.service.pid + "）" : "未启动" }) },
+                ? h("span", { class: "tag ok", text: "运行中 · PID " + data.service.pid
+                    + (data.service.pid_source === "log" ? "（PID 从日志恢复）" : "") })
+                : h("span", { class: "tag warn", text: data.service.leftovers
+                    ? "没在跑（有上次的残留文件，点「启动服务」会自动清掉）" : "未启动" }) },
             { k: "服务自报", v: live
                 ? (live.character_name || "—") + " · 声线 " + (live.tts || "—") + " · TTS " + (live.tts_loaded ? "已加载" : "未加载")
                 : h("span", { class: "muted", text: "点右边「问服务状态」问它一句" }) },

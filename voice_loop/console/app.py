@@ -80,10 +80,8 @@ class ConsoleContext:
         status = service_ctl.status(self.settings)
         if not status.running:
             why = "服务没在跑"
-            if status.pid_stale:
-                why = f"服务没在跑（pid 文件里是 {status.pid}，那是旧进程）"
-            elif status.log_pending:
-                why = "服务没在跑（还有没被处理的停止信号）"
+            if status.pid_stale or status.log_pending:
+                why = "服务没在跑（有上次留下的残留文件，点「启动服务」会顺手清掉）"
             return Reply(
                 id="", ok=False, error=f"{why}——先点右上角「启动服务」", at=time.time(), seconds=0.0
             )
@@ -216,19 +214,37 @@ def create_app(settings: Settings, logger: logging.Logger | None = None):
         st = service_ctl.status(settings)
         return {
             **st.as_dict(),
+            "last_log_lines": service_ctl.tail_lines(settings, 5),
             "mailbox": channel.status(),
-            "actions": {"can_start": not st.running, "can_stop": st.running or st.pid_stale},
+            "actions": {
+                "can_start": not st.running,
+                "can_stop": st.running or st.pid_stale or st.log_pending,
+            },
         }
 
     @app.post("/api/service/start")
     def api_service_start():
+        # ★等它真的起来才回成功★（最多 25 秒）：以前回一句「已发出命令」就算成功，
+        # 服务其实没起来（缺模型、端口/设备被占）时界面会说「已启动」= 看起来就是启停坏了
         started, message = service_ctl.start_service(settings)
-        return {"started": started, "message": message}
+        st = service_ctl.status(settings)
+        return {
+            "started": started,
+            "message": message,
+            "status": st.as_dict(),
+            "log_lines": service_ctl.tail_lines(settings, 6),
+        }
 
     @app.post("/api/service/stop")
     def api_service_stop():
         stopped, message = service_ctl.stop_service(settings)
-        return {"stopped": stopped, "message": message}
+        st = service_ctl.status(settings)
+        return {
+            "stopped": stopped,
+            "message": message,
+            "status": st.as_dict(),
+            "log_lines": service_ctl.tail_lines(settings, 6),
+        }
 
     @app.exception_handler(Exception)
     async def on_error(request: Request, exc: Exception):
