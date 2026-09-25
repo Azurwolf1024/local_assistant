@@ -1690,5 +1690,113 @@ chain_blocked(item, start, all_items, now)
 * 想换的话只需改角色文件两行：`voice_ref` → `data/personas/kaltsit/ref_join_B.wav`，
   `voice_ref_text` → 那个 `.txt` 的内容（或留空让它读同名 txt）。
 
+---
+
+## 22. 「词中间卡一下」：又是我们自己的后处理（2026-09-25 深夜）
+
+用户听完 `sessions/ref_ab/` 的 9 条（A/B/C × 3 遍）说：**B_r1 最好，其它都有异常卡顿，
+尤其在「组会」处**。
+
+### 22.1 量出来的指纹：8/9 条在同一个位置有一个 230 ms 的洞
+
+把 9 条的句内停顿全列出来，一眼就看到规律：
+
+| 文件 | 句内停顿（秒@毫秒） |
+|---|---|
+| A_r0 | 1.52@240 1.91@490 4.05@400 **4.97@230** 5.91@340 |
+| A_r1 | 1.56@240 1.99@490 3.81@230 4.29@440 **5.68@230** 6.12@310 |
+| A_r2 | 1.84@520 4.03@390 **5.41@230** 5.84@380 |
+| B_r0 | 1.63@280 3.54@330 **4.79@240** 5.22@330 |
+| **B_r1（用户说最好的那条）** | 1.64@350 3.54@370 5.04@310 ← **没有 230 的洞** |
+| B_r2 | 1.60@350 3.52@330 **4.79@230** 5.16@320 |
+| C_r0 | 1.43@240 1.79@370 3.74@340 **5.04@230** 5.46@310 |
+| C_r1 | 1.61@340 3.51@400 **4.83@230** 5.26@310 |
+| C_r2 | 1.56@240 1.89@330 3.50@230 3.98@360 **5.21@230** 5.58@310 |
+
+「下午两点还有组会」这句在 3.6~5.3 秒之间，那个 **230 ms 的洞就落在「组 会」中间** ——
+**230 ms 正好是 `trim_min_gap_ms = 240` 撑出来的值**（帧量化后差一点点）。
+
+### 22.2 根因：`trim_min_gap_ms` 把**词内**的自然空隙也撑成了停顿
+
+那个旋钮的初衷是修「我在，博士。」逗号只停 60 ms（微调模型的现象），
+配 `trim_min_gap_floor_ms = 60` 想挡掉字间音渡（10~40 ms）。但中文里
+**60~240 ms 的空隙并不只有标点**：塞音成阻、词内停顿也会落在这个区间，
+于是被无差别撑到 240 ms —— 听感正是「词中间卡一下」。
+
+对照实验（同一配置，只改这一个旋钮，各 3 遍）：
+
+| 设置 | 长句句内停顿 |
+|---|---|
+| 现在 `240 / floor 60` | 1.56@240 2.00@510 4.18@340 **5.16@230** **5.76@230** 6.25@370 |
+| **关掉 `0`** | 1.91@520 4.09@490 5.72@340（三遍都没有词内洞） |
+| `240 / floor 150` | 1.78@470 4.07@430 5.82@340（同样干净） |
+
+另外实测：**出厂模型在逗号处本来就停 320~550 ms**（短句「我在，博士。」也是 330 ms），
+根本不需要这个旋钮 —— 那个 60 ms 的逗号是微调模型特有的。所以 `config.toml` 里
+`trim_min_gap_ms` 默认改成 **0**，注释里写清「只有确实听到逗号太赶（<150 ms）才开，
+并且 floor 要提到 ≥120」。
+
+### 22.3 结论
+
+* **B_r1 听感最好，跟参考音频无关**：它只是恰好那一段没有词内洞。修掉之后 A/B/C 才可比。
+* ★教训（同类第二次）★：听着像「模型抽风」的毛病，先查**我们自己的后处理**——
+  2026-09-23 那次「两个角色都卡顿」也是 `trim_min_gap_ms`（那次的 floor=60 挡掉了 30 ms 的音渡，
+  这次是 60~240 ms 的区间没挡住）。**给音频做「补静音」这类后处理，触发条件宁可保守**。
+* 保留一把尺子：`sessions/` 里的探针会把每条 wav 的句内停顿列出来，
+  **词内那个洞（200~260 ms 且出现在非标点位置）是最好认的指纹**。
+
+---
+
+## 23. 路线 C：Piper 专属声线微调（环境实录，2026-09-25 深夜启动）
+
+目标：给凯尔希训一个 **Piper/VITS** 声线（音色是她的、声码器干净、RTF ~0.05、开口 0.13 s），
+彻底绕开 ZipVoice 的沙沙声。
+
+### 23.1 底模在哪（★第一坑★）
+
+**不在 `rhasspy/piper-voices`**（那里只有 `.onnx` + `.onnx.json`），
+在 **`datasets/rhasspy/piper-checkpoints`**：
+
+    zh/zh_CN/huayan/medium/epoch=3269-step=2460540.ckpt   # 845 MB
+
+hf-mirror 单连接实测约 20 MB/分钟 → 8 分片并行 ~10 分钟下完
+（脚本 `sessions/fetch_piper_ckpt.ps1`：分片 → 轮询大小 → `copy /b` 合并 → 校验字节数，
+**别用 `Get-Job | Wait-Job` 等**）。
+
+### 23.2 环境链（每一步都是踩出来的）
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| `ImportError: cannot import name 'tashkeel_run'` | 仓库 HEAD 的 `preprocess.py` 要新版 `piper_phonemize`，而 cp313 win 只有 1.4.7 | 打**可选导入**补丁（只在 `--tashkeel` 用到，我们用不到） |
+| `No module named 'onnxruntime'` | `norm_audio` 的 VAD 需要 | `.venv-piper` 里 `pip install onnxruntime` |
+| `RuntimeError: Failed to set eSpeak-ng voice` | **中文的 espeak 声线叫 `cmn` 不是 `zh`**（底模 `.onnx.json` 里写着 `espeak.voice = cmn`） | `--language cmn` |
+| `No module named 'piper_train.vits.monotonic_align.monotonic_align'` | Cython 扩展没编（源码 import 的是**嵌套包** `.monotonic_align.core`） | 本机有 VS（`D:\MicrosoftStudio\VisualStudio`）→ `setup.py build_ext --inplace`，再把 `.pyd` 复制到 `monotonic_align/monotonic_align/` |
+| `AttributeError: type object 'Trainer' has no attribute 'add_argparse_args'` | 厂商入口是 Lightning 1.x API | `.venv-piper` 降到 `pytorch-lightning==1.9.5`（厂商 metadata 写的也是 `~=1.7`） |
+| `cannot instantiate 'PosixPath' on your system` | ckpt 是 Linux 上存的，pickle 里带 `PosixPath` | load 前 `pathlib.PosixPath = pathlib.WindowsPath` |
+
+### 23.3 为什么自己写启动器（`scripts/train_piper.py`）
+
+厂商的 `--resume_from_checkpoint` 走 Lightning 的「恢复整段训练」：会把**别人训练时的超参和
+dataloader** 一起恢复（路径在我们机器上不存在）。对「拿别人的 ckpt 微调」是错的做法。
+启动器改成：**用自己的数据集配置造模型** + **只搬权重**（`load_state_dict(strict=False)`），
+并断言「生成器 embedding 不是全 0」——避免「以为在微调、其实从零训」。
+
+实测：784 个张量全部匹配（生成器 673 个），搬权重 0.5 秒。
+
+### 23.4 数据与速度
+
+* 数据集：`scripts/prepare_piper_dataset.py --dir data/personas/kaltsit --out data/piper/kaltsit --apply`
+  → **30 对 / 283.4 秒**（38 条里 8 条 <0.8s 被丢、2 条是拼接参考没文本被丢），
+  22050 Hz + `metadata.csv`；再跑 `piper_train.preprocess --language cmn --sample-rate 22050`
+  （30 条 → `dataset.jsonl` + 60 个 cache 文件；`num_symbols=256`、espeak 音素）。
+* 速度（CPU 8 线程，batch 8）：**30 条 = 4 步/epoch，约 40 秒/epoch** → 60 epoch ≈ 40 分钟。
+* 官方 train.sh 的参数是 `--batch-size 20 --validation-split 0 --num-test-examples 0
+  --max_epochs 10000 --checkpoint-epochs 10 --precision 32`；我们数据只有 4.7 分钟，
+  所以取 `--epochs 60 --checkpoint-epochs 20 --lr 1e-4`（先看效果，不够再续）。
+* ★验收标准（写在这里免得又忘）★：导出 ONNX 后
+  ① 用 `scripts/ab_clone_model.py --profile` 量 10-12 kHz（Piper 应该几乎没有；
+  ② 拿同一批文本和 ZipVoice 对着听；③ 量 RTF 与首声延迟。**音频存 `sessions/piper_ab/`**。
+
+
 
 

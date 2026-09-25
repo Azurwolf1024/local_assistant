@@ -900,6 +900,10 @@ python main.py skills
 > 定向削它不会碰齿音；★这个值跟模型绑定，换模型/参考后先量，见 §14 与日志第 20 节★）；
 > 保语气连贯用 `trim_shrink_pause`（按比例压长停顿，不压成一样长）+ `chunk_level_db`
 > （块间电平对齐）+ `join_pause_comma_ms` / `join_pause_period_ms`（按标点的接缝补白）。
+> ★`trim_min_gap_ms` 现在默认 **0（关）**★：它会把**词内** 60~240 ms 的自然空隙
+> （比如「还 有 组 会」中间那个）也撑成 240 ms——听感就是「词中间卡一下」（实测 9 条试听里
+> 8 条有这个 230 ms 洞，唯一没洞的那条恰恰是用户觉得最好的）。只有确实听到逗号太赶（<150 ms）
+> 才开，并且把 `trim_min_gap_floor_ms` 提到 ≥120。详见日志第 22 节。
 > 想听出差别：`python scripts/ab_voice.py --hiss` / `--rhythm`，产物在 `sessions/voice_ab2/`。
 >
 > **「语气连贯」还有一半是音高**（用户原话：不要出现异常的高亢和低沉）：
@@ -1488,6 +1492,13 @@ python scripts/ab_clone_model.py
 > `scripts/prepare_tts_dataset.py --dir data/personas/<id> --out data/finetune/<id> --apply`
 > （只产数据集，`python scripts/test_prepare_dataset.py` 有 24 条测试）、
 > `scripts/persona_voice.py --no-wire` 则跑完不自动写 `voice_model`（只训练，不动人格文件）。
+>
+> **2026-09-25：另起一条路 —— 训 Piper/VITS 专属声线（路线 C）**。理由：ZipVoice 的沙沙声
+> 住在 10~12 kHz（日志第 20 节），而 Piper 的 8 kHz 以上几乎为零（带限）+ RTF 0.05、开口 0.13 s。
+> 环境链已打通（底模在 `datasets/rhasspy/piper-checkpoints`、`--language cmn`、
+> 要编 `monotonic_align`、`pytorch-lightning==1.9.5`、ckpt 里带 PosixPath …）：
+> 踩坑与命令全部记在工程日志第 23 节，启动器 `scripts/train_piper.py`，
+> 数据准备 `scripts/prepare_piper_dataset.py`。
 
 ### 从清单文件导入台词（只添加，不替换）
 
