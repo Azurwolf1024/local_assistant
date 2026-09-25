@@ -48,6 +48,7 @@ ARM_GLOB = "data/piper/*/exp_*"
 # 训练日志里 train_piper.py 打的那行：「训练样本 24 条 → 每 epoch 6 步；共 300 epoch ≈ 1800 步」
 PROGRESS_HINT_RE = re.compile(r"每 epoch (\d+) 步；共 (\d+) epoch ≈ (\d+) 步")
 ATTEMPT_RE = re.compile(r"第 (\d+) 次尝试")
+CRASH_RE = re.compile(r"第 \d+ 次尝试崩了")
 RAM_AT_START_RE = re.compile(r"可用内存 ([\d.]+) GB")
 CKPT_RE = re.compile(r"epoch=(\d+)-step=(\d+)")
 
@@ -88,14 +89,18 @@ def parse_progress_hint(text: str) -> dict[str, int]:
     }
 
 
-def parse_attempts(text: str) -> tuple[int, float | None]:
-    """看门狗日志 →（重启到第几次, 那一次启动时的可用内存 GB）。
+def parse_attempts(text: str) -> tuple[int, float | None, int]:
+    """看门狗日志 →（本次启动是第几次尝试, 启动时可用内存 GB, 这个文件里累计崩过几次）。
 
+    ★取**最后一次**尝试，不取最大值★：console 日志现在是追加写的，新起一个看门狗时
+    它的尝试计数从 1 重数，而文件里还留着上一轮跑到 7 的记录 —— 取 max 会把
+    「本次启动第 1 次」报成「第 7 次」（改追加之后当场踩到的）。
     内存那一项来自看门狗每次启动打印的「可用内存 X GB」（★它就是为了追这个崩溃加的★）。
     """
     attempts = [int(m.group(1)) for m in ATTEMPT_RE.finditer(text or "")]
     rams = [float(m.group(1)) for m in RAM_AT_START_RE.finditer(text or "")]
-    return (max(attempts) if attempts else 0, rams[-1] if rams else None)
+    crashes = len(CRASH_RE.findall(text or ""))
+    return (attempts[-1] if attempts else 0, rams[-1] if rams else None, crashes)
 
 
 def human_duration(seconds: float) -> str:
@@ -264,16 +269,16 @@ def last_progress_hint(out_dir: Path) -> dict[str, int]:
     return {}
 
 
-def watchdog_state(out_dir: Path) -> tuple[int, float | None]:
-    """看门狗重启到第几次、最近一次启动时的可用内存。"""
+def watchdog_state(out_dir: Path) -> tuple[int, float | None, int]:
+    """看门狗本次启动是第几次、启动时的可用内存、这个日志里累计崩过几次。"""
     suffix = out_dir.name.replace("exp_", "")
     for name in (f"train_{suffix}_watchdog_console.log", f"train_{suffix}_watchdog.log"):
         path = ROOT / "sessions" / name
         if path.is_file():
-            attempts, ram = parse_attempts(path.read_text(encoding="utf-8", errors="replace"))
+            attempts, ram, crashes = parse_attempts(path.read_text(encoding="utf-8", errors="replace"))
             if attempts:
-                return attempts, ram
-    return 0, None
+                return attempts, ram, crashes
+    return 0, None, 0
 
 
 def collect_arm(out_dir: Path, procs: list[dict]) -> dict:
@@ -302,7 +307,7 @@ def collect_arm(out_dir: Path, procs: list[dict]) -> dict:
         info["ckpt_epoch"] = int(found.group(1)) if found else -1
         info["ckpt_count"] = len(list(out_dir.glob("lightning_logs/version_*/checkpoints/*.ckpt")))
     info["hint"] = last_progress_hint(out_dir)
-    info["attempts"], info["ram_at_start"] = watchdog_state(out_dir)
+    info["attempts"], info["ram_at_start"], info["crashes"] = watchdog_state(out_dir)
     proc = match_process(procs, out_dir)
     if proc:
         info["pid"] = proc.get("ProcessId")
@@ -383,8 +388,10 @@ def render_arm(info: dict) -> list[str]:
         lines.append("    还没存过 checkpoint（到 --checkpoint-epochs 才会存）")
     if info.get("attempts"):
         ram = info["ram_at_start"]
-        extra = f"，那次启动时可用内存 {ram:.1f} GB" if ram is not None else ""
-        lines.append(f"    看门狗：第 {info['attempts']} 次尝试（崩一次就 +1；只搬权重、不恢复优化器{extra}）")
+        extra = f"，启动时可用内存 {ram:.1f} GB" if ram is not None else ""
+        crashed = f"；这个日志里累计崩过 {info['crashes']} 次" if info.get("crashes") else ""
+        lines.append(f"    看门狗：本次启动第 {info['attempts']} 次尝试{extra}{crashed}"
+                     "（崩了自动从最近 checkpoint 续跑，只搬权重、不恢复优化器）")
     return lines
 
 

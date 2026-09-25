@@ -6,11 +6,16 @@
 **没有 traceback、没有 Python 异常**，崩在 worker 线程里（gdb 只能看到
 `[Thread ... exited with code 3221225477]`）。
 已经查清的事（详见 docs/ENGINEERING_LOG.md 第 30 节）：
-  * 与学习率无关、与并行无关、与存 checkpoint 无关、与内存无关；
-  * 长片段数据集（24 条，帧数/音素id 中位 1.91）跑了几百步没崩；
-  * 切短数据集（69 条）**同一份数据**：C 组跑到 26 步没崩、B 组 25 步崩了
-    —— 所以是**概率性**的，不是某条样本必崩。
-没查清的是确切的触发机制（怀疑 `rand_slice_segments` 抽到的切片位置）。
+  * 与学习率无关、与并行无关、与「切短的数据集」无关 —— 同一份数据、同一份代码，
+    一次崩一次不崩，所以是**概率性**的，不是某条样本必崩；
+  * ★**根因是内存**★（§30.11，看门狗第一次抓到真 traceback）：Lightning 的
+    `_atomic_save` 会把**整个 checkpoint 先序列化进内存缓冲**，内存紧的时候
+    `torch.save` 就失败 —— 运气好抛 `MemoryError`，运气不好在 C++ 里分配失败
+    直接变成 `0xC0000005`。所以 `train_piper.py` 现在用 `save_weights_only=True`
+    把存档峰值砍半，每次重启也打印可用内存、低于 3 GB 直接警告。
+  * ★但**没有完全结案**★：2026-09-26 夜里 B 臂崩了 6 次，每次**启动时**都有
+    7~8 GB 可用（崩溃那一刻的内存没记录）。也就是说「内存不足」至少不是唯一的
+    触发条件，剩下的没查清 —— 别把它当成已经解释干净了。
 
 既然做不到「让它不崩」，就做到「崩了也不心疼」：**崩了就自动从最近的 checkpoint
 接着跑**。每崩一次最多损失 `--checkpoint-epochs` 个 epoch。
@@ -78,6 +83,16 @@ def newest_checkpoint(out: Path) -> Path | None:
     return max(found, key=lambda p: p.stat().st_mtime) if found else None
 
 
+def stamp() -> str:
+    """给看门狗自己的输出打时间戳。
+
+    ★为什么需要★：这一整套东西都是为「半夜崩了」服务的，而原来的输出没有时间，
+    回头看日志只知道崩了几次、不知道几点崩的（`--log` 里只有子进程的 stdout，
+    看门狗打印的尝试/崩溃行全在 console 日志里）。
+    """
+    return time.strftime("%m-%d %H:%M:%S")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="崩溃自动重启的训练看门狗")
     ap.add_argument("--dataset-dir", required=True)
@@ -100,7 +115,7 @@ def main() -> int:
     for attempt in range(1, args.max_restarts + 1):
         resume = newest_checkpoint(out)
         source = resume if resume else Path(args.checkpoint)
-        print(f"\n=== 第 {attempt} 次尝试：从 {source.name} 开始 "
+        print(f"\n=== [{stamp()}] 第 {attempt} 次尝试：从 {source.name} 开始 "
               f"（{'上次的 checkpoint' if resume else '底模'}）；可用内存 {free_ram_gb():.1f} GB", flush=True)
         if free_ram_gb() < 3.0:
             print("   ★警告★ 可用内存不到 3 GB —— 训练很可能在写 checkpoint 时分配失败而硬崩"
@@ -125,10 +140,10 @@ def main() -> int:
         spent = (time.time() - started) / 60.0
 
         if code == 0:
-            print(f"√ 训练正常结束（第 {attempt} 次尝试，用时 {spent:.1f} 分钟）")
+            print(f"√ [{stamp()}] 训练正常结束（第 {attempt} 次尝试，用时 {spent:.1f} 分钟）")
             return 0
         why = CRASH_CODES.get(code, f"退出码 {code}")
-        print(f"★ 第 {attempt} 次尝试崩了：{why}（跑了 {spent:.1f} 分钟）→ 自动重启")
+        print(f"★ [{stamp()}] 第 {attempt} 次尝试崩了：{why}（跑了 {spent:.1f} 分钟）→ 自动重启")
         if spent < 0.5:
             print("   ★注意★ 这次连 30 秒都没撑到，可能不是偶发崩溃 —— "
                   "先去看看上面日志里的最后一次报错")

@@ -83,15 +83,23 @@ def main() -> int:
     check("无关文本 → 空 dict", parse_progress_hint("GPU available: False"), {})
     check("空串不炸", parse_progress_hint(""), {})
 
-    print("\n[3] parse_attempts：重启到第几次 + 最近一次启动时的可用内存")
+    print("\n[3] parse_attempts：本次启动是第几次 + 启动时可用内存 + 累计崩过几次")
     watchdog = (
-        "=== 第 1 次尝试：从 epoch=44-step=540.ckpt 开始 （上次的 checkpoint）；可用内存 9.2 GB\n"
-        "★ 第 1 次尝试崩了：0xC0000005 访问违例（跑了 0.7 分钟）→ 自动重启\n"
-        "=== 第 2 次尝试：从 epoch=14-step=180.ckpt 开始 （上次的 checkpoint）；可用内存 8.3 GB\n"
+        "=== [09-25 21:12:03] 第 1 次尝试：从 epoch=44-step=540.ckpt 开始；可用内存 9.2 GB\n"
+        "★ [09-25 21:12:47] 第 1 次尝试崩了：0xC0000005 访问违例（跑了 0.7 分钟）→ 自动重启\n"
+        "=== [09-25 21:13:00] 第 2 次尝试：从 epoch=14-step=180.ckpt 开始；可用内存 8.3 GB\n"
     )
-    check("取最大的尝试序号", parse_attempts(watchdog)[0], 2)
+    check("本次启动 = 最后一次尝试", parse_attempts(watchdog)[0], 2)
     check("内存取最后一次启动的", parse_attempts(watchdog)[1], 8.3)
-    check("没有尝试记录 → (0, None)", parse_attempts("训练样本 24 条"), (0, None))
+    check("累计崩溃次数", parse_attempts(watchdog)[2], 1)
+    check("没有尝试记录 → (0, None, 0)", parse_attempts("训练样本 24 条"), (0, None, 0))
+    # ★追加写的日志里，上一轮跑到 7、新的一轮从 1 重数★：必须报「第 1 次」，不是 max=7
+    appended = (
+        "=== 第 7 次尝试：从 epoch=59-step=1080.ckpt 开始；可用内存 8.1 GB\n"
+        "=== [09-26 03:56:20] 第 1 次尝试：从 epoch=29-step=540.ckpt 开始；可用内存 12.4 GB\n"
+    )
+    check("追加日志里新看门狗报第 1 次（不是 7）", parse_attempts(appended)[0], 1)
+    check("此时内存取新的那次", parse_attempts(appended)[1], 12.4)
 
     print("\n[4] series_stats：首段均值 / 末值 / 降幅")
     series = [(0, 100.0, 0.0), (1, 80.0, 30.0), (2, 40.0, 60.0), (3, 30.0, 90.0), (4, 20.0, 120.0)]
@@ -157,7 +165,7 @@ def main() -> int:
         },
         "hint": {"steps_per_epoch": 6, "epochs": 300, "target_steps": 1800},
         "ckpt": Path("epoch=29-step=360.ckpt"), "ckpt_age": 600.0, "ckpt_epoch": 29, "ckpt_count": 2,
-        "attempts": 3, "ram_at_start": 8.3,
+        "attempts": 3, "ram_at_start": 8.3, "crashes": 2,
     }
     text = "\n".join(render_arm(info))
     check("有在跑标记", "在跑" in text, True)
@@ -167,7 +175,8 @@ def main() -> int:
     check("显示 loss", "loss_gen" in text, True)
     check("显示 ETA", "若继续跑还需" in text, True)
     check("显示 checkpoint", "epoch=29-step=360.ckpt" in text, True)
-    check("显示看门狗次数", "第 3 次尝试" in text, True)
+    check("显示看门狗本次是第几次", "本次启动第 3 次尝试" in text, True)
+    check("显示累计崩溃次数", "累计崩过 2 次" in text, True)
 
     dead = dict(info)
     dead.pop("pid"); dead.pop("working_set_gb")
