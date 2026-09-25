@@ -83,6 +83,51 @@ def main() -> int:
     check("阈值可以放宽到 0.98（默认 0.99 偏严时）",
           tc.text_guard_verdict(0.982, 0.98, 0, 2), False)
 
+    print("\n[5] 懒加载：补丁不能在「引擎还没加载」时被丢掉")
+    from voice_loop.tts.lazy import LazyTts  # noqa: PLC0415
+
+    class FakeEngine:
+        name = "fake"
+        sample_rate = 24000
+        verifier_seen = None
+        configured_seen = None
+
+        def set_text_verifier(self, fn):
+            self.verifier_seen = fn
+
+        def set_reference(self, *a, **k):
+            self.configured_seen = a
+
+        def synth(self, text):  # pragma: no cover - 不在这里跑
+            return iter(())
+
+    made: list[FakeEngine] = []
+
+    def factory(_settings):
+        eng = FakeEngine()
+        made.append(eng)
+        return eng
+
+    class _S:
+        class tts:  # noqa: N801 - 只当 settings 用
+            inject_pauses = False
+
+    lazy = LazyTts(_S, factory, None)
+    sentinel = lambda *a: None  # noqa: E731
+    # ★关键★：还没 load 就登记，加载之后必须生效（configure 在这种情况下会丢）
+    lazy.on_load(lambda engine: engine.set_text_verifier(sentinel))
+    check("加载前未构造引擎", made == [])
+    lazy.load()
+    check("加载后补丁已生效（不是被丢掉）", made[0].verifier_seen is sentinel)
+    lazy.unload()
+    lazy.load()
+    check("卸载再加载也不丢（第二次加载过的引擎也有）", made[1].verifier_seen is sentinel)
+    # 对照：configure 在没加载时确实什么都不做（这是它设计上的语义，不是 bug）
+    lazy2 = LazyTts(_S, factory, None)
+    lazy2.configure(lambda engine: engine.set_text_verifier(sentinel))
+    lazy2.load()
+    check("对照：configure 在未加载时会被丢掉（所以守卫不能用它）", made[2].verifier_seen is None)
+
     print("\n" + "=" * 70)
     if FAILED:
         print(f" 失败 {len(FAILED)} 项：{FAILED}")

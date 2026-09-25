@@ -948,9 +948,11 @@ class VoiceLoop:
                 self.log.warning(f"合成回听失败（{exc}）——这一轮不做文本校验")
                 return None
 
-        configure = getattr(self.tts, "configure", None)
-        if callable(configure):
-            configure(lambda engine: engine.set_text_verifier(verify))
+        # ★必须用 on_load 而不是 configure★：管线是在「引擎还没加载」时接这一手的，
+        # configure 那种「没加载就丢掉」的语义会让守卫**一声不响地失效**（见 LazyTts.on_load）。
+        on_load = getattr(self.tts, "on_load", None)
+        if callable(on_load):
+            on_load(lambda engine: engine.set_text_verifier(verify))
         elif hasattr(self.tts, "set_text_verifier"):
             self.tts.set_text_verifier(verify)
         self.log.info(f"TTS 文本保真守卫已开（相似度 < {min_ratio:g} 就重采）")

@@ -38,6 +38,8 @@ class LazyTts:
         self._name = name
         self._engine: TtsEngine | None = None
         self._lock = threading.Lock()
+        # 每次引擎加载好都要打一遍的补丁（见 on_load）
+        self._pending: list[Callable[[TtsEngine], None]] = []
         self.inject_pauses = bool(getattr(settings.tts, "inject_pauses", False))
 
     # ------------------------------------------------------------- 加载/卸载
@@ -50,6 +52,8 @@ class LazyTts:
             if self._engine is None:
                 t0 = time.perf_counter()
                 self._engine = self._factory(self.settings)
+                for fn in self._pending:  # ★懒加载也要吃上补丁★
+                    fn(self._engine)
                 if self.log:
                     self.log.info(
                         f"TTS 已加载：{getattr(self._engine, 'name', self._name)}"
@@ -74,6 +78,21 @@ class LazyTts:
         换角色声线时用：声音正在用就不能白等一次重载，没用着就别为它加载。
         """
         with self._lock:
+            if self._engine is not None:
+                fn(self._engine)
+
+    def on_load(self, fn: Callable[[TtsEngine], None]) -> None:
+        """登记一个「**每次**引擎加载好都打一遍」的补丁；已加载就当场打。
+
+        跟 :meth:`configure` 的分别（踩过坑，写在这以免又被静默坑一次）：
+        ``configure`` 在引擎没加载时是**丢掉**的——那是因为它服务的「换参考音频」
+        有配置来源（构造函数会自己按 ``clone_audio`` 设好）。而有些补丁**只存在于
+        运行时**（比如管线把「合成回听」的校验器接进来），靠配置回不来；
+        启动时引擎还没加载，用 configure 就会**一声不吭地失效**。
+        这类补丁必须用 ``on_load``（``unload`` 后再加载也不会丢）。
+        """
+        with self._lock:
+            self._pending.append(fn)
             if self._engine is not None:
                 fn(self._engine)
 
