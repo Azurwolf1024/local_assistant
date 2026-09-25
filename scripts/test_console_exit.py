@@ -25,6 +25,7 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))      # [3] 要在本进程里 import voice_loop.console
 FAILED: list[str] = []
 
 
@@ -128,6 +129,29 @@ def main() -> int:
     print("\n[2] 没有 SSE 的对照组（别把普通情况弄坏）")
     ok2, cost2, _ = run_case(with_sse=False)
     check("几秒内退出", ok2, True, detail=f"{cost2:.1f}s")
+
+    print("\n[3] 端口被占用 → 要给人话 + 退出码 2（不要只丢一个 1 出来）")
+    # 自己先占住一个端口，再让 serve() 去起 —— 它应当立刻返回 2，而不是阻塞
+    import contextlib  # noqa: PLC0415
+    import io  # noqa: PLC0415
+
+    from voice_loop.console import serve as console_serve  # noqa: PLC0415
+    from voice_loop.settings import load_settings  # noqa: PLC0415
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as holder:
+        holder.bind(("127.0.0.1", 0))
+        holder.listen(1)
+        busy_port = holder.getsockname()[1]
+        started = time.perf_counter()
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            code = console_serve(load_settings(ROOT / "config.toml"), host="127.0.0.1",
+                                 port=busy_port, open_browser=False, logger=None)
+        cost = time.perf_counter() - started
+        printed = captured.getvalue()
+    check("退出码是 2（和参数错区分）", code, 2)
+    check("立刻返回（不阻塞）", cost < 5.0, True, detail=f"{cost:.2f}s")
+    check("提示里有人话", "已经有程序在听" in printed, True,
+          detail=printed.strip().splitlines()[0][:40] if printed.strip() else "")
 
     print("\n" + "=" * 70)
     if FAILED:

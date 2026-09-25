@@ -26,6 +26,7 @@ import sys
 import time
 from pathlib import Path
 
+import soundfile as sf
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -78,6 +79,9 @@ def main() -> int:
     ap.add_argument("--num-workers", type=int, default=0, help="Windows 上用 0（spawn 有额外开销）")
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--threads", type=int, default=0, help="torch 线程数（0 = 不设）")
+    ap.add_argument("--min-frames-per-id", type=float, default=0.9,
+                    help="护栏：梅尔帧数 / 音素 id 数的下限，低于它的样本直接剔除"
+                         "（0 = 不过滤）。不设会硬崩 0xC0000005，见 main() 里的说明")
     args = ap.parse_args()
 
     import json
@@ -97,6 +101,51 @@ def main() -> int:
     if not config_path.is_file() or not dataset_path.is_file():
         raise SystemExit(f"{dataset_dir} 里缺 config.json / dataset.jsonl（先跑 preprocess）")
     config = json.loads(config_path.read_text(encoding="utf-8"))
+
+    # ★护栏：梅尔帧数必须 ≥ 文本 token 数★
+    # 崩点做过定位（2026-09-25）：退码 `0xC0000005`（硬崩、没有 traceback）。
+    # 崩的地方是 `vits/models.py` 的 `monotonic_align.maximum_path`（Cython 单调对齐）：
+    # 它按「音频帧 × 文本 token」分配内存并找一条单调路径，
+    # **音频比文本短时它会写到界外**（Cython 不抛异常，直接踩内存）。
+    # 用 trace 探针（sessions/probe_train_trace.py）定位到具体样本：
+    # `行动开始_01.wav` 1.11s ≈ 95 帧却有 137 个音素 id（比值 0.70）—— 全数据集最极端的一条。
+    # 这类样本来自「把长独白切短」时切出了「话多音频短」的碎片，纯手工核对很难发现，
+    # 所以在这里自动剔除并打印，而不是让训练崩在半夜。
+    if args.min_frames_per_id > 0:
+        rows = [
+            json.loads(line)
+            for line in dataset_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        hop = int(config.get("hop_length") or 256)
+        rate = int(config["audio"]["sample_rate"])
+        kept_rows, dropped = [], []
+        for row in rows:
+            audio = Path(str(row["audio_path"]))
+            audio = audio if audio.is_absolute() else ROOT / audio
+            try:
+                info = sf.info(str(audio))
+                frames = info.frames * rate / info.samplerate / hop   # 换采样率也算对
+            except Exception as exc:  # noqa: BLE001 - 读不出来就当不合格
+                dropped.append((audio.name, float("nan"), f"读不出音频：{exc}"))
+                continue
+            ratio = frames / max(1, len(row["phoneme_ids"]))
+            if ratio < args.min_frames_per_id:
+                dropped.append((audio.name, ratio, f"{frames:.0f} 帧 / {len(row['phoneme_ids'])} id"))
+            else:
+                kept_rows.append(row)
+        if dropped:
+            print(f"剔除 {len(dropped)} 条「文本比音频长」的样本（比值 < {args.min_frames_per_id}）：")
+            for name, ratio, why in sorted(dropped, key=lambda x: x[1]):
+                print(f"  - {name:<24}{ratio:5.2f}  {why}")
+        if not kept_rows:
+            raise SystemExit("所有样本都被剔除了，检查 --min-frames-per-id")
+        filtered = dataset_dir / "dataset.filtered.jsonl"
+        filtered.write_text(
+            "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in kept_rows), encoding="utf-8"
+        )
+        print(f"用过滤后的数据集训练：{len(kept_rows)} 条（{filtered.name}）")
+        dataset_path = filtered
 
     if args.threads > 0:
         torch.set_num_threads(args.threads)

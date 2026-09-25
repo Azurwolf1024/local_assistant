@@ -280,6 +280,18 @@ def create_app(settings: Settings, logger: logging.Logger | None = None):
     return app
 
 
+def port_in_use(host: str, port: int) -> bool:
+    """端口上是否已经有人在听（用 connect 探一下，比 bind 试探安全）。"""
+    import socket  # noqa: PLC0415
+
+    target = host or "127.0.0.1"
+    if target in ("0.0.0.0", "::"):
+        target = "127.0.0.1"
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.5)
+        return sock.connect_ex((target, int(port))) == 0
+
+
 def serve(
     settings: Settings,
     *,
@@ -304,6 +316,18 @@ def serve(
         print(f"  ★注意★ 绑定在 {host}：同一局域网的人也能访问并改你的日程")
     print("  Ctrl+C 退出（不影响语音服务本身）")
     print("=" * 62 + "\n")
+
+    # ★为什么要提前自己查端口★：uvicorn 撞端口时只打一行 `[Errno 10048] error while
+    # attempting to bind …` 的 error 日志，然后 **`sys.exit(1)`** —— 用户看到的就是
+    # 「输出了个 1，什么也没说」。这里换成人话，并且把「直接开那一个」和「换端口」都写出来。
+    if port_in_use(host, port):
+        print(f"★端口 {port} 已经有程序在听★ —— 多半是**已经有一个控制台在跑**。")
+        print(f"  ① 先用浏览器打开现有那个：{url}")
+        print(f"     （能打开就是它，不用再起一个；两个控制台改同一批文件也不会更安全）")
+        print(f"  ② 确实要再起一个 → 换个端口：python main.py ui --port {int(port) + 1}")
+        print(f"  ③ 想看是谁占着 → PowerShell: Get-NetTCPConnection -LocalPort {int(port)} "
+              f"| Select-Object OwningProcess")
+        return 2
 
     if open_browser:
         def _open() -> None:
@@ -344,5 +368,11 @@ def serve(
         ConsoleServer(config).run()
     except KeyboardInterrupt:      # 有些终端下 Ctrl+C 会直接抛到这里
         pass
+    except SystemExit as exc:      # 竞态：刚查完端口就被别人抢了
+        if exc.code not in (0, None):
+            print(f"\n★控制台没能起来（退出码 {exc.code}）★ 看上面一行 uvicorn 的报错："
+                  f"最常见的就是端口 {port} 被占（改用 --port {int(port) + 1} 试试）。")
+            return 1
+        raise
     print("\n控制台已退出（语音服务不受影响，要停服务用 python main.py stop）")
     return 0
