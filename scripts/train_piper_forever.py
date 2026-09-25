@@ -34,6 +34,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import time
@@ -93,6 +94,62 @@ def stamp() -> str:
     return time.strftime("%m-%d %H:%M:%S")
 
 
+LOCK_NAME = ".watchdog.lock"
+
+
+def pid_alive(pid: int) -> bool:
+    """那个 PID 还活着吗。
+
+    ★不能用 `os.kill(pid, 0)`★：Windows 上 `os.kill` 对非 0 / 非 CTRL_* 的信号会
+    **直接 TerminateProcess** —— 想「查一下」反而把对方杀了（CPython 文档写得很清楚）。
+    Windows 走 OpenProcess + GetExitCodeProcess == STILL_ACTIVE，其余平台才用信号 0。
+    """
+    if pid <= 0:
+        return False
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
+    import ctypes  # noqa: PLC0415
+
+    # PROCESS_QUERY_LIMITED_INFORMATION = 0x1000（比 PROCESS_QUERY_INFORMATION 权限要求低）
+    handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+    if not handle:
+        return False
+    try:
+        code = ctypes.c_ulong()
+        if not ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return False
+        return code.value == 259  # STILL_ACTIVE
+    finally:
+        ctypes.windll.kernel32.CloseHandle(handle)
+
+
+def other_watchdog(out: Path) -> int | None:
+    """同一个 `--out` 上是不是已经有**活着的**看门狗了（有就返回它的 PID）。
+
+    锁文件里存的是 PID，而不是「文件存在就算被占」：进程被外部杀掉（2026-09-26 凌晨就是）
+    会留下死锁文件，按 PID 判活能让它自动失效，不用人工清。
+    """
+    try:
+        pid = int((out / LOCK_NAME).read_text(encoding="utf-8").split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+    return pid if pid != os.getpid() and pid_alive(pid) else None
+
+
+def release_lock(out: Path) -> None:
+    """收工时删掉自己那把锁（★只删自己的★：万一有人 --force 抢了，别把新锁删掉）。"""
+    lock = out / LOCK_NAME
+    try:
+        if int(lock.read_text(encoding="utf-8").split()[0]) == os.getpid():
+            lock.unlink()
+    except (OSError, ValueError, IndexError):
+        pass
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="崩溃自动重启的训练看门狗")
     ap.add_argument("--dataset-dir", required=True)
@@ -105,12 +162,27 @@ def main() -> int:
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--min-frames-per-id", type=float, default=0.7)
     ap.add_argument("--max-restarts", type=int, default=30)
+    ap.add_argument("--force", action="store_true",
+                    help="就算同一个 --out 已经有看门狗在跑也强行再起（★别乱用：两份训练会抢内存★）")
     ap.add_argument("--log", default="", help="训练输出写到哪（默认 sessions/train_forever.log）")
     args = ap.parse_args()
 
     out = Path(args.out)
     log_path = Path(args.log) if args.log else ROOT / "sessions" / "train_forever.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # ★防重入★：同一个输出目录起两份 = 两份训练抢同一份内存 + 互相把对方的 checkpoint 当
+    # “最新的”续跑。2026-09-26 凌晨就是这么把四个进程一起弄死的（A/B 割起 3 分钟就双双
+    # 以退出码 -1 消失，还带走了已经跑了 6.6 小时的进度）。
+    out.mkdir(parents=True, exist_ok=True)
+    existing = other_watchdog(out)
+    if existing and not args.force:
+        print(f"★ {out} 上已经有一个看门狗在跑了（PID {existing}），这次不重复启动。\n"
+              "  同一个输出目录跑两份训练会互相抢内存、也会把对方的 checkpoint 当成‘最新的’续跑。\n"
+              "  看进度： python scripts\\train_piper_watch.py\uff08--once 只看一眼\uff09\n"
+              "  确实要在同一个目录上再起一个：加 --force。", flush=True)
+        return 2
+    (out / LOCK_NAME).write_text(f"{os.getpid()} {stamp()}\n", encoding="utf-8")
 
     for attempt in range(1, args.max_restarts + 1):
         resume = newest_checkpoint(out)
@@ -141,6 +213,7 @@ def main() -> int:
 
         if code == 0:
             print(f"√ [{stamp()}] 训练正常结束（第 {attempt} 次尝试，用时 {spent:.1f} 分钟）")
+            release_lock(out)
             return 0
         why = CRASH_CODES.get(code, f"退出码 {code}")
         print(f"★ [{stamp()}] 第 {attempt} 次尝试崩了：{why}（跑了 {spent:.1f} 分钟）→ 自动重启")
@@ -150,6 +223,7 @@ def main() -> int:
         time.sleep(5)
 
     print(f"★ 连续 {args.max_restarts} 次都没跑完，先停下来看看日志：{log_path}")
+    release_lock(out)
     return 1
 
 
