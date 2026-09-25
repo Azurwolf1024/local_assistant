@@ -103,7 +103,10 @@ def register(app, ctx) -> None:
     def api_audition(payload: dict = Body(default={})):
         """让服务念一句（复用服务里已加载的 TTS）。服务没跑就明说，不假装成功。"""
         text = str((payload or {}).get("text") or "").strip() or "你好呀，我是本地语音助手。"
-        reply = ctx.call_service("say", timeout=float((payload or {}).get("timeout") or 25.0), text=text)
+        # ★给足 60 秒★：服务是懒加载的，第一次 `say` 要把声线加载进来（实测 11 秒量级，
+        # 机器忙时更久）。以前给 25 秒，机器一慢就会「超时但其实念出来了」。
+        timeout = float((payload or {}).get("timeout") or 60.0)
+        reply = ctx.call_service("say", timeout=timeout, text=text)
         return {
             "ok": reply.ok,
             "text": reply.text,

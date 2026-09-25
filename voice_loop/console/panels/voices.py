@@ -114,11 +114,12 @@ def register(app, ctx) -> None:
         text = str(body.get("text") or "").strip() or "你好呀，我是本地语音助手。"
         switched = None
         if cid and body.get("switch", True):
-            reply = ctx.call_service("character", timeout=20.0, id=cid)
+            reply = ctx.call_service("character", timeout=30.0, id=cid)
             switched = {"ok": reply.ok, "message": reply.text if reply.ok else reply.error}
             if not reply.ok:
                 return {"ok": False, "error": "切换失败：" + reply.error, "switch": switched}
-        say = ctx.call_service("say", timeout=float(body.get("timeout") or 30.0), text=text)
+        # 切声线后 TTS 要卸载重载 + 念一句，给足时间（实测首次 10 秒量级）
+        say = ctx.call_service("say", timeout=float(body.get("timeout") or 60.0), text=text)
         return {
             "ok": say.ok,
             "error": say.error,

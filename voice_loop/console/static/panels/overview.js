@@ -20,7 +20,13 @@
               e.target.disabled = true;
               const r = await ctx.api.safe(() => ctx.api.post("/api/overview/audition", { text: audition.value }));
               e.target.disabled = false;
-              if (r) ctx.toast(r.ok ? "服务已念出（服务侧耗时 " + secs(r.seconds) + "）" : "没念成：" + r.error, r.ok ? "ok" : "err", 12000);
+              if (!r) return;
+              // 第一次念要先加载声线（实测 11 秒量级，机器忙时更久）——超时时别只说「失败」
+              const hint = !r.ok && /没有回执/.test(r.error || "")
+                ? "（服务还在跑；第一次念要先加载声线，可能要十几秒，等它念完再点一次通常立刻就有）"
+                : "";
+              ctx.toast(r.ok ? "服务已念出（服务侧耗时 " + secs(r.seconds) + "）" : "没念成：" + r.error + hint,
+                r.ok ? "ok" : "err", 15000);
             },
           }),
           h("button", {
@@ -119,9 +125,14 @@
         .then((d) => { data = d; renderAll(); })
         .catch((err) => ctx.toast("概览读取失败：" + err.message, "err"));
 
-      // 服务状态变了就刷新那几行
+      // 服务状态变了就刷新那几行；★停了就把「服务自报」清掉★（那是上一次 ping 的结果，
+      // 留着会让人以为服务还活着）
       handleEvent = (ev) => {
-        if (ev.kind === "status" && data) { data.service = ev.data; renderAll(); }
+        if (ev.kind === "status" && data) {
+          data.service = ev.data;
+          if (!ev.data.running) live = null;
+          renderAll();
+        }
       };
     },
 
