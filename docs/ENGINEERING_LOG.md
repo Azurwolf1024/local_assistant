@@ -2555,3 +2555,51 @@ epoch 59  loss_gen=39.2   ┘
 ★教训★：**遇到「无 traceback 的原生崩溃」，先建立「重启 + 续跑」的能力，再去挖原因。**
 这次是反过来做的（先挖了三小时原因），而看门狗半小时就写完了 —— 而且它让剩下所有实验
 都不再受这个 bug 影响。
+
+
+### 30.11 ★★最终根因：不是数据、不是短片段，是**内存不够**（有 traceback 为止）★★
+
+看门狗（§30.10）第一次就抓到了一份**真正的 Python traceback**（B 组第 2 次尝试"只"退出码 1）：
+
+```
+MemoryError                              ← torch.save → zip_file.write_record
+  ...
+ModelCheckpoint._save_checkpoint → torch_io._atomic_save → torch.save(checkpoint, bytesbuffer)
+RuntimeError: [enforce fail at inline_container.cc:672] . unexpected pos 651145984 vs 651145876
+```
+
+**机制**：`lightning_fabric.utilities.cloud_io._atomic_save` 会**把整个 checkpoint 先序列化进
+内存缓冲区**（`torch.save(checkpoint, bytesbuffer)`）。内存紧的时候这个写入会失败 ——
+抛 `MemoryError` 是运气好的情况；**在 C++ 里分配失败就直接变成 `0xC0000005` 访问违例**
+（没有 traceback、崩在 worker 线程）—— 这就是前几小时看到的一切。
+
+当时的实际内存（31.5 GB 总）：
+
+| 进程 | 占用 |
+|---|---|
+| `llama-server`（本地大模型 / Ollama） | 4942 MB |
+| 训练 A / 训练 B（**提交内存**） | 5456 MB / 4448 MB |
+| VS Code（4 个进程） | ~6300 MB |
+| IntelGraphicsSoftware / WorkBuddy / Memory Compression | 2403 / 1187 / 976 MB |
+| **可用** | **3.9 GB** ← 就是这么被挤干的 |
+
+**这解释了全部"矛盾"**：为什么"与学习率无关、与并行无关"；为什么**概率性**（取决于当时有多少空闲内存）；
+为什么崩溃常在 ~40 秒（`--checkpoint-epochs 1` 时那正是第一次存档的时刻）；
+为什么我"测出"的「≥2.0 秒能训、切短的不能训」都是**伪相关**（不同数据集在不同时刻跑，
+当时机器上跑着别的进程/别的臂，空闲内存不同）。
+
+**修三处**：
+1. `train_piper.py` 的 `ModelCheckpoint(save_weights_only=True)` —— 只存权重。
+   续跑本来也只需要权重，而且**把存档内存峰值砍一半**（cpkt 60 MB → 30 MB）。
+   （连带要改 `load_weights`：`save_weights_only` 存的文件**本身就是 state_dict**，外面没有那层壳。）
+2. `train_piper_forever.py` 每次重启打印**可用内存**，低于 3 GB 直接警告。
+3. 不再 3 个臂并行（§30.9 那样 3×4 线程 + 3 份模型 = 15 GB 伺候）；只留 2 个。
+
+★三条教训（这条比前面所有结论都值钱）★：
+1. **"没有 traceback 的原生崩溃"要先怀疑资源**（内存/句柄），再怀疑数据和代码 ——
+   数据错误会报错，资源不够才是不讲道理的崩。
+2. **先建"重启+续跑"能力**（§30.10），再挖原因：正是它把这次唯一的 traceback 抓回来的
+   （一次干净的退出码 1 夹在两次硬崩之间）。
+3. **我自己造出的伪相关**：「≥2.0 秒能训」验证了三次都成立，于是我把它写成了结论 ——
+   其实两边跑的时候机器负载不同。**验证一个规律时，必须让"其他条件"真的保持不变**，
+   否则三次"验证成功"也可能只是三次碰巧。

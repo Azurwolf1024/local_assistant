@@ -43,6 +43,32 @@ CRASH_CODES = {
 }
 
 
+def free_ram_gb() -> float:
+    """可用物理内存（GB）。★内存是这台机器上训练崩掉的真正原因，所以每次重启都记一笔★。"""
+    try:
+        import ctypes  # noqa: PLC0415
+
+        class MemoryStatus(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = MemoryStatus()
+        status.dwLength = ctypes.sizeof(MemoryStatus)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
+        return status.ullAvailPhys / (1024 ** 3)
+    except Exception:  # noqa: BLE001 - 非 Windows 或调用失败就不显示
+        return float("nan")
+
+
 def newest_checkpoint(out: Path) -> Path | None:
     """`<out>/lightning_logs/version_*/checkpoints/*.ckpt` 里最新的那个（按修改时间）。"""
     logs = out / "lightning_logs"
@@ -75,7 +101,10 @@ def main() -> int:
         resume = newest_checkpoint(out)
         source = resume if resume else Path(args.checkpoint)
         print(f"\n=== 第 {attempt} 次尝试：从 {source.name} 开始 "
-              f"（{'上次的 checkpoint' if resume else '底模'}）", flush=True)
+              f"（{'上次的 checkpoint' if resume else '底模'}）；可用内存 {free_ram_gb():.1f} GB", flush=True)
+        if free_ram_gb() < 3.0:
+            print("   ★警告★ 可用内存不到 3 GB —— 训练很可能在写 checkpoint 时分配失败而硬崩"
+                  "（0xC0000005）。先关掉占内存的东西（本地大模型、浏览器）再跑。", flush=True)
         cmd = [
             sys.executable, "-u", str(TRAINER),
             "--dataset-dir", str(args.dataset_dir),

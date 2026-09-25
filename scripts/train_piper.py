@@ -45,7 +45,13 @@ def load_weights(model, ckpt_path: Path) -> tuple[int, int]:
     if pathlib.PosixPath is not pathlib.WindowsPath:  # pragma: no branch
         pathlib.PosixPath = pathlib.WindowsPath  # type: ignore[assignment,misc]
     blob = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
-    state = blob.get("state_dict") if isinstance(blob, dict) else None
+    state = None
+    if isinstance(blob, dict):
+        state = blob.get("state_dict")
+        if not isinstance(state, dict) and blob and all(hasattr(v, "shape") for v in blob.values()):
+            # `save_weights_only=True` 存的 checkpoint **本身就是 state_dict**（外面没那层壳）。
+            # ★续跑要认这种★：看门狗重启时喂进来的就是我们自己存的权重文件。
+            state = blob
     if not isinstance(state, dict):
         raise SystemExit(f"{ckpt_path.name} 里没有 state_dict（不是 Lightning 的 ckpt？）")
     # lightning 的 key 可能带 'model_g.' 前缀，也可能不带；两种都试
@@ -196,7 +202,18 @@ def main() -> int:
         precision=32,
         max_epochs=args.epochs,
         default_root_dir=str(out),
-        callbacks=[ModelCheckpoint(every_n_epochs=max(1, args.checkpoint_epochs), save_top_k=-1)],
+        callbacks=[
+            # ★`save_weights_only=True` 是必须的★：Lightning 的 `_atomic_save` 会把**整个
+            # checkpoint 先序列化进内存缓冲区**，默认连优化器状态一起存 —— 内存紧的时候
+            # `torch.save` 会抛 `MemoryError`（或者更糟：在 C++ 里分配失败 → `0xC0000005`
+            # 访问违例，没 traceback）。实测这台机器只剩 3.9 GB 可用时就成这样了。
+            # 只存权重既能减半内存峰值，又是我们续跑时唯一需要的东西。
+            ModelCheckpoint(
+                every_n_epochs=max(1, args.checkpoint_epochs),
+                save_top_k=-1,
+                save_weights_only=True,
+            )
+        ],
         num_sanity_val_steps=0,
         log_every_n_steps=1,
         enable_progress_bar=False,
