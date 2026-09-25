@@ -248,8 +248,14 @@ def main() -> int:
         x = read_mono(wav, TARGET_RATE)
         x16 = read_mono(wav, vad_rate)
         mask = speech_mask(x16, settings)
+        # ★先切出**全部**片段再标文本，最后才筛★（踩过，很隐蔽）：
+        # 第一版把 `min_seconds` 交给 `mask_to_regions`，于是短片段在**标文本之前**就被删了，
+        # 而标签是按「留下来的片段各自时长占比」分配全文的 —— 结果每个留下来的片段
+        # 都分到了被删片段的那份文本：`--min-seconds 2.0` 那版的中位「帧数/音素 id」
+        # 只有 **0.72**（正确口径应该 ~1.9），也就是说**文本比音频长了 2.65 倍**。
+        # 这种错误不会报错、只会让模型学歪，所以改成「标完再筛」。
         spans = mask_to_regions(mask, int(settings.audio.frame_size), args.min_silence,
-                               args.max_seconds, args.min_seconds)
+                               args.max_seconds, min_seconds=0.0)
         if not spans:
             unusable.append((wav.name, "VAD 没切出任何片段"))
             continue
@@ -287,6 +293,11 @@ def main() -> int:
         kept_seconds = 0.0
         for index, ((clip, heard), label) in enumerate(zip(pieces, labels), start=1):
             seconds = clip.size / TARGET_RATE
+            # 筛选放在**标完文本之后**：这样被丢掉的片段连同它那一段文本一起丢，
+            # 不会把文本摊到别人身上（见上面 mask_to_regions 那段的说明）。
+            if seconds < args.min_seconds:
+                dropped += 1
+                continue
             # 空转写 = 这段里没人说话（咳啦/翻页/呼吸）；这时切点不前进、标签也是空的，
             # 两边一起丢掉，正好自洽。
             if not heard or not label.strip():

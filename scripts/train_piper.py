@@ -79,7 +79,7 @@ def main() -> int:
     ap.add_argument("--num-workers", type=int, default=0, help="Windows 上用 0（spawn 有额外开销）")
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--threads", type=int, default=0, help="torch 线程数（0 = 不设）")
-    ap.add_argument("--min-frames-per-id", type=float, default=0.9,
+    ap.add_argument("--min-frames-per-id", type=float, default=0.7,
                     help="护栏：梅尔帧数 / 音素 id 数的下限，低于它的样本直接剔除"
                          "（0 = 不过滤）。不设会硬崩 0xC0000005，见 main() 里的说明")
     args = ap.parse_args()
@@ -138,6 +138,13 @@ def main() -> int:
             print(f"剔除 {len(dropped)} 条「文本比音频长」的样本（比值 < {args.min_frames_per_id}）：")
             for name, ratio, why in sorted(dropped, key=lambda x: x[1]):
                 print(f"  - {name:<24}{ratio:5.2f}  {why}")
+            # ★阈值定高了就是「静默地把数据扔掉」★：实测把阈值写成 0.9 时，
+            # 切短那个数据集从 38 条剔到只剩 **8 条**，训练 5 分钟就说“完成”——
+            # 比崩掉更难发现。所以剔掉太多必须大声报警。
+            share = len(dropped) / max(1, len(rows))
+            if share > 0.25:
+                print(f"★警告★ 剔掉了 {share * 100:.0f}% 的样本（{len(dropped)}/{len(rows)}）—— "
+                      f"要么阈值偏高，要么**标签和音频本来就不匹配**（回去查切分/对齐）")
         if not kept_rows:
             raise SystemExit("所有样本都被剔除了，检查 --min-frames-per-id")
         filtered = dataset_dir / "dataset.filtered.jsonl"
