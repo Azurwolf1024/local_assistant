@@ -349,6 +349,13 @@ def render_arm(info: dict) -> list[str]:
         if hint.get("epochs"):
             progress += f"/{hint['epochs']}"
         lines.append(f"    本轮 {info.get('version', '')}：{progress}")
+        # ★★重启之后不能用「本轮 step」说进度★：看门狗重启会新开一个 version、
+        # 步数从 0 重数，而模型是接着 checkpoint 训的。第一版就因此报了「还需 7.4 小时」，
+        # 而模型其实只剩 91 个 epoch（≈ 2 小时）—— 两边的数字对不上会让人做出错的安排。
+        ckpt_epoch = int(info.get("ckpt_epoch", -1))
+        if ckpt_epoch >= 0 and hint.get("epochs"):
+            lines.append(f"    模型：checkpoint epoch {ckpt_epoch}/{hint['epochs']}"
+                         f"（{ckpt_epoch / hint['epochs'] * 100:.0f}%）  ← 跨重启的真实进度")
 
         first_step, _, first_wall = (scalars.get("loss_gen_all") or [(0, 0, 0)])[0]
         elapsed = (scalars.get("loss_gen_all") or [(0, 0, 0)])[-1][2] - first_wall
@@ -360,15 +367,25 @@ def render_arm(info: dict) -> list[str]:
                      f"   共 {int(loss['count'])} 个点")
         rate = loss.get("rate_per_min") or 0.0
         if rate > 0:
+            ckpt_epoch = int(info.get("ckpt_epoch", -1))
+            epochs_total = int(hint.get("epochs") or 0)
+            per_epoch = int(hint.get("steps_per_epoch") or 0)
+            if ckpt_epoch >= 0 and epochs_total and per_epoch:
+                # 模型还差多少个 epoch（跨重启有意义），而不是本段的 step
+                remaining = max(0, epochs_total - ckpt_epoch) * per_epoch
+            else:
+                remaining = max(0, target - step)
             eta = ""
-            if target and step < target:
-                seconds = (target - step) / rate * 60
+            if remaining > 0:
+                seconds = remaining / rate * 60
+                when = (datetime.now() + timedelta(seconds=seconds)).strftime('%m-%d %H:%M')
                 # ★进程已经停了就别假装还在跑★：速率是“当时”的，算出来的完成时间是不存在的
                 # （第一版就这样报了「预计还需 2.2 小时」——而那个臂两分钟前已经被关掉了）。
-                when = (datetime.now() + timedelta(seconds=seconds)).strftime('%m-%d %H:%M')
                 eta = (f"   若继续跑还需 {human_duration(seconds)}（约 {when} 跑完）"
                        if info.get("pid") else
-                       f"   ★已经不在跑了★：剩 {target - step} 步，按停掉前的速率算要 {human_duration(seconds)}")
+                       f"   ★已经不在跑了★：剩 {remaining} 步，按停掉前的速率算要 {human_duration(seconds)}")
+            elif target:
+                eta = "   （已经跑完目标轮数）"
             lines.append(f"    速率 {rate * 60:.0f} 步/小时（{rate:.2f} 步/分）{eta}")
         # ★「最后更新」必须看最后一个标量的时间，不能看目录 mtime★：
         # 目录 mtime 只在增删文件时才变（比如存 checkpoint），训练一路写 events 它不动 ——

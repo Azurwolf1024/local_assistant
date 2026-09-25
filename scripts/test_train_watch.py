@@ -174,16 +174,28 @@ def main() -> int:
     check("epoch 带目标", "epoch 9/300" in text, True)
     check("显示 loss", "loss_gen" in text, True)
     check("显示 ETA", "若继续跑还需" in text, True)
+    check("显示跨重启的真实进度", "模型：checkpoint epoch 29/300" in text, True)
     check("显示 checkpoint", "epoch=29-step=360.ckpt" in text, True)
     check("显示看门狗本次是第几次", "本次启动第 3 次尝试" in text, True)
     check("显示累计崩溃次数", "累计崩过 2 次" in text, True)
+
+    # ★重启后剩余量要按 checkpoint 算★：步数从 0 重数，但模型是从 epoch 29 接着训的
+    restarted = dict(info)
+    restarted["scalars"] = {
+        "loss_gen_all": [(i, 40.0, 2000.0 + i * 15) for i in range(5)],   # 4 步/分
+        "epoch": [(i, float(i), 2000.0 + i * 15) for i in range(5)],
+    }
+    text_r = "\n".join(render_arm(restarted))
+    check("重启后：模型进度照实报", "checkpoint epoch 29/300" in text_r, True)
+    check("重启后：剩余量按 epoch 算（(300-29)*6=1626 步 ≈ 6.8 小时）",
+          "若继续跑还需 6.8 小时" in text_r, True, detail=text_r.splitlines()[4])
 
     dead = dict(info)
     dead.pop("pid"); dead.pop("working_set_gb")
     text_dead = "\n".join(render_arm(dead))
     check("已停的臂：明说不在跑了", "★已经不在跑了★" in text_dead, True)
     check("已停的臂：不说「跑完」", "跑完）" in text_dead, False)
-    check("已停的臂：剩余步数照说", "剩 1791 步" in text_dead, True)
+    check("已停的臂：剩余步数照说", "剩 1626 步" in text_dead, True)
 
     bare = dict(info)
     bare.pop("scalars"); bare.pop("pid"); bare.pop("working_set_gb")
