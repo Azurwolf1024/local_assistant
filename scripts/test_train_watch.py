@@ -165,16 +165,23 @@ def main() -> int:
     check("步数带目标与百分比", "step 9/1800（0%）" in text, True)
     check("epoch 带目标", "epoch 9/300" in text, True)
     check("显示 loss", "loss_gen" in text, True)
-    check("显示 ETA", "预计还需" in text, True)
+    check("显示 ETA", "若继续跑还需" in text, True)
     check("显示 checkpoint", "epoch=29-step=360.ckpt" in text, True)
     check("显示看门狗次数", "第 3 次尝试" in text, True)
+
+    dead = dict(info)
+    dead.pop("pid"); dead.pop("working_set_gb")
+    text_dead = "\n".join(render_arm(dead))
+    check("已停的臂：明说不在跑了", "★已经不在跑了★" in text_dead, True)
+    check("已停的臂：不说「跑完」", "跑完）" in text_dead, False)
+    check("已停的臂：剩余步数照说", "剩 1791 步" in text_dead, True)
 
     bare = dict(info)
     bare.pop("scalars"); bare.pop("pid"); bare.pop("working_set_gb")
     text2 = "\n".join(render_arm(bare))
     check("没进程 → 明说", "没找到训练进程" in text2, True)
     check("没 tfevents → 明说", "还没有 tfevents" in text2, True)
-    check("降级后不冒充进度", "预计还需" in text2, False)
+    check("降级后不冒充进度", "预计还需" in text2 or "若继续跑还需" in text2, False)
 
     print("\n[10] select_arms：点名 / 活跃度过滤 / --all")
     with tempfile.TemporaryDirectory() as tmp:

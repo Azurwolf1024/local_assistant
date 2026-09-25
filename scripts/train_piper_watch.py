@@ -358,8 +358,12 @@ def render_arm(info: dict) -> list[str]:
             eta = ""
             if target and step < target:
                 seconds = (target - step) / rate * 60
-                eta = f"   预计还需 {human_duration(seconds)}" \
-                      f"（约 {(datetime.now() + timedelta(seconds=seconds)).strftime('%m-%d %H:%M')} 跑完）"
+                # ★进程已经停了就别假装还在跑★：速率是“当时”的，算出来的完成时间是不存在的
+                # （第一版就这样报了「预计还需 2.2 小时」——而那个臂两分钟前已经被关掉了）。
+                when = (datetime.now() + timedelta(seconds=seconds)).strftime('%m-%d %H:%M')
+                eta = (f"   若继续跑还需 {human_duration(seconds)}（约 {when} 跑完）"
+                       if info.get("pid") else
+                       f"   ★已经不在跑了★：剩 {target - step} 步，按停掉前的速率算要 {human_duration(seconds)}")
             lines.append(f"    速率 {rate * 60:.0f} 步/小时（{rate:.2f} 步/分）{eta}")
         # ★「最后更新」必须看最后一个标量的时间，不能看目录 mtime★：
         # 目录 mtime 只在增删文件时才变（比如存 checkpoint），训练一路写 events 它不动 ——
