@@ -17,7 +17,7 @@
 | 想干什么 | 去哪看 |
 | --- | --- |
 | 装起来、跑起来 | 下面第 3 节「安装」、第 4 节「使用」 |
-| **在网页上改日程/闹钟、看日志、试听声线** | 第 4 节里的「可视化控制台」 |
+| **在网页上改日程/闹钟、看日志、试听声线、打字聊天** | 第 4 节里的「可视化控制台」 |
 | 改配置 / 改唤醒词 / 加事件 | 第 5 节「两个可配置的 json」 |
 | 加一个角色 / 换音色 / 训专属声线 | 第 14 节「角色设定」 |
 | 出问题了 | 第 8 节「常见问题」 |
@@ -52,6 +52,11 @@ flowchart LR
     J -. 每句话都上屏 .-> O["底部字幕<br/>半透明、点得穿"]
     L -. 你按 Esc .-> P["打断：停播放<br/>清空剩余音频"]
     P -. 掐掉播放，把那句话交给下一轮 .-> B
+
+    R["🖥 可视化控制台（网页）<br/>python main.py ui<br/>独立进程 · 只监听 127.0.0.1"]
+    R -. 直接读写同一批 json（日程/闹钟/备忘） .-> H
+    R -. 文件信箱：由服务代跑<br/>念一句 / 切声线 / 文字对话 .-> I
+    R -. 只读跟随日志 .-> S["sessions/listen.log"]
 ```
 
 ### 1.1 两级加载（`listen` 常驻服务）
@@ -141,7 +146,7 @@ flowchart LR
 ```
 <项目目录>\
 ├─ main.py                     # 入口：listen / stop / chat / text / ask / see / skills / asr / tts
-│                              #       / devices / gpu / persona / mcp / selftest
+│                              #       / ui（可视化控制台）/ devices / gpu / persona / mcp / selftest
 ├─ config.toml                 # 全部可调参数
 ├─ requirements.txt            # 依赖（Python 3.13）
 ├─ data/                       # ← 可以直接用编辑器改
@@ -208,6 +213,13 @@ flowchart LR
 │  ├─ test_prepare_dataset.py  # ★ 数据集那一步的测试（切分 / 音量 / 文本清洗 …）
 │  ├─ finetune_zipvoice.py     # ★ 分步微调（--stage 1..8）：数据 → 训练 → 导出 → 安装 → 写 voice_model
 │  ├─ persona_voice.py         # ★ 一条龙：--list/--dry-run/--verify，把上面几步串起来
+│  ├─ prepare_piper_dataset.py # ★ 素材 → Piper 微调数据集（22050Hz + metadata.csv）
+│  ├─ prepare_piper_segments.py# ★ 长独白切短成一句一条（VAD 切段 + 标签按比例回到原文）
+│  ├─ test_prepare_segments.py # ★ 上一步的离线测试（不变量：各段标签拼起来 == 原文）
+│  ├─ train_piper.py           # ★ Piper 微调启动器（绕开厂商入口；含「文本比音频长」护栏）
+│  ├─ train_piper_forever.py   # ★ 训练看门狗：崩了自动从最近的 checkpoint 续跑
+│  ├─ export_piper_onnx.py     # ★ 微调 ckpt → ONNX（含新版 torch 导出器的兼容阶梯）
+│  ├─ piper_ab.py              # ★ Piper 声线 A/B：沙沙声 / RTF / 首声 + 本地 ASR 回听
 │  ├─ test_voice_model.py      # ★ 角色语音模型的选择与降级（按角色 / 按精度 / 缺了就回退）
 │  ├─ test_skills_route.py     # 技能路由 + 关屏 + 课表 + 提醒文案 + 重启不丢数据
 │  ├─ test_bargein.py          # ★ 打断：合成对照 + 真机回声自测（--echo）/ 回环（--live）
@@ -233,6 +245,7 @@ flowchart LR
 │  ├─ clean_junk_data.py       # 清理早期版本写坏的数据（备忘「录吗？」、事件标题「我」这类）
 │  ├─ check_deploy.py          # ★ 搬家/换系统前的只读自检（七类问题 + 怎么办）
 │  ├─ pick_voice_ref.py        # ★ 声线体检：毛不毛先看参考/素材，附参考候选与 2×2 交叉
+│  ├─ make_ref_join.py         # ★ 把几段素材拼成一条克隆参考（挑得慢就用它，确定性可重建）
 │  ├─ migrate_events.py        # ★ 把旧的 alarms+schedule 迁成统一事件表（**已迁完**，留着给历史数据）
 │  ├─ test_events.py           # ★ 事件层测试（发生时间 / 二维去重 / 到期 / 事件链 / 迁移）
 │  ├─ test_event_text.py       # ★ 文字层测试（一句话 ↔ 一条事件：标题 / 提前量 / 工作日 / 纯闹钟）
@@ -241,10 +254,12 @@ flowchart LR
 │  ├─ test_precision.py        # ★ 精度（int8/fp32）与平台降级的离线测试
 │  ├─ test_refclean.py         # ★ 参考净化 / 输出去嘶 / 电平对齐 / 压长停顿（纯离线）
 │  ├─ test_pitch.py            # ★ 基频跟踪与音区守卫的离线自检（滑音/谐波陷阱/静音，纯离线）
-  ├─ test_store_lock.py       # ★ 存储层跨进程写安全（两个真进程抢着改同一个文件）
-  ├─ test_control.py          # ★ 控制台信箱：原子认领 / 旧请求不执行 / 崩半路判失败 / 命令表
-  ├─ test_console.py          # ★ 控制台端到端（真起 HTTP：六个面板、日程备忘增删改、SSE、容错）
-  ├─ test_textcheck.py         # ★ 合成回听：数字归一 / 正常 1.000 vs 丢字 0.982 / 阈值判定（纯离线）
+│  ├─ test_store_lock.py       # ★ 存储层跨进程写安全（两个真进程抢着改同一个文件）
+│  ├─ test_control.py          # ★ 控制台信箱：原子认领 / 旧请求不执行 / 崩半路判失败 / 命令表
+│  ├─ test_console.py          # ★ 控制台端到端（真起 HTTP：六个面板、日程备忘增删改、SSE、容错）
+│  ├─ test_console_exit.py     # ★ 控制台能在终端里退出（网页开着几秒内退 / 端口被占时给人话）
+│  ├─ test_service_ctl.py      # ★ 启停服务：状态判定（旧 pid 文件、日志里的旧 pid）+ 真启停
+│  ├─ test_textcheck.py        # ★ 合成回听：数字归一 / 正常 1.000 vs 丢字 0.982 / 阈值判定（纯离线）
 │  ├─ pitch_report.py          # ★ 音区体检：哪条 wav 整体偏高/偏低，带靶子与「会被重采」标记
 │  ├─ ab_voice.py              # ★ 音质 A/B：沙沙声与语气连贯，配对多遍 + 写试听 wav
 │  ├─ say.py                   # 用扬声器念一句话（不想开口时测唤醒词用）
@@ -376,6 +391,10 @@ python main.py ui --no-browser     # 不自动开浏览器
 python main.py ui --host 0.0.0.0   # ★让同一局域网的手机也能看★（见下面「安全」）
 ```
 
+> 它要的两个额外依赖（`fastapi` / `uvicorn`）**已经写在 `requirements.txt` 里**，
+> 按第 3 节装完就有了；万一没装，`python main.py ui` 会把该跑的那行 `pip install` 直接打给你，
+> 而且**不装只影响控制台** —— 语音链路（`listen` / `chat` / `text`）完全不依赖它们。
+
 它有六个标签页：
 
 | 标签 | 能干什么 |
@@ -402,12 +421,17 @@ python main.py ui --host 0.0.0.0   # ★让同一局域网的手机也能看★�
   不需要你先点一下「停止」。停止通常要 **5~20 秒**（服务得优雅退出、释放模型和设备），按钮会先置灰提示正在停。
 - **在终端里按 Ctrl+C 就能退出控制台**，网页开着也不影响（以前会被那条实时连接拖住，
   必须先关网页——已修）；退出**不会**停掉语音服务，要停服务用 `python main.py stop`。
+- **端口被占用时会给一句人话**：如果 8765 上已经有一个控制台在跑，新起的那个会**立刻**告诉你
+  「端口 8765 已经有程序在听」并给三条出路（直接用已开着的那个 / `--port 8766` 换一个 /
+  怎么查是谁占着），退出码是 **2**；以前 uvicorn 只丢一行 `[Errno 10048]` 加一个「退出码 1」，
+  看不出发生了什么。
 
 **安全**：默认只监听 `127.0.0.1`（只有本机能访问），**没有登录也没有密码**——
 它就是个本机工具。填 `--host 0.0.0.0` 会让同一局域网里任何人**都能改你的日程**，自己权衡。
 
-> 想知道「加一个新标签页要动哪些文件」「为什么用文件信箱而不是 socket」，看
-> [`docs/ENGINEERING_LOG.md`](docs/ENGINEERING_LOG.md) 第 25 节。
+> 想知道「加一个新标签页要动哪些文件」「为什么用文件信箱而不是 socket」「启停/退出那两个
+> bug 是怎么修的」，看 [`docs/ENGINEERING_LOG.md`](docs/ENGINEERING_LOG.md)
+> 第 25 节（控制台）、第 27 节（启停状态）、第 28 节（终端退出 + 聊天选角色）。
 
 ### 能用语音做的事
 
@@ -1025,6 +1049,21 @@ python main.py skills
 加载 TTS 之前会先把你的下半句收进来，所以不会丢指令；
 Whisper 是后台加载（首次编译图约 18~40 秒，之后有缓存），期间用 SenseVoice 回答，
 完全不影响对话。
+
+**Q：`python main.py ui` 只打印了一个退出码 1 就没了**
+**最常见的原因是控制台端口被占用**（多半是**已经有一个控制台在跑**）。
+以前 uvicorn 撞端口时只打一行 `[Errno 10048]` 然后 `sys.exit(1)`，光看那个 1 什么也看不出来；
+现在它会直接说人话并给三条出路：
+
+```
+★端口 8765 已经有程序在听★ —— 多半是**已经有一个控制台在跑**。
+  ① 先用浏览器打开现有那个：http://127.0.0.1:8765/
+  ② 确实要再起一个 → 换个端口：python main.py ui --port 8766
+  ③ 想看是谁占着 → PowerShell: Get-NetTCPConnection -LocalPort 8765 | Select-Object OwningProcess
+```
+
+（退出码是 `2`，和「参数写错」一致；两个控制台同时开也不会更安全，它们改的是同一批 json。）
+如果它没有打印这句就退了，那说明是别的原因 —— 把窗口里剩下的几行贴出来，真正的原因会在那里。
 
 **Q：常驻服务占多少内存**
 待唤醒约 **0.9 GB**（只跑 VAD + SenseVoice）；被唤醒后峰值约 2.5 GB，再加 Ollama 的
