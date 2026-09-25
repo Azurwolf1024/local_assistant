@@ -36,6 +36,7 @@ from ..manifest import manifest_pairs
 from ..settings import Settings
 from . import pitch as pitchkit
 from . import refclean as rc
+from . import textcheck
 from .pacing import LevelMatcher, PacingFixer
 from .precision import (
     DEFAULT_PRECISION,
@@ -220,6 +221,9 @@ class ZipVoiceTts:
         self._ref_f0: float | None = None
         # 最近几句**被接受**的音区（靶子用它的中位，见 pitch_target 的注释）
         self._pitch_recent: deque[float] = deque(maxlen=9)
+        # 文本保真守卫：由外部注入一个校验器（见 set_text_verifier / voice_loop/tts/textcheck.py）
+        self._text_guard_min = max(0.0, float(getattr(cfg, "text_guard_min", 0.0) or 0.0))
+        self._text_verifier = None
 
         # 参考音频（音色）
         self._ref_audio: np.ndarray | None = None
@@ -623,7 +627,9 @@ class ZipVoiceTts:
             return
         gen = self._gen_config()
         target, limit = pitch_target(self._pitch_recent, self._ref_f0, self._pitch_guard_st)
-        tries = self._pitch_guard_tries if (limit > 0 and target) else 1
+        want_text = self._text_verifier is not None and self._text_guard_min > 0
+        guarded = (limit > 0 and target) or want_text
+        tries = self._pitch_guard_tries if guarded else 1
         dev: float | None = None
         produced = False
         for attempt in range(tries):
@@ -632,15 +638,23 @@ class ZipVoiceTts:
             if first is None:
                 break
             med: float | None = None
-            if tries > 1:
+            ratio: float | None = None
+            if guarded:
                 med = pitchkit.f0_median(first[1], self._rate)
-                dev = pitchkit.semitone(med, target) if med else None
-            if pitch_guard_verdict(dev, limit, attempt, tries):
-                print(
-                    f"[tts] 这一遍整句音区偏了 {dev:+.1f} 半音（靶子 {target:.0f}Hz），"
-                    f"重采第 {attempt + 2} 遍…",
-                    flush=True,
-                )
+                # ★target 可能是 None★（参考音没量到 F0，而文本守卫单独开着）：
+                # 那时没有靶子可比，dev 只能空着，交给文本守卫去判。
+                dev = pitchkit.semitone(med, target) if (med and target) else None
+                if want_text:
+                    ratio = self._text_verifier(text, first[1], self._rate)
+            bad_pitch = pitch_guard_verdict(dev, limit, attempt, tries)
+            bad_text = textcheck.text_guard_verdict(ratio, self._text_guard_min, attempt, tries)
+            if bad_pitch or bad_text:
+                why = []
+                if bad_pitch:
+                    why.append(f"音区偏 {dev:+.1f} 半音（靶子 {target:.0f}Hz）")
+                if bad_text:
+                    why.append(f"文本相似度只有 {ratio:.3f}（少于 {self._text_guard_min:g}）")
+                print(f"[tts] 这一遍{'、'.join(why)}，重采第 {attempt + 2} 遍…", flush=True)
                 for _ in pieces:  # ★把这一遍抽干★：同一个引擎上并发跑两次不保险
                     pass
                 continue
@@ -657,9 +671,22 @@ class ZipVoiceTts:
                 f"[tts] 音区还是偏 {dev:+.1f} 半音（重采到上限了），先用这一遍出声",
                 flush=True,
             )
+        if ratio is not None and ratio < self._text_guard_min:
+            print(
+                f"[tts] ★这一遍可能没把字念全（相似度 {ratio:.3f}）★，重采到上限了，先用它出声",
+                flush=True,
+            )
         join = self._pause_after(text)
         if join.size:
             yield self._rate, join
+
+    def set_text_verifier(self, fn) -> None:
+        """注入「这段话到底说的是不是这句」的校验器：``fn(text, pcm, rate) -> 相似度|None``。
+
+        为什么不让引擎自己去调 ASR：这个模块不该依赖 ASR（有人只想用 TTS）。
+        管线（``pipeline``）拿着 ASR，就在它那里接（见 ``_wire_text_guard``）。
+        """
+        self._text_verifier = fn
 
     def _remember_register(self, med: float | None) -> None:
         """把这一句的音区记进基准（第一句会打印一行，方便回查）。"""

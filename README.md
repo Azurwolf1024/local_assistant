@@ -185,6 +185,7 @@ flowchart LR
 │  ├─ asr/                     # base.py（接口）/ sensevoice.py（快）/ whisper_ov.py（准）/ router.py
 │  └─ tts/                     # base.py（接口）/ piper_tts.py（快）/ zipvoice_tts.py（音色克隆）
 │                              # lazy.py（按需加载）/ pacing.py（停顿与断句）/ refclean.py（参考净化+去嘶声）
+│                              # ★ textcheck.py（合成回听：丢了字自动重采）/ pitch.py（音区量尺+守卫）
 │                              # precision.py（int8/fp32 选哪份模型）
 ├─ scripts/
 │  ├─ download_models.py       # 一键下载模型
@@ -230,6 +231,7 @@ flowchart LR
 │  ├─ test_precision.py        # ★ 精度（int8/fp32）与平台降级的离线测试
 │  ├─ test_refclean.py         # ★ 参考净化 / 输出去嘶 / 电平对齐 / 压长停顿（纯离线）
 │  ├─ test_pitch.py            # ★ 基频跟踪与音区守卫的离线自检（滑音/谐波陷阱/静音，纯离线）
+  ├─ test_textcheck.py         # ★ 合成回听：数字归一 / 正常 1.000 vs 丢字 0.982 / 阈值判定（纯离线）
 │  ├─ pitch_report.py          # ★ 音区体检：哪条 wav 整体偏高/偏低，带靶子与「会被重采」标记
 │  ├─ ab_voice.py              # ★ 音质 A/B：沙沙声与语气连贯，配对多遍 + 写试听 wav
 │  ├─ say.py                   # 用扬声器念一句话（不想开口时测唤醒词用）
@@ -913,6 +915,18 @@ python main.py skills
 > 代价：触发的那句多花一遍合成时间（实测阿米娅 1/6 的句子）。
 > 量自己的音频：`python scripts/pitch_report.py --ref data/personas/<id>/<参考>.wav sessions\*.wav`；
 > 完整推导见 [`docs/ENGINEERING_LOG.md`](docs/ENGINEERING_LOG.md) 第 19 节。
+>
+> **★内容保真：丢了字会自动重采★**（`text_guard_min`，默认 **0.99**，0 = 关）。
+> 采样生成偶尔会把「排好了」的「了」吞掉——**说的就不是那句话了**，比沙沙声严重。
+> 现在合成完会**拿本地 ASR（只说快路径 SenseVoice）回听一遍**，跟要念的文本比，
+> 低于阈值就丢掉重采（复用 `pitch_guard_tries` 的重采上限，最坏多花一遍时间；
+> 回听本身 RTF 0.014，6 秒音频约 0.1 s）。
+> ★比之前必须先**把中文数字归一成 ASCII**★：ASR 的 ITN 会把「九」写成 9，
+> 不归一的话正常合成也只有 0.93，跟丢字的 0.909 混在一起、根本没法定阈值；
+> 归一之后**正常 = 1.000、丢字 = 0.982**，0.99 分得很开（实测 9 遍 + 24 遍旧素材无误差）。
+> 局限：ASR 可能把小的吞字自己「补回来」→ 会漏报、很少误报；需要 `enable_listening = true`。
+> 自检：`python scripts/test_textcheck.py`；控制流探针：`python sessions\probe_text_guard.py`。
+> 详见 [`docs/ENGINEERING_LOG.md`](docs/ENGINEERING_LOG.md) 第 24.3 节。
 
 ## 7. 实测性能（要换机器 / 换模型先看这个）
 

@@ -45,6 +45,7 @@ from .tools import (
     reroute_correction,
 )
 from .tts import create_tts
+from .tts.zipvoice_tts import _resample
 from .tts import precision
 from . import ui
 from .wake import WakeSession, WakeWordMatcher, is_standby
@@ -131,6 +132,8 @@ class VoiceLoop:
         self.speaker = Speaker(settings)
         self.llm = OllamaClient(settings.llm)
         self.tts = create_tts(settings, self.log, lazy=self.lazy)
+        # ★合成回听★：有 ASR 就把「说的是不是这句」的校验器接上去（见 textcheck.py）
+        self._wire_text_guard()
         # ★角色声线的「默认值」快照★：切角色时用角色自己的，切回来时得能回默认，
         # 否则一个角色换过模型/声线后，另一个没配声线的角色会跟着沿用她
         self._base_voice = str(getattr(settings.tts, "voice", "") or "")
@@ -914,6 +917,43 @@ class VoiceLoop:
             if callable(configure):  # 已经加载了就当场换；没加载等下次加载自然生效
                 configure(lambda engine: engine.set_reference(want, text))
             self.log.info(f"[角色] 参考音色 → {want}（{reason or '切换'}）")
+
+    def _wire_text_guard(self) -> None:
+        """把「合成回听」的校验器接给 TTS（见 voice_loop/tts/textcheck.py）。
+
+        为什么放在管线里：ASR 是管线的资源，TTS 不该依赖它（有人只想用 TTS）。
+        ★只走 SenseVoice 快路径★（``prefer="sensevoice"``）：hybrid 策略会再跑一遍
+        Whisper，那是给「没听清的用户语音」用的，不是给回听自己合成音的。
+        """
+        cfg = self.settings.tts
+        min_ratio = float(getattr(cfg, "text_guard_min", 0.0) or 0.0)
+        if min_ratio <= 0 or self.asr is None:
+            return
+        from .tts.textcheck import similarity  # noqa: PLC0415
+
+        def verify(text: str, pcm, rate: int) -> float | None:
+            try:
+                audio = np.asarray(pcm, dtype=np.float32)
+                if audio.size == 0:
+                    return None
+                if audio.dtype != np.float32 and np.max(np.abs(audio), initial=0.0) > 2.0:
+                    audio = audio.astype(np.float32) / 32768.0
+                if int(rate) != 16000:
+                    audio = _resample(audio, int(rate), 16000)
+                heard = self.asr.transcribe(audio, 16000, prefer="sensevoice").text
+                if not heard.strip():
+                    return None      # 没听出东西 = 判不了，别因此重采
+                return similarity(text, heard)
+            except Exception as exc:  # noqa: BLE001 - 校验失败绝不能影响出声
+                self.log.warning(f"合成回听失败（{exc}）——这一轮不做文本校验")
+                return None
+
+        configure = getattr(self.tts, "configure", None)
+        if callable(configure):
+            configure(lambda engine: engine.set_text_verifier(verify))
+        elif hasattr(self.tts, "set_text_verifier"):
+            self.tts.set_text_verifier(verify)
+        self.log.info(f"TTS 文本保真守卫已开（相似度 < {min_ratio:g} 就重采）")
 
     def _missing_voice_model(self, path) -> list[str]:
         """角色的声音模型目录缺哪些文件（空列表 = 齐了）。
