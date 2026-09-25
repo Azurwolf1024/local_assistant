@@ -218,6 +218,8 @@ flowchart LR
 │  ├─ test_prepare_segments.py # ★ 上一步的离线测试（不变量：各段标签拼起来 == 原文）
 │  ├─ train_piper.py           # ★ Piper 微调启动器（绕开厂商入口；含「文本比音频长」护栏）
 │  ├─ train_piper_forever.py   # ★ 训练看门狗：崩了自动从最近的 checkpoint 续跑
+│  ├─ train_piper_watch.py     # ★ 训练看板：终端实时刷新（步数/loss/速率/ETA/可用内存）
+│  ├─ test_train_watch.py      # ★ 上一步的离线测试（版本排序 / 速率 / 进程归属 / 降级渲染）
 │  ├─ export_piper_onnx.py     # ★ 微调 ckpt → ONNX（含新版 torch 导出器的兼容阶梯）
 │  ├─ piper_ab.py              # ★ Piper 声线 A/B：沙沙声 / RTF / 首声 + 本地 ASR 回听
 │  ├─ test_voice_model.py      # ★ 角色语音模型的选择与降级（按角色 / 按精度 / 缺了就回退）
@@ -1621,6 +1623,16 @@ python scripts/ab_clone_model.py
 > 要编 `monotonic_align`、`pytorch-lightning==1.9.5`、ckpt 里带 PosixPath …）：
 > 踩坑与命令全部记在工程日志第 23 节，启动器 `scripts/train_piper.py`，
 > 数据准备 `scripts/prepare_piper_dataset.py`。
+>
+> **训练跑起来之后怎么看进度**：`python scripts/train_piper_watch.py` —— 终端看板，实时刷新，
+> 一眼看到「步数 / loss / 速率 / 预计完成时间 + **可用内存**」。为什么必须单独做看板：
+> `train_piper.py` 关掉了 Lightning 的进度条（`enable_progress_bar=False`），关掉之后
+> **日志里就没有逐步 loss 了**（`sessions/train_*_watchdog.log` 只有启动那几行）——
+> 进度只存在于 tfevents 里。而且本机训练**唯一**的崩因是内存不足（写 checkpoint 时
+> `0xC0000005`，没有 traceback），所以看板把可用内存摆在最显眼处，**低于 3 GB 就报警**。
+> 可选参数：`--once` 只看一眼、`-i 30` 改刷新间隔、`--arms A,B` 只看某几支、`--all` 连不活跃的实验目录一起看。
+> 想要曲线图：`.venv-piper\Scripts\tensorboard.exe --logdir data\piper`，再开 http://localhost:6006 。
+> 读 tfevents 要 tensorboard（**只装在 `.venv-piper` 里**）→ 用系统 python 启动时脚本会**自动换成那个解释器**。
 
 ### 从清单文件导入台词（只添加，不替换）
 

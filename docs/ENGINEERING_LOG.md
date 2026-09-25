@@ -2662,3 +2662,52 @@ RuntimeError: [enforce fail at inline_container.cc:672] . unexpected pos 6511459
 - 9/24 那份已经公开了约 5 天：搜索引擎、缓存、别人的 clone 都管不着。
   → **重写历史不能"召回"已经泄漏的内容，只能阻止它继续存在。**
 
+## 32. 训练进度看板 `scripts/train_piper_watch.py`（2026-09-25 用户要「给我也留一个监看训练进度的终端」）
+
+**为什么不能直接用日志**（这是做它的真正原因，不是顺手写个小工具）：
+`train_piper.py` 建 Trainer 时写了 `enable_progress_bar=False`（CPU 训练，进度条刷屏没意义），
+而 Lightning 在**关掉进度条之后也不再逐行打印 loss** —— 于是
+`sessions/train_A_watchdog.log` 里**只有启动那几行**（模型结构、参数量、dataloader 警告），
+`Get-Content -Tail` 一看完全不知道跑到哪了。**进度只存在于 tfevents**
+（`<out>/lightning_logs/version_*/events.out.tfevents.*`）。
+而 tensorboard **只装在 `.venv-piper` 里** → 脚本发现当前解释器没有它，就 `os.execv`
+换成 `.venv-piper\Scripts\python.exe` **重跑自己**，所以用系统 python 直接跑也能用
+（`--no-reexec` 可关掉这个行为）。
+
+**看板要回答的四个问题，以及各自的坑**：
+
+1. **跑到哪了** —— 本轮 `version_N` 的 step/epoch + 目标。目标不是写死的，是从训练日志里那句
+   「训练样本 24 条 → 每 epoch 6 步；共 300 epoch ≈ 1800 步」正则抠出来的（各臂 epoch 数不同）。
+   ★坑：`sorted()` 按名字排，`version_10` 会排在 `version_9` **前面**★（字符串比较），
+   看板于是会显示一个早就死掉的旧目录 → 改成按「编号 + mtime」排（`version_key()`，有测试）。
+2. **还剩多久** —— 用 tfevents 里**事件自带的 wall_time** 算步/分（**不能用 `now`**：
+   tfevents 是攒着写的，拿 now 算会把速度算低），再乘剩余步数。
+   ★单位也踩了一次★：第一版把「步/小时」和「步/分」的换算写反了（显示 0.077 步/分、实际 5.0）。
+3. **还活着吗** —— ★**不能用目录 mtime**★：只有增删文件（存 checkpoint）时目录 mtime 才变，
+   训练一路写 events 它不动 —— 第一版照它显示「本轮目录 42 分钟前更新」，而训练一直在跑。
+   改成「**最后一个标量 X 前**」。顺带用 PowerShell 的 CIM 查 python 进程（本机没有 psutil，
+   也**不想为看个进度**给训练环境加依赖）。
+4. **会不会崩** —— 可用内存，见下。
+
+**★进程归属的坑（真会发生）★**：看门狗 `train_piper_forever.py` 与它拉起的
+`train_piper.py`，**命令行里都带 `--out ...\exp_A`** —— 取第一个匹配就会显示看门狗的 20 MB，
+而真正占内存、会因内存不足崩掉的是训练子进程（几个 GB）。
+→ 匹配到多个时取**工作集最大**的那个（`match_process()`，有测试）。
+
+**内存摆在最显眼处**：本机训练唯一的崩因就是它（§30.11：`_atomic_save` 把整个 ckpt
+序列化进内存缓冲，失败时要么 `MemoryError`、要么在 C++ 里 `0xC0000005`）。
+看板可用内存低于 3 GB 直接打 `★★太低了：存档时会硬崩★★`，低于 5 GB 提示「偏低」。
+**第一次试跑就当场命中：可用内存 2.8 GB**（两支训练同时在跑）—— 这正是要它干的事。
+
+**其他**：
+
+- `--once` 只看一眼、`-i 30` 改刷新间隔、`--arms A,B` 只看某几支、`--all` 连不活跃的一起看。
+  默认只显示**最近 3 小时活跃过**的实验目录：`data/piper/*/exp_*` 下已经有十几支一次性实验
+  （`exp_probe`/`exp_steptrace`/`exp_sub_2`…），全列出来是噪音。
+- `sessions/train_status.py`（旧的一次性脚本）改成**转发入口**（`os.execv` 调新脚本），
+  **一行实现都不复制** —— 两份实现必然漂移（这个项目在 `precision.py` 上已经吃过一次亏）。
+- 测试 `scripts/test_train_watch.py`（10 节 40 条断言，已进 `sessions/run_tests.cmd`，
+  全套 **28** 个脚本全 0）。它挡的正是上面四个坑：版本排序、速率（含除零与「时间没前进」）、
+  **进程归属挑内存大的**、以及**降级渲染不许冒充进度**。
+- 曲线图：`.venv-piper\Scripts\tensorboard.exe --logdir data\piper` → http://localhost:6006 。
+
