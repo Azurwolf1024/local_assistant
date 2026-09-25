@@ -527,6 +527,19 @@ class EventStore:
     def path(self) -> Path:
         return self._store.path
 
+    @property
+    def lock_path(self) -> Path:
+        """跨进程锁文件（控制台 UI 是另一个进程，改同一份 events.json）。"""
+        return self._store.lock_path
+
+    def locked(self):
+        """跨进程互斥锁（见 ``JsonStore.locked``）。
+
+        ★为什么必须用★：本层是「读全部 → 改一条 → 写全部」，而提醒线程也在做同样的事
+        （``due_now`` 回写 ``state.fired``）。两个进程各持一份快照时后写的会静默盖掉前一个。
+        """
+        return self._store.locked()
+
     def ensure(self) -> None:
         """确保文件存在（首次运行生成一个空数组）。"""
         self._store.ensure()
@@ -576,10 +589,11 @@ class EventStore:
 
     def update_by_id(self, eid: Any, **fields: Any) -> dict | None:
         """按 id 改一条（id 是唯一的，比「序号」稳）。"""
-        for index, item in enumerate(self.load(), start=1):
-            if str(item.get("id")) == str(eid):
-                return self.update(index, **fields)
-        return None
+        with self.locked():
+            for index, item in enumerate(self.load(force=True), start=1):
+                if str(item.get("id")) == str(eid):
+                    return self.update(index, **fields)
+            return None
 
     def by_id(self, eid: Any) -> dict | None:
         return next((it for it in self.load() if str(it.get("id")) == str(eid)), None)
@@ -610,11 +624,14 @@ class EventStore:
 
     # ------------------------------------------------------------ 到期封装
     def due_now(self, now: datetime) -> list[tuple[dict, datetime, int]]:
-        items = self.load()
-        got = due(items, now, self.default_lead)
-        if got:
-            self.save(items)      # due() 已经就地写回了 state.fired
-        return got
+        # ★整段持锁★：due() 会就地回写 state.fired，如果另一进程在这中间改了别的条目，
+        # 我们这份快照一回写就把它的改动盖掉了（实测过的静默丢数据）。
+        with self.locked():
+            items = self.load(force=True)
+            got = due(items, now, self.default_lead)
+            if got:
+                self.save(items)      # due() 已经就地写回了 state.fired
+            return got
 
     def pending_context(self, now: datetime | None = None) -> dict[str, Any]:
         """给「A 结束之后才提醒 B」类问题做报告：谁被挡着、为什么。"""

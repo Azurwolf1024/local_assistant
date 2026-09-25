@@ -27,7 +27,6 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import re
 import subprocess
 import sys
 import time
@@ -37,6 +36,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from voice_loop.audio import list_devices, load_wav, save_wav, segment_audio  # noqa: E402
+from voice_loop import service_ctl  # noqa: E402
 from voice_loop.settings import Settings, load_settings  # noqa: E402
 
 LOG_LEVELS = {"debug": logging.DEBUG, "info": logging.INFO, "warning": logging.WARNING}
@@ -134,29 +134,12 @@ def build_loop(
 
 # --------------------------------------------------------------------------- #
 # 进程工具（后台运行用）
+# ★实现下沉到 voice_loop/service_ctl.py★：控制台 UI 是另一个进程，也要查状态/启停服务，
+# 而它不该为了这点事去 import main（会连带加载 numpy / sounddevice）。
+# 这里保留同名别名，免得改散落到各处的调用点（也保证只有一份实现）。
 # --------------------------------------------------------------------------- #
-def _pid_alive(pid: int) -> bool:
-    if os.name != "nt":
-        try:
-            os.kill(pid, 0)
-            return True
-        except OSError:
-            return False
-    import ctypes
-
-    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-    STILL_ACTIVE = 259
-    kernel32 = ctypes.windll.kernel32
-    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
-    if not handle:
-        return False
-    try:
-        code = ctypes.c_ulong()
-        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
-            return False
-        return code.value == STILL_ACTIVE
-    finally:
-        kernel32.CloseHandle(handle)
+_pid_alive = service_ctl.pid_alive
+_pid_from_log = service_ctl.pid_from_log
 
 
 def write_pid(settings: Settings, pid: int | None = None) -> Path:
@@ -291,16 +274,8 @@ def _spawn_background(settings: Settings, args: argparse.Namespace, log_file: Pa
 
 
 def _pid_from_log(settings: Settings) -> int | None:
-    """pid 文件丢了时，从日志里最后一条「PID=xxxx」恢复。"""
-    log_file = settings.resolve(settings.wake.log_file)
-    if not log_file.exists():
-        return None
-    try:
-        text = log_file.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
-    matches = re.findall(r"PID=(\d+)", text)
-    return int(matches[-1]) if matches else None
+    """（已下沉到 service_ctl；这里不再重复实现——见本文件顶部别名）"""
+    return service_ctl.pid_from_log(settings)
 
 
 def cmd_stop(settings: Settings, args: argparse.Namespace) -> int:
