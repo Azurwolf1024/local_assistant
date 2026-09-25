@@ -11,6 +11,11 @@ venv/
 .zipvoice-src/
 # 微调数据集（从 data/personas/kaltsit 重新生成即可）
 data/finetune/
+# Piper 微调（路线 C，见工程日志第 23 节）：数据集与底模/checkpoint 都能重建，不进 git
+data/piper/
+models/tts/piper/_train/
+models/tts/piper/*.ckpt
+models/tts/piper/*.pth
 build/
 dist/
 .pytest_cache/
