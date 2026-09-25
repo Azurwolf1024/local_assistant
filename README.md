@@ -1489,6 +1489,19 @@ python scripts/persona_voice.py --persona kaltsit --dry-run # 只打印会做什
 > 否则也会变成她的声音（没配的角色走 `[tts] clone_dir` 的默认模型，不受影响）。
 > 这也正是「按角色配模型」的意义——每个角色各用各的 `voice_model`。
 
+> **另一条路（Piper 专属声线）实测结论：5 分钟素材训不出来，别走**（2026-09-26）。
+> 60 epoch / lr 1e-4 训完之后，音区确实更接近参考音了（187 Hz vs 出厂 209 Hz，参考 180 Hz），
+> **但话说不清了**——两个独立 ASR（SenseVoice / Whisper）回听同一句，相似度只有 0.54~0.94
+> （出厂 Piper 是 0.958~1.000，ZipVoice 是 1.000）。数据集格式、底模权重搬运、素材量
+> 都已逐项排查过：**不是代码错，是「5 分钟素材」这个量级下 VITS 会崩**。
+> 想要专属音色，请用上面那条 ZipVoice 的流程，或者再攒 10~20 分钟素材。
+> 完整数据在 [`docs/ENGINEERING_LOG.md`](docs/ENGINEERING_LOG.md) 第 26 节。
+>
+> 顺带一个**值得知道的选项**：**出厂 Piper 本身没有沙沙声、而且快 15~20 倍**
+> （安静帧高频占比 0.1% vs ZipVoice 0.8%；RTF 0.07 vs 1.18；首声 0.18 秒 vs 3.6 秒），
+> 代价是音色换成 huayan 的女声。要试就把 `[tts] backend` 改回 `piper`。
+
+
 训练规模按「目标 epoch 数」自动换算（`--epochs`，默认 20）：实测 **283 秒素材 ÷ 每批最多 60 秒
 ≈ 4.7 批/epoch**，所以 100 iter ≈ 21 epoch。实测速度见下表。
 
