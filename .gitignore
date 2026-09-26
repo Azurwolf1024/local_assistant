@@ -85,7 +85,7 @@ data/vision/
 #   删掉本地文件就等于失忆，但删错了也回不来，所以宁可它不在版本库里。
 data/memory/
 
-# 你放进去的知识库资料：模板只留说明，别的都当私人资料挡在外面。
+# 你放进去的知识库资料：说明文件（下划线开头）只留模板，别的都当私人资料挡在外面。
 # （想公开某一本，就 `git add -f data/knowledge/xxx.md` 显式加。）
 data/knowledge/*
-!data/knowledge/README.md
+!data/knowledge/_README.md

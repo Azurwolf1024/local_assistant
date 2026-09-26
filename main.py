@@ -1195,7 +1195,20 @@ def cmd_memory(settings: Settings, args: argparse.Namespace) -> int:
     if not getattr(settings, "memory", None) or not settings.memory.enabled:
         print("记忆功能关着（config.toml 的 [memory] enabled = false）—— 打开它才能用。")
         return 1
-    hub = MemoryHub(settings, schedule=SharedSchedule(settings))
+
+    # ★角色级知识库也要接上★：不接的话命令行看不到「世界观组 / 专属资料」那两层
+    # （共享那层能看，因为它跟角色无关）—— 助手那边由 pipeline 注入，这里得自己接。
+    def _knowledge_spec(char_id: str) -> dict:
+        try:
+            from voice_loop.persona import CharacterRegistry, knowledge_spec_for
+
+            registry = CharacterRegistry(settings.resolve(settings.persona.file))
+            return knowledge_spec_for(registry, char_id)
+        except Exception:  # noqa: BLE001 - 角色文件坏了就当「只有共享库」
+            return {"paths": [], "worlds": [], "world": "", "title": "", "shared": True}
+
+    hub = MemoryHub(settings, schedule=SharedSchedule(settings),
+                    character_knowledge=_knowledge_spec)
     # ★默认角色必须跟助手一致★：它用的是 characters.json 索引里的 default，
     # 只看 `[persona] default`（通常是空的）会落到 "default" 目录 →
     # 命令行记的东西和助手记的东西分家（实打实踩过）。

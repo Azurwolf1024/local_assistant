@@ -55,6 +55,8 @@ def check_text(name: str, condition, text: str) -> None:
 BAIZE_WORD = "白泽纹章"        # 只应出现在白泽的世界观里
 KALTSIT_WORD = "罗德岛病房"     # 只应出现在凯尔希的世界观里
 SHARED_WORD = "这台机器的主人叫阁下"   # 共享资料，谁都该看到
+WORLD_WORD = "源石"            # ★世界观组：挂了「明日方舟」的角色共享★
+ARKS = "明日方舟"
 
 
 def make_world(tmp: Path):
@@ -62,12 +64,16 @@ def make_world(tmp: Path):
     kn = tmp / "knowledge"
     (kn / "baize").mkdir(parents=True)
     (kn / "kaltsit").mkdir(parents=True)
+    (kn / "_worlds" / ARKS).mkdir(parents=True)          # ★同一个 IP 共享的那份★
     (kn / "共享说明.md").write_text(f"# 共享说明\n\n{SHARED_WORD}，用中文跟他说话。\n",
                                     encoding="utf-8")
+    (kn / "_说明.md").write_text("# 说明\n\n这份是给人看的，不该被当成知识。\n", encoding="utf-8")
     (kn / "baize" / "世界观.md").write_text(f"# 白泽的世界\n\n白泽是瑞兽，{BAIZE_WORD}是它的凭证。\n",
                                             encoding="utf-8")
     (kn / "kaltsit" / "世界观.md").write_text(f"# 罗德岛\n\n{KALTSIT_WORD}在三层，她是医疗主管。\n",
                                               encoding="utf-8")
+    (kn / "_worlds" / ARKS / "泰拉.md").write_text(
+        f"# 泰拉\n\n{WORLD_WORD}是整个世界观的基础设定。\n", encoding="utf-8")
 
     personas = tmp / "personas"
     personas.mkdir()
@@ -78,8 +84,9 @@ def make_world(tmp: Path):
     }, ensure_ascii=False), encoding="utf-8")
     (personas / "kaltsit.json").write_text(json.dumps({
         "id": "kaltsit", "name": "凯尔希", "user_title": "博士",
-        # ★这个角色连共享那份也不看★（全隔离）
+        # ★这个角色连共享那份也不看★（全隔离）；但世界观组是它自己挂的，照用
         "knowledge_shared": False,
+        "worlds": [ARKS],
     }, ensure_ascii=False), encoding="utf-8")
     (personas / "amiya.json").write_text(json.dumps({
         "id": "amiya", "name": "阿米娅",
@@ -87,6 +94,7 @@ def make_world(tmp: Path):
         "knowledge": ["knowledge/共享说明.md"],
         "world": "阿米娅是罗德岛的领袖，年纪不大但很坚定。",
         "knowledge_title": "阿米娅的世界观",
+        "worlds": [ARKS],            # ★同一个世界观，不用把设定拷到她名下★
     }, ensure_ascii=False), encoding="utf-8")
 
     index = tmp / "characters.json"
@@ -328,6 +336,52 @@ def test_cross_character(tmp: Path) -> None:
     check_text("中文写法『全部角色』也认", "导师" in out, out)
 
 
+def test_shared_world(tmp: Path) -> None:
+    print("\n[9] ★同一个 IP 的角色共享世界观★（一份文件，不用拷到每个人名下）")
+    settings, registry, kn = make_world(tmp)
+    hub = make_hub(settings, registry)
+
+    kaltsit = texts(hub.knowledge_for("kaltsit"))
+    amiya = texts(hub.knowledge_for("amiya"))
+    baize = texts(hub.knowledge_for("baize"))
+    check_text("凯尔希拿到世界观（她挂了明日方舟）", WORLD_WORD in kaltsit, kaltsit[:80])
+    check_text("★阿米娅也拿到同一份★（两人共享一份文件）", WORLD_WORD in amiya, amiya[:80])
+    check_text("白泽没挂 → 拿不到明日方舟的设定", WORLD_WORD not in baize, baize[:80])
+    check("共享一份文件：两人看到的是同一个来源",
+          [c.source for c in hub.knowledge_for("kaltsit").chunks() if WORLD_WORD in c.text]
+          == [c.source for c in hub.knowledge_for("amiya").chunks() if WORLD_WORD in c.text], True)
+
+    check("stats 里能看出这是世界观那一层",
+          [k for k in hub.knowledge_for("kaltsit").stats() if k.startswith("local:world:")],
+          [f"local:world:{ARKS}"])
+    check("凯尔希做到了三层叠加（世界观 + 自己 + 关掉了共享）",
+          ("local:world:" + ARKS in hub.knowledge_for("kaltsit").stats()
+           and "local:kaltsit" in hub.knowledge_for("kaltsit").stats()
+           and "local" not in hub.knowledge_for("kaltsit").stats()), True)
+    check("凯尔希检索得到世界观里的词", bool(hub.for_character("kaltsit").recall(WORLD_WORD)), True)
+    check("★白泽检索不到（世界观组不泄给别人）★", hub.for_character("baize").recall(WORLD_WORD), [])
+
+    # 挂两个世界观 + 世界观目录可以后建（下一次取就生效）
+    (kn / "_worlds" / "联动").mkdir()
+    (kn / "_worlds" / "联动" / "活动.md").write_text("# 联动\n\n这次联动有共同剧情。\n", encoding="utf-8")
+    raw = json.loads((tmp / "personas" / "amiya.json").read_text(encoding="utf-8"))
+    raw["worlds"] = [ARKS, "联动"]
+    (tmp / "personas" / "amiya.json").write_text(json.dumps(raw, ensure_ascii=False),
+                                                encoding="utf-8")
+    # ★人格文件的改动要先热加载★（生产里是 pipeline 每轮调 maybe_reload；
+    #   hub 每次取知识库都会重读「说明书」，所以热加载之后下一句话就生效）
+    registry.maybe_reload()
+    amiya2 = texts(hub.knowledge_for("amiya"))
+    check_text("★可以挂多个世界观★（后加的那个下一句话就生效）", "共同剧情" in amiya2, amiya2[:80])
+    check_text("凯尔希没挂那个 → 看不到", "共同剧情" not in texts(hub.knowledge_for("kaltsit")),
+               texts(hub.knowledge_for("kaltsit"))[:80])
+
+    check("下划线开头的说明文件不当知识（顶层）",
+          "这份是给人看的" not in texts(hub.knowledge_for("baize")), True)
+    check("下划线开头的目录不当知识（_worlds 不会当成角色）",
+          "_worlds" not in [k for k in hub.knowledge_for("baize").stats()], True)
+
+
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="memory_mcp_"))
     try:
@@ -339,6 +393,7 @@ def main() -> int:
         test_mcp_tools(tmp / "f")
         test_standalone_fallback(tmp / "g")
         test_cross_character(tmp / "h")
+        test_shared_world(tmp / "i")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print()

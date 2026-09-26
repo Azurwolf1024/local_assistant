@@ -106,8 +106,12 @@ class LocalFilesProvider:
     """扫目录里的文本文件（`.md` / `.txt` / `.json`），带 mtime 缓存。
 
     ★`skip_subdirs` 是「角色隔离」的关键★：共享知识库只收**顶层文件**，
-    子目录按约定属于某个角色（`data/knowledge/<角色id>/`），
-    否则共享库会把所有人的专属世界观一起卷进来 —— 那就无所谓隔离了。
+    子目录按约定属于某个角色（`data/knowledge/<角色id>/`）或一个世界观组
+    （`data/knowledge/_worlds/<世界观>/`），否则共享库会把所有人的专属设定一起卷进来 ——
+    那就无所谓隔离了。
+
+    ★下划线开头的不当知识★（任何一层都适用）：`_README.md`、`_worlds/` 这种是**结构**，
+    不是给模型读的正文。没有这条，一份使用说明会被当成世界观检索出来。
     """
 
     name: str = "local"
@@ -123,13 +127,25 @@ class LocalFilesProvider:
         for raw in self.roots:
             path = Path(raw)
             if path.is_file():
-                out.append(path)
-            elif path.is_dir():
-                for ext in TEXT_EXTS:
-                    if self.skip_subdirs:
-                        out.extend(sorted(p for p in path.glob(f"*{ext}") if p.is_file()))
-                    else:
-                        out.extend(sorted(path.rglob(f"*{ext}")))
+                if not path.name.startswith("_"):
+                    out.append(path)
+                continue
+            if not path.is_dir():
+                continue
+            for ext in TEXT_EXTS:
+                if self.skip_subdirs:
+                    found = [p for p in path.glob(f"*{ext}") if p.is_file()]
+                else:
+                    found = list(path.rglob(f"*{ext}"))
+                for got in sorted(found):
+                    # ★只看**相对这个根**的路径★：不然 D:\_work\… 这种带下划线的上级目录
+                    #   会把整个知识库静默屏蔽掉（排查起来极其费劲）
+                    try:
+                        rel = got.relative_to(path)
+                    except ValueError:
+                        rel = Path(got.name)
+                    if not any(part.startswith("_") for part in rel.parts):
+                        out.append(got)
         return out
 
     def chunks(self) -> list[Chunk]:

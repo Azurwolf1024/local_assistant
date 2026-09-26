@@ -439,11 +439,15 @@ class MemoryHub:
            → 每个角色都能检索到（这是「可以调用相同知识库」那半边）。
         2. **专属**：`<那个目录>/<角色id>/` 子目录 + 人格文件里的 `knowledge` / `world`
            → 只有这个角色能检索到（这是「不同 IP 各看各的世界观」那半边）。
-        3. 人格文件里 `knowledge_shared = false` → 连共享那份也不看（全隔离的角色）。
+        3. **世界观组**：`<那个目录>/_worlds/<世界观>/` + 人格文件里的 `worlds: ["明日方舟"]`
+           → **挂到同一个世界观上的角色共享**（凯尔希 + 阿米娅共用明日方舟那一套，
+           白泽没挂就看不到）—— 一份文件，不用拷到每个人名下。
+        4. 人格文件里 `knowledge_shared = false` → 连共享那份也不看（全隔离的角色）。
 
-    ★为什么要靠「子目录 = 角色」这条约定★：只写配置很容易忘，而目录结构一眼就能看懂、
-    新建一个角色只要建一个同名目录。共享库那边靠 `skip_subdirs=True` **不收子目录**，
-    所以专属世界观不会泄漏给别的角色。
+    ★为什么靠目录约定而不是配置里互相指路径★：只写配置很容易忘、也容易改漏一处；
+    目录结构一眼能看懂（建一个同名目录 = 这个角色/这个世界观有了资料），
+    而“谁能看”这件事在人格文件里一行就写完。
+    共享库那边靠 `skip_subdirs=True` **不收子目录**，专属世界观不会泄漏给别的角色。
     """
 
     def __init__(self, settings=None, *, root: str | Path | None = None,
@@ -491,10 +495,13 @@ class MemoryHub:
         self._cache: dict[str, Memory] = {}
 
     def knowledge_for(self, character: str | None) -> KnowledgeBase:
-        """某个角色的**完整**知识库 = 共享的 + 它自己那份（`knowledge_shared=false` 时只要自己的）。
+        """某个角色的**完整**知识库 = 共享的 + 世界观组的 + 它自己那份。
+
+        `knowledge_shared=false` 只关掉**共享那一层**；世界观组是人格文件里显式挂的，
+        属于「这个角色本来就活在这个设定里」，不归它管（否则凯尔希会说“我不是明日方舟的”）。
 
         ★每次都重新拼★：`LocalFilesProvider` 自己按 mtime 缓存片段，拼一遍只是几个对象，
-        换来的是「往 `data/knowledge/<角色>/` 里丢个文件、下一句话就生效」。
+        换来的是「往 `data/knowledge/<角色>/` 或 `_worlds/<世界观>/` 里丢个文件、下一句话就生效」。
         """
         key = (character or "default").strip() or "default"
         spec: dict = {}
@@ -504,19 +511,36 @@ class MemoryHub:
             except Exception as exc:  # noqa: BLE001 - 人格文件坏了不该把知识库带崩
                 self.log.warning(f"[记忆] {key} 的知识库说明读取失败：{exc}")
                 spec = {}
-        own: list[str] = []
-        for parent in self.knowledge_roots:
-            # 约定：<共享目录>/<角色id>/ = 只有这个角色看得到的资料
-            own.append(str(Path(parent) / safe_id(key)))
-        own.extend(str(p) for p in (spec.get("paths") or []) if str(p).strip())
         base = Path(self.settings.root) if self.settings is not None else Path(".")
-        resolved = [str(base / p) if not Path(p).is_absolute() else str(p) for p in own]
+
+        def _resolve(paths: Iterable[str]) -> list[str]:
+            return [str(base / p) if not Path(p).is_absolute() else str(p) for p in paths]
+
+        # ① 自己的：约定目录 + 人格文件里显式写的路径/内联世界观
+        own = [str(Path(parent) / safe_id(key)) for parent in self.knowledge_roots]
+        own.extend(str(p) for p in (spec.get("paths") or []) if str(p).strip())
         title = str(spec.get("title") or f"{key} 的设定")
-        own_kb = build_knowledge(
-            resolved, inline=[(title, spec.get("world") or "")], name=f"local:{key}")
-        if spec.get("shared") is False:
-            return own_kb          # ★全隔离的角色★：连共享世界观都不给
-        return self.knowledge.merge(own_kb)
+        own_kb = build_knowledge(_resolve(own), inline=[(title, spec.get("world") or "")],
+                                 name=f"local:{key}")
+
+        # ② 世界观组：挂在同一个世界观上的角色共享（一份文件，不用拷到每个人名下）
+        joined = [str(w) for w in (spec.get("worlds") or []) if str(w).strip()]
+        world_kb = KnowledgeBase()
+        if joined:
+            world_paths = _resolve(
+                [str(Path(parent) / "_worlds" / safe_id(w))
+                 for w in joined for parent in self.knowledge_roots]
+                + [str(p) for p in (spec.get("world_paths") or []) if str(p).strip()]
+            )
+            world_kb = build_knowledge(world_paths, name=f"local:world:{'+'.join(joined)}")
+
+        parts = [world_kb, own_kb]
+        if spec.get("shared") is not False:
+            parts.insert(0, self.knowledge)      # 全隔离的角色不拿共享那层
+        merged = parts[0]
+        for extra in parts[1:]:
+            merged = merged.merge(extra)
+        return merged
 
     def for_character(self, character: str | None) -> Memory:
         """取某个角色的记忆（同一个角色只建一个实例）。"""

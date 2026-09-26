@@ -40,6 +40,10 @@
       "voice_dir": "",                        // 可选：语音素材目录（空 = data/personas/<id>/）
       "temperature": 0.7,                     // 可选：覆盖全局温度（0 = 用全局）
       "knowledge": ["data/knowledge/zzz/设定.md"],  // 可选：这个角色专属的知识库文件/目录
+      "worlds": ["明日方舟"],                   // 可选：★挂在哪个世界观上★（可多个）
+                                              //   同一个世界观的资料放在 data/knowledge/_worlds/明日方舟/
+                                              //   挂上去的角色共享它（凯尔希 + 阿米娅各写一行就完事，
+                                              //   不用把同一份设定拷进两个目录）
       "knowledge_title": "",                  // 可选：专属世界观的标题（空 = 「<名字> 的设定」）
       "world": "",                            // 可选：直接把它的世界观写在这里
       "knowledge_shared": true,               // 可选：要不要连共享知识库一起看
@@ -53,7 +57,9 @@
 知识库（L4）的分层（详见 memory/ 的模块说明）
     data/knowledge/*.md              ← 顶层文件：**所有角色共享**
     data/knowledge/<角色id>/*.md     ← 子目录：**只有这个角色**看得到
+    data/knowledge/_worlds/<世界观>/ ← 世界观组：**挂了它的角色共享**（人格文件 worlds 字段）
     人格文件的 knowledge / world      ← 同上，但路径写得很明白（可以指到仓库外）
+    下划线开头的文件/目录             ← 不当知识（给 README 这类说明文件用）
     knowledge_shared = false         ← 连共享那份也不看
 
 热加载
@@ -113,6 +119,9 @@ class Character:
     voice_dir: str = ""                   # 语音素材目录（空 = data/personas/<id>/）
     # ★这个角色专属的知识库（L4）★：不同 IP 的角色各看各的世界观，见模块说明。
     knowledge: list[str] = field(default_factory=list)   # 文件/目录（相对路径按项目根算）
+    # ★挂在哪个世界观上★（可多个）：同 IP 的角色共享一份设定，不用拷来拷去
+    #   （凯尔希 + 阿米娅都写 ["明日方舟"] → 两人共享 _worlds/明日方舟/ 下的资料）
+    worlds: list[str] = field(default_factory=list)
     knowledge_title: str = ""             # 专属世界观的标题（空 = 「<名字> 的设定」）
     world: str = ""                       # 直接写在人格文件里的世界观正文
     knowledge_shared: bool = True         # false = 只看自己的那份（全隔离）
@@ -188,6 +197,7 @@ class Character:
             # ★新增字段必须在这里显式搬一次★（白名单式构造，漏了就是静默忽略；
             #   test_memory_mcp 里有专门的断言守这个）
             knowledge=[str(p).strip() for p in _list("knowledge") if str(p).strip()],
+            worlds=[str(w).strip() for w in _list("worlds") if str(w).strip()],
             knowledge_title=str(raw.get("knowledge_title") or "").strip(),
             world=str(raw.get("world") or "").strip(),
             knowledge_shared=bool(raw.get("knowledge_shared", True)),
@@ -213,9 +223,10 @@ def knowledge_spec_for(registry: "CharacterRegistry | None", char_id: str) -> di
         except Exception:  # noqa: BLE001 - 角色文件坏了不该把知识库带崩
             char = None
     if char is None:
-        return {"paths": [], "world": "", "title": "", "shared": True}
+        return {"paths": [], "worlds": [], "world": "", "title": "", "shared": True}
     return {
         "paths": list(char.knowledge),
+        "worlds": list(char.worlds),
         "world": char.world,
         "title": char.knowledge_title or f"{char.name} 的设定",
         "shared": bool(char.knowledge_shared),
