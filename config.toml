@@ -121,6 +121,33 @@ file = "data/characters.json"
 default = ""            # 没指定角色时用谁（id 或名字）；留空 = 用文件里 default=true 的那个
 extra_prompt = ""        # 追加到任何角色后面的附加要求（想全局改口风写这里）
 
+# ── 模型记忆：四级记忆 + 自清洁 + 知识库 ────────────────────────────────────────
+# 参考人脑：L1 原始对话（滑动窗口定期清）→ L2 重要事件（会衰减、会合并、会用旧）
+#           → L3 事实/身份（自己的名字这类 pinned，永不淡化）→ L4 知识库（世界观/资料）
+# ★记忆按角色隔离★（各在 data/memory/<角色>/）；
+# ★但日程/备忘是所有角色共享的★（同一份 data/events.json）。
+# 看/查/整理：
+#   python main.py memory                        # 一眼看四级各有多少
+#   python main.py memory --recall "组会几点" --when 上周
+#   python main.py memory --consolidate          # 手动做一次自清洁
+[memory]
+enabled = true
+dir = ""                      # 记忆根目录；留空 = 跟 [skills] data_dir（默认就是 data/memory）
+inject = true                 # 要不要把「记忆摘要」塞进提示词
+inject_chars = 700            # 摘要的硬上限（字符），超了截断
+archive_on_close = true       # 退出/会话结束时归档原始对话（L1 → L2/L3）
+consolidate_on_close = true   # 归档时做一次自清洁（合并/压缩/淘汰/L2→L3）
+prune_sessions = true         # 顺手做 L1 滑动窗口清理（只删归档过的）
+keep_session_days = 30        # 原始对话保留天数
+keep_session_files = 10       # ★保底留几个（不是上限）★：设大了滑动窗口就不动了
+max_episodes = 800            # L2 条数上限（超了按有效重要度淘汰）
+max_facts = 200               # L3 条数上限
+llm_summary = true            # 用本地模型总结（不可用/超时自动退回规则摘要）
+llm_summary_max = 8           # 一次归档最多总结几条（免得退出时卡很久）
+knowledge_paths = ["data/knowledge"]   # 知识库：文件或目录（.md/.txt/.json）
+world_title = "世界观"
+world = ""                    # 也可以直接把背景设定写在这里（不用建文件）
+
 # ── 语音合成 ─────────────────────────────────────────────────────────────────
 # backend：
 #   "zipvoice" = 用角色本人的音色读中文（零样本克隆，就是凯尔希的声线）——当前默认

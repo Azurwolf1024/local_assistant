@@ -1183,6 +1183,75 @@ def cmd_selftest(settings: Settings, args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- #
 # 参数
 # --------------------------------------------------------------------------- #
+def cmd_memory(settings: Settings, args: argparse.Namespace) -> int:
+    """模型记忆：看 / 检索 / 巩固 / 清理。
+
+    ★记忆按角色隔离★（`--who` 指定）；日程是所有角色共享的，不在这里改 ——
+    要改日程用「技能」那套（`main.py skills` 或直接跟助手说）。
+    """
+    from voice_loop.memory import MemoryHub
+    from voice_loop.memory.schedule import SharedSchedule
+
+    if not getattr(settings, "memory", None) or not settings.memory.enabled:
+        print("记忆功能关着（config.toml 的 [memory] enabled = false）—— 打开它才能用。")
+        return 1
+    hub = MemoryHub(settings, schedule=SharedSchedule(settings))
+    # ★默认角色必须跟助手一致★：它用的是 characters.json 索引里的 default，
+    # 只看 `[persona] default`（通常是空的）会落到 "default" 目录 →
+    # 命令行记的东西和助手记的东西分家（实打实踩过）。
+    who = args.who or settings.persona.default
+    if not who:
+        try:
+            from voice_loop.persona import CharacterRegistry
+
+            char = CharacterRegistry(settings.resolve(settings.persona.file)).default()
+            who = char.id if char else "default"
+        except Exception:  # noqa: BLE001 - 角色文件坏了就退回 default，不要挡住记忆功能
+            who = "default"
+    mem = hub.for_character(who)
+    acted = False
+
+    if args.remember:
+        episode, facts = mem.remember(args.remember)
+        print(f"记下了：{episode.title}")
+        for fact in facts:
+            print(f"  · 事实 {fact.key} = {fact.value}")
+        acted = True
+    if args.recall is not None or args.when:
+        hits = mem.recall(args.recall or "", when=args.when, limit=args.limit)
+        print(f"检索「{args.recall or ''}」" + (f"（{args.when}）" if args.when else "") + f"：{len(hits)} 条")
+        for hit in hits:
+            print(f"  [{hit.kind}] {hit.score:.2f}  {hit.text[:90]}")
+        acted = True
+    if args.knowledge:
+        chunks = mem.knowledge.search(args.knowledge, limit=args.limit)
+        print(f"知识库命中 {len(chunks)} 段：")
+        for chunk in chunks:
+            print(f"  [{chunk.source}] {chunk.title}：{chunk.text[:80]}")
+        acted = True
+    if args.forget:
+        print("忘掉了。" if mem.forget(args.forget) else "没找到这条（用 --recall 里的 id / key）。")
+        acted = True
+    if args.consolidate:
+        print("巩固（自清洁）：", mem.consolidate())
+        acted = True
+    if args.prune:
+        victims = mem.prune_raw_sessions(settings.sessions_dir, dry_run=not args.apply)
+        what = "删掉" if args.apply else "可以删（加 --apply 才真删）"
+        print(f"滑动窗口：{what} {len(victims)} 个原始对话" + (f"：{victims[:5]}" if victims else ""))
+        acted = True
+
+    if not acted:
+        print("=" * 62)
+        print(f" 记忆：{who}")
+        print("=" * 62)
+        for key, value in mem.stats().items():
+            print(f"  {key:<18}{value}")
+        print("\n用法：--recall \"组会几点\" [--when 上周] / --knowledge 世界观 / --remember \"…\"")
+        print("      --consolidate（自清洁） / --prune [--apply]（清理原始对话） / --forget <id|key>")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="main.py",
@@ -1298,6 +1367,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int, default=8765, help="端口，默认 8765")
     p.add_argument("--no-browser", action="store_true", help="不要自动开浏览器")
     p.set_defaults(func=cmd_ui)
+
+    p = sub.add_parser("memory", help="模型记忆：看 / 检索 / 巩固 / 清理（按角色隔离）")
+    p.add_argument("--who", default=None, help="哪个角色的记忆（默认用默认角色）")
+    p.add_argument("--recall", default=None, help="按内容检索，例如 --recall \"组会\"")
+    p.add_argument("--when", default=None, help="配合 --recall：中文时间，如 上周 / 最近三天")
+    p.add_argument("--knowledge", default=None, help="只搜知识库（世界观/资料）")
+    p.add_argument("--limit", type=int, default=8, help="最多返回几条")
+    p.add_argument("--remember", default=None, help="手动记一条（走同一套信号/事实抽取）")
+    p.add_argument("--forget", default=None, help="忘掉一条（episode id 或 fact key）")
+    p.add_argument("--consolidate", action="store_true", help="手动做一次自清洁（合并/压缩/淘汰/L2→L3）")
+    p.add_argument("--prune", action="store_true", help="滑动窗口：列出可清理的原始对话")
+    p.add_argument("--apply", action="store_true", help="配合 --prune：真的删")
+    p.set_defaults(func=cmd_memory)
 
     return ap
 

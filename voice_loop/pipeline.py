@@ -45,6 +45,8 @@ from .tools import (
     repair_args,
     reroute_correction,
 )
+from .memory import MemoryHub
+from .memory.schedule import SharedSchedule
 from .tts import BACKENDS as TTS_BACKENDS, create_tts
 from .tts.zipvoice_tts import _resample
 from .tts import precision
@@ -294,6 +296,16 @@ class VoiceLoop:
         self._watcher: threading.Thread | None = None
         self._turn = 0
         self._session_file = settings.sessions_dir / f"session-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
+        # ★记忆（四级 + 自清洁 + 知识库）★：见 voice_loop/memory/ 与工程日志第 36 节。
+        # 关掉就完全回到「没有记忆」的老行为（inject/archive 都不会发生）。
+        self._memory_summaries = 0
+        self.memory_hub: MemoryHub | None = None
+        if getattr(settings, "memory", None) is not None and settings.memory.enabled:
+            try:
+                self.memory_hub = MemoryHub(settings, schedule=SharedSchedule(settings),
+                                            llm_call=self._memory_llm, logger=self.log)
+            except Exception as exc:  # noqa: BLE001 - 记忆起不来不该影响说话
+                self.log.warning(f"[记忆] 初始化失败，这次不带记忆：{exc}")
 
     # ======================================================================
     # 预热
@@ -810,7 +822,22 @@ class VoiceLoop:
         if char.ack:
             self.wake.settings.ack = char.ack
         self._apply_voice(char, reason)
+        self._seed_memory_identity(char)
         self.log.info(f"[角色] 生效：{char.label}（{reason or '设定'}）")
+
+    def _seed_memory_identity(self, char: Character) -> None:
+        """把角色的名字/身份/称呼写成 L3 的 **pinned** 事实（深层记忆的起点）。
+
+        「我叫白泽」这类不该随时间淡化，也不该被淘汰掉——所以它们 pinned。
+        幂等：人格文件是唯一真相，改了称呼下次生效时会跟着改。
+        """
+        hub = getattr(self, "memory_hub", None)
+        if hub is None:
+            return
+        try:
+            hub.for_character(char.id).seed_identity(char.name, char.title, char.user_title)
+        except Exception as exc:  # noqa: BLE001
+            self.log.warning(f"[记忆] 身份写入失败（不影响说话）：{exc}")
 
     def _tts_label(self) -> str:
         """启动横幅用的一行说明（不加载模型，纯看配置）。"""
@@ -1402,6 +1429,11 @@ class VoiceLoop:
         # 实测：放在最前面时 qwen3.5:4b 会当没看见，直接凭记忆答「下周有什么安排」；
         # 挪到用户话前面（extra_messages 插在最后一条之前）就稳定调工具了。
         hint = [{"role": "system", "content": TOOL_HINT}] if tools else None
+        # ★记忆摘要在 TOOL_HINT 之前★：工具提示必须紧贴用户那一句（实测过），
+        # 记忆是背景信息，放前面正合适。没有记忆时这一层完全不存在。
+        memory_block = self._memory_context(prompt)
+        if memory_block:
+            hint = [{"role": "system", "content": memory_block}] + (hint or [])
 
         def speak(sentence: str) -> None:
             nonlocal first_audio
@@ -2116,6 +2148,65 @@ class VoiceLoop:
     # ======================================================================
     # 收尾
     # ======================================================================
+    def _memory_context(self, text: str) -> str:
+        """这一轮要带上的记忆摘要（塞进提示词）。★不加载模型、失败也不影响回答★。"""
+        hub = getattr(self, "memory_hub", None)
+        cfg = getattr(self.settings, "memory", None)
+        if hub is None or not getattr(cfg, "inject", True):
+            return ""
+        try:
+            mem = hub.for_character(self.character.id if self.character else "default")
+            return mem.prompt_block(text, max_chars=int(getattr(cfg, "inject_chars", 700) or 700))
+        except Exception as exc:  # noqa: BLE001
+            self.log.warning(f"[记忆] 摘要生成失败（这一轮不带记忆）：{exc}")
+            return ""
+
+    def _memory_llm(self, prompt: str) -> str:
+        """给记忆层用的「一句问、一句答」口子（归档时总结用）。
+
+        ★两个必须处理的地方★：
+        1. `llm.chat()` 会把「问 + 答」写进对话历史，而这段提示词跟用户的对话毫无关系
+           （真混进去，角色下轮会突然开始念记忆条目）→ 用完 `reset()` 清掉。
+           归档发生在退出路径上，历史本来就要丢，所以这里清掉是安全的。
+        2. ★限次★：一次归档最多总结几条（`[memory] llm_summary_max`），
+           否则「退出」会卡在几十次模型调用上。用完就报错 → 引用方退回规则摘要。
+        """
+        limit = int(getattr(self.settings.memory, "llm_summary_max", 8) or 8)
+        if self._memory_summaries >= limit:
+            raise RuntimeError("本次归档的总结次数已用完")
+        self._memory_summaries += 1
+        try:
+            return self.llm.chat(prompt)
+        finally:
+            self.llm.reset()
+
+    def _close_memory(self) -> None:
+        """收尾：归档原始对话（L1→L2/L3）→ 巩固（自清洁）→ 滑窗清原始对话。
+
+        ★像睡觉那样整理一次★。任何一步失败都不能影响「退出」本身，
+        所以整段包在 try 里：最坏只是这次没归档（原始文件还在，下次还会扫到）。
+        """
+        hub = getattr(self, "memory_hub", None)
+        if hub is None:
+            return
+        cfg = getattr(self.settings, "memory", None)
+        try:
+            mem = hub.for_character(self.character.id if self.character else "default")
+            self._memory_summaries = 0
+            if getattr(cfg, "archive_on_close", True) and self._session_file.exists():
+                use_llm = getattr(cfg, "llm_summary", True)
+                got = mem.ingest_session(self._session_file,
+                                         llm_call=self._memory_llm if use_llm else None)
+                self.log.info(f"[记忆] 归档：{got}")
+            if getattr(cfg, "consolidate_on_close", True):
+                self.log.info(f"[记忆] 巩固：{mem.consolidate()}")
+            if getattr(cfg, "prune_sessions", True):
+                gone = mem.prune_raw_sessions(self.settings.sessions_dir, dry_run=False)
+                if gone:
+                    self.log.info(f"[记忆] 滑动窗口清掉 {len(gone)} 个原始对话")
+        except Exception as exc:  # noqa: BLE001
+            self.log.warning(f"[记忆] 收尾失败（不影响退出）：{exc}")
+
     def _write_session(self, stats: TurnStats) -> None:
         try:
             with open(self._session_file, "a", encoding="utf-8") as f:
@@ -2125,6 +2216,9 @@ class VoiceLoop:
 
     def close(self) -> None:
         self._stop.set()
+        # ★先归档记忆再拆别的东西★：记忆收尾只需要原始对话文件与配置，
+        # 而 MCP/hotkey 的清理有可能报错（报错就不该把归档吞掉）。
+        self._close_memory()
         if self._hotkey is not None:
             # 按键监听要收尾：POSIX 下它把终端设成了 cbreak，得还原回去
             try:

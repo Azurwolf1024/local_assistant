@@ -341,6 +341,37 @@ class BargeInConfig:
 
 
 @dataclass
+class MemoryConfig:
+    """模型记忆：四级记忆 + 自清洁 + 知识库。见 docs/ENGINEERING_LOG.md 第 36 节。
+
+    L1 工作记忆 = 原始对话（`sessions/session-*.jsonl`，滑动窗口定期清）
+    L2 情景记忆 = 重要事件（`<dir>/<角色>/episodes.jsonl`）
+    L3 语义记忆 = 事实与身份（`<dir>/<角色>/facts.json`，身份 pinned 不衰减）
+    L4 知识库   = 世界观/资料（`knowledge_paths` + 配置里直接写的 world）
+    """
+
+    enabled: bool = True
+    dir: str = ""                         # 记忆根目录；留空 = 跟 [skills] data_dir 走（默认 data/memory）★
+                                          #   ★为什么允许留空★：记忆属于项目数据，应该跟其他数据放一起。
+                                          #   测试/多开把 data_dir 指到临时目录时，记忆也就自动隔离了
+                                          #   （不然跑一次自测就会把测试对话写进真实记忆库 —— 踩过）
+    inject: bool = True                   # 要不要把「记忆摘要」塞进提示词
+    inject_chars: int = 700               # 摘要的硬上限（字符），超了截断
+    archive_on_close: bool = True         # 退出/会话结束时归档原始对话（L1 → L2/L3）
+    consolidate_on_close: bool = True     # 归档时做一次自清洁（合并/压缩/淘汰/提升）
+    prune_sessions: bool = True           # 顺手做 L1 滑动窗口清理（只删归档过的）
+    keep_session_days: float = 30.0       # 原始对话保留多少天
+    keep_session_files: int = 10          # ★保底留几个★（不是上限；设大了滑窗就不动了）
+    max_episodes: int = 800               # L2 条数上限（超了按有效重要度淘汰）
+    max_facts: int = 200                  # L3 条数上限
+    llm_summary: bool = True              # 用本地模型总结（失败自动退回规则摘要）
+    llm_summary_max: int = 8              # 一次归档最多总结几条（免得退出时卡很久）
+    knowledge_paths: list[str] = field(default_factory=list)   # 知识库文件/目录（空 = data/knowledge）
+    world_title: str = "世界观"           # 写在配置里的那段背景的标题
+    world: str = ""                       # 直接写在配置里的世界观背景
+
+
+@dataclass
 class SubtitleConfig:
     """屏幕底部居中的半透明字幕（关掉声音时靠它沟通）。"""
 
@@ -365,6 +396,7 @@ class Settings:
     tts: TtsConfig = field(default_factory=TtsConfig)
     chat: ChatConfig = field(default_factory=ChatConfig)
     persona: PersonaConfig = field(default_factory=PersonaConfig)
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
     wake: WakeConfig = field(default_factory=WakeConfig)
     skills: SkillsConfig = field(default_factory=SkillsConfig)
     subtitle: SubtitleConfig = field(default_factory=SubtitleConfig)
