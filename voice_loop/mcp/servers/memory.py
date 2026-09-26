@@ -39,7 +39,29 @@ INSTRUCTIONS = (
     "或者问「上次/上周/以前」时，先查一下再回答，不要凭印象编。"
     "remember 用来「记住」——用户明确说「记住…」、或者提到值得长期记住的偏好/事实时调用。"
     "查不到就如实说记不起来，不要编造。"
+    "★记忆默认按角色隔离★：只能查自己的；有 memory_all 权限的角色（如白泽）可以用 who=\"*\" "
+    "查全部，但★回答时必须说清每一条是从谁的记忆里查到的★。"
 )
+
+# who="*" 的写法（小模型可能写中文，都认）
+ALL_ALIASES = {"*", "all", "全部", "所有", "全部角色", "所有角色", "每个角色", "everyone"}
+
+
+# --------------------------------------------------------------------------- #
+def _wants_all(who: str) -> bool:
+    """这个 who 是要「所有人的记忆」吗。"""
+    return str(who or "").strip().lower() in ALL_ALIASES
+
+
+def _format_hit(hit) -> str:
+    """把一条命中排成一行（★每条都带种类，跨角色时外面还会套上「谁记的」★）。"""
+    item = hit.item
+    if hit.kind == "episode":
+        line = f"[那件事] {str(getattr(item, 'ts', ''))[:16]} {item.title}"
+        return line + (f"：{item.summary}" if getattr(item, "summary", "") else "")
+    if hit.kind == "fact":
+        return f"[事实] {item.key.split('.')[-1]} = {item.value}"
+    return f"[资料] {item.title}：{item.text[:160]}"
 
 
 # --------------------------------------------------------------------------- #
@@ -111,6 +133,8 @@ def build_server(
     logger: logging.Logger | None = None,
     hub: Any = None,                 # ★宿主注入的回调★：要的是同一个 MemoryHub
     character: Any = None,           # 同上：要的是「此刻」的角色 id
+    character_label: Any = None,     # 同上：角色 id → 给人看的名字（白泽）
+    can_read_all: Any = None,        # 同上：当前角色有没有跨角色读的权限
     **_ignored: Any,                 # skills/其它宿主依赖，用不到就忽略
 ) -> MCPServer:
     log = logger or logging.getLogger("voice_loop")
@@ -133,12 +157,56 @@ def build_server(
 
     def who_of(args: dict) -> str:
         wanted = str((args or {}).get("who") or "").strip()
-        if wanted:
+        if wanted and not _wants_all(wanted):
             return wanted
         now = _maybe_call(character)
         if isinstance(now, str) and now.strip():
             return now.strip()
         return default_character(settings)
+
+    def label_of(char_id: str) -> str:
+        """给用户看的称呼（白泽 而不是 baize）：优先用宿主给的取名回调。"""
+        if callable(character_label):
+            try:
+                nice = str(character_label(char_id) or "").strip()
+                if nice:
+                    return nice
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            from ...persona import CharacterRegistry
+
+            char = CharacterRegistry(settings.resolve(settings.persona.file)).get(char_id)
+            if char is not None and char.name:
+                return str(char.name)
+        except Exception:  # noqa: BLE001
+            pass
+        return char_id
+
+    def allowed_all(char_id: str) -> bool:
+        """当前角色能不能查全部（★宿主回调优先，独立进程自己读人格文件★）。"""
+        got = _maybe_call(can_read_all)
+        if got is not None:
+            return bool(got)
+        try:
+            from ...persona import CharacterRegistry, can_read_all_memory
+
+            registry = CharacterRegistry(settings.resolve(settings.persona.file))
+            return can_read_all_memory(registry, char_id)
+        except Exception:  # noqa: BLE001 - 读不到就当没权限（权限宁严不松）
+            return False
+
+    def all_character_ids() -> list[str]:
+        """全部角色：记忆目录里的 + 角色索引里的（只有知识库、还没记忆目录的也要算）。"""
+        names = set(get_hub().characters())
+        try:
+            from ...persona import CharacterRegistry
+
+            names |= {c.id for c in CharacterRegistry(
+                settings.resolve(settings.persona.file)).all(only_enabled=True) if c.id}
+        except Exception:  # noqa: BLE001
+            pass
+        return sorted(names)
 
     server = MCPServer(name=NAME, version="1.0.0", instructions=INSTRUCTIONS)
 
@@ -152,6 +220,31 @@ def build_server(
         if not query and not when:
             return {"text": "要查什么？给我一个内容词或一个时间（例如「上周」）。", "is_error": True}
         who = who_of(args)
+        wants_all = _wants_all(str((args or {}).get("who") or ""))
+
+        # ★跨角色查询是权限★：能查，但每一条都要说清是谁的
+        if wants_all:
+            if not allowed_all(who):
+                log.info(f"[mcp:memory.recall] {who} 没跨角色权限，已拒")
+                return {"text": f"{label_of(who)}没有查所有人记忆的权限 —— "
+                                "只能查自己的。需要的话在人格文件里加 \"memory_all\": true。",
+                        "is_error": True}
+            try:
+                pairs = get_hub().recall_everywhere(query, when=when or None, limit=limit,
+                                                   characters=all_character_ids())
+            except Exception as exc:  # noqa: BLE001
+                log.warning(f"[mcp:memory.recall] 跨角色检索失败：{exc}")
+                return {"text": f"记忆检索失败：{exc}", "is_error": True}
+            if not pairs:
+                return (f"查了 {len(all_character_ids())} 个角色的记忆，"
+                        f"没有关于「{query or when}」的记录。可以如实说记不起来，不要编。")
+            lines = [f"★跨角色（以 {label_of(who)} 的身份查）★查了 {len(all_character_ids())} 个角色，"
+                     f"命中 {len(pairs)} 条。回答时★必须说清楚每一条是谁记的★："]
+            for cid, hit in pairs:
+                lines.append(f"- [{label_of(cid)}] {_format_hit(hit)}")
+            log.info(f"[mcp:memory.recall] 跨角色 {query or when} → {len(pairs)} 条")
+            return "\n".join(lines)
+
         try:
             mem = get_hub().for_character(who)
             hits = mem.recall(query, when=when or None, limit=limit)
@@ -162,16 +255,8 @@ def build_server(
             asked = f"「{query}」" if query else ""
             span = f"（时间范围：{when}）" if when else ""
             return f"没有相关记忆{asked}{span}。可以如实说记不起来，不要编。"
-        lines = [f"关于「{query or when}」的记忆（{who}，{len(hits)} 条）："]
-        for hit in hits:
-            item = hit.item
-            if hit.kind == "episode":
-                lines.append(f"- [那件事] {str(getattr(item, 'ts', ''))[:16]} {item.title}"
-                             + (f"：{item.summary}" if getattr(item, "summary", "") else ""))
-            elif hit.kind == "fact":
-                lines.append(f"- [事实] {item.key.split('.')[-1]} = {item.value}")
-            else:
-                lines.append(f"- [资料] {item.title}：{item.text[:160]}")
+        lines = [f"关于「{query or when}」的记忆（来自 {label_of(who)}，{len(hits)} 条）："]
+        lines.extend(f"- {_format_hit(hit)}" for hit in hits)
         log.info(f"[mcp:memory.recall] {who} {query or when} → {len(hits)} 条")
         return "\n".join(lines)
 
@@ -207,7 +292,9 @@ def build_server(
     server.add_tool(
         "recall",
         "检索长期记忆：过去发生的事（事件）、记住的事实、知识库资料。"
-        "用户提到过去（「上次」「上周三」「以前」）时先用它查，再回答；不要凭印象编。",
+        "用户提到过去（「上次」「上周三」「以前」）时先用它查，再回答；不要凭印象编。"
+        "记忆按角色隔离，默认只查当前角色；★有权限的角色（白泽）可以给 who 传 \"*\" "
+        "查全部人的记忆，那种情况下回答必须说明每一条是谁记的★。",
         {
             "type": "object",
             "properties": {
@@ -215,7 +302,8 @@ def build_server(
                 "when": {"type": "string",
                          "description": "时间范围：昨天/今天/上周/上周三/最近7天/上个月/去年，或 2026-09-20"},
                 "limit": {"type": "integer", "description": "最多返回几条（1-10，默认 5）"},
-                "who": {"type": "string", "description": "查哪个角色的记忆（默认当前角色）"},
+                "who": {"type": "string",
+                        "description": "查谁的记忆：留空 = 当前角色；\"*\" = 所有人（需权限，仅白泽）"},
             },
         },
         recall,

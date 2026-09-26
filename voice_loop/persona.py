@@ -44,6 +44,9 @@
       "world": "",                            // 可选：直接把它的世界观写在这里
       "knowledge_shared": true,               // 可选：要不要连共享知识库一起看
                                               //   （false = 全隔离，只看自己的那份）
+      "memory_all": false,                    // 可选：★能不能查所有人的记忆★（默认不能）
+                                              //   只有默认助手白泽开了这个权限；开着的角色
+                                              //   查完必须说明每一条是从谁的记忆里查到的
       "notes": "给自己看的备注"                 // 不进提示词
     }
 
@@ -113,6 +116,10 @@ class Character:
     knowledge_title: str = ""             # 专属世界观的标题（空 = 「<名字> 的设定」）
     world: str = ""                       # 直接写在人格文件里的世界观正文
     knowledge_shared: bool = True         # false = 只看自己的那份（全隔离）
+    # ★跨角色读记忆的权限★（默认关，只给默认助手开）：
+    # 开着就能用 recall 的「全部角色」模式，但**必须把来源标出来**（「凯尔希记的」）——
+    # 不标来源等于把「这是谁说的」丢掉，比查不到还糟。
+    memory_all: bool = False
     temperature: float = 0.0              # 0 = 用全局 [llm] temperature
     default: bool = False
     enabled: bool = True
@@ -184,6 +191,7 @@ class Character:
             knowledge_title=str(raw.get("knowledge_title") or "").strip(),
             world=str(raw.get("world") or "").strip(),
             knowledge_shared=bool(raw.get("knowledge_shared", True)),
+            memory_all=bool(raw.get("memory_all", False)),
             temperature=float(raw.get("temperature") or 0.0),
             default=bool(raw.get("default")),
             enabled=bool(raw.get("enabled", True)),
@@ -212,6 +220,22 @@ def knowledge_spec_for(registry: "CharacterRegistry | None", char_id: str) -> di
         "title": char.knowledge_title or f"{char.name} 的设定",
         "shared": bool(char.knowledge_shared),
     }
+
+
+def can_read_all_memory(registry: "CharacterRegistry | None", char_id: str) -> bool:
+    """某个角色能不能查**所有人的**记忆（人格文件里的 `memory_all`，默认不能）。
+
+    ★这是权限，不是配置★：开着就能看到别的角色的经历和事实，所以默认关。
+    ★找不到这个角色时**不给**权限★（不要退回默认角色 —— 默认角色恰好开着这个权限，
+    一旦退回就是「不小心把权限发出去了」）。
+    """
+    if registry is None or not str(char_id or "").strip():
+        return False
+    try:
+        char = registry.get(char_id)
+    except Exception:  # noqa: BLE001 - 角色文件坏了就当没权限
+        return False
+    return bool(char and char.memory_all)
 
 
 def render_system_prompt(char: Character, extra: str = "") -> str:

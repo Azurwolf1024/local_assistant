@@ -74,6 +74,7 @@ def make_world(tmp: Path):
     (personas / "baize.json").write_text(json.dumps({
         "id": "baize", "name": "白泽", "user_title": "阁下",
         "knowledge_shared": True,
+        "memory_all": True,          # ★只有默认助手开这个权限★
     }, ensure_ascii=False), encoding="utf-8")
     (personas / "kaltsit.json").write_text(json.dumps({
         "id": "kaltsit", "name": "凯尔希", "user_title": "博士",
@@ -103,6 +104,8 @@ def make_world(tmp: Path):
     settings.memory.knowledge_paths = [str(kn)]           # 绝对路径 → 不吃项目根的相对解析
     settings.memory.world = ""
     settings.memory.llm_summary = False
+    # ★角色索引也要指到临时目录★：默认角色、跨角色查询的范围都从它读
+    settings.persona.file = str(tmp / "characters.json")
     registry = CharacterRegistry(index)
     return settings, registry, kn
 
@@ -140,8 +143,7 @@ def test_per_character(tmp: Path) -> None:
     check("★凯尔希设了 knowledge_shared=false → 看不到共享资料★", SHARED_WORD not in kaltsit)
     check("凯尔希也看不到白泽的", BAIZE_WORD not in kaltsit)
     check("stats 分得清谁是谁",
-          sorted(hub.knowledge_for("baize").stats()) == ["local", "local:baize"], True,
-          str(hub.knowledge_for("baize").stats()))
+          sorted(hub.knowledge_for("baize").stats()), ["local", "local:baize"])
 
 
 def test_persona_fields(tmp: Path) -> None:
@@ -153,6 +155,10 @@ def test_persona_fields(tmp: Path) -> None:
     check("world 解析出来了", "领袖" in char.world)
     check("knowledge_title 解析出来了", char.knowledge_title == "阿米娅的世界观")
     check("knowledge_shared 默认是 True", char.knowledge_shared is True)
+    check("memory_all 默认是 False（权限宁严不松）",
+          Character.from_dict({"id": "x", "name": "X"}).memory_all is False, True)
+    check("memory_all 能解析出来", registry.get("baize").memory_all is True, True)
+    check("没写的角色没有这个权限", registry.get("kaltsit").memory_all is False, True)
     check("凯尔希的 knowledge_shared=false 解析出来了",
           registry.get("kaltsit").knowledge_shared is False)
 
@@ -277,6 +283,51 @@ def test_standalone_fallback(tmp: Path) -> None:
                f"{real} 里有这条 → 隔离漏了")
 
 
+def test_cross_character(tmp: Path) -> None:
+    print("\n[8] ★跨角色查全部记忆★（白泽的权限）+ 来源必须标清楚")
+    settings, registry, _ = make_world(tmp)
+    hub = make_hub(settings, registry)
+    baize = hub.for_character("baize")
+    kaltsit = hub.for_character("kaltsit")
+    baize.remember("记住：我周五下午跟导师见面")
+    kaltsit.remember("记住：博士下周要交体检报告")
+
+    pairs = hub.recall_everywhere("导师", characters=["baize", "kaltsit"])
+    check_text("hub 层：跨角色检索能查到", bool(pairs) and pairs[0][0] == "baize",
+               str([(cid, h.text[:16]) for cid, h in pairs]))
+    pairs = hub.recall_everywhere("体检报告", characters=["baize", "kaltsit"])
+    check("★每条都带着它属于谁（不是混在一起）★", [cid for cid, _ in pairs], ["kaltsit"])
+    # ★话题完全不通的不能靠「新鲜+重要」混进来★（打分是加性的，第一版就撞上了）
+    check("话题不重合的查询：白泽那边一无所获", hub.for_character("baize").recall("体检报告"), [])
+    check("同一个角色自己的话题照常查得到",
+          bool(hub.for_character("baize").recall("导师")), True)
+    check("只给时间（不给内容）仍然能查：今天",
+          bool(hub.for_character("baize").recall("", when="今天")), True)
+
+    # 服务器：不给权限回调 → 自己读人格文件（完全按生产路径走）
+    server = mem_server.build_server(settings=settings, hub=lambda: hub,
+                                     character=lambda: "baize",
+                                     character_label=lambda cid: registry.get(cid).name
+                                     if registry.get(cid) else cid)
+    out = call(server, "recall", {"query": "体检报告", "who": "*"})
+    check_text("白泽用 who=* 能查全部", "体检报告" in out, out)
+    check_text("★并且标出了是谁记的（凯尔希）★", "凯尔希" in out, out)
+    check_text("头部也说了这是跨角色查询", "跨角色" in out, out)
+
+    # 凯尔希：没权限 → 直接拒（这才叫权限）
+    server2 = mem_server.build_server(settings=settings, hub=lambda: hub,
+                                      character=lambda: "kaltsit",
+                                      character_label=lambda cid: registry.get(cid).name
+                                      if registry.get(cid) else cid)
+    out = call(server2, "recall", {"query": "导师", "who": "*"})
+    check_text("★没权限的角色跨角色查询被拒★", "权限" in out and "导师" not in out, out)
+    out = call(server2, "recall", {"query": "导师"})
+    check_text("但查自己的照常能用", "没有相关记忆" in out or "导师" in out, out)
+
+    out = call(server, "recall", {"query": "导师", "who": "全部角色"})
+    check_text("中文写法『全部角色』也认", "导师" in out, out)
+
+
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="memory_mcp_"))
     try:
@@ -287,6 +338,7 @@ def main() -> int:
         test_recall_isolation(tmp / "e")
         test_mcp_tools(tmp / "f")
         test_standalone_fallback(tmp / "g")
+        test_cross_character(tmp / "h")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print()

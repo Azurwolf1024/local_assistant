@@ -166,6 +166,12 @@ class VoiceLoop:
                     # 模型刚记住的东西在这一轮的提示词里就看不到（用回调就当场拿到）。
                     "hub": lambda: self.memory_hub,
                     "character": lambda: (self.character.id if self.character else ""),
+                    # 跨角色查记忆是**权限**（人格文件 memory_all）：白泽开着，别的角色没开
+                    "character_label": lambda cid: (
+                        self.persona.get(cid).name
+                        if self.persona is not None and self.persona.get(cid) is not None else cid
+                    ),
+                    "can_read_all": lambda: bool(self.character and self.character.memory_all),
                 },
             )
             if self.skills and getattr(settings, "mcp", None) is not None

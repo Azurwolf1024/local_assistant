@@ -133,6 +133,12 @@ class Memory:
 
         ★命中就给记忆「回血」★：事件 recalls+1、事实 last_seen 刷新 —— 这是「越用越牢」
         的实现点（写回失败也不影响本次返回）。
+
+        ★两道门★（都是实测出来的）：
+            1. 给了时间窗：时间窗内的都算候选（用户可能只记得时间）。
+            2. 给了内容词：**必须有话题重合** —— 打分是加性的（主题 + 重要度 + 新鲜度），
+               不加这道门，“新鲜又重要”的**无关**事件能拿到 0.96 分混进结果
+               （跨角色检索时当场撞上：查「体检报告」把白泽那条到导师的事也翻出来了）。
         """
         moment = now or datetime.now()
         window = self._window(when, moment)
@@ -148,6 +154,9 @@ class Memory:
             # 只按时间问（没给内容）时，时间窗内的都算候选
             if not tokens and window is not None:
                 score, why = max(score, 0.4), {**why, "time_only": 1.0}
+            # ★给了内容词就没有话题重合的直接淘汰★（详见 recall 的说明）
+            if tokens and why.get("topic", 0.0) <= 0.0:
+                continue
             if score >= 0.12:
                 hits.append(Hit(kind="episode", score=score, item=ep, why=why))
         for fact in self.facts():
@@ -156,11 +165,16 @@ class Memory:
             if window is not None and not tokens:
                 continue
             score, why = score_fact(fact, tokens, moment)
+            # ★同样要话题重合★（否则任何一条可信事实都能靠 W_CONFIDENCE 混进来）
+            if tokens and why.get("topic", 0.0) <= 0.0:
+                continue
             if score >= 0.2:
                 hits.append(Hit(kind="fact", score=score, item=fact, why=why))
         if use_knowledge:
             for chunk in self.knowledge.chunks():
                 score, why = score_chunk(chunk, tokens, moment)
+                if tokens and why.get("body", 0.0) <= 0.0 and why.get("title", 0.0) <= 0.0:
+                    continue
                 if score >= 0.12:
                     hits.append(Hit(kind="chunk", score=score, item=chunk, why=why))
 
@@ -525,6 +539,31 @@ class MemoryHub:
         if not self.root.is_dir():
             return []
         return sorted(p.name for p in self.root.iterdir() if p.is_dir())
+
+    def recall_everywhere(self, query: str = "", when=None, limit: int = 8,
+                          characters: Iterable[str] | None = None,
+                          per_character: int = 2) -> list[tuple[str, Hit]]:
+        """★跨角色查全部记忆★（白泽的特权，见 persona 的 `memory_all`）。
+
+        返回 ``[(角色 id, Hit), ...]``，按分数排序。★每一条都带着「它属于谁」★——
+        混在一起不标来源，等于把「这是谁说的」丢掉，那比不查还糟。
+
+        `characters` 不传就用「记忆目录下所有角色」；想连只有知识库、还没记忆目录的角色
+        一起查，就把角色 id 列表传进来（命令行和 MCP 工具都会把索引里的人一并传）。
+        """
+        names = [str(c) for c in (characters if characters is not None else self.characters())]
+        picked: list[tuple[str, Hit]] = []
+        for name in names:
+            try:
+                hits = self.for_character(name).recall(query, when=when,
+                                                      limit=max(1, int(per_character)))
+            except Exception as exc:  # noqa: BLE001 - 一个角色出错不该让整次查询失败
+                self.log.warning(f"[记忆] 跨角色查询时 {name} 出错：{exc}")
+                continue
+            picked.extend((name, hit) for hit in hits)
+        # 跨角色比较只能比分数（各角色的「新鲜度」基准是一样的，所以这么排是公平的）
+        picked.sort(key=lambda pair: pair[1].score, reverse=True)
+        return picked[:max(1, int(limit))]
 
     def consolidate_all(self, now: datetime | None = None) -> dict[str, dict]:
         return {name: self.for_character(name).consolidate(now) for name in self.characters()}

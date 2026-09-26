@@ -1218,10 +1218,28 @@ def cmd_memory(settings: Settings, args: argparse.Namespace) -> int:
             print(f"  · 事实 {fact.key} = {fact.value}")
         acted = True
     if args.recall is not None or args.when:
-        hits = mem.recall(args.recall or "", when=args.when, limit=args.limit)
-        print(f"检索「{args.recall or ''}」" + (f"（{args.when}）" if args.when else "") + f"：{len(hits)} 条")
-        for hit in hits:
-            print(f"  [{hit.kind}] {hit.score:.2f}  {hit.text[:90]}")
+        if args.all:
+            # ★跨角色查全部★：命令行是机主本人，不需要人格权限（那套是拦「角色」的）
+            names = hub.characters()
+            try:
+                from voice_loop.persona import CharacterRegistry
+
+                registry = CharacterRegistry(settings.resolve(settings.persona.file))
+                names = sorted(set(names) | {c.id for c in registry.all(only_enabled=True) if c.id})
+            except Exception:  # noqa: BLE001 - 角色文件坏了就只查有记忆目录的
+                pass
+            pairs = hub.recall_everywhere(args.recall or "", when=args.when, limit=args.limit,
+                                          characters=names)
+            print(f"检索「{args.recall or ''}」" + (f"（{args.when}）" if args.when else "")
+                  + f"：{len(pairs)} 条（查了 {len(names)} 个角色：{'、'.join(names)}）")
+            for cid, hit in pairs:
+                print(f"  [{cid}] [{hit.kind}] {hit.score:.2f}  {hit.text[:80]}")
+        else:
+            hits = mem.recall(args.recall or "", when=args.when, limit=args.limit)
+            print(f"检索「{args.recall or ''}」" + (f"（{args.when}）" if args.when else "")
+                  + f"：{len(hits)} 条（来自 {who}）")
+            for hit in hits:
+                print(f"  [{hit.kind}] {hit.score:.2f}  {hit.text[:90]}")
         acted = True
     if args.knowledge:
         chunks = mem.knowledge.search(args.knowledge, limit=args.limit)
@@ -1370,6 +1388,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("memory", help="模型记忆：看 / 检索 / 巩固 / 清理（按角色隔离）")
     p.add_argument("--who", default=None, help="哪个角色的记忆（默认用默认角色）")
+    p.add_argument("--all", action="store_true",
+                   help="★跨角色检索★：查所有人的记忆并标出每条是谁的（配 --recall/--when）")
     p.add_argument("--recall", default=None, help="按内容检索，例如 --recall \"组会\"")
     p.add_argument("--when", default=None, help="配合 --recall：中文时间，如 上周 / 最近三天")
     p.add_argument("--knowledge", default=None, help="只搜知识库（世界观/资料）")

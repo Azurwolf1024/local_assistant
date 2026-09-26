@@ -65,5 +65,6 @@
   "temperature": 0.0,
   "default": true,
   "enabled": true,
+  "memory_all": true,
   "notes": "★原创默认助手（2026-09-26 设，默认角色）★：名字、背景、风格、台词全部自己写的，不含任何第三方作品的角色、台词或配音素材 —— 这样这个项目可以给任何人用。★backend=piper 是刻意的★：全局 [tts] backend 是 zipvoice（克隆），不写这一行，新角色会跟着全局去用某条参考音频；而声线固定用出厂 Piper（zh_CN-huayan-medium，公开模型）。以后想给它换声线，就换 models/tts/piper/ 里另一个公开模型，别接克隆。"
 }
