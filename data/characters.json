@@ -9,13 +9,19 @@
     "default": "没指定角色时用谁。也可以写在人格文件里；两边都写时以索引为准",
     "_人格文件里的字段": "name / title / background / user_title / wake_words / aliases / ack / style / rules / avoid / lines / voice / temperature / notes，详见 README 第 14 节"
   },
-  "default": "kaltsit",
+  "default": "baize",
   "characters": [
+    {
+      "id": "baize",
+      "file": "personas/baize.json",
+      "enabled": true,
+      "default": true
+    },
     {
       "id": "kaltsit",
       "file": "personas/kaltsit.json",
       "enabled": true,
-      "default": true
+      "default": false
     },
     {
       "id": "amiya",

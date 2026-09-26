@@ -45,7 +45,7 @@ from .tools import (
     repair_args,
     reroute_correction,
 )
-from .tts import create_tts
+from .tts import BACKENDS as TTS_BACKENDS, create_tts
 from .tts.zipvoice_tts import _resample
 from .tts import precision
 from . import ui
@@ -138,6 +138,8 @@ class VoiceLoop:
         # ★角色声线的「默认值」快照★：切角色时用角色自己的，切回来时得能回默认，
         # 否则一个角色换过模型/声线后，另一个没配声线的角色会跟着沿用她
         self._base_voice = str(getattr(settings.tts, "voice", "") or "")
+        # ★全局后端★：角色没写 backend 时就回到它（见 _apply_voice）
+        self._base_backend = (str(getattr(settings.tts, "backend", "") or "piper")).strip().lower()
         self._base_clone_dir = str(getattr(settings.tts, "clone_dir", "") or "")
         self._base_clone_audio = str(getattr(settings.tts, "clone_audio", "") or "")
         self._base_clone_text = str(getattr(settings.tts, "clone_text", "") or "")
@@ -834,7 +836,27 @@ class VoiceLoop:
         维度（微调过的角色用自己那份），同样要卸载重载；只换参考音频则当场生效。
         声线/模型/参考不存在就只警告、继续用当前的——**绝不能因为换声线把嘴弄哑了**。
         """
-        if (self.settings.tts.backend or "piper").strip().lower() == "zipvoice":
+        # ★先定后端，再定声线★：角色可以指定自己的后端（Character.backend）。
+        # 默认角色「白泽」是原创助手，固定 backend=piper —— 用**公开的出厂声线**，
+        # 不跟着全局的克隆后端去用某条参考音频（那是别人的配音素材）。
+        # 空 = 跟 config.toml 的 [tts] backend（也就是原来的行为）。
+        want_backend = (getattr(char, "backend", "") or "").strip().lower() or self._base_backend
+        cur_backend = (str(getattr(self.settings.tts, "backend", "") or "piper")).strip().lower()
+        if want_backend not in TTS_BACKENDS:
+            # ★写错后端名不能把嘴弄哑★：忽略它、继续用当前的（跟「声线没装就沿用旧的」一个道理）
+            self.log.warning(f"角色 {char.name} 的 backend={want_backend!r} 不认识，忽略")
+            want_backend = cur_backend
+        if want_backend != cur_backend:
+            self.settings.tts.backend = want_backend
+            # 换后端必须把当前引擎卸掉（克隆那份可能几百 MB ~ 几 GB）；
+            # 下次出声时按新后端重建 —— 这就是 create_tts 把「选哪一类引擎」
+            # 推迟到加载那一刻的原因（见 voice_loop/tts/__init__.py 的 resolve_backend）。
+            unload_old = getattr(self.tts, "unload", None)
+            if callable(unload_old):
+                unload_old()
+            self.log.info(f"[角色] 后端：{cur_backend} → {want_backend}（{char.name} 指定）")
+            print(f"[角色] TTS 后端切到 {want_backend}（{char.name} 指定的）", flush=True)
+        if want_backend == "zipvoice":
             self._apply_reference(char, reason)
             return
         want = (char.voice or "").strip() or self._base_voice

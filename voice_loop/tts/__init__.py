@@ -14,17 +14,21 @@ from .lazy import LazyTts
 from .piper_tts import PiperTts
 from .zipvoice_tts import ZipVoiceTts, missing_files
 
-__all__ = ["TtsEngine", "PiperTts", "ZipVoiceTts", "LazyTts", "create_tts", "missing_files"]
+__all__ = ["TtsEngine", "PiperTts", "ZipVoiceTts", "LazyTts", "create_tts", "resolve_backend",
+           "missing_files"]
 
 BACKENDS = ("piper", "zipvoice")
 ZIPVOICE_HINT = "python scripts/download_models.py --only zipvoice"
 
 
-def create_tts(settings, logger=None, lazy: bool = True) -> TtsEngine:
-    """按配置创建 TTS 引擎。
+def resolve_backend(settings) -> tuple[type, str]:
+    """按当前 settings 决定「用哪一类引擎」+ 一句说明。
 
-    ``lazy=True``（默认）返回按需加载的封装：待唤醒状态完全不占内存，
-    被唤醒时才加载，睡回去时释放（克隆模型 156 MB，这一条很重要）。
+    ★每次**加载**时都重新算一遍★，而不是在 `create_tts` 那一刻定死：
+    `[tts] backend` 会被**角色**临时覆盖（`Character.backend` —— 原创默认助手「白泽」
+    固定用出厂 Piper，凯尔希她们继续用克隆），切角色时只要改 settings + `unload()`，
+    下一次出声就按新后端重建引擎。要是把类定死，按角色切后端就得重建整个 TTS 外壳，
+    而外壳上挂着「文本保真守卫」这类补丁（pipeline 用 `on_load` 挂的），很容易漏。
     """
     backend = (settings.tts.backend or "piper").strip().lower()
     if backend == "zipvoice":
@@ -39,14 +43,28 @@ def create_tts(settings, logger=None, lazy: bool = True) -> TtsEngine:
             backend = "piper"
 
     if backend == "piper":
-        engine_cls, desc = PiperTts, f"piper / {settings.tts.voice}"
-    elif backend == "zipvoice":
+        return PiperTts, f"piper / {settings.tts.voice}"
+    if backend == "zipvoice":
         ref = str(getattr(settings.tts, "clone_audio", "") or "").strip()
-        engine_cls, desc = ZipVoiceTts, f"zipvoice / 参考 {ref or '（未设）'}"
-    else:
-        raise ValueError(f"暂不支持 TTS 后端：{backend}（可选：{'、'.join(BACKENDS)}）")
+        return ZipVoiceTts, f"zipvoice / 参考 {ref or '（未设）'}"
+    raise ValueError(f"暂不支持 TTS 后端：{backend}（可选：{'、'.join(BACKENDS)}）")
 
-    engine = LazyTts(settings, engine_cls, logger, name=backend) if lazy else engine_cls(settings)
+
+def create_tts(settings, logger=None, lazy: bool = True) -> TtsEngine:
+    """按配置创建 TTS 引擎。
+
+    ``lazy=True``（默认）返回按需加载的封装：待唤醒状态完全不占内存，
+    被唤醒时才加载，睡回去时释放（克隆模型 156 MB，这一条很重要）。
+    """
+    engine_cls, desc = resolve_backend(settings)
+    if lazy:
+        # 工厂里**再算一次**：运行期换 [tts] backend（按角色切后端）只要 unload 就够了
+        engine: TtsEngine = LazyTts(
+            settings, lambda s: resolve_backend(s)[0](s), logger,
+            name=(settings.tts.backend or "piper").strip().lower(),
+        )
+    else:
+        engine = engine_cls(settings)
     if logger:
         logger.info(f"TTS: {desc}" + ("（按需加载）" if lazy else ""))
     return engine

@@ -29,6 +29,8 @@
       "rules": ["不知道就直说不知道"],           // 硬性要求
       "avoid": ["不要用「作为一个AI」"],         // 明确不要出现什么
       "lines": [{"scene": "被唤醒", "text": "我在，博士。"}],
+      "backend": "",                         // 可选：这个角色用哪个 TTS 后端（piper / zipvoice；
+                                              //   空 = 跟 config.toml 的 [tts] backend）
       "voice": "",                            // 可选：这个角色用自己的 piper 声线
       "voice_ref": "",                        // 可选：克隆音色的参考音频（wav，backend = "zipvoice" 时用）
       "voice_ref_text": "",                   // 可选：参考音频的逐字文本；留空则用同名 .txt 或自动转写
@@ -99,6 +101,11 @@ class Character:
     default: bool = False
     enabled: bool = True
     notes: str = ""                       # 给自己看的备注（不会进提示词）
+    # ★可选：这个角色用哪个 TTS 后端（piper / zipvoice）★
+    # 空 = 跟 config.toml 的 [tts] backend。存在的意义：默认角色「白泽」是原创助手，
+    # 它必须用**公开可商用的出厂 Piper 声线**，不能跟着全局的克隆后端去用某条参考音频。
+    # 放在最后（而不是挪到 voice 旁边）：dataclass 的字段顺序会被位置构造依赖。
+    backend: str = ""
 
     # ------------------------------------------------------------------ 基础
     @property
@@ -147,6 +154,9 @@ class Character:
             rules=[str(s).strip() for s in _list("rules")],
             avoid=[str(s).strip() for s in _list("avoid")],
             lines=lines,
+            # ★backend 要在这儿显式搬一次★：解析是「白名单式」的显式构造，
+            # 新增字段只加 dataclass 不改这里 = 配置被静默忽略（test_persona [7] 就是守这个的）。
+            backend=str(raw.get("backend") or "").strip(),
             voice=str(raw.get("voice") or "").strip(),
             voice_ref=str(raw.get("voice_ref") or "").strip(),
             voice_ref_text=str(raw.get("voice_ref_text") or "").strip(),

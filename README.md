@@ -1422,6 +1422,8 @@ tools = ["get_volume", "set_volume"]    # 白名单（想全开就留空，但�
 
 ```
 data/characters.json          ← 索引：只写「加载哪些人格」+ 默认是谁（= 谁可被唤醒）
+data/personas/baize.json      ← ★默认角色「白泽」：原创助手★（名字/风格/台词都是自己写的，
+                                声线用公开的出厂 Piper —— 见下面「默认角色是原创的」）
 data/personas/kaltsit.json    ← 一个人格一个文件（名字/背景/称呼/风格/示例台词/唤醒词…）
 data/personas/amiya.json
 data/personas/别人.json        ← 放着不挂：不会被加载，也不会被唤醒
@@ -1446,8 +1448,9 @@ python main.py --character amiya text       # 临时用某个角色（chat / lis
 ```jsonc
 // data/characters.json
 {
-  "default": "kaltsit",                 // 没指定角色时用谁（也可以写在各人格文件里，索引优先）
+  "default": "baize",                  // 没指定角色时用谁（默认是原创助手白泽）
   "characters": [
+    { "id": "baize", "file": "personas/baize.json", "default": true },  // ★默认角色★
     { "id": "kaltsit", "file": "personas/kaltsit.json" },   // 挂上 = 可以被「凯尔希」唤醒
     { "id": "amiya",   "file": "personas/amiya.json", "enabled": false },  // 临时停用
     "personas/lucy.json"                // 简写：只给路径也行
@@ -1479,11 +1482,28 @@ python main.py --character amiya text       # 临时用某个角色（chat / lis
     { "scene": "被唤醒", "text": "我在，博士。" }
   ],
   "voice": "",                      // 可选：这个角色用自己的 piper 声线
+  "backend": "",                    // 可选：这个角色用哪个 TTS 后端（piper / zipvoice；
+                                    //   空 = 跟 config.toml 的 [tts] backend）
   "temperature": 0.0,               // 可选：覆盖全局温度（0 = 用全局）
   "enabled": true,                  // 可选：false 则不参与唤醒（索引里写也一样）
   "notes": "给自己看的备注，不进提示词"
 }
 ```
+
+### 默认角色是原创的（白泽）
+
+默认角色是一个**自己写的角色「白泽」**（神话里「知万物之名」的瑞兽 —— 刚好贴合
+「替你记事、替你念日程」这个定位），目的有两个：**不让这个项目带任何需要授权的素材**，
+也让它换个机器、换个人都直接能用。三条规矩（`scripts/test_persona.py` 第 [7] 节守着）：
+
+1. **名字 / 背景 / 风格 / 台词都是自己写的** —— 不用任何作品的角色名、原文台词；
+2. **声线固定用公开的出厂模型**（`zh_CN-huayan-medium`）；
+3. ★**`voice_ref` / `voice_model` 必须为空**★ —— 这是最容易坏的一条：全局 `[tts] backend`
+   是 `zipvoice`（克隆），角色不写 `backend` 就会跟着全局去用某条**参考音频**；
+   白泽写了 `"backend": "piper"`，所以它走的是出厂声线，跟克隆素材完全无关。
+
+想换成别的原创角色：新写一个人格文件 + 在索引里把 `default` 改过去就行。
+想让某个角色也用出厂声线（不克隆）：在它的人格文件里加 `"backend": "piper"`。
 
 ### 多角色怎么工作
 

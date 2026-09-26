@@ -255,6 +255,69 @@ def test_pipeline(tmp: Path) -> None:
         loop2.close()
 
 
+def test_original_default(tmp: Path) -> None:
+    """★原创默认助手「白泽」★：默认角色必须是自己写的，而且不能跟克隆后端绑在一起。
+
+    这一节守的是**发出去的那个项目**：任何人 clone 下来，默认助手都该是一个不带第三方
+    作品素材的角色（名字/风格/台词自己写、声线用公开的出厂 Piper）。
+    最容易坏的方式是「有人在 baize.json 里填了一条 voice_ref」—— 那样它会跟着全局的
+    克隆后端去用别人的配音素材，所以这里直接断言它必须是空的。
+    """
+    print("\n[7] 原创默认助手：默认是谁 / 声线从哪来 / 不沾克隆素材")
+    reg = CharacterRegistry(ROOT / "data" / "characters.json")
+    person = reg.default()
+    check("默认角色是白泽（原创）", person is not None and person.name == "白泽",
+          getattr(person, "name", None))
+    if person is None:
+        return
+    check("它指定了自己的后端 = piper，不跟全局的克隆", person.backend == "piper",
+          repr(person.backend))
+    check("声线是公开的出厂模型", person.voice == "zh_CN-huayan-medium", person.voice)
+    check("★没带克隆参考音频★", not person.voice_ref.strip(), person.voice_ref)
+    check("★没带微调出来的克隆模型目录★", not person.voice_model.strip(), person.voice_model)
+    check("有唤醒词", bool(person.wake_words), "、".join(person.wake_words))
+    check("称呼不是别人的（不是「博士」）", person.user_title != "博士", person.user_title)
+    prompt = render_system_prompt(person)
+    check("提示词里没提别的作品", "凯尔希" not in prompt and "罗德岛" not in prompt)
+    check("技术字段不进提示词", "piper" not in render_system_prompt(
+        Character("x", "测试", backend="beizetsu-marker")))
+
+    print("\n[7b] 按角色切 TTS 后端（原创角色 piper / 其它角色继续用全局）")
+    chars_path = tmp / "backend_chars.json"
+    write_chars(chars_path, [
+        {"id": "orig", "name": "原创的", "backend": "piper", "voice": "zh_CN-huayan-medium"},
+        {"id": "cloned", "name": "克隆的"},
+        {"id": "typo", "name": "写错的", "backend": "pipe"},
+    ])
+    settings = load_settings()
+    settings.persona.file = str(chars_path)
+    settings.subtitle.enabled = False
+    settings.skills.visual_alert = False
+    settings.wake.file = str(tmp / "wakewords2.json")
+    (tmp / "wakewords2.json").write_text(
+        json.dumps({"enabled": True, "words": ["原创的"], "idle_timeout": 30}), encoding="utf-8")
+    settings.skills.data_dir = str(tmp)
+    settings.skills.event_file = str(tmp / "events2.json")
+    settings.skills.memo_file = str(tmp / "m2.json")
+    settings.tts.backend = "zipvoice"          # 故意设成克隆，看角色能不能把它掰回 piper
+
+    from voice_loop.pipeline import VoiceLoop
+
+    loop = VoiceLoop(settings, enable_listening=False, lazy_whisper=True)
+    try:
+        loop._apply_character(loop.persona.get("orig"), "测试")  # noqa: SLF001
+        check("角色写了 piper 时后端真的切过去", settings.tts.backend == "piper",
+              settings.tts.backend)
+        loop._apply_character(loop.persona.get("cloned"), "测试")  # noqa: SLF001
+        check("没写 backend 的角色回到全局（zipvoice）", settings.tts.backend == "zipvoice",
+              settings.tts.backend)
+        loop._apply_character(loop.persona.get("typo"), "测试")  # noqa: SLF001
+        check("★写错后端名不会把嘴弄哑（忽略并沿用当前的）★", settings.tts.backend == "zipvoice",
+              settings.tts.backend)
+    finally:
+        loop.close()
+
+
 def test_default_file() -> None:
     print("\n[5] 默认模板：删了也能重建，且自带两个角色")
     with tempfile.TemporaryDirectory(prefix="voiceloco_persona_") as d:
@@ -385,6 +448,7 @@ def main() -> int:
         test_pipeline(tmp)
         test_default_file()
         test_split_layout()
+        test_original_default(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
