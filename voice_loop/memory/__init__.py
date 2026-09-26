@@ -532,9 +532,39 @@ class MemoryHub:
                  for w in joined for parent in self.knowledge_roots]
                 + [str(p) for p in (spec.get("world_paths") or []) if str(p).strip()]
             )
-            world_kb = build_knowledge(world_paths, name=f"local:world:{'+'.join(joined)}")
+            world_kb = build_knowledge(world_paths, name=f"local:world:{'+'.join(joined)}",
+                                      owner=f"{'+'.join(joined)}（世界观）")
 
-        parts = [world_kb, own_kb]
+        # ③ ★全知（白泽默认有）★：所有世界观目录 + 别人的专属资料 + 别人的内联设定。
+        #    ★看得到 ≠ 会代入★：每个片段的 owner 都写着“这是谁的”，提示词里也明确要求旁观。
+        #    没这一层，白泽就只能答自己那点东西；有这一层它才像个「知道很多事」的助手。
+        all_kb = KnowledgeBase()
+        if spec.get("all"):
+            mine = {safe_id(w) for w in joined}
+            for parent in self.knowledge_roots:
+                for world_dir in sorted((Path(parent) / "_worlds").glob("*")):
+                    if not world_dir.is_dir() or world_dir.name.startswith("_"):
+                        continue
+                    if world_dir.name in mine:
+                        continue          # 自己已经挂过这个世界观，别重复收两份
+                    all_kb = all_kb.merge(build_knowledge(
+                        [str(world_dir)], name=f"local:world:{world_dir.name}",
+                        owner=f"{world_dir.name}（世界观）"))
+            here = safe_id(key)
+            for cid, cname in (spec.get("others") or []):
+                if safe_id(str(cid)) == here:
+                    continue
+                for parent in self.knowledge_roots:
+                    room = Path(parent) / safe_id(str(cid))
+                    if room.is_dir():
+                        all_kb = all_kb.merge(build_knowledge(
+                            [str(room)], name=f"local:{cid}", owner=f"{cname} 的专属资料"))
+            for title, text, who in (spec.get("others_inline") or []):
+                all_kb = all_kb.merge(build_knowledge(
+                    inline=[(str(title), str(text))], name=f"local:{who}",
+                    owner=f"{who} 的设定"))
+
+        parts = [world_kb, own_kb, all_kb]
         if spec.get("shared") is not False:
             parts.insert(0, self.knowledge)      # 全隔离的角色不拿共享那层
         merged = parts[0]

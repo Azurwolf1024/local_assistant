@@ -51,6 +51,10 @@
       "memory_all": false,                    // 可选：★能不能查所有人的记忆★（默认不能）
                                               //   只有默认助手白泽开了这个权限；开着的角色
                                               //   查完必须说明每一条是从谁的记忆里查到的
+      "knowledge_all": null,                  // 可选：能不能看**全部**知识库（所有人格的世界观 +
+                                              //   别人的专属资料）。默认跟着 memory_all 走；
+                                              //   ★看得到不等于代入★：提到别人时用旁观说法
+                                              //   （“据我所知”），不说成自己的身份
       "notes": "给自己看的备注"                 // 不进提示词
     }
 
@@ -122,6 +126,10 @@ class Character:
     # ★挂在哪个世界观上★（可多个）：同 IP 的角色共享一份设定，不用拷来拷去
     #   （凯尔希 + 阿米娅都写 ["明日方舟"] → 两人共享 _worlds/明日方舟/ 下的资料）
     worlds: list[str] = field(default_factory=list)
+    # ★能不能看到**全部**知识库★（所有人格的世界观 + 别人的专属资料）：
+    # 默认跟着 `memory_all` 走（None = 跟随）；想「只给跨角色查记忆、但不给看别的世界观」
+    # 就显式写 `"knowledge_all": false`。看得到不等于会代入 —— 见 render_system_prompt 里的旁观要求。
+    knowledge_all: bool | None = None
     knowledge_title: str = ""             # 专属世界观的标题（空 = 「<名字> 的设定」）
     world: str = ""                       # 直接写在人格文件里的世界观正文
     knowledge_shared: bool = True         # false = 只看自己的那份（全隔离）
@@ -198,6 +206,8 @@ class Character:
             #   test_memory_mcp 里有专门的断言守这个）
             knowledge=[str(p).strip() for p in _list("knowledge") if str(p).strip()],
             worlds=[str(w).strip() for w in _list("worlds") if str(w).strip()],
+            knowledge_all=(None if raw.get("knowledge_all") is None
+                           else bool(raw.get("knowledge_all"))),
             knowledge_title=str(raw.get("knowledge_title") or "").strip(),
             world=str(raw.get("world") or "").strip(),
             knowledge_shared=bool(raw.get("knowledge_shared", True)),
@@ -223,13 +233,21 @@ def knowledge_spec_for(registry: "CharacterRegistry | None", char_id: str) -> di
         except Exception:  # noqa: BLE001 - 角色文件坏了不该把知识库带崩
             char = None
     if char is None:
-        return {"paths": [], "worlds": [], "world": "", "title": "", "shared": True}
+        return {"paths": [], "worlds": [], "world": "", "title": "", "shared": True,
+                "all": False, "label": "", "others": [], "others_inline": []}
+    siblings = [c for c in (registry.all(only_enabled=True) if registry else [])
+                if c.id and c.id != char.id]
     return {
         "paths": list(char.knowledge),
         "worlds": list(char.worlds),
         "world": char.world,
         "title": char.knowledge_title or f"{char.name} 的设定",
         "shared": bool(char.knowledge_shared),
+        # ★全知权限★：默认跟着 memory_all（白泽默认有），也可以单独关掉
+        "all": bool(char.memory_all if char.knowledge_all is None else char.knowledge_all),
+        "label": char.name,
+        "others": [[c.id, c.name] for c in siblings],
+        "others_inline": [[f"{c.name} 的设定", c.world, c.name] for c in siblings if c.world],
     }
 
 
@@ -272,6 +290,15 @@ def render_system_prompt(char: Character, extra: str = "") -> str:
         parts.append("【必须做到】\n" + "\n".join(f"- {s}" for s in char.rules))
     if char.avoid:
         parts.append("【不要这么做】\n" + "\n".join(f"- {s}" for s in char.avoid))
+    # ★全知角色的「旁观要求」★：它的资料里会有**别人的**世界观和设定。
+    # 不写这一段，小模型会把资料当成自己的身份（“我来自泰拉”“我是罗德岛的医疗主管”），
+    # 而这件事**不会报错**，只是听起来越来越不像它自己。
+    if char.memory_all or char.knowledge_all:
+        parts.append(
+            "【关于你手里的资料】你读过很多设定和资料，其中有一部分是**别人的**（别的角色、别的作品）。"
+            "提到它们时要用旁观的说法（「据我所知」「在……的设定里」），★不要说成自己的身份、来历或经历★；"
+            "除非对方明确问到，不要主动把别人的设定抡出来。你自己的身份只有一个：上面写着的那些。"
+        )
     if char.lines:
         shown = "\n".join(f"- 场景：{ln['scene']} → {ln['text']}" for ln in char.lines)
         parts.append(

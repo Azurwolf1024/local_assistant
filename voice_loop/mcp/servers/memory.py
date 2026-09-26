@@ -54,14 +54,16 @@ def _wants_all(who: str) -> bool:
 
 
 def _format_hit(hit) -> str:
-    """把一条命中排成一行（★每条都带种类，跨角色时外面还会套上「谁记的」★）。"""
+    """把一条命中排成一行（★带种类 + 归属★：跨角色/全知时必须看得出「这是谁的」）。"""
     item = hit.item
     if hit.kind == "episode":
         line = f"[那件事] {str(getattr(item, 'ts', ''))[:16]} {item.title}"
         return line + (f"：{item.summary}" if getattr(item, "summary", "") else "")
     if hit.kind == "fact":
         return f"[事实] {item.key.split('.')[-1]} = {item.value}"
-    return f"[资料] {item.title}：{item.text[:160]}"
+    owner = str(getattr(item, "owner", "") or "")
+    tag = f"资料·{owner}" if owner else "资料"
+    return f"[{tag}] {item.title}：{item.text[:160]}"
 
 
 # --------------------------------------------------------------------------- #

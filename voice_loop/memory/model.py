@@ -100,6 +100,9 @@ class Chunk:
     text: str = ""
     keywords: list[str] = field(default_factory=list)
     updated_at: str = field(default_factory=now_iso)
+    # ★这份资料「属于谁」★（空 = 共享/无主）：
+    # 全知的角色会看到别人的世界观，这时必须能告诉它「这不是你的身份」（见 prompt_block）。
+    owner: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

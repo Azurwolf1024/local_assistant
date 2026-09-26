@@ -1258,7 +1258,9 @@ def cmd_memory(settings: Settings, args: argparse.Namespace) -> int:
         chunks = mem.knowledge.search(args.knowledge, limit=args.limit)
         print(f"知识库命中 {len(chunks)} 段：")
         for chunk in chunks:
-            print(f"  [{chunk.source}] {chunk.title}：{chunk.text[:80]}")
+            # ★带归属★：全知角色（白泽）的库里会有别人的世界观，得看得出“这是谁的”
+            tag = f"·{chunk.owner}" if getattr(chunk, "owner", "") else ""
+            print(f"  [资料{tag}] {chunk.source} {chunk.title}：{chunk.text[:80]}")
         acted = True
     if args.forget:
         print("忘掉了。" if mem.forget(args.forget) else "没找到这条（用 --recall 里的 id / key）。")

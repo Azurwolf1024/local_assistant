@@ -94,9 +94,9 @@ def split_text(text: str, source: str, title: str = "") -> list[Chunk]:
     return kept
 
 
-def _make_chunk(title: str, text: str, source: str, index: int) -> Chunk:
+def _make_chunk(title: str, text: str, source: str, index: int, owner: str = "") -> Chunk:
     return Chunk(id=_chunk_id(source, index, text), source=source, title=title or Path(source).name,
-                 text=text[:MAX_CHUNK_CHARS],
+                 text=text[:MAX_CHUNK_CHARS], owner=owner,
                  keywords=keywords_of(f"{title} {text}", prefer=title),
                  updated_at=now_iso())
 
@@ -117,6 +117,7 @@ class LocalFilesProvider:
     name: str = "local"
     roots: list[str] = field(default_factory=list)
     skip_subdirs: bool = False          # True = 只收 roots 下的顶层文件（共享库用）
+    owner: str = ""                     # ★这份资料属于谁★（空 = 共享/无主）；会写进每个 Chunk
     _cache: dict[str, tuple[float, list[Chunk]]] = field(default_factory=dict, repr=False)
 
     def available(self) -> bool:
@@ -167,6 +168,8 @@ class LocalFilesProvider:
                 text = json.dumps(json.loads(text or "{}"), ensure_ascii=False, indent=2) \
                     if _looks_json(text) else text
             pieces = split_text(text, source=str(path), title=path.stem)
+            for piece in pieces:
+                piece.owner = self.owner
             self._cache[str(path)] = (stamp, pieces)
             out.extend(pieces)
         return out
@@ -184,6 +187,7 @@ class InlineProvider:
     name: str = "inline"
     title: str = "设定"
     text: str = ""
+    owner: str = ""                     # ★这段设定属于谁★（人格文件里内联的那种）
 
     def available(self) -> bool:
         return bool(self.text.strip())
@@ -191,7 +195,10 @@ class InlineProvider:
     def chunks(self) -> list[Chunk]:
         if not self.available():
             return []
-        return split_text(self.text, source=f"<{self.name}>", title=self.title)
+        pieces = split_text(self.text, source=f"<{self.name}>", title=self.title)
+        for piece in pieces:
+            piece.owner = self.owner
+        return pieces
 
 
 @dataclass
@@ -248,17 +255,19 @@ class KnowledgeBase:
 
 
 def build_knowledge(paths: Iterable[str] = (), inline: Iterable[tuple[str, str]] = (),
-                    name: str = "local", skip_subdirs: bool = False) -> KnowledgeBase:
+                    name: str = "local", skip_subdirs: bool = False, owner: str = "") -> KnowledgeBase:
     """按配置拼一个知识库：`paths` 是文件/目录，`inline` 是 (标题, 正文)。
 
     `name` 只影响 `stats()` 里的显示（角色专属的会显示成 `local:<角色>`），
-    这样一眼能看出「这条知识是谁的」。
+    这样一眼能看出「这条知识是谁的」。`owner` 是给**模型看**的归属（写进每个片段），
+    两句人话不一样：name 是给日志/命令行看的，owner 是给提示词看的。
     """
     kb = KnowledgeBase()
     roots = [str(p) for p in paths if str(p).strip()]
     if roots:
-        kb.add(LocalFilesProvider(name=name, roots=roots, skip_subdirs=skip_subdirs))
+        kb.add(LocalFilesProvider(name=name, roots=roots, skip_subdirs=skip_subdirs, owner=owner))
     for title, text in inline:
         if str(text).strip():
-            kb.add(InlineProvider(name=name, title=str(title or "设定"), text=str(text)))
+            kb.add(InlineProvider(name=name, title=str(title or "设定"), text=str(text),
+                                  owner=owner))
     return kb

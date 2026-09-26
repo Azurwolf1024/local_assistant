@@ -21,7 +21,13 @@ sys.path.insert(0, str(ROOT))
 
 from voice_loop.mcp.servers import memory as mem_server  # noqa: E402
 from voice_loop.memory import MemoryHub  # noqa: E402
-from voice_loop.persona import Character, CharacterRegistry, knowledge_spec_for  # noqa: E402
+from voice_loop.persona import (  # noqa: E402
+    Character,
+    CharacterRegistry,
+    can_read_all_memory,
+    knowledge_spec_for,
+    render_system_prompt,
+)
 from voice_loop.settings import load_settings  # noqa: E402
 
 PASS, FAIL = "√", "×"
@@ -146,12 +152,16 @@ def test_per_character(tmp: Path) -> None:
     kaltsit = texts(hub.knowledge_for("kaltsit"))
     check("白泽看得到自己的世界观", BAIZE_WORD in baize)
     check("白泽看得到共享资料（knowledge_shared 默认 true）", SHARED_WORD in baize)
-    check("白泽看不到凯尔希的世界观", KALTSIT_WORD not in baize)
     check("凯尔希看得到自己的世界观", KALTSIT_WORD in kaltsit)
     check("★凯尔希设了 knowledge_shared=false → 看不到共享资料★", SHARED_WORD not in kaltsit)
-    check("凯尔希也看不到白泽的", BAIZE_WORD not in kaltsit)
-    check("stats 分得清谁是谁",
-          sorted(hub.knowledge_for("baize").stats()), ["local", "local:baize"])
+    check("凯尔希也看不到白泽的（她没全知权限）", BAIZE_WORD not in kaltsit)
+    check("★阿米娅（无全知权限）同样看不到凯尔希的★",
+          KALTSIT_WORD not in texts(hub.knowledge_for("amiya")), True)
+    check("stats 分得清谁是谁（全知角色能看到多个来源）",
+          {"local", "local:baize", "local:kaltsit"} <= set(hub.knowledge_for("baize").stats()), True)
+    check("★没有全知权限的角色：stats 里只有自己那几层★",
+          sorted(hub.knowledge_for("amiya").stats()),
+          ["local", "local:amiya", f"local:world:{ARKS}"])
 
 
 def test_persona_fields(tmp: Path) -> None:
@@ -346,7 +356,10 @@ def test_shared_world(tmp: Path) -> None:
     baize = texts(hub.knowledge_for("baize"))
     check_text("凯尔希拿到世界观（她挂了明日方舟）", WORLD_WORD in kaltsit, kaltsit[:80])
     check_text("★阿米娅也拿到同一份★（两人共享一份文件）", WORLD_WORD in amiya, amiya[:80])
-    check_text("白泽没挂 → 拿不到明日方舟的设定", WORLD_WORD not in baize, baize[:80])
+    check_text("★白泽没挂，但它是全知角色 → 也看得到★", WORLD_WORD in baize, baize[:80])
+    check("★差别在归属标注：白泽看到的带着「谁的世界观」★",
+          [c.owner for c in hub.knowledge_for("baize").chunks() if WORLD_WORD in c.text],
+          [f"{ARKS}（世界观）"])
     check("共享一份文件：两人看到的是同一个来源",
           [c.source for c in hub.knowledge_for("kaltsit").chunks() if WORLD_WORD in c.text]
           == [c.source for c in hub.knowledge_for("amiya").chunks() if WORLD_WORD in c.text], True)
@@ -359,7 +372,11 @@ def test_shared_world(tmp: Path) -> None:
            and "local:kaltsit" in hub.knowledge_for("kaltsit").stats()
            and "local" not in hub.knowledge_for("kaltsit").stats()), True)
     check("凯尔希检索得到世界观里的词", bool(hub.for_character("kaltsit").recall(WORLD_WORD)), True)
-    check("★白泽检索不到（世界观组不泄给别人）★", hub.for_character("baize").recall(WORLD_WORD), [])
+    check("★白泽（全知）检索得到，且带着归属★",
+          [h.item.owner for h in hub.for_character("baize").recall(WORLD_WORD, limit=3)
+           if h.kind == "chunk" and WORLD_WORD in h.item.text][:1], [f"{ARKS}（世界观）"])
+    check("★阿米娅没有全知权限 → 只拿得到自己挂的那份★",
+          [h.item.owner for h in hub.for_character("amiya").recall("白泽纹章", limit=3)], [])
 
     # 挂两个世界观 + 世界观目录可以后建（下一次取就生效）
     (kn / "_worlds" / "联动").mkdir()
@@ -382,6 +399,53 @@ def test_shared_world(tmp: Path) -> None:
           "_worlds" not in [k for k in hub.knowledge_for("baize").stats()], True)
 
 
+def test_knowledge_all_switch(tmp: Path) -> None:
+    print("\n[10] ★全知默认开、可以特意关★ + 非全知角色仍然隔离")
+    settings, registry, _ = make_world(tmp)
+
+    # 默认：memory_all=true 的角色，knowledge_all 跟着走（白泽就是这种）
+    raw = json.loads((tmp / "personas" / "baize.json").read_text(encoding="utf-8"))
+    check("没写 knowledge_all 时跟随 memory_all",
+          Character.from_dict(raw).knowledge_all, None)
+    check("说明书里算出来的 all = True", knowledge_spec_for(registry, "baize")["all"], True)
+    check("非全知角色：all = False", knowledge_spec_for(registry, "kaltsit")["all"], False)
+
+    hub = make_hub(settings, registry)
+    check("白泽看得到凯尔希的专属资料（全知）",
+          KALTSIT_WORD in texts(hub.knowledge_for("baize")), True)
+    check("带上了归属标注",
+          [c.owner for c in hub.knowledge_for("baize").chunks() if KALTSIT_WORD in c.text],
+          ["凯尔希 的专属资料"])
+    check("stats 里能看到别人的那层",
+          "local:kaltsit" in hub.knowledge_for("baize").stats(), True)
+
+    # ★特意关掉★：还能跨角色查记忆，但不看别人的世界观/资料
+    raw["knowledge_all"] = False
+    (tmp / "personas" / "baize.json").write_text(json.dumps(raw, ensure_ascii=False),
+                                                 encoding="utf-8")
+    registry.maybe_reload()
+    hub2 = make_hub(settings, registry)
+    spec = knowledge_spec_for(registry, "baize")
+    check("关掉之后 all = False", spec["all"], False)
+    check("跨角色查记忆的权限不受影响（memory_all 还在）", spec["paths"] is not None and
+          can_read_all_memory(registry, "baize"), True)
+    check_text("★看不到别人的专属资料了★",
+               KALTSIT_WORD not in texts(hub2.knowledge_for("baize")),
+               texts(hub2.knowledge_for("baize"))[:80])
+    check("自己挂的世界观还在", WORLD_WORD in texts(hub2.knowledge_for("kaltsit")), True)
+
+
+def test_no_imitation_prompt(tmp: Path) -> None:
+    print("\n[11] ★不代入：全知角色的系统提示里要有「旁观」要求★")
+    _settings, registry, _ = make_world(tmp)
+    baize = registry.get("baize")
+    prompt = render_system_prompt(baize)
+    check_text("写了「不要说成自己的身份」", "不要说成自己的身份" in prompt, prompt[-200:])
+    check_text("写了要旁观（据我所知）", "据我所知" in prompt, prompt[-200:])
+    check("全知角色才有这一段（凯尔希没有）",
+          "不要说成自己的身份" not in render_system_prompt(registry.get("kaltsit")), True)
+
+
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="memory_mcp_"))
     try:
@@ -394,6 +458,8 @@ def main() -> int:
         test_standalone_fallback(tmp / "g")
         test_cross_character(tmp / "h")
         test_shared_world(tmp / "i")
+        test_knowledge_all_switch(tmp / "j")
+        test_no_imitation_prompt(tmp / "k")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print()
