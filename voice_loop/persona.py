@@ -39,8 +39,19 @@
                                               //    如 models/tts/zipvoice/personas/kaltsit）
       "voice_dir": "",                        // 可选：语音素材目录（空 = data/personas/<id>/）
       "temperature": 0.7,                     // 可选：覆盖全局温度（0 = 用全局）
+      "knowledge": ["data/knowledge/zzz/设定.md"],  // 可选：这个角色专属的知识库文件/目录
+      "knowledge_title": "",                  // 可选：专属世界观的标题（空 = 「<名字> 的设定」）
+      "world": "",                            // 可选：直接把它的世界观写在这里
+      "knowledge_shared": true,               // 可选：要不要连共享知识库一起看
+                                              //   （false = 全隔离，只看自己的那份）
       "notes": "给自己看的备注"                 // 不进提示词
     }
+
+知识库（L4）的分层（详见 memory/ 的模块说明）
+    data/knowledge/*.md              ← 顶层文件：**所有角色共享**
+    data/knowledge/<角色id>/*.md     ← 子目录：**只有这个角色**看得到
+    人格文件的 knowledge / world      ← 同上，但路径写得很明白（可以指到仓库外）
+    knowledge_shared = false         ← 连共享那份也不看
 
 热加载
     索引和**所有人格文件**的改动都会被监听到（``maybe_reload``），保存即生效。
@@ -97,6 +108,11 @@ class Character:
     voice_model: str = ""                 # 这个角色专用的 ZipVoice 模型目录
                                           #   （空 = 用 [tts] clone_dir；见 scripts/persona_voice.py）
     voice_dir: str = ""                   # 语音素材目录（空 = data/personas/<id>/）
+    # ★这个角色专属的知识库（L4）★：不同 IP 的角色各看各的世界观，见模块说明。
+    knowledge: list[str] = field(default_factory=list)   # 文件/目录（相对路径按项目根算）
+    knowledge_title: str = ""             # 专属世界观的标题（空 = 「<名字> 的设定」）
+    world: str = ""                       # 直接写在人格文件里的世界观正文
+    knowledge_shared: bool = True         # false = 只看自己的那份（全隔离）
     temperature: float = 0.0              # 0 = 用全局 [llm] temperature
     default: bool = False
     enabled: bool = True
@@ -162,6 +178,12 @@ class Character:
             voice_ref_text=str(raw.get("voice_ref_text") or "").strip(),
             voice_model=str(raw.get("voice_model") or "").strip(),
             voice_dir=str(raw.get("voice_dir") or "").strip(),
+            # ★新增字段必须在这里显式搬一次★（白名单式构造，漏了就是静默忽略；
+            #   test_memory_mcp 里有专门的断言守这个）
+            knowledge=[str(p).strip() for p in _list("knowledge") if str(p).strip()],
+            knowledge_title=str(raw.get("knowledge_title") or "").strip(),
+            world=str(raw.get("world") or "").strip(),
+            knowledge_shared=bool(raw.get("knowledge_shared", True)),
             temperature=float(raw.get("temperature") or 0.0),
             default=bool(raw.get("default")),
             enabled=bool(raw.get("enabled", True)),
@@ -170,6 +192,28 @@ class Character:
 
 
 # --------------------------------------------------------------------------- #
+def knowledge_spec_for(registry: "CharacterRegistry | None", char_id: str) -> dict:
+    """某个角色的知识库「说明书」——给记忆层用（memory 不该认识 Character）。
+
+    返回 ``{"paths": [...], "world": str, "title": str, "shared": bool}``；
+    找不到角色就返回空说明书（= 只看共享知识库）。
+    """
+    char = None
+    if registry is not None:
+        try:
+            char = registry.get(char_id) or registry.default()
+        except Exception:  # noqa: BLE001 - 角色文件坏了不该把知识库带崩
+            char = None
+    if char is None:
+        return {"paths": [], "world": "", "title": "", "shared": True}
+    return {
+        "paths": list(char.knowledge),
+        "world": char.world,
+        "title": char.knowledge_title or f"{char.name} 的设定",
+        "shared": bool(char.knowledge_shared),
+    }
+
+
 def render_system_prompt(char: Character, extra: str = "") -> str:
     """把角色字段拼成 system prompt。
 

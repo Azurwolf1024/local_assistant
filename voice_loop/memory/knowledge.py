@@ -103,10 +103,16 @@ def _make_chunk(title: str, text: str, source: str, index: int) -> Chunk:
 
 @dataclass
 class LocalFilesProvider:
-    """扫目录里的文本文件（`.md` / `.txt` / `.json`），带 mtime 缓存。"""
+    """扫目录里的文本文件（`.md` / `.txt` / `.json`），带 mtime 缓存。
+
+    ★`skip_subdirs` 是「角色隔离」的关键★：共享知识库只收**顶层文件**，
+    子目录按约定属于某个角色（`data/knowledge/<角色id>/`），
+    否则共享库会把所有人的专属世界观一起卷进来 —— 那就无所谓隔离了。
+    """
 
     name: str = "local"
     roots: list[str] = field(default_factory=list)
+    skip_subdirs: bool = False          # True = 只收 roots 下的顶层文件（共享库用）
     _cache: dict[str, tuple[float, list[Chunk]]] = field(default_factory=dict, repr=False)
 
     def available(self) -> bool:
@@ -120,7 +126,10 @@ class LocalFilesProvider:
                 out.append(path)
             elif path.is_dir():
                 for ext in TEXT_EXTS:
-                    out.extend(sorted(path.rglob(f"*{ext}")))
+                    if self.skip_subdirs:
+                        out.extend(sorted(p for p in path.glob(f"*{ext}") if p.is_file()))
+                    else:
+                        out.extend(sorted(path.rglob(f"*{ext}")))
         return out
 
     def chunks(self) -> list[Chunk]:
@@ -213,14 +222,27 @@ class KnowledgeBase:
                 rows[provider.name] = 0
         return rows
 
+    def merge(self, other: "KnowledgeBase") -> "KnowledgeBase":
+        """并上另一份知识库（★拼接，不是替换★）。
 
-def build_knowledge(paths: Iterable[str] = (), inline: Iterable[tuple[str, str]] = ()) -> KnowledgeBase:
-    """按配置拼一个知识库：`paths` 是文件/目录，`inline` 是 (标题, 正文)。"""
+        「共享世界观 + 这个角色专属世界观」就是这么拼出来的：
+        各自保留自己的 provider，检索时统一打分，`stats()` 也分得清哪几段是谁的。
+        """
+        return KnowledgeBase(providers=[*self.providers, *other.providers])
+
+
+def build_knowledge(paths: Iterable[str] = (), inline: Iterable[tuple[str, str]] = (),
+                    name: str = "local", skip_subdirs: bool = False) -> KnowledgeBase:
+    """按配置拼一个知识库：`paths` 是文件/目录，`inline` 是 (标题, 正文)。
+
+    `name` 只影响 `stats()` 里的显示（角色专属的会显示成 `local:<角色>`），
+    这样一眼能看出「这条知识是谁的」。
+    """
     kb = KnowledgeBase()
     roots = [str(p) for p in paths if str(p).strip()]
     if roots:
-        kb.add(LocalFilesProvider(roots=roots))
+        kb.add(LocalFilesProvider(name=name, roots=roots, skip_subdirs=skip_subdirs))
     for title, text in inline:
         if str(text).strip():
-            kb.add(InlineProvider(title=str(title or "设定"), text=str(text)))
+            kb.add(InlineProvider(name=name, title=str(title or "设定"), text=str(text)))
     return kb

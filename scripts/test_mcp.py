@@ -282,8 +282,12 @@ def test_pipeline(tmp: Path) -> None:
         check("pipeline 里挂了 MCP 宿主", loop.mcp is not None)
         specs = loop._tool_specs() or []  # noqa: SLF001
         names = {s["function"]["name"] for s in specs}
+        # 8 个技能 + 2 个记忆工具（recall / remember，白名单控制；见 config.toml）
         check("工具清单来自宿主", {"list_events", "add_memo", "add_event"} <= names
-              and len(names) == 8, f"{len(names)} 个")
+              and len(names) == 10, f"{len(names)} 个")
+        check("记忆工具也露出来了（带 mcp__memory__ 前缀）",
+              {"mcp__memory__recall", "mcp__memory__remember"} <= names,
+              str(sorted(names))[:80])
         check("TOOL_HINT 会一起给（老行为没变）", bool(names))
 
         ok, text = loop._call_tool({"function": {"name": "add_memo",            # noqa: SLF001

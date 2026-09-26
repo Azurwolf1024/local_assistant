@@ -440,6 +440,17 @@ module = "voice_loop.mcp.servers.skills"
 namespace = false              # 工具名保持 list_events / add_memo 原样：模型已经认得这 8 个
 timeout = 15
 
+# ★长期记忆★：让模型自己决定去查（信息检索 + 时间检索）和去记（见工程日志第 36、38 节）。
+# 只露出 2 个工具：recall / remember。工具一多本地小模型就选不准（实测 8 个是甜点），
+# memory_stats 就不露给模型了，给命令行 `python main.py memory` 和外部 agent 用。
+# ★记忆按角色隔离★：工具默认操作「当前角色」的记忆，不存在串角色的问题。
+[[mcp.servers]]
+name = "memory"
+transport = "inproc"
+module = "voice_loop.mcp.servers.memory"
+tools = ["recall", "remember"]   # 白名单：想全开就删掉这一行
+timeout = 10
+
 # 想更隔离就把它挪到子进程（每次调用多几毫秒，但服务器崩了不影响助手）：
 # [[mcp.servers]]
 # name = "skills"

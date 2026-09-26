@@ -1747,6 +1747,59 @@ world = "白泽是通晓万物之名的瑞兽，如今住在本地机器里…�
 以后想接外部知识库（向量库 / 联网检索），实现一个 `search(query)`
 返回片段数组的类，传给 `build_knowledge(providers=[...])` 就行（接口在 `voice_loop/memory/knowledge.py`）。
 
+### 多角色：各看各的世界观（知识库也能共享）
+
+知识库（L4）分两层，**摆法决定谁看得到**：
+
+| 放哪里 | 谁能检索到 |
+| --- | --- |
+| `data/knowledge/某个文件.md`（**顶层**） | **所有角色**（这就是「可以调用相同知识库」） |
+| `data/knowledge/<角色id>/任何文件.md` | **只有那个角色**（不同 IP 各一套世界观） |
+
+```
+data/knowledge/
+    通用说明.md          ← 大家都看
+    baize/世界观.md      ← 只有白泽看
+    kaltsit/罗德岛.md    ← 只有凯尔希看
+```
+
+人格文件里还能再细控（可选）：`knowledge` 显式路径、`world` 内联世界观、
+`knowledge_shared = false` 连顶层那份也不看（全隔离）。
+
+```json
+{
+  "id": "amiya", "name": "阿米娅",
+  "knowledge": ["data/knowledge/amiya/泰拉.md"],
+  "knowledge_title": "泰拉大陆",
+  "world": "阿米娅是罗德岛的领袖……"
+}
+```
+
+检查某一名的知识库（`local` = 共享，`local:<角色>` = 它自己的）：
+
+```powershell
+python main.py memory --who baize            # knowledge: {'local': 6, 'local:baize': 3}
+python main.py memory --who baize --knowledge 白泽
+```
+
+★隔离是断在检索层的★：共享库只收**顶层文件**、不收任何角色子目录，
+所以凯尔希拿白泽的设定去回答这类事在结构上就不会发生（自测里逐条钉住）。
+
+### 模型自己会去查（MCP 工具）
+
+除了每轮自动带上的记忆摘要，记忆还挂了两个 MCP 工具（见 `config.toml`）：
+
+| 工具 | 干什么 |
+| --- | --- |
+| `mcp__memory__recall` | 按内容 + 时间检索（「上次」「上周三」这类说法直接传 `when`） |
+| `mcp__memory__remember` | 记一条（用户说「记住…」、或提到值得长期留的偏好时） |
+
+好处是模型可以从「被动接受几条」变成「自己去翻旧账」：
+你说「我们上个月是不是聊过这个」，它会先 recall 再回答，而不是凭印象编。
+
+只露出 2 个工具是有意的：工具一多本地小模型就选不准（实测 8 个是甜点，
+加上这两个共 10 个）。`memory_stats` 没露给模型，留给命令行和外部 agent。
+
 ### 多角色：记忆分开，日程共用
 
 - 每个角色一份目录 `data/memory/<角色>/`：**经历、事实、知识互不可见**；

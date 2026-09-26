@@ -48,6 +48,7 @@ from .levels import (
 )
 from .model import Chunk, Episode, Fact, Hit, now_iso
 from .retrieve import in_window, parse_when, rank, score_chunk, score_episode, score_fact
+from .store import safe_id
 from .store import MemoryPaths, append_jsonl, read_json, read_jsonl, rewrite_jsonl, session_key, write_json
 
 # 默认上限（config.toml 的 [memory] 可以改）
@@ -416,13 +417,27 @@ class Memory:
 
 
 class MemoryHub:
-    """按角色分发记忆（★隔离★），并持有共享的日程接口与全局知识库。"""
+    """按角色分发记忆（★隔离★），并持有共享的日程接口与知识库（★可共享、也可各看各的★）。
+
+    知识库（L4）的分层规则（这次新加的，回答「不同角色能不能用不同世界观」）：
+
+        1. **共享**：`[memory] knowledge_paths` 目录里的**顶层文件**（默认 `data/knowledge/*.md`）
+           → 每个角色都能检索到（这是「可以调用相同知识库」那半边）。
+        2. **专属**：`<那个目录>/<角色id>/` 子目录 + 人格文件里的 `knowledge` / `world`
+           → 只有这个角色能检索到（这是「不同 IP 各看各的世界观」那半边）。
+        3. 人格文件里 `knowledge_shared = false` → 连共享那份也不看（全隔离的角色）。
+
+    ★为什么要靠「子目录 = 角色」这条约定★：只写配置很容易忘，而目录结构一眼就能看懂、
+    新建一个角色只要建一个同名目录。共享库那边靠 `skip_subdirs=True` **不收子目录**，
+    所以专属世界观不会泄漏给别的角色。
+    """
 
     def __init__(self, settings=None, *, root: str | Path | None = None,
                  schedule: Schedule | None = None,
                  llm_call: Callable[[str], str] | None = None,
                  logger: logging.Logger | None = None,
-                 global_knowledge: KnowledgeBase | None = None) -> None:
+                 global_knowledge: KnowledgeBase | None = None,
+                 character_knowledge: Callable[[str], dict] | None = None) -> None:
         cfg = getattr(settings, "memory", None)
         configured = str(getattr(cfg, "dir", "") or "").strip()
         if configured:
@@ -446,15 +461,48 @@ class MemoryHub:
                                       or KEEP_SESSION_FILES)
         self.enabled = bool(getattr(cfg, "enabled", True))
         self.inject = bool(getattr(cfg, "inject", True))
-        # 全局知识库：data/knowledge/ + 配置里 inline 的设定（每个角色都能看到）
+        # 共享知识库：目录里的**顶层文件** + 配置里 inline 的设定（每个角色都能看到）
         paths = list(getattr(cfg, "knowledge_paths", None) or [])
         if not paths:
             paths = ["data/knowledge"]
+        base = Path(settings.root) if settings is not None else Path(".")
+        self.knowledge_roots = [str((base / p) if not Path(p).is_absolute() else Path(p))
+                               for p in paths]
         inline = [(getattr(cfg, "world_title", "设定"), getattr(cfg, "world", ""))]
         self.knowledge = global_knowledge or build_knowledge(
-            [str(Path(settings.root) / p) if settings is not None and not Path(p).is_absolute() else p
-             for p in paths], inline)
+            self.knowledge_roots, inline, name="local", skip_subdirs=True)
+        # ★人格文件那条路★：由 pipeline / MCP 服务器注入（记忆层不认识 Character，
+        # 只认一个「给我说明书」的回调 —— 跟 schedule 用协议是同一个思路）。
+        self.character_knowledge = character_knowledge
         self._cache: dict[str, Memory] = {}
+
+    def knowledge_for(self, character: str | None) -> KnowledgeBase:
+        """某个角色的**完整**知识库 = 共享的 + 它自己那份（`knowledge_shared=false` 时只要自己的）。
+
+        ★每次都重新拼★：`LocalFilesProvider` 自己按 mtime 缓存片段，拼一遍只是几个对象，
+        换来的是「往 `data/knowledge/<角色>/` 里丢个文件、下一句话就生效」。
+        """
+        key = (character or "default").strip() or "default"
+        spec: dict = {}
+        if self.character_knowledge is not None:
+            try:
+                spec = self.character_knowledge(key) or {}
+            except Exception as exc:  # noqa: BLE001 - 人格文件坏了不该把知识库带崩
+                self.log.warning(f"[记忆] {key} 的知识库说明读取失败：{exc}")
+                spec = {}
+        own: list[str] = []
+        for parent in self.knowledge_roots:
+            # 约定：<共享目录>/<角色id>/ = 只有这个角色看得到的资料
+            own.append(str(Path(parent) / safe_id(key)))
+        own.extend(str(p) for p in (spec.get("paths") or []) if str(p).strip())
+        base = Path(self.settings.root) if self.settings is not None else Path(".")
+        resolved = [str(base / p) if not Path(p).is_absolute() else str(p) for p in own]
+        title = str(spec.get("title") or f"{key} 的设定")
+        own_kb = build_knowledge(
+            resolved, inline=[(title, spec.get("world") or "")], name=f"local:{key}")
+        if spec.get("shared") is False:
+            return own_kb          # ★全隔离的角色★：连共享世界观都不给
+        return self.knowledge.merge(own_kb)
 
     def for_character(self, character: str | None) -> Memory:
         """取某个角色的记忆（同一个角色只建一个实例）。"""
@@ -462,12 +510,15 @@ class MemoryHub:
         got = self._cache.get(key)
         if got is None:
             got = self._cache[key] = Memory(
-                self.root, key, knowledge=self.knowledge, schedule=self.schedule,
+                self.root, key, knowledge=self.knowledge_for(key), schedule=self.schedule,
                 llm_call=self.llm_call, logger=self.log,
                 max_episodes=self.max_episodes, max_facts=self.max_facts,
                 keep_session_days=self.keep_session_days,
                 keep_session_files=self.keep_session_files,
             )
+        else:
+            # 知识库热更新：人格文件改了 `knowledge` / 新丢了个专属知识文件，下一轮就生效
+            got.knowledge = self.knowledge_for(key)
         return got
 
     def characters(self) -> list[str]:

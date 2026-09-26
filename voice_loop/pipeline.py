@@ -28,7 +28,7 @@ from .control import ControlChannel, reap as reap_control, serve_once as serve_c
 from .llm import OllamaClient, OllamaError
 from .mcp import MCPHost
 from .names import NameCorrector
-from .persona import Character, CharacterRegistry, render_system_prompt
+from .persona import Character, CharacterRegistry, knowledge_spec_for, render_system_prompt
 from .scheduler import ReminderScheduler
 from .settings import Settings
 from .skills import Skills
@@ -157,7 +157,16 @@ class VoiceLoop:
             MCPHost(
                 settings.mcp,
                 self.log,
-                deps={"settings": settings, "skills": self.skills, "logger": self.log},
+                deps={
+                    "settings": settings,
+                    "skills": self.skills,
+                    "logger": self.log,
+                    # ★记忆工具要拿到**同一个** hub 和**当前**角色★：
+                    # 另建一个 hub 也能读写同样的文件，但两边各持一份缓存，
+                    # 模型刚记住的东西在这一轮的提示词里就看不到（用回调就当场拿到）。
+                    "hub": lambda: self.memory_hub,
+                    "character": lambda: (self.character.id if self.character else ""),
+                },
             )
             if self.skills and getattr(settings, "mcp", None) is not None
             else None
@@ -303,7 +312,8 @@ class VoiceLoop:
         if getattr(settings, "memory", None) is not None and settings.memory.enabled:
             try:
                 self.memory_hub = MemoryHub(settings, schedule=SharedSchedule(settings),
-                                            llm_call=self._memory_llm, logger=self.log)
+                                            llm_call=self._memory_llm, logger=self.log,
+                                            character_knowledge=self._character_knowledge)
             except Exception as exc:  # noqa: BLE001 - 记忆起不来不该影响说话
                 self.log.warning(f"[记忆] 初始化失败，这次不带记忆：{exc}")
 
@@ -2160,6 +2170,19 @@ class VoiceLoop:
         except Exception as exc:  # noqa: BLE001
             self.log.warning(f"[记忆] 摘要生成失败（这一轮不带记忆）：{exc}")
             return ""
+
+    def _character_knowledge(self, char_id: str) -> dict:
+        """某个角色的知识库说明书（L4）—— ★不同 IP 的角色各看各的世界观★。
+
+        数据来自人格文件（`knowledge` / `world` / `knowledge_shared`，见 persona.py），
+        另外记忆层还有一条约定：`data/knowledge/<角色id>/` 目录自动算这个角色的。
+        取不到就返回空说明书（= 只看共享知识库），绝不让它挡住说话。
+        """
+        try:
+            return knowledge_spec_for(self.persona, char_id)
+        except Exception as exc:  # noqa: BLE001 - 人格文件坏了不该把知识库带崩
+            self.log.debug(f"[记忆] {char_id} 的知识库说明取不到：{exc}")
+            return {"paths": [], "world": "", "title": "", "shared": True}
 
     def _memory_llm(self, prompt: str) -> str:
         """给记忆层用的「一句问、一句答」口子（归档时总结用）。
