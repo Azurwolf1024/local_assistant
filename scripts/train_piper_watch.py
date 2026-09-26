@@ -144,20 +144,29 @@ def series_stats(events: list[tuple[int, float, float]]) -> dict[str, float]:
     return out
 
 
-def rate_per_min(events: list[tuple[int, float, float]], window: int = 20) -> float:
+def rate_per_min(events: list[tuple[int, float, float]], window: int = 30,
+                 max_gap_s: float = 600.0) -> float:
     """最近 `window` 个标量算出「步/分」。
 
     ★必须用 events 里的 wall_time、不能用「现在」★：读文件的那一刻跟最后一个标量
     之间可能有几分钟差（tfevents 是攒着写的），拿 now 算会把速度算低。
+
+    ★还必须扔掉超长间隔★：机器**休眠/断电**之后，那个几小时的洞会被算进速率 ——
+    2026-09-26 就出了这个：A 的真实速率 ~4 步/分，被一个 9 小时的空洞拉成
+    「8 步/小时」，ETA 从 2 小时变成「2.7 天」。
     """
     tail = events[-window:] if len(events) > window else events
-    if len(tail) < 2:
+    steps = 0
+    seconds = 0.0
+    for i in range(1, len(tail)):
+        step_delta = tail[i][0] - tail[i - 1][0]
+        time_delta = tail[i][2] - tail[i - 1][2]
+        if step_delta > 0 and 0 < time_delta <= max_gap_s:
+            steps += step_delta
+            seconds += time_delta
+    if steps <= 0 or seconds <= 0:
         return 0.0
-    step_span = tail[-1][0] - tail[0][0]
-    time_span = tail[-1][2] - tail[0][2]
-    if step_span <= 0 or time_span <= 0:
-        return 0.0
-    return step_span / (time_span / 60.0)
+    return steps / (seconds / 60.0)
 
 
 # --------------------------------------------------------------------------- #
@@ -349,13 +358,13 @@ def render_arm(info: dict) -> list[str]:
         if hint.get("epochs"):
             progress += f"/{hint['epochs']}"
         lines.append(f"    本轮 {info.get('version', '')}：{progress}")
-        # ★★重启之后不能用「本轮 step」说进度★：看门狗重启会新开一个 version、
-        # 步数从 0 重数，而模型是接着 checkpoint 训的。第一版就因此报了「还需 7.4 小时」，
-        # 而模型其实只剩 91 个 epoch（≈ 2 小时）—— 两边的数字对不上会让人做出错的安排。
-        ckpt_epoch = int(info.get("ckpt_epoch", -1))
-        if ckpt_epoch >= 0 and hint.get("epochs"):
-            lines.append(f"    模型：checkpoint epoch {ckpt_epoch}/{hint['epochs']}"
-                         f"（{ckpt_epoch / hint['epochs'] * 100:.0f}%）  ← 跨重启的真实进度")
+        # ★重启之后的本轮计数是「局部」的★：看门狗重启会新开一个 version，step/epoch 从 0 重数
+        #（checkpoint 文件名里的 epoch 也是这一轮的，不是跨重启累计的 —— 别把它当成
+        # 「模型的真实进度」，第一版这么标过，是错的）。所以进度就跟「本轮 vs 目标」说，
+        # 并明确告诉重启过几次，让人知道重数这回事。
+        if info.get("attempts", 0) > 1:
+            lines.append(f"    （这个 run 重启过 {info['attempts'] - 1} 次：每次从最近的 checkpoint 续，"
+                         "**本轮 epoch 从 0 重数**）")
 
         first_step, _, first_wall = (scalars.get("loss_gen_all") or [(0, 0, 0)])[0]
         elapsed = (scalars.get("loss_gen_all") or [(0, 0, 0)])[-1][2] - first_wall
@@ -367,12 +376,11 @@ def render_arm(info: dict) -> list[str]:
                      f"   共 {int(loss['count'])} 个点")
         rate = loss.get("rate_per_min") or 0.0
         if rate > 0:
-            ckpt_epoch = int(info.get("ckpt_epoch", -1))
             epochs_total = int(hint.get("epochs") or 0)
             per_epoch = int(hint.get("steps_per_epoch") or 0)
-            if ckpt_epoch >= 0 and epochs_total and per_epoch:
-                # 模型还差多少个 epoch（跨重启有意义），而不是本段的 step
-                remaining = max(0, epochs_total - ckpt_epoch) * per_epoch
+            if epochs_total and per_epoch and epoch >= 0:
+                # 本轮的 epoch 还差多少个 → 换算成步（这才是「什么时候会停」）
+                remaining = max(0, epochs_total - epoch) * per_epoch
             else:
                 remaining = max(0, target - step)
             eta = ""

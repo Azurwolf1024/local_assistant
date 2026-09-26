@@ -174,28 +174,36 @@ def main() -> int:
     check("epoch 带目标", "epoch 9/300" in text, True)
     check("显示 loss", "loss_gen" in text, True)
     check("显示 ETA", "若继续跑还需" in text, True)
-    check("显示跨重启的真实进度", "模型：checkpoint epoch 29/300" in text, True)
+    check("重启过就明说（本轮 epoch 从 0 重数）", "重启过 2 次" in text, True)
     check("显示 checkpoint", "epoch=29-step=360.ckpt" in text, True)
     check("显示看门狗本次是第几次", "本次启动第 3 次尝试" in text, True)
     check("显示累计崩溃次数", "累计崩过 2 次" in text, True)
+    check("★不许再把 checkpoint 的局部 epoch 当成跨重启进度★",
+          "跨重启的真实进度" in text, False)
 
-    # ★重启后剩余量要按 checkpoint 算★：步数从 0 重数，但模型是从 epoch 29 接着训的
+    # ★要按「本轮 epoch vs 目标」算剩余★：fixture 本轮 epoch=9、目标 300 epoch、每轮 6 步
+    # → 剩 (300-9)*6 = 1746 步；速率来自 loss_gen 序列（60 秒/步 → 1 步/分）→ 1746 分钟 ≈ 29.1 小时
     restarted = dict(info)
-    restarted["scalars"] = {
-        "loss_gen_all": [(i, 40.0, 2000.0 + i * 15) for i in range(5)],   # 4 步/分
-        "epoch": [(i, float(i), 2000.0 + i * 15) for i in range(5)],
-    }
     text_r = "\n".join(render_arm(restarted))
-    check("重启后：模型进度照实报", "checkpoint epoch 29/300" in text_r, True)
-    check("重启后：剩余量按 epoch 算（(300-29)*6=1626 步 ≈ 6.8 小时）",
-          "若继续跑还需 6.8 小时" in text_r, True, detail=text_r.splitlines()[4])
+    check("剩余量按本轮 epoch 算", "若继续跑还需 29.1 小时" in text_r, True,
+          detail=[line for line in text_r.splitlines() if "步/小时" in line][0])
+
+    print("\n[9b] rate_per_min：★休眠/断电造成的长间隔必须丢掉★")
+    # 前面正常（每 15 秒一步），中间有一个 9 小时的空洞，后面又正常
+    with_gap = [(i, 1.0, i * 15.0) for i in range(20)]
+    with_gap += [(20 + i, 1.0, 20 * 15.0 + 9 * 3600 + i * 15.0) for i in range(20)]
+    rate_gap = rate_per_min(with_gap)
+    check("有 9 小时空洞时速率不变（4 步/分）", round(rate_gap, 2), 4.0)
+    no_gap = [(i, 1.0, i * 15.0) for i in range(40)]
+    check("没有空洞时同样算 4 步/分", round(rate_per_min(no_gap), 2), 4.0)
+    check("整段只有空洞 → 0（不拿它吹牛）", rate_per_min([(0, 1.0, 0.0), (1, 1.0, 9 * 3600.0)]), 0.0)
 
     dead = dict(info)
     dead.pop("pid"); dead.pop("working_set_gb")
     text_dead = "\n".join(render_arm(dead))
     check("已停的臂：明说不在跑了", "★已经不在跑了★" in text_dead, True)
     check("已停的臂：不说「跑完」", "跑完）" in text_dead, False)
-    check("已停的臂：剩余步数照说", "剩 1626 步" in text_dead, True)
+    check("已停的臂：剩余步数照说", "剩 1746 步" in text_dead, True)
 
     bare = dict(info)
     bare.pop("scalars"); bare.pop("pid"); bare.pop("working_set_gb")
