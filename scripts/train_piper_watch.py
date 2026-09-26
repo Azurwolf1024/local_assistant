@@ -37,6 +37,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -217,6 +218,30 @@ def read_python_processes() -> list[dict]:
         return []
 
 
+_PROC_CACHE: dict = {"procs": [], "stamp": 0.0, "busy": False}
+
+
+def refresh_processes_in_background() -> None:
+    """★进程查询必须放后台★：`Get-CimInstance` 要把每个进程的 CommandLine 都取回来，
+    在这台机器上实测要**十几秒到几十秒**。放在主循环里会让看板「第一帧半天不出来」——
+    用户会以为卡死，直接按 Ctrl+C 退出（2026-09-26 就这么发生过，我还以为是脚本崩了）。
+
+    改成：拿上一次的结果先渲染，查完了下一轮自然换上；底部标注它是多少秒前查的。
+    """
+    if _PROC_CACHE["busy"]:
+        return
+    _PROC_CACHE["busy"] = True
+
+    def worker() -> None:
+        try:
+            _PROC_CACHE["procs"] = read_python_processes()
+            _PROC_CACHE["stamp"] = time.time()
+        finally:
+            _PROC_CACHE["busy"] = False
+
+    threading.Thread(target=worker, daemon=True, name="proc-scan").start()
+
+
 def match_process(procs: list[dict], out_dir: Path) -> dict | None:
     """哪条 python 进程属于这个臂。
 
@@ -339,7 +364,10 @@ def render_arm(info: dict) -> list[str]:
         mem = f"内存 {info['working_set_gb']:.1f} GB" if "working_set_gb" in info else "内存 ?"
         title += f"   ★在跑★ PID {info['pid']} {mem}"
     else:
-        title += "   （没找到训练进程：可能已结束、或还没启动）"
+        # ★「还没查」和「真不在」必须分开说★：进程表在后台扫，第一帧肯定还没有 ——
+        # 写成「没找到训练进程」会让人以为训练挂了（实际正跑得好好的）。
+        title += ("   （进程信息还在查…）" if info.get("procs_unknown")
+                  else "   （没找到训练进程：可能已结束、或还没启动）")
     lines = [f"  {title}"]
 
     scalars = info.get("scalars") or {}
@@ -420,7 +448,7 @@ def render_arm(info: dict) -> list[str]:
     return lines
 
 
-def render(all_infos: list[dict], hidden: int, interval: int) -> list[str]:
+def render(all_infos: list[dict], hidden: int, interval: int, procs_age: float = -1.0) -> list[str]:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     lines = [f"Piper 微调进度   {now}   （每 {interval} 秒刷新，Ctrl+C 退出）", "═" * 78]
     for info in all_infos:
@@ -436,6 +464,9 @@ def render(all_infos: list[dict], hidden: int, interval: int) -> list[str]:
         lines.append(f"可用内存 {ram:.1f} GB{warn}")
     if hidden:
         lines.append(f"（另有 {hidden} 个不活跃的实验目录没显示，加 --all 可看全）")
+    if procs_age >= 0:
+        lines.append(f"（进程/内存那几行是 {human_age(procs_age)}查的；"
+                     "PowerShell 扫进程很慢，所以它在后台查、不阻塞刷新）")
     lines.append("曲线图：.venv-piper\\Scripts\\tensorboard.exe --logdir data\\piper → http://localhost:6006")
     return lines
 
@@ -514,10 +545,16 @@ def main() -> int:
         return 1
 
     while True:
-        procs = read_python_processes()
+        # 进程信息在后台刷新（它慢，不能挡住渲染）；这里先用上一次的结果
+        refresh_processes_in_background()
+        procs = _PROC_CACHE["procs"]
+        age = time.time() - _PROC_CACHE["stamp"] if _PROC_CACHE["stamp"] else -1.0
         picked, hidden = select_arms(all_dirs, procs, args.arms, args.recent_hours, args.all)
         infos = [collect_arm(d, procs) for d in picked]
-        text = "\n".join(render(infos, hidden, args.interval))
+        if not _PROC_CACHE["stamp"]:  # 第一次扫描还没回来
+            for info in infos:
+                info["procs_unknown"] = True
+        text = "\n".join(render(infos, hidden, args.interval, age))
         if not args.no_clear and not args.once:
             sys.stdout.write("\x1b[2J\x1b[H")  # 清屏+光标归位（Windows Terminal 认这个）
         print(text, flush=True)
@@ -534,4 +571,22 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except KeyboardInterrupt:
+        # 用户按 Ctrl+C 退出看板 —— 这是正常用法（终端里 cmd 可能报 1，那是控制台的退出码，
+        # 不是看板失败；训练在别的进程里，不受影响）。
         raise SystemExit(0) from None
+    except Exception:  # noqa: BLE001
+        # ★看板是最难查的那种故障★：它全屏刷新，报错行会被下一次清屏冲掉，用户只看到
+        # 「跑完只剩一个退出码」。2026-09-26 就遇到过一次（不知道是真报错还是 Ctrl+C）。
+        # → 把 traceback 落盘，下次有据可查。
+        import traceback  # noqa: PLC0415
+
+        text = traceback.format_exc()
+        target = ROOT / "sessions" / "watch_crash.log"
+        try:
+            target.write_text(text, encoding="utf-8")
+        except OSError:
+            target = None
+        sys.stdout.write(f"\n{text}\n")
+        if target:
+            sys.stdout.write(f"（上面这段也写进了 {target}）\n")
+        raise SystemExit(1) from None

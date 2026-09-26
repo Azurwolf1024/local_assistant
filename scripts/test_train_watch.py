@@ -212,6 +212,12 @@ def main() -> int:
     check("没 tfevents → 明说", "还没有 tfevents" in text2, True)
     check("降级后不冒充进度", "预计还需" in text2 or "若继续跑还需" in text2, False)
 
+    still_scanning = dict(bare)
+    still_scanning["procs_unknown"] = True
+    check("★进程表还没查完时，不能说「没找到训练进程」★",
+          "没找到训练进程" in "\n".join(render_arm(still_scanning)), False)
+    check("而是说「还在查」", "还在查" in "\n".join(render_arm(still_scanning)), True)
+
     print("\n[10] select_arms：点名 / 活跃度过滤 / --all")
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
