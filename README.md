@@ -12,7 +12,7 @@
 ## 这份 README 里有什么
 
 **这里只讲怎么装、怎么用。** 所有「为什么这么设计」「实测多少」「踩过什么坑」
-都在 [`docs/ENGINEERING_LOG.md`](docs/ENGINEERING_LOG.md)（工程日志，1300+ 行实测记录）。
+都在 [`docs/ENGINEERING_LOG.md`](docs/ENGINEERING_LOG.md)（工程日志，42 节 / 3200+ 行实测记录）。
 
 | 想干什么 | 去哪看 |
 | --- | --- |
@@ -58,6 +58,12 @@ flowchart LR
     R -. 直接读写同一批 json（日程/闹钟/备忘） .-> H
     R -. 文件信箱：由服务代跑<br/>念一句 / 切声线 / 文字对话 .-> I
     R -. 只读跟随日志 .-> S["sessions/listen.log"]
+
+    T["🧠 记忆（四级）<br/>L1 原始对话 → L2 情节 → L3 事实 → L4 知识库"]
+    I -. 每轮带几条相关记忆进提示词 .-> T
+    I -. MCP 工具：recall / remember .-> T
+    T -. 退出时归档 + 自清洁（合并/衰减/提升） .-> T2["data/memory/&lt;角色&gt;/<br/>每角色一份 · 日程共享"]
+    T -. 世界观/资料 .-> T3["data/knowledge/<br/>共享 · 世界观组 · 专属"]
 ```
 
 ### 1.1 两级加载（`listen` 常驻服务）
@@ -68,12 +74,15 @@ flowchart LR
 | **已唤醒**（加载） | 前台加载 TTS，后台预热 Whisper 与 qwen3.5:4b | 约 2.5 GB + Ollama |
 | **空闲超时**（回收） | 卸载 Whisper / TTS，并让 Ollama 释放模型 | 回到 0.9 GB |
 
+记忆和知识库**不占这两级**：它们就是磁盘上的 json / markdown（`data/memory/`、`data/knowledge/`），
+每轮只读几个文件，不加载模型（第 15 节）。
+
 ### 1.2 技能 / 工具 / 模型怎么分工
 
 一句话：**模型**负责「听懂要干什么、该用哪个工具」，**确定性代码**负责「算时间、查数据、做守卫」。
 
 ```
-你说 ──▶ ① 模型（带着 8 个工具，流式）
+你说 ──▶ ① 模型（带着 10 个工具，流式：8 个生活技能 + 2 个记忆工具）
            ├ tool_call  → ② MCP 工具层（宿主 → 服务器）
            │               └ 算日期、去重、反问确认全在服务器后面的确定性代码里
            │               → 工具产出的话直接播报（不再多跑一轮模型）
@@ -104,9 +113,10 @@ flowchart LR
 > 想完全不调工具：`[llm] router = "chat"`（这时自动走 `rules`）。
 > 想自己量一遍选工具准不准：`python scripts/eval_router.py --builtin`（带预期标注，会算选对率）。
 
-工具只有 8 个，都只收一句原话（`text`）：
+工具一共 10 个：**8 个生活技能**都只收一句原话（`text`）——
 `list_events`（事件列表，也接「有哪些提醒」）`next_event` `add_event` `change_event`
-`list_memos` `add_memo`、`now`（报时）、`fix_last`（「我说是…」改刚记下那条）。
+`list_memos` `add_memo`、`now`（报时）、`fix_last`（「我说是…」改刚记下那条）；
+再加 **2 个记忆工具**（第 15 节）：`mcp__memory__recall`、`mcp__memory__remember`。
 
 > ★合并前是 11 个★：`add_schedule`/`add_alarm` 是一回事，`change_schedule`/`cancel_alarm`
 > 是一回事，`list_schedule`/`list_alarms` 也是一回事。现在**一条事件只有一个入口**。
@@ -147,12 +157,16 @@ flowchart LR
 ```
 <项目目录>\
 ├─ main.py                     # 入口：listen / stop / chat / text / ask / see / skills / asr / tts
-│                              #       / ui（可视化控制台）/ devices / gpu / persona / mcp / selftest
+│                              #       / ui（可视化控制台）/ devices / gpu / persona / mcp / memory
+│                              #       / selftest
 ├─ config.toml                 # 全部可调参数
 ├─ requirements.txt            # 依赖（Python 3.13）
 ├─ data/                       # ← 可以直接用编辑器改
 │  ├─ characters.json          #   ★角色索引★：挂上谁（= 谁可被唤醒）+ 默认角色
 │  ├─ personas/                #   ★独立人格文件★：一个角色一个 json（没挂上的不会被唤醒）
+│  ├─ knowledge/               #   ★知识库（L4）★：顶层=所有角色 / <角色id>/=专属 /
+│  │                           #     _worlds/<世界观>/*=挂了它的角色共享；详见第 15 节
+│  ├─ memory/                  #   ★记忆（L1~L3）★：一个角色一个目录（不进 git，是隐私）
 │  ├─ wakewords.json           #   唤醒词调参（唤醒词本身在人格文件里）
 │  ├─ events.json              #   ★全部事件★：提醒 / 闹钟 / 课 / 会议 / 约会都是一条
 │  └─ memos.json               #   备忘
@@ -165,6 +179,15 @@ flowchart LR
 │  ├─ settings.py              # config.toml → dataclass（含启动时校验与路径解析）
 │  ├─ vision.py                # 看图：截屏 / 摄像头 / 剪贴板 / 找文件并抽取文本
 │  ├─ persona.py               # ★角色设定：名字/背景/称呼/风格/示例台词 → system prompt
+│  │                           #   还管知识库分层（knowledge/worlds/knowledge_all）
+│  ├─ memory/                  # ★ 四级记忆 + 自清洁 + 双路检索 + 知识库（见第 15 节）
+│  │  ├─ model.py              #   Episode（情节）/ Fact（事实）/ Chunk（知识）/ Hit
+│  │  ├─ store.py              #   原子写、跨进程锁、坏文件不静默丢
+│  │  ├─ levels.py             #   ★自清洁规则★：合并 / 衰减 / 压缩 / 提升 / 裁剪（纯函数）
+│  │  ├─ extract.py            #   对话 → 事件 / 事实（规则为主，可用本地模型总结）
+│  │  ├─ retrieve.py           #   打分与时间检索（parse_when 认中文时间）
+│  │  ├─ knowledge.py          #   知识库：共享 / 世界观组 / 专属三层 + 可插拔 provider
+│  │  └─ schedule.py           #   日程只读接口（共享那一半）｜ __init__.py = Memory / MemoryHub
 │  ├─ tools.py                 # 工具层：技能包成模型能调的工具（现在是 MCP 的一个服务器）
 │  ├─ mcp/                     # ★ 自己搭的 MCP 架构（协议 / 服务器 / 客户端 / 宿主）
 │  │  ├─ protocol.py           #   JSON-RPC 2.0 + MCP 消息形状
@@ -172,7 +195,8 @@ flowchart LR
 │  │  ├─ client.py             #   两种传输走同一套消息
 │  │  ├─ host.py               #   聚合工具清单 + 白名单 + 路由 + 崩了重启
 │  │  ├─ serve.py              #   python -m voice_loop.mcp.serve <服务器>
-│  │  └─ servers/skills.py     #   技能服务器（见第 13 节）
+│  │  ├─ servers/skills.py     #   技能服务器（见第 13 节）
+│  │  └─ servers/memory.py     #   ★记忆服务器★：recall / remember / memory_stats
 │  ├─ scheduler.py             # 后台提醒调度器
 │  ├─ system_ops.py            # 系统操作：关/开显示器（只关屏，不休眠）
 │  ├─ bargein.py               # 语音自动打断（实验性、默认关）：分清「自己的回声」和「你在插话」
@@ -205,6 +229,9 @@ flowchart LR
 │                              # precision.py（int8/fp32 选哪份模型）
 ├─ scripts/
 │  ├─ download_models.py       # 一键下载模型
+│  ├─ preflight_heavy.py       # ★ 跑重活（全套自测/评测）前的起飞检查：训练在跑+内存紧张就拦下
+│  ├─ test_memory.py           # ★ 记忆：分级 / 自清洁规则 / 双路检索 / 角色隔离（90 条断言，纯离线）
+│  ├─ test_memory_mcp.py       # ★ 记忆：知识库三层隔离 / 世界观组 / 全知不代入 / MCP 工具
 │  ├─ test_offline.py          # 离线自测（分块/时间/技能/唤醒/生命周期，含 09-19 那次误解析误删的回归）
 │  ├─ tts_clone_probe.py       # ★ 音色克隆试听/测速（生成 wav 供耳朵判断，可与 Piper 对比）
 │  ├─ test_tts_clone.py        # ★ 克隆后端测试（--full 会真的加载模型跑一句）
@@ -219,6 +246,7 @@ flowchart LR
 │  ├─ test_prepare_segments.py # ★ 上一步的离线测试（不变量：各段标签拼起来 == 原文）
 │  ├─ train_piper.py           # ★ Piper 微调启动器（绕开厂商入口；含「文本比音频长」护栏）
 │  ├─ train_piper_forever.py   # ★ 训练看门狗：崩了自动从最近的 checkpoint 续跑
+│  ├─ test_train_forever.py    # ★ 上一步的离线测试（防重入锁 + PID 判活，用临时目录）
 │  ├─ train_piper_watch.py     # ★ 训练看板：终端实时刷新（步数/loss/速率/ETA/可用内存）
 │  ├─ test_train_watch.py      # ★ 上一步的离线测试（版本排序 / 速率 / 进程归属 / 降级渲染）
 │  ├─ export_piper_onnx.py     # ★ 微调 ckpt → ONNX（含新版 torch 导出器的兼容阶梯）
@@ -1321,7 +1349,7 @@ pipeline（会话编排）
        └─ …                           │   │
                                       ↓   ↓
                             MCPServer（自家能力域）
-                              skills / vision / system…
+                              skills / memory / vision / system…
 ```
 
 | 文件 | 干什么 |
@@ -1331,6 +1359,7 @@ pipeline（会话编排）
 | `mcp/client.py` | 两种传输走**同一套消息**：inproc（不起进程，5 ms 握手）/ stdio（起子进程） |
 | `mcp/host.py` | 聚合工具清单、白名单、路由、服务器崩了自动重启 |
 | `mcp/servers/skills.py` | 第一个服务器：把现成的 `ToolRegistry`（事件/提醒/备忘）挂到协议后面 |
+| `mcp/servers/memory.py` | ★ 记忆服务器（第 15 节）：`recall` / `remember` / `memory_stats`，默认只露前两个 |
 
 第一条命令：
 
@@ -1374,6 +1403,8 @@ claude mcp add voice-assistant -- python -m voice_loop.mcp.serve skills
    把几十个工具摊在模型面前，它就开始乱选甚至不选。所以 `[[mcp.servers]]` 支持
    `tools = [...]` 白名单：**没进白名单的工具根本不出现在模型面前**（比调用时再拒绝安全得多）。
    接外来服务器时请默认只放只读工具。
+   —— 现在自家共 **10 个**（技能 8 + 记忆 2），记忆那边也只露 `recall` / `remember`
+   （`memory_stats` 留给命令行和外部 agent，不占模型的注意力）。
 2. **★stdout 是协议通道★**。服务器里任何 `print()` 都会把对端的解析搞坏，
    日志一律走 `stderr`（`server.log_stderr()`），Python 子进程建议带
    `PYTHONIOENCODING=utf-8`（否则中文可能走 cp936）。
@@ -1413,7 +1444,8 @@ tools = ["get_volume", "set_volume"]    # 白名单（想全开就留空，但�
 
 - 自家的能力域 `namespace = false`：名字保持 `list_events` / `add_memo` 原样
   （模型已经认得这 8 个，TOOL_HINT 和评估脚本也照旧）。
-- 其它服务器自动加前缀 `mcp__<服务器>__<工具>`（跟 Claude Code 一致），防止撞名。
+- 其它服务器自动加前缀 `mcp__<服务器>__<工具>`（跟 Claude Code 一致），防止撞名 ——
+  所以记忆那两个工具在模型眼里叫 `mcp__memory__recall` / `mcp__memory__remember`。
 
 ---
 
@@ -1442,6 +1474,7 @@ python main.py persona --show 阿米娅 --prompt # 看她拼出来的 system pro
 python main.py persona --voices             # 每个角色的声线装没装
 python main.py persona --split              # 旧版（角色全写在一个文件里）→ 一键拆成独立文件
 python main.py --character amiya text       # 临时用某个角色（chat / listen / text / ask 都支持）
+python main.py memory --who amiya            # 她记得什么、知识库读到几段（第 15 节）
 ```
 
 ### 索引长什么样
@@ -1485,6 +1518,14 @@ python main.py --character amiya text       # 临时用某个角色（chat / lis
   "voice": "",                      // 可选：这个角色用自己的 piper 声线
   "backend": "",                    // 可选：这个角色用哪个 TTS 后端（piper / zipvoice；
                                     //   空 = 跟 config.toml 的 [tts] backend）
+  // ↓↓↓ 下面这几个是「它知道什么」（第 15 节）↓↓↓
+  "knowledge": ["data/knowledge/x/设定.md"],  // 可选：专属知识库文件/目录
+  "worlds": ["明日方舟"],           // 可选：★挂在哪个世界观上★（同一个 IP 的角色共享一套）
+  "world": "",                     // 可选：把它的世界观直接写在这
+  "knowledge_title": "",           // 可选：专属世界观的标题
+  "knowledge_shared": true,         // 可选：false = 连共享知识库也不看（全隔离）
+  "memory_all": false,              // 可选：能不能查所有人的记忆（只有白泽开）
+  "knowledge_all": null,            // 可选：能不能看全部知识库（默认跟随 memory_all）
   "temperature": 0.0,               // 可选：覆盖全局温度（0 = 用全局）
   "enabled": true,                  // 可选：false 则不参与唤醒（索引里写也一样）
   "notes": "给自己看的备注，不进提示词"
@@ -1697,6 +1738,9 @@ python scripts/import_lines.py 台词.txt --json data/personas/amiya.json --appl
 ---
 
 ## 15. 记忆：会自己整理，也会忘（但重要的事不忘）
+
+> 设计缘由、自清洁规则的推导、开发中抓到的 8 个 bug、以及「全知/不代入」怎么落地的实测，
+> 都在工程日志 **第 36 ~ 42 节**。这一节只讲**怎么用**。
 
 参考人脑的**四级记忆**，另外加了一个「会自己整理」的机制 —— 不是一堆永远只增不减的死文件。
 

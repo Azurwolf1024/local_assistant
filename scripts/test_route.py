@@ -154,7 +154,11 @@ def test_model_first() -> None:
         check("工具名记进了统计", "list_events" in str(stats.extra.get("tool")), True)
         check("没有落在技能路径上", stats.extra.get("skill"), None)
         check("只问了一次模型（没有多余往返）", loop.llm.turns, 1)
-        check("模型确实拿到了工具清单", len(loop.llm.last_tools or []), 8)
+        # 10 = 8 个生活技能 + 2 个记忆工具（mcp__memory__recall / remember，见 config.toml 白名单）
+        check("模型确实拿到了工具清单", len(loop.llm.last_tools or []), 10)
+        check("记忆工具也在清单里（名字带前缀，不会和技能撞）",
+              {t["function"]["name"] for t in (loop.llm.last_tools or [])}
+              >= {"mcp__memory__recall", "mcp__memory__remember"}, True)
         check("答话来自工具（不是模型自己编）", "没" in stats.answer or "安排" in stats.answer, True)
         loop.close()
 
