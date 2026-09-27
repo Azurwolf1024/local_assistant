@@ -22,12 +22,20 @@
 from __future__ import annotations
 
 import argparse
+import statistics
 import sys
 import time
 from pathlib import Path
 
 import soundfile as sf
 import torch
+
+# ★「梅尔帧 / 音素 id」的健康下限（经验值，来自两份实测数据）★
+#   A `kaltsit_long`  24 条：中位 **1.91** → 29 epoch 的模型 ASR 回听 0.79/1.00/1.00（能用）
+#   B `kaltsit_split` 69 条：中位 **1.02** → 29 与 49 epoch 的模型都是**胡话**（0.04~0.38）
+# 两者用的是同一份脚本、同一个底模、同样的 lr，只有数据形状不同。
+# 所以「中位低于这个值」不是硬错误，而是**强烈预警**：先回去查切分与标签对齐，别急着训。
+RATIO_HEALTHY_LOW = 1.5
 
 ROOT = Path(__file__).resolve().parents[1]
 PIPER_SRC = ROOT / ".piper-src" / "src" / "python"
@@ -126,6 +134,7 @@ def main() -> int:
         hop = int(config.get("hop_length") or 256)
         rate = int(config["audio"]["sample_rate"])
         kept_rows, dropped = [], []
+        ratios: list[float] = []          # ★全部样本的比值★（不只是被剔的那几条）
         for row in rows:
             audio = Path(str(row["audio_path"]))
             audio = audio if audio.is_absolute() else ROOT / audio
@@ -136,10 +145,30 @@ def main() -> int:
                 dropped.append((audio.name, float("nan"), f"读不出音频：{exc}"))
                 continue
             ratio = frames / max(1, len(row["phoneme_ids"]))
+            ratios.append(ratio)
             if ratio < args.min_frames_per_id:
                 dropped.append((audio.name, ratio, f"{frames:.0f} 帧 / {len(row['phoneme_ids'])} id"))
             else:
                 kept_rows.append(row)
+        # ★无论剔没剔，都要报一句比值分布★（2026-09-27 补）：
+        # 实测有一份数据**一条都没被剔**（阈值 0.7），但比值中位只有 1.02（正常区间 ~1.5~2.0），
+        # 训出来是**胡话**（本地 ASR 回听相似度 0.04~0.38，而出厂模型是 0.958~1.000），
+        # 而且高频抬到 −16 dB（出厂 −74）。静默通过比崩掉难查一百倍。
+        if ratios:
+            kept_ratios = sorted(r for r in ratios if r >= args.min_frames_per_id)
+            median = statistics.median(kept_ratios) if kept_ratios else 0.0
+            # ★最小/最大要自己算★：ratios 这个列表**没排序**（按数据集原序追加），
+            # 直接取 [0]/[-1] 会打出「最大 0.96 < 中位 1.02」这种自相矛盾的行
+            # —— 第一次跑就被自己的输出抓到了（教训：验证要**读**输出，不能只看退出码）。
+            print(f"[护栏] 「梅尔帧 / 音素 id」比值：最小 {min(ratios):.2f} / "
+                  f"中位 {median:.2f} / 最大 {max(ratios):.2f}"
+                  f"（全 {len(ratios)} 条，正常区间 ~{RATIO_HEALTHY_LOW}~2.0）")
+            if 0 < median < RATIO_HEALTHY_LOW:
+                print(f"★警告★ 比值中位只有 {median:.2f}（低于 {RATIO_HEALTHY_LOW}）："
+                      "文本相对音频偏长 —— 这份数据训出来的声音会「吐字不清、像在说胡话」，"
+                      "而且**训练过程不会报任何错**。先回去查切分与标签对齐"
+                      "（prepare_piper_segments.py 那种「按比例把全文分给各段」最容易出这个问题），"
+                      "别急着拿它训。")
         if dropped:
             print(f"剔除 {len(dropped)} 条「文本比音频长」的样本（比值 < {args.min_frames_per_id}）：")
             for name, ratio, why in sorted(dropped, key=lambda x: x[1]):
