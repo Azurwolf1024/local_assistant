@@ -3347,6 +3347,63 @@ B 中位 1.02，一条都没被剔 → **一声不呢地放行**（正好撞上 
 4. `models/tts/piper/kaltsit-b29.onnx` 与 `kaltsit-b49.onnx` 留着当**反面样本**（想听“胡话”是什么样时可以放）。
 
 
+---
+
+## 45. 清理：36.5 GB 中间产物 + 141 个测试垃圾会话（2026-09-27，用户要求）
+
+### 45.1 最大的那块：`data/piper` 39.1 GB → 2.5 GB
+
+崩溃循环的代价比想象中大：**B 组留了 41 个 version 目录**（每次看门狗重启就新建一个 ✓），
+加 A 组的 5 个、早期 iso 实验的 14 个，一共 **39 GB 检查点** —— 全在 `data/` 下（没进 git，但占着盘）。
+
+删的：
+
+| 位置 | 内容 | 释放 |
+|---|---|---|
+| `exp_B/lightning_logs/version_{0..38,40,41}` | 41 个目录、崩溃重启的重复快照 | 18.8 GB |
+| `exp_A/lightning_logs/version_{1,2,3}` + version_4 的其余 19 个 ckpt | 300 epoch × 每 15 存一次 | 11.3 GB |
+| `data/piper/kaltsit/**`（iso_xingdong / iso_xinnian / sub_2 等） | §23~26 早期实验的检查点 + 360 个 trace 转储 | 4.9 GB |
+| `exp_C`（lr=1e-4 那条弃掉的臂） | 2 个全量 ckpt | 1.6 GB |
+| `sessions/piper_ab/*.onnx`、`sessions/wheels`、`data/ref_cache`、`__pycache__` | 临时副本与缓存 | ~0.2 GB |
+
+留的（都有理由）：
+
+- `exp_A/version_0/epoch=29-step=360.ckpt`（807 MB）——**唯一能用那份声线的源头**（§35 的 e029）。
+- `exp_B/version_39/checkpoints/*.ckpt`（5 个）——§44 验收的**证据**（e9~e49）。
+- `exp_A/version_4` 的最后一个 ckpt、各实验的 `training/` 数据集、`models/`（在用）。
+- `sessions/train_B_watchdog*.log`（唯一完整崩溃时间线）、`sessions/piper_ab_*`（试听 wav）。
+- `data/vision/`（3 MB 截图）**没动** —— 那是隐私数据，删不删除交给机主自己决定。
+
+★我自己搞错了一步★：想留 A 的「最后一个检查点」，用 `Sort-Object Name` 排 →
+`epoch=89` 赢了 `epoch=299` ✗ —— **名字里带数字就不能按字典序排**。
+后果很小（e299 的 ONNX 导出 `kaltsit-long.onnx` 与 §35 的实测数据都在），
+但跟 §44 那个「min/max 没排序」是**同一类错**：排东西/取极值前先想清楚按什么排。
+
+### 45.2 聊天记录：测试一直在往真目录写
+
+`sessions/` 下积了 **231 个 `session-*.jsonl`**。按内容分了一下（`sessions/classify_sessions.py`，
+一次性脚本，带 `--apply --archive`）：
+
+- **141 个纯测试垃圾**（全句都在 `test_*.py` 的固定台词里，或文件是空的）→ 删。
+  光「这周有什么安排」被记了 **299 次**。
+- **90 个可能真聊过**（含白名单之外的句子，例如「阿绵呀很可爱呢」「罗得导罪」「调戏」）→
+  ★不删，而是**归档进记忆库**★（这正是 L1 → L2/L3 那条路）：
+  `memory.ingest_session(llm_call=None)` → 90 个入库，产出 4 条事件 + 1 条事实。
+  只有 4 条不是丢东西：规则摘要**只收有信号的句子**（记住/决定/偏好…），闲聊不存 —— 这本来就是这个设计。
+  原始文件留着（`keep_session_days=30` 的滑窗到点会自己清）。
+
+★根因不是脏数据，是测试没隔离★：会话写在 `[app] sessions_dir`（默认 `sessions/`），
+而测试只改了 `settings.skills.data_dir` ✗ —— 所以每跑一次测试就往真目录丢一批。
+已修 `scripts/test_route.py` 的 `make_loop()`（加一行 `settings.app.sessions_dir = str(tmp / "sessions")`），
+实测：跑前 90 个会话文件 → 跑后 **90 个**（不再污染 ✓）。
+
+★还欠的账（写在这里不装做已做完）★：另外 6 个建 `VoiceLoop` 的测试文件
+（`test_offline` / `test_persona` / `test_mcp` / `test_dialog` / `test_bargein` / `test_wake_cycle`）
+还没加那一行 —— 它们各自有 2~4 处内联 `load_settings()`，得逐处补。
+现在最脏的那个（test_route）已经治了。
+
+
+
 
 
 

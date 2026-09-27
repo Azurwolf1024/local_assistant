@@ -95,6 +95,11 @@ def make_loop(tmp: Path, route: str = "model"):
     settings.subtitle.enabled = False
     settings.skills.visual_alert = False
     settings.skills.data_dir = str(tmp)
+    # ★会话文件也要指到临时目录★（2026-09-27 补）：`data_dir` 只管 data/，
+    # 而原始对话写在 `[app] sessions_dir`（默认 sessions/）里 —— 不覆盖它，
+    # 每跑一次测试就往真实 `sessions/` 丢一堆 session-*.jsonl 测试垃圾
+    # （实测清出 141 个，"这周有什么安排"被记了 299 次）。
+    settings.app.sessions_dir = str(tmp / "sessions")
     settings.skills.event_file = str(tmp / "events.json")
     settings.skills.memo_file = str(tmp / "memos.json")
     settings.llm.route = route

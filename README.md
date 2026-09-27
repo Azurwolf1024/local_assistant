@@ -1249,6 +1249,17 @@ Piper 的 `zh_CN-huayan-medium` 是官方唯一的中文女声。调 `noise_w_sc
 都只是本机 json 文件）。唯一的外部依赖是 `http://127.0.0.1:11434`（本机 Ollama）。
 断网可正常使用。
 
+这些文件是**你自己的数据**，都在 `.gitignore` 里（不会被推到仓库）：
+
+| 位置 | 是什么 | 生命周期 |
+| --- | --- | --- |
+| `sessions/session-*.jsonl` | 每次对话的原始记录（L1） | 归档进记忆库后，**超过 30 天自动清**（`[memory] keep_session_days`） |
+| `data/memory/<角色>/` | 记忆（L2 情节 / L3 事实） | 只在本地；删掉就等于失忆 |
+| `data/vision/` | 截屏 / 摄像头拍到的画面 | 想清就整个删掉，不影响运行 |
+| `data/knowledge/` | 你给它的世界观/资料 | 随你放 |
+
+想立刻清原始对话：`python main.py memory --prune --apply`（只删**已归档**过的，没进记忆库的不动）。
+
 ---
 
 ## 11. 协议
