@@ -118,6 +118,13 @@ class Character:
     voice: str = ""                       # piper 声线名（空 = 用 config.toml 的 [tts]）
     voice_ref: str = ""                   # 克隆音色的参考音频（backend = "zipvoice" 时生效）
     voice_ref_text: str = ""              # 参考音频的逐字文本（空 = 同名 .txt / 自动转写）
+    voice_refs: dict[str, Any] = field(default_factory=dict)   # ★分风格的多条参考★：{"calm": "..."}
+                                          #   键名自己定（calm/催促/happy 都行）；
+                                          #   值可以是路径字符串，也可以是 {ref, text}；
+                                          #   取不到那一档就退回 voice_ref（老行为）。
+                                          #   ★这是当前模型下唯一能做的「情绪控制」★：
+                                          #   ZipVoice 没有风格输入维度，风格只能从参考音里来。
+                                          #   素材不会挑？python scripts/pick_voice_ref.py --who <id>
     voice_model: str = ""                 # 这个角色专用的 ZipVoice 模型目录
                                           #   （空 = 用 [tts] clone_dir；见 scripts/persona_voice.py）
     voice_dir: str = ""                   # 语音素材目录（空 = data/personas/<id>/）
@@ -200,6 +207,8 @@ class Character:
             voice=str(raw.get("voice") or "").strip(),
             voice_ref=str(raw.get("voice_ref") or "").strip(),
             voice_ref_text=str(raw.get("voice_ref_text") or "").strip(),
+            voice_refs=({str(k): v for k, v in (raw.get("voice_refs") or {}).items()
+                         if str(k).strip() and v} if isinstance(raw.get("voice_refs"), dict) else {}),
             voice_model=str(raw.get("voice_model") or "").strip(),
             voice_dir=str(raw.get("voice_dir") or "").strip(),
             # ★新增字段必须在这里显式搬一次★（白名单式构造，漏了就是静默忽略；

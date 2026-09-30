@@ -223,6 +223,11 @@ class TtsConfig:
     #   python scripts/download_models.py --only speaker
     speaker_model: str = "models/speaker/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx"
     speaker_threads: int = 2          # onnxruntime 线程数（这是个短任务，2 就够）
+    # ---- 风格控制（见 voice_loop/tts/style.py）：角色写 voice_refs 时才有效果 ----
+    # ★默认关★：开着要求模型回答开头带 <style=键>，模型的稳定性不是 100%，
+    #   所以先默认关，要的人自己开（开了没标签也不会出错，只是按默认语气说）。
+    style_from_llm: bool = False      # true = 允许 LLM 用 <style=键> 指定语气（需角色写了 voice_refs）
+    style_default: str = ""           # 启动时的默认风格键（空 = 用 voice_ref 那一档）
 
 
 @dataclass

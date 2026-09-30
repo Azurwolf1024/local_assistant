@@ -1530,6 +1530,12 @@ python main.py memory --who amiya            # 她记得什么、知识库读到
     { "scene": "被唤醒", "text": "我在，博士。" }
   ],
   "voice": "",                      // 可选：这个角色用自己的 piper 声线
+  "voice_ref": "",                 // 可选：克隆音色的参考音频（backend = zipvoice 时用）
+  "voice_ref_text": "",             // 可选：那条参考的逐字文本（空 = 同名 .txt / 清单 / 自动转写）
+  "voice_refs": {},                 // 可选：★分风格的多条参考★（当前模型下唯一的「情绪控制」手段）
+                                    //   {"calm": "data/personas/<id>/a.wav",
+                                    //    "催促": {"ref": "...b.wav", "text": "那句话"}}
+                                    //   取不到那一档就退回 voice_ref；素材不会挑→ pick_voice_ref.py
   "backend": "",                    // 可选：这个角色用哪个 TTS 后端（piper / zipvoice；
                                     //   空 = 跟 config.toml 的 [tts] backend）
   // ↓↓↓ 下面这几个是「它知道什么」（第 15 节）↓↓↓
@@ -1639,6 +1645,45 @@ python scripts/pick_voice_ref.py --who kaltsit                        # 素材�
 ★但要看它给的跨度★：凯尔希在 3.5~8 秒区间里音区只差约 **0.6 个半音** —— 她的素材本身
 语气就单一，换参考只能给出细微差别；想要明显不同的情绪，得另找带情绪的素材
 （或者换支持风格条件的模型）。工具会自己把这句话打出来。
+
+### 让语气跟着情绪走（`voice_refs`）
+
+★前提★：ZipVoice 的接口里**没有「情绪」这个输入维度** —— 风格只能从**参考音频**里来
+（实测：参考音自己只差 1.4 倍，到输出被放大 2.5 倍）。所以当前模型下能做的「情绪控制」就是：
+**准备几条不同语气的参考，按需要换**。
+
+```jsonc
+// data/personas/kaltsit.json
+"voice_ref": "data/personas/kaltsit/干员报到.wav",        // 默认那一档（老写法，仍然有效）
+"voice_refs": {
+  "calm":  "data/personas/kaltsit/完成高难行动.wav",
+  "催促":  { "ref": "data/personas/kaltsit/精英化晋升1.wav", "text": "文件在这里，自己看。" }
+}
+```
+
+三条命令就够用：
+
+```powershell
+python scripts/pick_voice_ref.py --who kaltsit   # 挑素材：给音区/摆幅/像不像她 + 直接给 voice_refs 建议
+python scripts/spk_check.py 合成.wav --ref data/personas/kaltsit   # 量「换档后像不像她」
+```
+
+怎么让它真的切档（**默认关**，因为要靠模型听话）：
+
+```toml
+# config.toml
+[tts]
+style_from_llm = true      # 允许回答开头写 <style=calm>；角色没写 voice_refs 时完全无效
+style_default  = ""        # 启动时用哪一档（空 = voice_ref 那一档）
+```
+
+- 标签会被**边收边剥**（模型是一个 token 一个 token 吐的，标签会被切开），
+  **不会念出来**；没写标签、或写了不存在的档 → 按默认语气说，不会把声线弄坏。
+- 代码里也可以直接切：`loop.set_style("催促")`（引擎已加载时**当场生效**，
+  因为换参考不需要重载模型）。
+- ★门槛先说清楚★：绝大多数素材里「不同语气」的差别是**细微**的（凯尔希 3.5~8 秒区间
+  音区只跨 0.6 个半音）。想要明显不同的情绪，得先有带情绪的素材 —— 
+  `pick_voice_ref.py` 会把这句话自己打出来。
 
 ### 给角色训专属声线（标准化流程，Windows 原生）
 

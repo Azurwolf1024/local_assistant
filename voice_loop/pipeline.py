@@ -929,6 +929,38 @@ class VoiceLoop:
             unload()
         self.log.info(f"[角色] 声线：{current} → {want}（{reason or '切换'}）")
 
+    @property
+    def style(self) -> str:
+        """当前风格键（空 = 用角色默认那一档参考音）。"""
+        return str(getattr(self, "_style", "") or "")
+
+    def set_style(self, key: str, reason: str = "") -> str:
+        """换风格键 → 真的去换参考音频（只换参考是**当场生效**的）。
+
+        返回实际生效的键：角色没写这一档就**不动**、返回空串（宁可不变，也别把声线弄坏）。
+        角色没写 `voice_refs` 时它就是个空操作 —— 默认行为一点没变。
+        """
+        want = str(key or "").strip()
+        if want == self.style:
+            return want
+        char = self.character
+        if want:
+            from .tts import style as stylekit  # noqa: PLC0415
+
+            known = stylekit.keys(char)
+            if want not in known:
+                self.log.warning(
+                    f"风格 {want!r} 不在 {char.name} 的 voice_refs 里（可用：{known or '没写'}），忽略"
+                )
+                return ""
+        self._style = want
+        backend = (getattr(char, "backend", "") or "").strip().lower() or self._base_backend
+        if backend == "zipvoice":
+            # ★引擎没加载也要改配置★：不然「空闲时切了风格」要等到下次换角色才生效。
+            # _apply_reference 自己会分开处理「已加载（configure 当场换）」和「没加载（改配置）」两路。
+            self._apply_reference(char, reason or f"风格 {want or '默认'}")
+        return want
+
     def _apply_reference(self, char: Character, reason: str = "") -> None:
         """克隆后端下，换角色 = 换「模型目录」+「参考音频」（都没配就用回默认）。
 
@@ -963,8 +995,14 @@ class VoiceLoop:
                 tts_cfg.clone_dir = self._base_clone_dir
                 model_changed = True
         # ---- ② 参考音频 ----
-        want = str(getattr(char, "voice_ref", "") or "").strip() or self._base_clone_audio
-        text = str(getattr(char, "voice_ref_text", "") or "").strip()
+        # ★风格★：角色写了 `voice_refs` 就按**当前风格键**取那一档（见 voice_loop/tts/style.py）；
+        # 没写、或没这一档 → 退回 `voice_ref`（老行为，什么都不变）。
+        # 这是当前模型下唯一能做的「情绪控制」：ZipVoice 没有风格输入维度，
+        # 风格只能从参考音频里来（实测参考音只差 1.4 倍，输出就放大 2.5 倍）。
+        from .tts import style as stylekit  # noqa: PLC0415 - 只在切声线时用得上
+
+        want, text = stylekit.pick_ref(char, self.style)
+        want = want or self._base_clone_audio
         ref_changed = False
         if want:
             path = self.settings.resolve(want)
@@ -1522,6 +1560,20 @@ class VoiceLoop:
         if memory_block:
             hint = [{"role": "system", "content": memory_block}] + (hint or [])
 
+        # ★情绪标签（④，默认关）★：允许模型在回答开头写 `<style=键>`，
+        # 这里边收边剥（标签会被拆成好几个 token），剥出来的键用来换参考音频。
+        # 只在「开关打开 + 这个角色真写了 voice_refs」时才存在 —— 否则什么都没有。
+        stripper = None
+        if bool(getattr(tts_cfg, "style_from_llm", False)):
+            from .tts import style as stylekit  # noqa: PLC0415
+
+            if stylekit.keys(self.character):
+                stripper = stylekit.StyleStripper()
+                style_hint = stylekit.hint(self.character)
+                if style_hint:
+                    # 放在 TOOL_HINT 前面：工具提示必须紧贴用户那一句（实测过）
+                    hint = [{"role": "system", "content": style_hint}] + (hint or [])
+
         def speak(sentence: str) -> None:
             nonlocal first_audio
             if not self.tts_enabled:
@@ -1548,6 +1600,17 @@ class VoiceLoop:
                     if calls:
                         continue          # 已经在调工具了，后面的解释性文字不念
                     delta = ev["delta"]
+                    if stripper is not None:
+                        # ★先剥标签，再走后面那套「像不像工具 JSON」的判断★：
+                        # 标签本身以 `<`/`[` 开头，不先剥掉会被当成可疑开头而攒住不念。
+                        delta = stripper.feed(delta)
+                        if stripper.style:
+                            self.set_style(stripper.style, reason="LLM 标签")
+                            stripper.style = ""          # 只换一次
+                        if not delta:
+                            if self._interrupt.is_set():
+                                break
+                            continue
                     if holding or SUSPICIOUS_START.match(delta):
                         # 可能是「把工具调用写成 JSON」：先攒着，一个字都不念
                         holding = True
@@ -1586,6 +1649,13 @@ class VoiceLoop:
                         break
 
                 if not self._interrupt.is_set() and not calls:
+                    if stripper is not None:
+                        # 流结束时把还攒着的吐出来（否则「就说两句」的短回答会被吃掉）
+                        tail = stripper.finish()
+                        if tail:
+                            pieces.append(tail)
+                            for sentence in chunker.feed(tail):
+                                speak(sentence)
                     for sentence in chunker.flush():
                         speak(sentence)
                     self._drain_playback()
