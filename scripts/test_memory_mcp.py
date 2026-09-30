@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -21,6 +22,7 @@ sys.path.insert(0, str(ROOT))
 
 from voice_loop.mcp.servers import memory as mem_server  # noqa: E402
 from voice_loop.memory import MemoryHub  # noqa: E402
+from voice_loop.memory.model import Episode, Hit  # noqa: E402
 from voice_loop.persona import (  # noqa: E402
     Character,
     CharacterRegistry,
@@ -446,6 +448,76 @@ def test_no_imitation_prompt(tmp: Path) -> None:
           "不要说成自己的身份" not in render_system_prompt(registry.get("kaltsit")), True)
 
 
+def test_image_memory(tmp: Path) -> None:
+    print("\n[12] ★看图进记忆（按人脑三层）★：感觉输入会过期，事情记得住")
+    settings, registry, _ = make_world(tmp)
+    hub = make_hub(settings, registry)
+    mem = hub.for_character("baize")
+
+    shots = tmp / "vision"
+    shots.mkdir()
+    old_shot, new_shot = shots / "old.jpg", shots / "new.jpg"
+    for i, p in enumerate((old_shot, new_shot)):
+        p.write_bytes(b"x")
+        os.utime(p, (1_700_000_000 + i, 1_700_000_000 + i))
+
+    # ① 情节只存路径，而且老数据（没这个字段）照样能读
+    check("新字段 episode.image 默认空（老数据兼容）", Episode.from_dict(
+        {"ts": "2026-01-01 00:00", "title": "t"}).image, "")
+    ep = mem.note("看了屏幕截图", "你让我看屏幕，我看到一个报错窗口", kind="vision",
+                  image=str(old_shot), salience=0.7)
+    check("落盘再读回来，路径还在", [e.image for e in mem.episodes()][-1], str(old_shot))
+    check("检索结果里能看出「看过图」", "[看过图]" in Hit(kind="episode", score=1.0, item=ep).text, True)
+
+    # ② 回忆：图还在就找得回来；图没了就只记得「当时看到什么」
+    check("recent_image 找得到最近那张", mem.recent_image(), str(old_shot))
+    check("★图片不进记忆的像素★：只存了路径", (mem.paths.episodes.read_text(encoding="utf-8")
+          .count("base64")), 0)
+    old_shot.unlink()
+    check("图不在 → 返回空（只能说「那张已经不在了」，不能编）", mem.recent_image(), "")
+    check("但那件事还在记忆里", any(e.image == str(old_shot) for e in mem.episodes()), True)
+
+    # ③ 图片清理：记忆还活着的图要护住，其余照旧只留最近 keep_images 张
+    from voice_loop.settings import VisionConfig
+    from voice_loop.vision import Vision
+
+    cfg = VisionConfig()
+    cfg.save_dir = str(shots)
+    cfg.keep_images = 2
+    vis = Vision(cfg, tmp)
+    extra = []
+    for i in range(4):
+        p = shots / f"filler{i}.jpg"
+        p.write_bytes(b"x")
+        os.utime(p, (1_700_000_000 + 10 + i, 1_700_000_000 + 10 + i))
+        extra.append(p)
+    pegged = shots / "protected.jpg"       # 很旧，但记忆里还记着
+    pegged.write_bytes(b"x")
+    os.utime(pegged, (1_600_000_000, 1_600_000_000))
+    mem.note("看了摄像头画面", "你拿了一件东西给我看", kind="vision", image=str(pegged),
+             salience=0.9)
+
+    gone = vis.prune(protect=mem.images_in_use())
+    check_text("清理时被记忆引用的图不会被删", pegged.is_file(), str(sorted(p.name for p in shots.iterdir())))
+    check("其余只留 keep_images 张（2 张 + 保护的不算）",
+          len([p for p in shots.glob("*.jpg") if p.name != "protected.jpg"]), 2)
+    check("确实删掉了一些", gone > 0, True)
+
+    # ④ ★褪色之后就不再保护★（不然磁盘会被很久以前的图填满）
+    stale = make_hub(settings, registry).for_character("baize")
+    check("默认还在保护（显著性没掉下去）", str(pegged) in stale.images_in_use(), True)
+    check("显著度为 0 / 太老的 → 不再保护",
+          "" not in stale.images_in_use(days=0.0), True)
+
+    # ⑤ 技能层认得「上次那张截图」（重启后靠这一句 + 上面的回调把图找回来）
+    from voice_loop.skills import Skills
+
+    for said in ("刚才那张图", "上次那张截图", "之前那张照片", "昨天那张图"):
+        check(f"认得「{said}」", bool(Skills._V_SRC_LAST.search(said)), True)
+    check("但「看看我的屏幕」不算回顾（那是新拍一张）",
+          bool(Skills._V_SRC_LAST.search("看看我的屏幕上是什么")), False)
+
+
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="memory_mcp_"))
     try:
@@ -460,6 +532,7 @@ def main() -> int:
         test_shared_world(tmp / "i")
         test_knowledge_all_switch(tmp / "j")
         test_no_imitation_prompt(tmp / "k")
+        test_image_memory(tmp / "l")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print()

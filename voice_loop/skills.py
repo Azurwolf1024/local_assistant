@@ -21,7 +21,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from . import event_text as et
 from .events import (
@@ -267,6 +267,9 @@ class Skills:
         self.vision = Vision(vcfg, settings.root, self.log) if vcfg.enabled else None
         self._vision_pending: dict | None = None   # 「是这个文件吗？」等着回答
         self._vision_shot: dict | None = None      # 最近一次「看了什么」
+        # ★去长期记忆找「上次那张图」的回调★（由 pipeline 接上记忆层；没接就只认进程内那一张）：
+        # 技能层不认记忆（分层），但「刚才那张」重启后会丢 —— 得有人能从记忆里把路径拿回来。
+        self.last_image: Callable[[], str] | None = None
 
     # ======================================================================
     # 入口
@@ -868,7 +871,8 @@ class Skills:
         r"(?:什么事|有什么安排|有什么日程|有什么活动|有什么计划|有什么任务|都有什么|"
         r"有哪些安排|有哪些事|什么时候)"
     )
-    _V_SRC_LAST = re.compile(r"(?:刚才(?:那|的)?(?:张|幅)?图|上一张|刚才拍的|刚刚拍的|刚才看到的)")
+    _V_SRC_LAST = re.compile(r"(?:刚才(?:那|的)?(?:张|幅)?图|上一张|刚才拍的|刚刚拍的|刚才看到的"
+                             r"|(?:上次|之前|那天|昨天|前几天)(?:那|的)?(?:张|幅)?(?:图|截图|照片|画面))")
     _V_SRC_CLIP = re.compile(r"(?:剪贴板|复制的东西|复制的那|刚复制的|我复制的)")
     _V_SRC_FILE = re.compile(
         r"(?:\.(?:txt|md|py|json|csv|tsv|log|pdf|docx?|xlsx?|pptx?|ini|toml|ya?ml|xml|html|bat|ps1|sh|c|cpp|h|java|js|ts)\b"
@@ -921,12 +925,23 @@ class Skills:
                 return self._vision_ask_file(text)
             if source == "last":
                 shot = self.vision.last
-                if shot is None:
-                    return SkillResult(
-                        reply="我还没看过什么东西。说「看看我的屏幕」或者「用摄像头看看」？",
-                        action="vision_miss",
-                    )
-                return self._vision_look(shot.path, shot.what, text)
+                if shot is not None:
+                    return self._vision_look(shot.path, shot.what, text)
+                # ★「刚才那张」不在了 → 去长期记忆里找★
+                # 工作记忆（进程内那一张）重启就没了，人脑也是：短时记忆丢了还能回想。
+                # `last_image` 由 pipeline 接上记忆层（技能自己不认记忆，见 §47）。
+                remembered = ""
+                try:
+                    remembered = str(self.last_image() if self.last_image else "")
+                except Exception:  # noqa: BLE001 - 记忆出了问题就当没想起来
+                    remembered = ""
+                if remembered and Path(remembered).is_file():
+                    return self._vision_look(remembered, "上次那张图", text)
+                return SkillResult(
+                    reply="我记得看过图，但那张已经不在了——重新给我看一眼吧，说「看看我的屏幕」就行。"
+                    if remembered else "我还没看过什么东西。说「看看我的屏幕」或者「用摄像头看看」？",
+                    action="vision_miss",
+                )
             if source == "screen":
                 shot = self.vision.screen()
             elif source == "clipboard":

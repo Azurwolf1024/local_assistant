@@ -51,7 +51,12 @@ class Episode:
     confidence: float = 1.0                     # 摘要的可信度（LLM 总结失败的会低）
     source: str = ""                            # 来自哪个原始对话文件
     turn: int = 0                               # 原始对话里的第几轮
-    event_id: int | None = None                 # 顺手写进日程/提醒的话，记下它的 id（共享层）
+    event_id: int | None = None
+    # ★「那一次看图」记得的那张图★（路径，不是像素）：
+    # 人脑记的是「我看过一张屏幕截图，上面写着…」，不是把画面原样存下来。
+    # 图片本身活在 data/vision/ 的环形缓冲里（感觉记忆，会过期），
+    # 而这条路径让「上次那张图」能找回来 —— 文件还在就能再看一眼，不在就只能回忆当时看到了什么。
+    image: str = ""                 # 顺手写进日程/提醒的话，记下它的 id（共享层）
     links: list[str] = field(default_factory=list)   # 合并过的同类事件
     recalls: int = 0                            # 被检索命中几次（越常用越不会被清）
     last_recall: str = ""
@@ -125,7 +130,10 @@ class Hit:
     def text(self) -> str:
         item = self.item
         if isinstance(item, Episode):
-            return f"[{item.ts[:16]}] {item.title}：{item.summary}"
+            # ★带图的情节要标出来★：模型看到标记才知道「那次是看过一张图的」，
+            # 于是可以说「我再看一眼」而不是凭印象编（路径由上层决定能不能再打开）。
+            mark = "[看过图] " if getattr(item, "image", "") else ""
+            return f"{mark}[{item.ts[:16]}] {item.title}：{item.summary}"
         if isinstance(item, Fact):
             return f"{item.key}：{item.value}"
         assert isinstance(item, Chunk)

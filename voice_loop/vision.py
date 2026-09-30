@@ -158,9 +158,17 @@ class Vision:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         return self.save_dir / f"{stamp}_{tag}.jpg"
 
-    def prune(self) -> int:
-        """只留最近 ``keep_images`` 张，返回删掉几张。"""
+    def prune(self, protect: set[str] | None = None) -> int:
+        """只留最近 ``keep_images`` 张；★`protect` 里的图一律不删★。
+
+        ★为什么要有 protect★：记忆里会有一条「看过这张图」的情节（工程日志 §47），
+        而这里是个环形缓冲 —— 不护着它，会话里记的路径就成了死链，
+        「上次那张图我再看一眼」永远做不到。
+        语义上对应人脑：**重要的事记得久，它当时看的画面也跟着留久一点**；
+        被保护的理由（显著性/时间）由记忆层算，这里只负责不删。
+        """
         keep = max(1, int(self.cfg.keep_images))
+        alive = {str(p) for p in (protect or set())}
         try:
             files = sorted(
                 (p for p in self.save_dir.glob("*.jpg") if p.is_file()),
@@ -170,7 +178,13 @@ class Vision:
         except OSError:
             return 0
         gone = 0
-        for old in files[keep:]:
+        kept = 0
+        for old in files:
+            if str(old) in alive:            # 被记忆引用的：不管多旧都不碰
+                continue
+            if kept < keep:
+                kept += 1
+                continue
             try:
                 old.unlink()
                 gone += 1

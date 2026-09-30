@@ -322,6 +322,11 @@ class VoiceLoop:
                                             character_knowledge=self._character_knowledge)
             except Exception as exc:  # noqa: BLE001 - 记忆起不来不该影响说话
                 self.log.warning(f"[记忆] 初始化失败，这次不带记忆：{exc}")
+        # ★「上次那张图」要能想起来★（工程日志 §47）：
+        # `Vision.last` 只在内存里（重启就没），而记忆里存着看过哪张图 —— 把它接上，
+        # 于是第二天说「上次那张截图」也找得回来（文件还在就能再看一眼）。
+        if self.skills is not None and getattr(self.skills, "vision", None) is not None:
+            self.skills.last_image = self._last_seen_image
 
     # ======================================================================
     # 预热
@@ -1400,7 +1405,56 @@ class VoiceLoop:
             stats.answer = hint
             stats.extra["vision_error"] = str(exc)
             self.speak_text(hint, fresh=True)
+        else:
+            # ★这一次看图要进记忆★（工程日志 §47）：记「看过什么」，不记像素。
+            self._remember_vision(stats, user_text, shot)
         return stats
+
+    def _last_seen_image(self) -> str:
+        """记忆里最近「看过」的那张图（★文件还在才给路径★）。
+
+        给技能层兜「刚才那张图 / 上次那张截图」用：`Vision.last` 是进程内的短时记忆，
+        重启就没了；这里是长时记忆那一份 —— 所以第二天也能找回来。
+        文件已经不在了就返回空串（上层会说「那张已经不在了」）。
+        """
+        hub = getattr(self, "memory_hub", None)
+        if hub is None:
+            return ""
+        try:
+            mem = hub.for_character(self.character.id if self.character else "default")
+            return mem.recent_image()
+        except Exception as exc:  # noqa: BLE001 - 想不起来不该影响说话
+            self.log.debug(f"[记忆] 取上次那张图失败：{exc}")
+            return ""
+
+    def _remember_vision(self, stats: TurnStats, user_text: str, shot: str) -> None:
+        """把「看过一张图」记成一条情节，并护住那张图不被环形缓冲清掉。
+
+        ★按人脑那三层分的★：
+            感觉输入（像素）= `data/vision/` 里的环形缓冲 —— 新的顶掉旧的，本来就不该永久留；
+            情节记忆（这件事）= 这里：什么时候、你让我看什么、我当时看到了什么；
+            回忆（再用一次）= 图还在就把路径给回去（技能层能再看一眼），
+                              不在就只记得「当时看到了什么」—— 人脑也是这样，回忆是重建不是回放。
+        图片本身在记忆里只存**路径**：存像素既没意义（下次也不一定能用）又占地方。
+        """
+        hub = getattr(self, "memory_hub", None)
+        cfg = getattr(self.settings, "memory", None)
+        if hub is None or not shot or not getattr(cfg, "enabled", False):
+            return
+        try:
+            mem = hub.for_character(self.character.id if self.character else "default")
+            seen = str(stats.extra.get("vision") or "画面")
+            mine = " ".join((stats.answer or "").split())
+            summary = f"你让我看{seen}：「{user_text.strip()[:80]}」；我看到：{mine[:160]}"
+            mem.note(f"看了{seen}", summary, kind="vision", turn=stats.turn,
+                     image=shot, salience=0.7)
+            # 图片清理：护住记忆里还活着的那些（其余照旧只留最近 keep_images 张）
+            vision = getattr(self.skills, "vision", None) if self.skills is not None else None
+            if vision is not None:
+                vision.prune(protect=mem.images_in_use())
+            self.log.info(f"[记忆] 记住这次看图：{seen} -> {shot}")
+        except Exception as exc:  # noqa: BLE001 - 记忆写不进去不该影响已经说完的话
+            self.log.warning(f"[记忆] 看图没记上：{exc}")
 
     def _stream_answer(
         self,

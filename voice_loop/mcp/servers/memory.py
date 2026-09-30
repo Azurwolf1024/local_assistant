@@ -57,7 +57,9 @@ def _format_hit(hit) -> str:
     """把一条命中排成一行（★带种类 + 归属★：跨角色/全知时必须看得出「这是谁的」）。"""
     item = hit.item
     if hit.kind == "episode":
-        line = f"[那件事] {str(getattr(item, 'ts', ''))[:16]} {item.title}"
+        # ★看过图的那次要标出来★：模型才知道「当时确实有一张图」，可以说「我再看一眼」
+        tag = "那件事·带图" if getattr(item, "image", "") else "那件事"
+        line = f"[{tag}] {str(getattr(item, 'ts', ''))[:16]} {item.title}"
         return line + (f"：{item.summary}" if getattr(item, "summary", "") else "")
     if hit.kind == "fact":
         return f"[事实] {item.key.split('.')[-1]} = {item.value}"

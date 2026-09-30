@@ -270,15 +270,59 @@ class Memory:
 
     def note(self, title: str, summary: str = "", *, kind: str = "event",
              when: str | None = None, turn: int = 0, detail: str = "",
-             event_id: int | None = None, salience: float = 0.75) -> Episode:
-        """记一件事（pipeline 在技能真的写动日程/提醒时调它）。"""
+             event_id: int | None = None, salience: float = 0.75,
+             image: str = "") -> Episode:
+        """记一件事（pipeline 在技能真的写动日程/提醒时调它）。
+
+        `image`：这一次「看过」的图（路径）—— 之后能把那张图找回来（见 recent_image）。
+        """
         episode = Episode(
             ts=when or now_iso(), kind=kind, title=title[:80], summary=summary[:400],
-            detail=detail[:600], keywords=keywords_of(f"{title} {summary}", prefer=title),
-            salience=salience, source="", turn=turn, event_id=event_id,
+            detail=detail[:600] or (str(image)[:600] if image else ""),
+            keywords=keywords_of(f"{title} {summary}", prefer=title),
+            salience=salience, source="", turn=turn, event_id=event_id, image=str(image or ""),
         )
         append_jsonl(self.paths.episodes, [episode.to_dict()])
         return episode
+
+    def images_in_use(self, days: float = 60.0, min_salience: float = 0.15) -> set[str]:
+        """还「活着」的图片路径：被还记得的情节引用过的那些。
+
+        ★给图片清理用的★（`Vision.prune(protect=...)`）：
+        按人脑的规矩，**重要的事记得久，它当时看的画面也跟着留久一点** ——
+        等这条情节自己淡到 `min_salience` 以下（或超过 `days`），图片就不再受保护，
+        跟记忆一起褪色（不然磁盘会被「很久以前看过的截图」填满）。
+        """
+        moment = datetime.now()
+        out: set[str] = set()
+        for ep in self.episodes():
+            if not ep.image:
+                continue
+            born = parse_ts(ep.ts)
+            if born is not None and (moment - born).total_seconds() / 86400.0 > days:
+                continue
+            if salience_eff(ep, moment) < min_salience:
+                continue
+            out.add(str(ep.image))
+        return out
+
+    def recent_image(self, days: float = 30.0) -> str:
+        """最近「看过」的一张图（★文件还在才返回★）。
+
+        用途：`Vision.last` 是**进程内**的「刚才那张图」，重启就没了；
+        这里是长期记忆那一份 —— 于是「上次我给你看的那张截图」在第二天也找得回来。
+        文件已经不在（感觉记忆过期或被清）就返回空串，上层只能说「记不起来 / 那张已经不在了」。
+        """
+        moment = datetime.now()
+        for ep in sorted(self.episodes(), key=lambda e: e.ts, reverse=True):
+            if not ep.image:
+                continue
+            born = parse_ts(ep.ts)
+            if born is not None and (moment - born).total_seconds() / 86400.0 > days:
+                continue
+            if Path(ep.image).is_file():
+                return str(ep.image)
+        return ""
 
     def remember(self, text: str, *, kind: str = "talk", when: str | None = None,
                  turn: int = 0) -> tuple[Episode, list[Fact]]:

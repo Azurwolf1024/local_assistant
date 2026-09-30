@@ -153,7 +153,9 @@ def test_confirm_flow() -> None:
 
     skills.handle("读一下会议纪要")
     r = skills.handle("今天有什么课")
-    check("下一句是新指令时不误当成确认", getattr(r, "action", ""), "schedule_query")
+    # 期望从 schedule_query 改成 event_query（2026-09-28）：§17 把日程/闹钟合并成一份
+    # events.json 之后，这个动作就叫 event_query 了 —— 这行没跟着改，于是它一直红着（已修）
+    check("下一句是新指令时不误当成确认", getattr(r, "action", ""), "event_query")
     check("新指令后待确认也清掉", skills._vision_pending, None)
 
     # 多个候选 -> 让用户挑
@@ -292,12 +294,12 @@ def test_routing() -> None:
 
     # 不是看图的句子要原样交给别的技能 / LLM
     check("「看看今天的日程」还是日程查询",
-          getattr(skills.handle("看看今天的日程"), "action", "").startswith("schedule"), True)
+          getattr(skills.handle("看看今天的日程"), "action", "").startswith("event"), True)
     check("「关屏幕」还是关屏而不是看图",
           getattr(skills.handle("关屏幕"), "action", ""), "screen_off")
     check("「看看新闻」不该去拍照", skills.handle("看看新闻"), None)
     check("「今天有什么课」不受影响",
-          getattr(skills.handle("今天有什么课"), "action", ""), "schedule_query")
+          getattr(skills.handle("今天有什么课"), "action", ""), "event_query")
     import shutil
 
     shutil.rmtree(tmp, ignore_errors=True)
