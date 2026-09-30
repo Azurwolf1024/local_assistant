@@ -1045,6 +1045,23 @@ class VoiceLoop:
             return []
         return [str(path / name) for name in precision.PRECISION_FILES[precision.want_precision(self.settings)]]
 
+    def reload_voice(self) -> str:
+        """按**当前角色**重新应用一次声线（控制台刚改了参考音频/声线时用）。
+
+        ★为什么需要它★：`_switch_character` 在「切到的就是当前角色」时会早退
+        （那在唤醒服务里是对的 —— 没必要白重载），于是改完 `voice_ref` 再点
+        「切过去试听」不会重建 TTS。这里绕过早退，直接按当前角色的字段重来一遍
+        （只换参考音频时是当场生效的，见 _apply_voice 的说明）。
+        返回角色名（没有角色时返回空串），失败只记日志、绝不把嘴弄哑。
+        """
+        if self.character is None:
+            return ""
+        try:
+            self._apply_voice(self.character, reason="控制台重载")
+        except Exception as exc:  # noqa: BLE001 - 换声线失败不该把服务搞崩
+            self.log.warning(f"[角色] 重载声线失败（继续用当前声线）：{exc}")
+        return self.character.name
+
     def _switch_character(self, cid: str) -> Character | None:
         """唤醒词点了谁的名就切到谁（人设 + 应答语 + 声线）。"""
         if self.persona is None or not cid:

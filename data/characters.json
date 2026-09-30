@@ -28,6 +28,12 @@
       "file": "personas/amiya.json",
       "enabled": true,
       "default": false
+    },
+    {
+      "id": "exusiai",
+      "file": "personas/exusiai.json",
+      "enabled": true,
+      "default": false
     }
   ]
 }

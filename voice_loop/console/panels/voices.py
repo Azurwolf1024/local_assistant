@@ -136,3 +136,74 @@ def register(app, ctx) -> None:
             if row["id"] == cid:
                 return {"id": cid, "lines": row["lines"], "wake_words": row["wake_words"]}
         raise HTTPException(status_code=404, detail=f"没有角色 {cid!r}")
+
+    @app.get("/api/voices/clone")
+    def api_clone_info(cid: str = ""):
+        """单条克隆能挑哪些参考：角色素材目录里的音频 + 当前参考。"""
+        from ...console import clone as clone_mod  # noqa: PLC0415
+
+        char = None
+        for got in ctx.characters().all():
+            if got.id == cid:
+                char = got
+                break
+        if char is None:
+            raise HTTPException(status_code=404, detail=f"没有角色 {cid!r}")
+        return {
+            "id": char.id,
+            "name": char.name,
+            "candidates": clone_mod.candidates(ctx.settings, char.voice_dir, char.voice_ref),
+            "voice_ref": char.voice_ref or "",
+            "voice_ref_text": char.voice_ref_text or "",
+            "backend": char.backend or ctx.settings.tts.backend,
+            "say": clone_mod.preview_sentence(char),
+            "limits": {"min_seconds": clone_mod.MIN_SECONDS,
+                       "max_seconds": clone_mod.MAX_SECONDS,
+                       "max_upload_mb": clone_mod.MAX_UPLOAD_MB},
+        }
+
+    @app.post("/api/voices/clone")
+    def api_clone(payload: dict = Body(default={})):
+        """★只用一条语音就能克隆★：挑一条（或传一条）音频 → 写进人格文件当参考 → 可选立刻试听。
+
+        真正的出声还是服务：写完之后用 `force` 让服务**重建一次** TTS
+        （同角色切换会早退，不带 force 就白写）。
+
+        `dry_run=true` 只做主验并告诉你会改什么（测试与「先看一眼」用）。
+        """
+        from ...console import clone as clone_mod  # noqa: PLC0415
+
+        body = payload or {}
+        cid = str(body.get("id") or "").strip()
+        if not cid:
+            raise HTTPException(status_code=400, detail="缺少 id")
+        char = None
+        for got in ctx.characters().all():
+            if got.id == cid:
+                char = got
+                break
+        if char is None:
+            raise HTTPException(status_code=404, detail=f"没有角色 {cid!r}")
+        dry = bool(body.get("dry_run")) or not bool(body.get("apply", True))
+        try:
+            report = clone_mod.install(
+                ctx.settings, char,
+                clip=str(body.get("path") or ""),
+                data_base64=str(body.get("data") or ""),
+                filename=str(body.get("filename") or ""),
+                ref_text=str(body.get("ref_text") or ""),
+                dry_run=dry,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        out: dict = {"ok": True, **report}
+        if body.get("audition") and not dry:
+            switched = ctx.call_service("character", timeout=30.0, id=cid, force=True)
+            said = ctx.call_service("say", timeout=float(body.get("timeout") or 90.0),
+                                    text=str(body.get("say") or clone_mod.preview_sentence(char)))
+            out["audition"] = {
+                "reloaded": switched.ok, "reload_message": switched.text or switched.error,
+                "ok": said.ok, "message": said.text or said.error,
+                "seconds": round(said.seconds, 2),
+            }
+        return out

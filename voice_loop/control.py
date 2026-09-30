@@ -373,6 +373,11 @@ def execute(loop: Any, req: Request) -> Reply:
             char = switch(cid)
             if char is None:
                 return Reply(id=req.id, ok=False, error=f"没有角色 {cid!r}", at=t0)
+            # ★force★：同角色时会早退，但「刚改过参考音频/声线」得真重建一次 TTS
+            # （控制台的单条克隆就是这条短信：写完人格文件 → 带 force 切一次）
+            reload_voice = getattr(loop, "reload_voice", None)
+            if bool(args.get("force")) and callable(reload_voice):
+                reload_voice()
             return Reply(id=req.id, ok=True, text=getattr(char, "name", cid), at=t0, data=_describe(loop))
 
         if cmd == "toast":
