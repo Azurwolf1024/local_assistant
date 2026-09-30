@@ -30,6 +30,12 @@ HF_MIRRORS = ["https://hf-mirror.com", "https://huggingface.co"]
 SENSEVOICE_REPO = "csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
 PIPER_REPO = "rhasspy/piper-voices"
 
+# 说话人向量（声纹）：★不是合成用的★，是量「像不像」用的尺子。
+# 3D-Speaker CAM++ 中文版，16 kHz 单声道输入，输出 192 维向量，27 MB。
+# 用途：scripts/spk_check.py、pick_voice_ref.py 的「音色相似度」列。
+SPEAKER_REPO = "csukuangfj/speaker-embedding-models"
+SPEAKER_MODEL = "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx"
+
 # Silero VAD 的可选来源（按顺序尝试）
 SILERO_VAD_URLS = [
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
@@ -168,12 +174,25 @@ def fetch_zipvoice(force: bool = False) -> None:
     print("      完成。用法见 README 第 14 节，试听：python scripts/tts_clone_probe.py --help")
 
 
+def fetch_speaker(force: bool = False) -> None:
+    """说话人向量模型（声纹尺子）：量「合出来的像不像她」用的，不参与合成。
+
+    可选但强烈建议：没有它，音色好不好只能靠耳朵（本项目已有的其他尺子是
+    音区/停顿/沙沙声，都量不了「这是不是同一个人」）。
+    """
+    print("[5/5] 说话人向量（3D-Speaker CAM++ 中文，27 MB）")
+    out = MODELS / "speaker"
+    out.mkdir(parents=True, exist_ok=True)
+    download_with_fallback(hf_urls(SPEAKER_REPO, SPEAKER_MODEL), out / SPEAKER_MODEL, force=force)
+    print("      用法：python scripts/spk_check.py <wav...> [--ref <wav|目录>]")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="下载本地语音链路模型")
     ap.add_argument(
         "--only",
         nargs="*",
-        choices=["sensevoice", "vad", "piper", "zipvoice"],
+        choices=["sensevoice", "vad", "piper", "zipvoice", "speaker"],
         help="只下载指定模型",
     )
     ap.add_argument("--force", action="store_true", help="强制重新下载")
@@ -188,6 +207,8 @@ def main() -> int:
         fetch_piper(force=args.force)
     if "zipvoice" in targets:
         fetch_zipvoice(force=args.force)
+    if "speaker" in targets:
+        fetch_speaker(force=args.force)
 
     print("\n完成。模型目录：")
     for p in sorted(MODELS.rglob("*")):

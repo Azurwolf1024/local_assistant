@@ -275,7 +275,9 @@ flowchart LR
 │  ├─ test_mic_loopback.py     # 麦克风回环诊断（放一段语音，看能不能听到 + 识别）
 │  ├─ clean_junk_data.py       # 清理早期版本写坏的数据（备忘「录吗？」、事件标题「我」这类）
 │  ├─ check_deploy.py          # ★ 搬家/换系统前的只读自检（七类问题 + 怎么办）
-│  ├─ pick_voice_ref.py        # ★ 声线体检：毛不毛先看参考/素材，附参考候选与 2×2 交叉
+│  ├─ pick_voice_ref.py        # ★ 声线体检：毛不毛先看参考/素材，音区/摆幅/像不像她 + 风格参考建议
+│  ├─ spk_check.py             # ★ 声纹：量「像不像她」（同人 vs 跨人），合成结果对素材质心
+│  ├─ test_speaker.py          # ★ 上一步的离线自测（含真素材上「同人 > 跨人」的分辨力验证）
 │  ├─ make_ref_join.py         # ★ 把几段素材拼成一条克隆参考（挑得慢就用它，确定性可重建）
 │  ├─ migrate_events.py        # ★ 把旧的 alarms+schedule 迁成统一事件表（**已迁完**，留着给历史数据）
 │  ├─ test_events.py           # ★ 事件层测试（发生时间 / 二维去重 / 到期 / 事件链 / 迁移）
@@ -309,6 +311,7 @@ cd <项目目录>
 pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 python scripts/download_models.py     # 补上 SenseVoice / Silero VAD / Piper 中文女声（约 300 MB）
 python scripts/download_models.py --only zipvoice   # 可选：ZipVoice 音色克隆（约 156 MB；不装就退回 Piper）
+python scripts/download_models.py --only speaker    # 可选：声纹尺子（27 MB，量「像不像她」，不参与合成）
 ollama pull qwen3.5:4b                # 主模型：文本 + 看图 + 工具（3.4 GB）
 python main.py selftest               # 10 项检查，全过就能用了
 ```
@@ -1610,6 +1613,32 @@ python scripts/import_lines.py data/personas/exusiai/exusiai.txt --apply   # 只
 
 > 素材音频本仓库不带（`data/personas/<id>/*.wav` 没进 git）：想复现就把自己的音频
 > 按那个目录名放好，再照上面两步克隆。
+
+### 量「像不像她」：声纹尺子
+
+以前能量音区、停顿、沙沙声，唯独量不了用户最在意的那件事 —— **「这是不是同一个人在说」**。
+换参考、换精度、换步数、重训模型，几次调整之间没有共同刻度，就说不清「这次到底好没好」。
+现在有了一把尺子（3D-Speaker CAM++ 中文版，27 MB，纯 CPU，走 sherpa-onnx，零新依赖）：
+
+```powershell
+python scripts/download_models.py --only speaker                      # 一次性
+python scripts/spk_check.py 合成.wav --ref data/personas/kaltsit      # vs 她的素材（质心）
+python scripts/spk_check.py a.wav b.wav c.wav                          # 两两矩阵
+python scripts/pick_voice_ref.py --who kaltsit                        # 素材体检（多两列 + 风格建议）
+```
+
+**阈值是量出来的，不是拍的**：同人素材两两 **0.635~0.977**、跨人 **0.313~0.535**
+→ **0.60** 是个干净的分界（两边各留约 0.1 余量）。
+
+**2026-09-30 的基准**：合出来的凯尔希 vs 她的素材质心 = **0.70~0.77**，
+而她素材内部两两中位 = **0.82** —— 也就是「像她，但比她自己的素材之间还差一档」。
+这句话以前只能凭感觉，现在有数了；以后每次改参考/改后端，都能看它是涨还是跌。
+
+`pick_voice_ref.py` 现在除干净度还给**语气层次**（音区中位 / 摆幅 / 持续偏离）
+并直接建议几条风格参考（附一段能粘进人格文件的 JSON）。
+★但要看它给的跨度★：凯尔希在 3.5~8 秒区间里音区只差约 **0.6 个半音** —— 她的素材本身
+语气就单一，换参考只能给出细微差别；想要明显不同的情绪，得另找带情绪的素材
+（或者换支持风格条件的模型）。工具会自己把这句话打出来。
 
 ### 给角色训专属声线（标准化流程，Windows 原生）
 

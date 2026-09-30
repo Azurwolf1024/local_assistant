@@ -37,7 +37,7 @@ from ..settings import Settings
 from . import pitch as pitchkit
 from . import refclean as rc
 from . import textcheck
-from .pacing import LevelMatcher, PacingFixer
+from .pacing import LevelMatcher, PacingFixer, resample
 from .precision import (
     DEFAULT_PRECISION,
     PRECISION_FILES,
@@ -103,12 +103,8 @@ def register_adoptable(med: float | None, ref_f0: float | None) -> bool:
 
 
 def _resample(x: np.ndarray, src: int, dst: int) -> np.ndarray:
-    """线性插值重采样（只为喂 ASR，够用且不引入新依赖）。"""
-    if src == dst or x.size == 0:
-        return np.asarray(x, dtype=np.float32)
-    n = max(1, int(round(x.size * dst / float(src))))
-    idx = np.linspace(0.0, x.size - 1.0, n)
-    return np.interp(idx, np.arange(x.size, dtype=np.float64), x).astype(np.float32)
+    """保留旧名字（测试在用）—— 实现已收成 `pacing.resample` 一份。"""
+    return resample(x, src, dst)
 
 
 def missing_files(settings: Settings) -> list[Path]:

@@ -216,6 +216,13 @@ class TtsConfig:
     # 实测：正常的合成比出来是 1.000，丢了「了」的那种是 0.982 → 阀值 0.99 分得很开。
     # 代价：多一次本地 ASR（RTF 0.014，6 秒音频几十毫秒）；重采才多花合成时间。
     text_guard_min: float = 0.99      # 相似度低于它就重采（0 = 关；需要管线注入 ASR 校验器）
+    # ---- 说话人向量（声纹尺子）：量「像不像她」；★不参与合成★ ----
+    # 见 voice_loop/tts/speaker.py：已有的尺子只能量音区/停顿/沙沙声，
+    # 量不了「这是不是同一个人」——换参考、换精度、重训模型都只能靠耳朵判。
+    # 模型：3D-Speaker CAM++ 中文版（27 MB，纯 CPU），
+    #   python scripts/download_models.py --only speaker
+    speaker_model: str = "models/speaker/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx"
+    speaker_threads: int = 2          # onnxruntime 线程数（这是个短任务，2 就够）
 
 
 @dataclass

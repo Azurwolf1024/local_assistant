@@ -39,6 +39,19 @@ DEFAULT_SHRINK_OVER_MS = 450      # 超过它才开始压
 DEFAULT_MIN_GAP_FLOOR_MS = 60
 
 
+def resample(x: np.ndarray, src: int, dst: int) -> np.ndarray:
+    """线性插值重采样（够用且不引入新依赖）。
+
+    ★只此一份★：以前 `zipvoice_tts._resample` 和别的脚本各写一遍。
+    用途都很窄 —— 把音频喂给只吃 16 kHz 的东西（ASR、声纹模型），不做音质用途。
+    """
+    if src == dst or x.size == 0:
+        return np.asarray(x, dtype=np.float32)
+    n = max(1, int(round(x.size * dst / float(src))))
+    idx = np.linspace(0.0, x.size - 1.0, n)
+    return np.interp(idx, np.arange(x.size, dtype=np.float64), x).astype(np.float32)
+
+
 def _to_int16(pcm) -> np.ndarray:
     x = np.asarray(pcm)
     if x.dtype == np.int16:

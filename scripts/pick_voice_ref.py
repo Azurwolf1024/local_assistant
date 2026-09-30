@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import statistics
 import sys
 from pathlib import Path
@@ -41,6 +42,8 @@ from scripts.ab_clone_model import (  # noqa: E402
     lead_silence,
     rms_swing,
 )
+from voice_loop.tts import pitch as pitchkit  # noqa: E402
+from voice_loop.tts import speaker as spk     # noqa: E402
 
 PERSONA_DIR = ROOT / "models" / "tts" / "zipvoice" / "personas"
 DATA_DIR = ROOT / "data" / "personas"
@@ -73,7 +76,13 @@ def quiet_hf(path: Path) -> tuple[float, float, float]:
 
 
 def measure(path: Path) -> dict | None:
-    """一条音频的全部体检数据。"""
+    """一条音频的全部体检数据。
+
+    ★两把尺子，各管一件事★：
+    - 干净度（高频/波动/头静音）→ 决定有没有沙沙声；
+    - **音区与摆幅**（YIN 量的 f0）→ 决定这条参考会把输出带到哪个「语气」音区，
+      以及它自己的情绪起伏大小（摆幅大 = 念白有起伏，适合当「有情绪」的参考）。
+    """
     try:
         x, rate = sf.read(str(path), dtype="float32", always_2d=True)
     except Exception as exc:  # noqa: BLE001
@@ -83,11 +92,52 @@ def measure(path: Path) -> dict | None:
     pcm = np.clip(mono * 32768.0, -32768, 32767).astype(np.int16)
     whole, quiet, share = quiet_hf(path)
     swing, _peak = rms_swing(pcm, rate)
+    _, f0 = pitchkit.f0_track(mono, rate)
+    pitch = pitchkit.stats(f0)
     return {
         "name": path.name, "path": path, "seconds": pcm.size / rate,
         "hf": whole, "quiet_hf": quiet, "quiet_share": share,
         "swing": swing, "lead": lead_silence(pcm, rate), "rate": rate,
+        "f0_med": float(pitch["f0_med"]), "iqr_st": float(pitch["iqr_st"]),
+        "sustained_up": float(pitch["sustained_up"]),
+        "sustained_dn": float(pitch["sustained_dn"]),
+        "voiced_pct": float(pitch["voiced_pct"]),
+        "sim": float("nan"),
     }
+
+
+def style_picks(rows: list[dict], want: int = 4) -> list[tuple[str, dict]]:
+    """从素材里挑几条「互相听得出来不一样」的。返回 ``[(风格键, 行)]``。
+
+    判据都是量出来的（不再靠感觉）：
+    1. **能当参考**：3.5~8 秒、像不像她 >= SAME_SPEAKER、安静帧高频不过分；
+    2. **可分辨**：按**音区中位**排序，低/中/高各取一条 → 这三条会把输出带到不同音区；
+    3. 再补一条**摆幅最大**的（摆幅 ≈ 情绪起伏）当「有情绪」那档。
+    ★风格名字是占位★：听完之后把 low/mid/high/lively 换成你真听到的语气。
+    """
+    pool = [r for r in rows
+            if MIN_REF_S <= r["seconds"] <= MAX_REF_S
+            and r["f0_med"] == r["f0_med"]
+            and (r["sim"] != r["sim"] or r["sim"] >= spk.SAME_SPEAKER)]
+    if not pool:
+        return []
+    quiet_ok = statistics.median([r["quiet_hf"] for r in pool
+                                  if r["quiet_hf"] == r["quiet_hf"]] or [0.0])
+    pool = [r for r in pool if r["quiet_hf"] <= quiet_ok + 3.0] or pool   # 先别挑明显毛的
+
+    by_pitch = sorted(pool, key=lambda r: r["f0_med"])
+    picks: list[tuple[str, dict]] = []
+    for key, pos in (("low", 0), ("mid", len(by_pitch) // 2), ("high", len(by_pitch) - 1)):
+        got = by_pitch[pos]
+        if all(got["name"] != r["name"] for _k, r in picks):
+            picks.append((key, got))
+    taken = {r["name"] for _k, r in picks}
+    rest = [r for r in pool if r["name"] not in taken]
+    if rest:
+        # 摆幅最大的一条从**没选中的**里挑（否则它往往又被 low/high 占掉）
+        live = max(rest, key=lambda r: (r["iqr_st"] if r["iqr_st"] == r["iqr_st"] else -1))
+        picks.append(("lively", live))
+    return picks[:max(1, want)]
 
 
 # ----------------------------------------------------------------- 模式一：素材体检
@@ -97,25 +147,86 @@ def survey(who: str) -> int:
         print(f"{who}：没有素材（{DATA_DIR / who}）")
         return 1
     rows = [m for m in (measure(p) for p in files) if m]
+
+    # ★声纹★：同一套素材的质心当基准，量「每条自己像不像这个角色」。
+    # 换参考时最容易踩的坑就是「挑了一条其实不太像她、但很干净的素材」。
+    emb = spk.load()
+    if emb is None:
+        print(f"  · 跳过「像不像她」：{spk.missing().strip().splitlines()[0]}")
+    else:
+        vecs = {}
+        for r in rows:
+            got = emb.embedding_file(r["path"])
+            if got is not None:
+                vecs[r["name"]] = got
+        base = spk.centroid(list(vecs.values()))
+        for r in rows:
+            got = vecs.get(r["name"])
+            r["sim"] = spk.cosine(got, base) if got is not None else float("nan")
+        if vecs:
+            inside = sorted(spk.cosine(a, b) for a, b in itertools.combinations(vecs.values(), 2))
+            print(f"  声纹：{len(vecs)}/{len(rows)} 条算出向量；素材内部两两中位 "
+                  f"{inside[len(inside) // 2]:.3f}（这是「像她」的手感基准）")
+
     quiet = [r["quiet_hf"] for r in rows if r["quiet_hf"] == r["quiet_hf"]]
-    print(f"\n{'=' * 92}")
+    print(f"\n{'=' * 104}")
     print(f"{who}：{len(rows)} 条素材　"
           f"安静帧高频占比 中位 {statistics.median(quiet):.2f}%（越小越干净）　"
           f"整条中位 {statistics.median(r['hf'] for r in rows):.2f}%")
-    print("=" * 92)
+    print("=" * 104)
     band = [r for r in rows if MIN_REF_S <= r["seconds"] <= MAX_REF_S]
     print(f"\n  ★ 候选参考（{MIN_REF_S}~{MAX_REF_S} 秒，按安静帧高频占比升序 = 最干净在前）")
     print(f"    {'文件':<22} {'时长':>6} {'安静帧高频':>10} {'整条高频':>9} "
-          f"{'波动':>7} {'头静音':>7}")
-    for r in sorted(band, key=lambda r: r["quiet_hf"])[:6]:
+          f"{'波动':>7} {'头静音':>7} {'音区':>7} {'像不像她':>8}")
+    for r in sorted(band, key=lambda r: r["quiet_hf"])[:8]:
         print(f"    {r['name']:<22} {r['seconds']:5.2f}s {r['quiet_hf']:9.2f}% "
-              f"{r['hf']:8.2f}% {r['swing']:6.2f}dB {r['lead']:6.2f}s")
+              f"{r['hf']:8.2f}% {r['swing']:6.2f}dB {r['lead']:6.2f}s "
+              f"{r['f0_med']:5.0f}Hz {r['sim']:7.3f}")
     print(f"\n  最脏的 3 条（别拿它们当参考）")
     for r in sorted(band, key=lambda r: -r["quiet_hf"])[:3]:
         print(f"    {r['name']:<22} {r['seconds']:5.2f}s {r['quiet_hf']:9.2f}%")
+
+    # ★风格体检★：把「音区 / 摆幅」摆出来，一眼看出素材里有没有可分辨的语气层次
+    print(f"\n  ★ 语气层次（按音区中位排序；摆幅 = 情绪起伏）")
+    print(f"    {'文件':<22} {'音区':>7} {'摆幅(四分位)':>12} {'持续最远':>10} "
+          f"{'有声占比':>8} {'时长':>6}")
+    for r in sorted([r for r in rows if r["f0_med"] == r["f0_med"]],
+                    key=lambda r: r["f0_med"])[:12]:
+        print(f"    {r['name']:<22} {r['f0_med']:5.0f}Hz {r['iqr_st']:11.2f}半音 "
+              f"{r['sustained_up']:9.1f}st {r['voiced_pct']:7.1f}% {r['seconds']:5.2f}s")
+
+    picks = style_picks(rows)
+    if picks:
+        meds = [r["f0_med"] for r in band if r["f0_med"] == r["f0_med"]]
+        span = pitchkit.semitone(max(meds), min(meds)) if len(meds) >= 2 else float("nan")
+        print(f"\n  ★ 建议先拿这几条当「风格参考」（互相听得出来不一样，且都像她）")
+        for key, r in picks:
+            print(f"    {key:<7} {r['name']:<22} 音区 {r['f0_med']:.0f}Hz  "
+                  f"摆幅 {r['iqr_st']:.2f}半音  像不像她 {r['sim']:.3f}  "
+                  f"{r['seconds']:.1f}s")
+        if span == span:
+            print(f"    音区跨度：候选里最低 {min(meds):.0f}Hz ~ 最高 {max(meds):.0f}Hz "
+                  f"= {span:.2f} 个半音")
+        if span == span and span < 1.5:
+            # ★把「素材本来就没层次」这种情况说出来★：换参考只能给出细微差别，
+            # 想要明显不同的语气，得另找/另录带情绪的素材（或换带风格条件的模型）。
+            print("    ⚠ 跨度不到 1.5 个半音 —— 这套素材**本身语气偏单一**："
+                  "换参考只能给出细微差别，\n      想要明显不同的情绪，得另找带情绪的素材"
+                  "（或换支持风格条件的模型）。")
+        rel = f"data/personas/{who}/"
+        print(f"\n    贴进 data/personas/{who}.json（★名字听完再改成你真听到的语气★）：")
+        print("      \"voice_refs\": {")
+        for i, (key, r) in enumerate(picks):
+            print(f"        \"{key}\": \"{rel}{r['name']}\"{',' if i < len(picks) - 1 else ''}")
+        print("      }")
+    else:
+        print(f"\n  · 挑不出风格参考（{MIN_REF_S}~{MAX_REF_S} 秒、且像她的素材太少）")
+
     print("\n  怎么用：把候选填进人格文件的 voice_ref，或者先试听——")
     print("    python scripts/tts_clone_probe.py --ref <wav> --compare")
-    print("  ★先听后改★：这几个数字只能筛掉明显毛的，定不了好不好听。")
+    print("  想量「合出来的像不像她」（声纹）：")
+    print(f"    python scripts/spk_check.py <合成的wav> --ref data/personas/{who}")
+    print("  ★先听后改★：这些数字能筛掉明显不行的，定不了好不好听。")
     return 0
 
 
