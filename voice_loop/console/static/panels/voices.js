@@ -48,17 +48,61 @@
       }
 
       // ★只用一条语音就能克隆★：挑一条素材（或传一条）→ 写进人格文件当参考 → 可选立刻试听
+      // 文本能按文件名对上素材清单（<id>.txt）/她的台词时**自动填入** ——
+      // 零样本克隆吃的是「这条音频 + 它逐字对应的文本」，文本对不上就会声不对词。
       function cloneBlock(c) {
         const { h } = UI;
+        const cands = c.ref_candidates || [];
+        const index = c.ref_index || {};
+        const loose = (s) => String(s).replace(/[\s.\-_()（）\[\]【】·、]+/g, "").toLowerCase();
         const pick = h("select", {});
-        (c.ref_candidates || []).forEach((p) => {
-          const parts = String(p).split("/");
-          pick.appendChild(h("option", { value: p, text: parts[parts.length - 1] + "   （" + parts.slice(-2)[0] + "）" }));
+        cands.forEach((it) => {
+          const bits = [
+            it.name,
+            it.seconds ? it.seconds.toFixed(1) + " 秒" : "时长未知",
+            it.text ? "有文本" : "没文本",
+            it.ok ? "" : "✗ " + (it.problem || "不能用"),
+          ];
+          pick.appendChild(h("option", {
+            value: it.path, title: it.text || "", disabled: !it.ok,
+            text: bits.filter(Boolean).join(" · "),
+          }));
         });
-        if (!pick.options.length) pick.appendChild(h("option", { value: "", text: "（她的素材目录里没找到音频，就传一条）" }));
+        if (!cands.length) {
+          pick.appendChild(h("option", {
+            value: "",
+            text: "（素材目录里没找到音频：" + (c.materials_dir || "没写 voice_dir") + "，就传一条）",
+          }));
+        }
+        if (c.voice_ref && cands.some((it) => it.path === c.voice_ref)) pick.value = c.voice_ref;
         const file = h("input", { type: "file", accept: "audio/*", style: "font-size:11px" });
         const refText = h("input", { placeholder: "这条音频的逐字文本（可留空）", value: c.voice_ref_text || "" });
+        const hint = h("p", { class: "muted", text: "" });
         const status = h("p", { class: "muted", text: "" });
+
+        function fillFromPick() {
+          const it = cands.find((x) => x.path === pick.value);
+          if (it && it.text) {
+            refText.value = it.text;
+            hint.textContent = "文本已自动填入（来源：" + (it.text_source || "素材清单") + "）";
+          } else if (it) {
+            hint.textContent = "这条没找到对应文本 —— 手填它的原文会让克隆更准（可留空）";
+          }
+        }
+        pick.addEventListener("change", fillFromPick);
+        file.addEventListener("change", () => {
+          const f = (file.files || [])[0];
+          if (!f) return;
+          const stem = String(f.name).replace(/\.[^.]+$/, "");
+          const hit = index[loose(stem)];
+          if (hit) {
+            refText.value = hit;
+            hint.textContent = "文本已自动填入（文件名对上了素材清单里的「" + stem + "」）";
+          } else {
+            hint.textContent = "这个文件名没查到对应文本，手填它的原文更准（可留空）";
+          }
+        });
+        if (!refText.value) fillFromPick();
 
         async function apply(audition) {
           const f = (file.files || [])[0];
@@ -74,6 +118,8 @@
           if (!r.ok) { status.textContent = "没成：" + (r.error || ""); ctx.toast("克隆参考没设上", "err"); return; }
           const changed = Object.keys(r.changed || {}).join("、") || "（无变化）";
           let msg = "参考已设为 " + r.reference + "（写入 " + changed + "" + (r.backup ? "，旧文件备份在 " + r.backup.split("\\").pop() : "") + "）";
+          if (r.ref_text) msg += "；参考文本：" + (r.ref_text.length > 24 ? r.ref_text.slice(0, 24) + "…" : r.ref_text) + "（来源 " + (r.text_source || "手填") + "）";
+          else if (r.cleared_text) msg += "；旧参考文本已清掉（换了音频又没新文本，留着会声不对词）";
           if (r.audition) msg += r.audition.ok ? "；已念出（" + secs(r.audition.seconds) + "）" : "；但试听没成：" + (r.audition.message || "");
           status.textContent = msg;
           ctx.toast(r.audition ? (r.audition.ok ? "已应用并试听" : "已应用，试听失败") : "已应用克隆参考", r.audition && !r.audition.ok ? "err" : "ok");
@@ -83,10 +129,11 @@
         return h("details", {}, [
           h("summary", { class: "muted", text: "★只用一条语音就能克隆★（现在参考：" + (c.voice_ref || "用全局") + "）" }),
           h("div", { style: "padding:6px 0" }, [
-            h("p", { class: "muted", text: "挑一条她的素材（或传一段你自己的录音）→ 写进人格文件当参考 → 可选立刻试听。只换参考音是当场生效的，不用重启服务。" }),
+            h("p", { class: "muted", text: "素材目录 " + (c.materials_dir || "—") + "：" + (c.materials_count || 0) + " 条音频，其中 " + (c.materials_with_text || 0) + " 条能按文件名对上文本。挑一条（或传一段你自己的录音）→ 写进人格文件当参考 → 可选立刻试听。只换参考音是当场生效的，不用重启服务。" }),
             h("div", { class: "row" }, [h("div", { class: "grow" }, pick)]),
             h("div", { class: "row" }, [h("div", { class: "grow" }, file)]),
             h("div", { class: "row" }, [h("div", { class: "grow" }, refText)]),
+            hint,
             h("div", { class: "row" }, [
               h("button", { class: "btn small primary", text: "设为克隆参考并试听", onclick: () => apply(true) }),
               h("button", { class: "btn small", text: "只设为参考", onclick: () => apply(false) }),
@@ -112,8 +159,10 @@
             c.voice_model ? h("p", { class: "mono", text: "专属模型：" + c.voice_model + (c.voice_model_exists ? " ✓" : " ✗ 目录不在") }) : null,
             c.ref_candidates && c.ref_candidates.length
               ? h("details", {}, [
-                  h("summary", { class: "muted", text: "素材库里还有 " + c.ref_candidates.length + " 个参考候选" }),
-                  h("div", { class: "mono", style: "font-size:11px" }, c.ref_candidates.map((p) => h("div", { text: p }))),
+                  h("summary", { class: "muted", text: "素材库 " + (c.materials_dir || "（没写 voice_dir）") + "：" + c.ref_candidates.length + " 条音频，" + (c.materials_with_text || 0) + " 条有文本" }),
+                  h("div", { class: "mono", style: "font-size:11px" }, c.ref_candidates.map((it) => h("div", {
+                    text: "· " + it.name + (it.seconds ? "  " + it.seconds.toFixed(1) + "s" : "") + (it.text ? "  ✓有文本" : "（没文本）") + (it.ok ? "" : "  ✗ " + (it.problem || "不能用")),
+                  }))),
                 ])
               : null,
             c.lines && c.lines.length

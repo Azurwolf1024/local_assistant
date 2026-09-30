@@ -51,7 +51,8 @@ def make_wav(path: Path, seconds: float = 1.5, rate: int = 24000) -> Path:
     return path
 
 
-# 沙盒用的角色：voice_dir 用绝对路径（真实角色的 voice_dir 都是相对项目根的）
+# 沙盒用的角色：**故意不写 voice_dir** —— 素材目录要走约定（<人格文件目录>/<id>/），
+# 能天使人格里就是这样，之前只从 voice_ref 目录列候选 → 面板显示「没找到音频」。
 FIXTURE = {
     "id": "exusiai", "name": "能天使", "user_title": "老板",
     "wake_words": ["能天使"],
@@ -59,6 +60,15 @@ FIXTURE = {
               {"scene": "长句", "text": "这是一条明显更长的台词，用来验证试听挑的是最短那句。"}],
     "notes": "别把我弄丢",
 }
+
+# 素材清单（名字行紧接正文行，之后空行 —— 与真实素材同排版）
+MANIFEST = """交谈1
+老板，这单我送完了 —— 要不要现在就去吃点什么？
+
+戳一下
+欸，干吗。
+"""
+CLIP_TEXT = "老板，这单我送完了 —— 要不要现在就去吃点什么？"
 
 # 钉住：整个测试跑完，真实仓库里这个文件的字节数一个不能变
 REAL_PERSONA = ROOT / "data" / "personas" / "exusiai.json"
@@ -72,9 +82,9 @@ def setup(tmp: Path):
     room.mkdir()
     for name, seconds in (("交谈1.wav", 2.0), ("戳一下.wav", 1.2), ("太短.wav", 0.3)):
         make_wav(room / name, seconds)
+    (room / "exusiai.txt").write_text(MANIFEST, encoding="utf-8")   # 素材清单（带文本）
     (personas / "exusiai.json").write_text(
-        json.dumps({**FIXTURE, "voice_dir": room.as_posix()}, ensure_ascii=False, indent=2),
-        encoding="utf-8")
+        json.dumps(FIXTURE, ensure_ascii=False, indent=2), encoding="utf-8")
     (tmp / "characters.json").write_text(json.dumps({
         "default": "exusiai",
         "characters": [{"id": "exusiai", "file": "personas/exusiai.json"}],
@@ -98,15 +108,25 @@ def test_inspect(tmp: Path) -> None:
 
 
 def test_candidates(tmp: Path) -> None:
-    print("\n[2] 候选：从她的素材目录里挑")
+    print("\n[2] 候选：从她的素材目录里挑（没写 voice_dir 也找得到）")
     settings, registry = setup(tmp)
     char = registry.get("exusiai")
-    rows = clone.candidates(settings, voice_dir=str(tmp / "personas" / "exusiai"))
+    room = tmp / "personas" / "exusiai"
+    check("素材目录走约定：<人格文件目录>/<id>/", clone.material_dir(settings, char), room)
+
+    rows = clone.candidates(settings, char)
     names = sorted(r["name"] for r in rows)
-    check("列全了三种音频", names, ["交谈1.wav", "太短.wav", "戳一下.wav"])
+    check("列全了三种音频（不含清单 txt）", names, ["交谈1.wav", "太短.wav", "戳一下.wav"])
     check("逐条带体检结果（太短的标出来）",
           [r["ok"] for r in rows if r["name"] == "太短.wav"], [False])
-    here = str(tmp / "personas" / "exusiai" / "交谈1.wav")
+    check("候选自带对应文本（按文件名对清单）",
+          [(r["name"], r["text"]) for r in rows if r["text"]],
+          [("交谈1.wav", CLIP_TEXT), ("戳一下.wav", "欸，干吗。")])
+    check("文本来源标出来了", [r["text_source"] for r in rows if r["text"]], ["清单", "清单"])
+    check("没文本的那条如实留空", [r["text"] for r in rows if r["name"] == "太短.wav"], [""])
+    check("前端查表（传文件时按文件名查）", clone.ui_index(settings, char, rows).get("交谈1"), CLIP_TEXT)
+
+    here = str(room / "交谈1.wav")
     check("素材在项目根外面时给绝对路径（不瞎猜相对路径）",
           any(r["path"] == here for r in rows), True)
 
@@ -120,28 +140,45 @@ def test_candidates(tmp: Path) -> None:
         shutil.rmtree(inside.parent, ignore_errors=True)
     check("试听挑的是最短那句台词（她真会说的话）", clone.preview_sentence(char), "在的在的，老板！")
 
+    # 目录不存在时不报错、返回空表（UI 会提示「就传一条」）
+    empty = clone.candidates(settings, char, limit=0)
+    check("limit=0 → 空表（不抛）", empty, [])
+
 
 def test_install(tmp: Path) -> None:
-    print("\n[3] 安装：写进人格文件（带备份、不碰别的键）")
+    print("\n[3] 安装：写进人格文件（带备份、不碰别的键、文本自动填）")
     settings, registry = setup(tmp)
     char = registry.get("exusiai")
     clip = tmp / "personas" / "exusiai" / "交谈1.wav"
 
     plan = clone.install(settings, char, clip=str(clip), dry_run=True)
     check("试运行不写文件", Path(plan["file"]).exists(), False)
-    check("试运行也会告诉你会改什么", sorted(plan["changed"]), ["backend", "voice_ref"])
+    check("试运行也会告诉你会改什么",
+          sorted(plan["changed"]), ["backend", "voice_ref", "voice_ref_text"])
+    check("★没手填也会自动带上参考文本★", (plan["ref_text"], plan["text_source"]),
+          (CLIP_TEXT, "清单"))
 
     got = clone.install(settings, char, clip=str(clip), ref_text="在的，老板！", dry_run=False)
     target = tmp / "personas" / "exusiai.json"
     saved = json.loads(target.read_text(encoding="utf-8"))
     check("voice_ref 写进去了", Path(saved["voice_ref"]).name, "交谈1.wav")
-    check("参考文本写进去了", saved["voice_ref_text"], "在的，老板！")
+    check("手填的文本优先（不被清单覆盖）", saved["voice_ref_text"], "在的，老板！")
     check("backend 补成 zipvoice（单条克隆走的就是它）", saved["backend"], "zipvoice")
     check("别的键一个没动", (saved["notes"], len(saved["lines"])), ("别把我弄丢", 2))
     check("留了备份", Path(got["backup"]).is_file(), True)
 
     again = clone.install(settings, char, clip=str(clip), ref_text="在的，老板！", dry_run=False)
     check("重复设置同一份 → 无变化（幂等）", again["changed"], {})
+
+    # ★换了音频却没文本 → 把上一段那行清掉★（留着就是「声不对词」，工程日志 §21）
+    quiet = make_wav(tmp / "personas" / "exusiai" / "没有文本.wav", 2.0)
+    moved = clone.install(settings, char, clip=str(quiet), dry_run=True)
+    check("换成没文本的音频 → 试运行里就看得到会清空",
+          (moved["ref_text"], moved["changed"].get("voice_ref_text"), moved["cleared_text"]),
+          ("", "", True))
+    real = clone.install(settings, char, clip=str(quiet), dry_run=False)
+    after = json.loads(target.read_text(encoding="utf-8"))
+    check("真写下去时旧文本也真清掉了", (after["voice_ref_text"], real["cleared_text"]), ("", True))
 
 
 def test_install_upload(tmp: Path) -> None:
@@ -158,6 +195,12 @@ def test_install_upload(tmp: Path) -> None:
     check("文件真的在（字节一个不差）", (ref.is_file(), ref.stat().st_size),
           (True, len(base64.b64decode(blob))))
     check("报告里标了 uploaded", got["uploaded"], True)
+
+    # 传上来的文件名能对上清单 → 文本自动带上（不用手打）
+    named = clone.install(settings, char, data_base64=blob, filename="交谈1.wav", dry_run=True)
+    check("上传也能按文件名对上文本", (named["ref_text"], named["text_source"]), (CLIP_TEXT, "清单"))
+    odd = clone.install(settings, char, data_base64=blob, filename="我的录音.wav", dry_run=True)
+    check("对不上就留空（不乱填别人的文本）", (odd["ref_text"], odd["text_source"]), ("", ""))
 
     dry = clone.install(settings, char, data_base64=blob, filename="x.wav", dry_run=True)
     check("试运行不上传（只说会怎么做）", (dry["dry_run"], dry["uploaded"]), (True, False))
@@ -203,12 +246,15 @@ def test_console_endpoint(tmp: Path) -> None:
     client = TestClient(app)
 
     listing = client.get("/api/voices/clone", params={"cid": "exusiai"})
-    check("GET /api/voices/clone 列候选", (listing.status_code, len(listing.json()["candidates"])),
-          (200, 3))
+    got = listing.json()
+    check("GET /api/voices/clone 列候选", (listing.status_code, len(got["candidates"])), (200, 3))
+    check("GET 也带文本（前端直接能用）",
+          (got["ref_index"].get("交谈1"), got["materials_with_text"]), (CLIP_TEXT, 2))
     clip = tmp / "personas" / "exusiai" / "交谈1.wav"
     r = client.post("/api/voices/clone", json={"id": "exusiai", "path": str(clip), "dry_run": True})
-    check("POST dry_run 告诉我们改什么",
-          (r.status_code, sorted(r.json()["changed"])), (200, ["backend", "voice_ref"]))
+    check("POST dry_run 告诉我们改什么（含自动填的文本）",
+          (r.status_code, sorted(r.json()["changed"])),
+          (200, ["backend", "voice_ref", "voice_ref_text"]))
     check("dry_run 时不会去动服务", r.json()["dry_run"], True)
     bad = client.post("/api/voices/clone", json={"id": "exusiai", "path": str(tmp / "nope.wav")})
     check("坏输入返回 400 + 人话", (bad.status_code, "不存在" in bad.json()["detail"]), (400, True))

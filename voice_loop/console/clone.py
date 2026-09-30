@@ -14,10 +14,14 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from ..manifest import manifest_pairs
+from ..voice_data import persona_audio_dir
 
 # 参考音频的合理范围：太短没音色，太长白等（ZipVoice 编码参考也要时间）
 MIN_SECONDS = 0.8
@@ -126,6 +130,139 @@ def candidates(settings: Any, voice_dir: str = "", voice_ref: str = "") -> list[
     return out
 
 
+def _loose(name: str) -> str:
+    """松一点的键：去掉空白/标点/大小写差异（「交谈1 (1)」也能和「交谈1」对上）。"""
+    return re.sub(r"[\s\.\-_()（）\[\]【】·、]+", "", str(name)).lower()
+
+
+def material_dir(settings: Any, char: Any) -> Path:
+    """她的素材目录：人格里写了 `voice_dir` 就用它，**否则按约定** `<人格文件目录>/<id>/`。
+
+    ★和 `voice_data.persona_audio_dir()` 同一套约定★（那边给 `persona_voice.py` 用）：
+    没写 `voice_dir` 的角色（比如能天使）也能在这里看见素材，不必逼人先补一个字段
+    —— 之前只从 `voice_ref` 所在目录列候选，没设参考的角色就是一片空白。
+    """
+    explicit = str(getattr(char, "voice_dir", "") or "")
+    cid = str(getattr(char, "id", "") or "")
+    try:
+        anchor = _persona_file(settings, char)
+    except ValueError:                      # 人格文件都找不到：退回项目根下的约定目录
+        return settings.resolve(f"data/personas/{cid}")
+    return persona_audio_dir(anchor, cid, explicit=explicit, root=settings.root)
+
+
+def text_index(settings: Any, char: Any = None, room: Path | None = None) -> dict[str, str]:
+    """音频名 → 对应文本：素材目录里的清单 txt（`<id>.txt`）＋ 人格 `lines` 的 scene。
+
+    ★为什么要自动匹配★：零样本克隆吃的是「参考音频 + **它对应的**文本」，
+    文本对不上就会照着错词对齐 → 听着像「声不对词」（工程日志 §21）。
+    所以能按文件名找到就自动填，找不到才让用户手打。
+    键同时给原名（小写）与松键，前端拿文件名直接查得上。
+    """
+    found: dict[str, str] = {}
+    directory = room if room is not None else (material_dir(settings, char) if char is not None else None)
+    if directory is not None and directory.is_dir():
+        for name, body in manifest_pairs(directory).items():
+            body = (body or "").strip()
+            if name and body:
+                found.setdefault(name, body)
+                found.setdefault(_loose(name), body)
+    lines = getattr(char, "lines", None) or []
+    if isinstance(lines, dict):              # 老写法：{场景: 文本}
+        lines = [{"scene": k, "text": v} for k, v in lines.items()]
+    for row in lines:
+        if not isinstance(row, dict):
+            continue
+        scene = str(row.get("scene") or "").strip()
+        text = str(row.get("text") or "").strip()
+        if scene and text:
+            found.setdefault(scene.lower(), text)
+            found.setdefault(_loose(scene), text)
+    return found
+
+
+def text_for(index: dict[str, str], *names: str, room: Path | None = None) -> tuple[str, str]:
+    """按文件名找文本：先精确（小写）再松匹配，最后看同名 `.txt`。
+
+    返回 `(文本, 来源)`；找不到就是 `("", "")`。
+    """
+    for name in names:
+        if not name:
+            continue
+        got = index.get(str(name).lower()) or index.get(_loose(name))
+        if got:
+            return got, "清单"
+    if room is not None:
+        for name in names:
+            if not name:
+                continue
+            sidecar = (room / Path(str(name)).name).with_suffix(".txt")
+            if not sidecar.is_file():
+                continue
+            try:
+                body = sidecar.read_text(encoding="utf-8", errors="replace").strip()
+            except OSError:
+                continue
+            if body:
+                return body, "同名文本"
+    return "", ""
+
+
+def candidates(settings: Any, char: Any = None, *, voice_dir: str = "", voice_ref: str = "",
+               limit: int = 200) -> list[dict]:
+    """这个角色能挑的参考候选：她的素材目录（约定 `data/personas/<id>/`）＋参考所在目录。
+
+    每条候选除了体检结果，还带 `text`：按**文件名**从素材清单 / 她的台词里找到的原文。
+    素材目录不存在时返回空表（UI 会提示「就传一条」）。
+    """
+    vdir = voice_dir or str(getattr(char, "voice_dir", "") or "")
+    vref = voice_ref or str(getattr(char, "voice_ref", "") or "")
+    roots: list[Path] = []
+    room: Path | None = None
+    if char is not None or vdir:
+        room = material_dir(settings, char) if char is not None else settings.resolve(vdir)
+        roots.append(room)
+    if vdir:
+        got = settings.resolve(vdir)
+        if got not in roots:
+            roots.append(got)
+    if vref:
+        got = settings.resolve(vref)
+        if got.parent not in roots:
+            roots.append(got.parent)
+
+    index = text_index(settings, char, room)
+    seen: set[str] = set()
+    out: list[dict] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for p in sorted(root.iterdir()):
+            if not p.is_file() or p.suffix.lower() not in AUDIO_EXTS:
+                continue
+            if len(out) >= limit:
+                return out
+            path = _as_ref(settings, p)
+            if path in seen:
+                continue
+            seen.add(path)
+            clip = inspect(p)
+            text, source = text_for(index, p.name, p.stem, room=root)
+            out.append({**clip.to_dict(), "path": path, "text": text, "text_source": source})
+    return out
+
+
+def ui_index(settings: Any, char: Any, rows: list[dict] | None = None) -> dict[str, str]:
+    """给控制台用的查表 `{松键(文件名): 文本}` —— 用户自己传音频时按文件名直接查得上。"""
+    rows = rows if rows is not None else candidates(settings, char)
+    out: dict[str, str] = {}
+    for row in rows:
+        text = str(row.get("text") or "")
+        if text:
+            out.setdefault(_loose(Path(str(row.get("name") or "")).stem), text)
+    return out
+
+
 def preview_sentence(char: Any, limit: int = 28) -> str:
     """试听念哪句：用她**自己的台词**里较短的一条（听的是她真会说的话）。
 
@@ -225,16 +362,35 @@ def install(settings: Any, char: Any, *, clip: str = "", data_base64: str = "",
     if not info.ok:
         raise ValueError(info.problem or "这条音频不能当参考")
 
+    # ★参考文本★：零样本克隆要的是「这条音频 + 它逐字对应的文本」。
+    # 用户没手填就按文件名从素材清单/她的台词里找（找得到最准）；
+    # 换了音频却又找不到新文本 → 把上一段那行清掉（留着就是「声不对词」）。
+    # ★旧值一律读人格文件★：内存里的 char 可能是几秒前那份（角色是被监听热加载的）。
+    room = material_dir(settings, char)
+    try:
+        current = json.loads(_persona_file(settings, char).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        current = {}
+    chosen = Path(filename or rel).name
+    matched, source = text_for(text_index(settings, char, room), chosen,
+                               Path(chosen).stem, room=room)
+    text = ref_text.strip() or matched
+    cleared = False
     fields = {"voice_ref": rel}
-    if ref_text.strip():
-        fields["voice_ref_text"] = ref_text.strip()
-    if not str(getattr(char, "backend", "") or "").strip():
+    if text:
+        fields["voice_ref_text"] = text
+    elif str(current.get("voice_ref_text") or "").strip() \
+            and str(current.get("voice_ref") or "") != rel:
+        fields["voice_ref_text"] = ""
+        cleared = True
+    if not str(current.get("backend") or getattr(char, "backend", "") or "").strip():
         # 单条克隆走的是 ZipVoice（零样本）——不写 backend 会跟全局走，写明白更稳
         fields["backend"] = "zipvoice"
     report = _write_persona(settings, char, fields) if not dry_run else \
         {"file": "(试运行没写)", "changed": fields, "backup": ""}
     return {
         "character": char.id, "name": getattr(char, "name", char.id),
-        "reference": rel, "uploaded": bool(saved) and not dry_run, "clip": info.to_dict(),
+        "reference": rel, "ref_text": text, "text_source": source, "cleared_text": cleared,
+        "uploaded": bool(saved) and not dry_run, "clip": info.to_dict(),
         "dry_run": bool(dry_run), **report,
     }

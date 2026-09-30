@@ -25,6 +25,8 @@ def register(app, ctx) -> None:
     from fastapi import Body, HTTPException  # noqa: PLC0415
 
     def character_rows() -> list[dict]:
+        from ...console import clone as clone_mod  # noqa: PLC0415
+
         registry = ctx.characters()
         default_id = str(ctx.settings.persona.default or "")
         resolved = registry.get(default_id) or registry.default()
@@ -33,12 +35,18 @@ def register(app, ctx) -> None:
         for char in registry.all():
             ref = str(getattr(char, "voice_ref", "") or "")
             ref_path = ctx.settings.resolve(ref) if ref else None
-            ref_files = []
-            if ref_path is not None and ref_path.parent.is_dir():
-                ref_files = sorted(
-                    f"{p.relative_to(ctx.root).as_posix()}"
-                    for p in ref_path.parent.glob("*.wav")
-                )
+            # ★素材候选★：素材目录按约定兜底（`voice_dir` → `<人格文件目录>/<id>/`）——
+            # 只从 `voice_ref` 所在目录列的话，没设参考的角色会显示成「没找到音频」。
+            try:
+                cands = clone_mod.candidates(ctx.settings, char, limit=80)
+                index = clone_mod.ui_index(ctx.settings, char, cands)
+                room = clone_mod.material_dir(ctx.settings, char)
+            except Exception:  # noqa: BLE001 - 一个角色的素材目录坏了不该让整页打不开
+                cands, index, room = [], {}, None
+            room_text = ""
+            if room is not None:
+                room_text = room.relative_to(ctx.root).as_posix() if room.is_relative_to(ctx.root) \
+                    else str(room)
             rows.append({
                 "id": char.id,
                 "name": char.name,
@@ -60,7 +68,12 @@ def register(app, ctx) -> None:
                     char.voice_model and ctx.settings.resolve(char.voice_model).is_dir()
                 ),
                 "voice_dir": char.voice_dir or "",
-                "ref_candidates": ref_files[:40],
+                "materials_dir": room_text,
+                "materials_exists": bool(room is not None and room.is_dir()),
+                "materials_count": len(cands),
+                "materials_with_text": sum(1 for c in cands if c.get("text")),
+                "ref_candidates": cands,
+                "ref_index": index,
                 "lines": [{"scene": ln.get("scene", ""), "text": ln.get("text", "")}
                           for ln in (char.lines or [])][:8],
                 "notes": char.notes or "",
@@ -149,10 +162,16 @@ def register(app, ctx) -> None:
                 break
         if char is None:
             raise HTTPException(status_code=404, detail=f"没有角色 {cid!r}")
+        rows = clone_mod.candidates(ctx.settings, char)
+        room = clone_mod.material_dir(ctx.settings, char)
         return {
             "id": char.id,
             "name": char.name,
-            "candidates": clone_mod.candidates(ctx.settings, char.voice_dir, char.voice_ref),
+            "candidates": rows,
+            "ref_index": clone_mod.ui_index(ctx.settings, char, rows),
+            "materials_dir": str(room),
+            "materials_count": len(rows),
+            "materials_with_text": sum(1 for r in rows if r.get("text")),
             "voice_ref": char.voice_ref or "",
             "voice_ref_text": char.voice_ref_text or "",
             "backend": char.backend or ctx.settings.tts.backend,

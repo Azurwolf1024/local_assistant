@@ -31,5 +31,5 @@
   "knowledge_shared": true,
   "temperature": 0.7,
   "enabled": true,
-  "notes": "★资料卡★ 语料来自 data/personas/exusiai/exusiai.txt（113 行，用 scripts/import_lines.py 导进 lines，只添加不替换）；语音素材 data/personas/exusiai/*.wav 共 39 条（约 40 MB），可用来做零样本克隆（一条参考音频即可），也可以用 scripts/prepare_piper_dataset.py + train_piper.py 训专属声线。占位用 voice_ref = data/personas/exusiai/交谈1.wav，想换就在控制台的「声线」面板里挑一条重设。"
+  "notes": "★资料卡★ 语料来自 data/personas/exusiai/exusiai.txt（113 行，用 scripts/import_lines.py 导进 lines，只添加不替换）；语音素材 data/personas/exusiai/*.wav 实测 38 条（约 40 MB），可用来做零样本克隆（一条参考音频即可），也可以用 scripts/prepare_piper_dataset.py + train_piper.py 训专属声线。还没写 voice_ref（先用全局声线）——想定下音色就在控制台的「声线」面板里挑一条，那一块会把素材清单里对应的文本一起自动填上。"
 }
