@@ -17,6 +17,7 @@ ALL = [
     "schedule",
     "memos",
     "logs",
+    "persona",
     "voices",
     "chat",
 ]

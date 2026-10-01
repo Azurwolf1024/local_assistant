@@ -116,12 +116,14 @@ def section_meta(base: str, app) -> None:
     code, meta = request(base, "GET", "/api/meta")
     check("GET /api/meta 是 200", code, 200)
     ids = [p["id"] for p in meta.get("panels", [])]
-    check("六个面板都在", ids, ["overview", "schedule", "memos", "logs", "voices", "chat"])
+    check("七个面板都在", ids,
+          ["overview", "schedule", "memos", "logs", "persona", "voices", "chat"])
     check("没有面板装载失败", meta.get("panels_failed"), {})
 
     for path in ("/", "/index.html", "/style.css", "/app.js", "/ui.js",
                  "/panels/overview.js", "/panels/schedule.js", "/panels/memos.js",
-                 "/panels/logs.js", "/panels/voices.js", "/panels/chat.js"):
+                 "/panels/logs.js", "/panels/persona.js", "/panels/voices.js",
+                 "/panels/chat.js"):
         code, _ = request(base, "GET", path)
         check(f"静态文件 {path}", code, 200)
 
@@ -227,7 +229,7 @@ def section_misc(base: str, tmp: Path) -> None:
 
     code, health = request(base, "GET", "/api/health")
     check("健康检查 200", code, 200)
-    check("面板清单一致", len(health["panels"]), 6)
+    check("面板清单一致", len(health["panels"]), 7)
 
     code, chars = request(base, "GET", "/api/chat/characters")
     check("聊天角色列表 200", code, 200)
