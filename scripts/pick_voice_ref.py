@@ -38,6 +38,7 @@ sys.path.insert(0, str(ROOT))
 from scripts.ab_clone_model import (  # noqa: E402
     TEXTS,
     audible_quiet_hf,
+    floor_db,
     hf_ratio,
     lead_silence,
     rms_swing,
@@ -54,6 +55,12 @@ FRAME_MS = 30.0
 QUIET_PCT = 25.0
 # 参考音频的舒适区：太短音色学不全，太长每次合成都要多付「参考重编码」的钱（≈0.36×秒数）
 MIN_REF_S, MAX_REF_S = 3.5, 8.0
+# ★停顿电平（帧电平 p10）门槛★：说话停顿时底下还响着东西（伴奏 / 底噪 / 音效）就不合格。
+# 为什么单独拎出来量（2026-10-01，能天使那次「沙 + 杂音」）：
+# 原来只看「安静帧高频占比」，而**带伴奏的参考**里那些帧根本不算安静帧 → 指标看着挺干净，
+# 实际上停顿时一直有东西在响（实测那条参考 p10 = −30 dB）。换成没有伴奏的参考（−70 dB）之后，
+# 输出「可闻安静帧高频」从 2.11% 降到 0.79%，沙沙声当场消失。
+FLOOR_OK_DB = -55.0
 
 
 # ----------------------------------------------------------------- 指标
@@ -98,6 +105,7 @@ def measure(path: Path) -> dict | None:
         "name": path.name, "path": path, "seconds": pcm.size / rate,
         "hf": whole, "quiet_hf": quiet, "quiet_share": share,
         "swing": swing, "lead": lead_silence(pcm, rate), "rate": rate,
+        "floor": float(floor_db(pcm, rate)),
         "f0_med": float(pitch["f0_med"]), "iqr_st": float(pitch["iqr_st"]),
         "sustained_up": float(pitch["sustained_up"]),
         "sustained_dn": float(pitch["sustained_dn"]),
@@ -118,6 +126,7 @@ def style_picks(rows: list[dict], want: int = 4) -> list[tuple[str, dict]]:
     pool = [r for r in rows
             if MIN_REF_S <= r["seconds"] <= MAX_REF_S
             and r["f0_med"] == r["f0_med"]
+            and (r["floor"] != r["floor"] or r["floor"] < FLOOR_OK_DB)   # ★停顿里不能有伴奏★
             and (r["sim"] != r["sim"] or r["sim"] >= spk.SAME_SPEAKER)]
     if not pool:
         return []
@@ -177,11 +186,14 @@ def survey(who: str) -> int:
     band = [r for r in rows if MIN_REF_S <= r["seconds"] <= MAX_REF_S]
     print(f"\n  ★ 候选参考（{MIN_REF_S}~{MAX_REF_S} 秒，按安静帧高频占比升序 = 最干净在前）")
     print(f"    {'文件':<22} {'时长':>6} {'安静帧高频':>10} {'整条高频':>9} "
-          f"{'波动':>7} {'头静音':>7} {'音区':>7} {'像不像她':>8}")
+          f"{'波动':>7} {'头静音':>7} {'音区':>7} {'像不像她':>8} {'停顿电平':>9}")
     for r in sorted(band, key=lambda r: r["quiet_hf"])[:8]:
+        bad = r["floor"] == r["floor"] and r["floor"] >= FLOOR_OK_DB
+        mark = "  ✗ 停顿里有伴奏/底噪" if bad else ""
         print(f"    {r['name']:<22} {r['seconds']:5.2f}s {r['quiet_hf']:9.2f}% "
               f"{r['hf']:8.2f}% {r['swing']:6.2f}dB {r['lead']:6.2f}s "
-              f"{r['f0_med']:5.0f}Hz {r['sim']:7.3f}")
+              f"{r['f0_med']:5.0f}Hz {r['sim']:7.3f} {r['floor']:8.1f}dB{mark}")
+    print(f"    （停顿电平 = 帧电平 p10，要 < {FLOOR_OK_DB:.0f} dB；★带伴奏的参考会让输出沙、杂音多★）")
     print(f"\n  最脏的 3 条（别拿它们当参考）")
     for r in sorted(band, key=lambda r: -r["quiet_hf"])[:3]:
         print(f"    {r['name']:<22} {r['seconds']:5.2f}s {r['quiet_hf']:9.2f}%")
