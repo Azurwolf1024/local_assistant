@@ -278,20 +278,17 @@ def preview_sentence(char: Any, limit: int = 28) -> str:
 
 # --------------------------------------------------------------------------- #
 def _persona_file(settings: Any, char: Any) -> Path:
-    """角色的人格文件在哪：索引里写的那条为准（索引不在项目根下也照样找得到）。"""
-    index_path = settings.resolve(settings.persona.file)
-    index = json.loads(index_path.read_text(encoding="utf-8"))
-    for item in index.get("characters") or []:
-        entry = item if isinstance(item, dict) else {"file": item}
-        cid = str(entry.get("id") or Path(str(entry.get("file") or "")).stem)
-        if cid == getattr(char, "id", ""):
-            target = (index_path.parent / str(entry.get("file") or "")).resolve()
-            if target.is_file():
-                return target
-    fallback = index_path.parent / f"personas/{char.id}.json"
-    if fallback.is_file():
-        return fallback
-    raise ValueError(f"找不到 {char.id} 的人格文件")
+    """角色的人格文件在哪：索引里写的那条为准（索引不在项目根下也照样找得到）。
+
+    ★只有一份实现★：`persona_card.file_of()` ——「哪个文件是这个角色的」这件事
+    资料卡编辑、克隆、素材目录三处都要答一遍，各写一套迟早答得不一样。
+    """
+    from . import persona_card as card  # noqa: PLC0415 - 避免模块级循环导入
+
+    target = card.file_of(settings, str(getattr(char, "id", "") or ""))
+    if not target.is_file():
+        raise ValueError(f"找不到 {char.id} 的人格文件")
+    return target
 
 
 def _as_ref(settings: Any, path: Path) -> str:

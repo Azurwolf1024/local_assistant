@@ -116,16 +116,19 @@ def section_meta(base: str, app) -> None:
     code, meta = request(base, "GET", "/api/meta")
     check("GET /api/meta 是 200", code, 200)
     ids = [p["id"] for p in meta.get("panels", [])]
-    check("七个面板都在", ids,
-          ["overview", "schedule", "memos", "logs", "persona", "voices", "chat"])
+    check("六个面板都在（★voices 已并入角色★）", ids,
+          ["overview", "schedule", "memos", "logs", "persona", "chat"])
     check("没有面板装载失败", meta.get("panels_failed"), {})
 
     for path in ("/", "/index.html", "/style.css", "/app.js", "/ui.js",
                  "/panels/overview.js", "/panels/schedule.js", "/panels/memos.js",
-                 "/panels/logs.js", "/panels/persona.js", "/panels/voices.js",
+                 "/panels/logs.js", "/panels/persona.js",
                  "/panels/chat.js"):
         code, _ = request(base, "GET", path)
         check(f"静态文件 {path}", code, 200)
+    # ★合并后旧脚本必须真的没了★：留着它只会让人以为还分两个标签页
+    code, _ = request(base, "GET", "/panels/voices.js")
+    check("旧的面板脚本 voices.js 已经删了", code, 404)
 
 
 def section_events(base: str) -> str:
@@ -213,9 +216,27 @@ def section_misc(base: str, tmp: Path) -> None:
     check("概览里报告服务未运行", ov["service"]["running"], False)
 
     code, voices = request(base, "GET", "/api/voices")
-    check("角色 200", code, 200)
+    check("角色 200（路由仍是 /api/voices，但挂在角色面板下）", code, 200)
     check("角色名字对", voices["characters"][0]["name"], "阿米娅")
     check("参考音文件不存在时如实标记", voices["characters"][0]["voice_ref_exists"], False)
+
+    # ★改资料卡★：先把她的资料读回表单，改一栏写回，再确认别的键没丢
+    code, got = request(base, "GET", "/api/persona/get?cid=amiya")
+    check("读回资料卡表单", (code, got["fields"]["name"]), (200, "阿米娅"))
+    fields = dict(got["fields"])
+    fields["ack"] = "我在，博士。"
+    code, upd = request(base, "POST", "/api/persona/update", {"fields": fields, "apply": True})
+    check("改一栏写回成功", (code, upd["changed"]), (200, ["ack"]))
+    saved = json.loads((tmp / "data" / "personas" / "amiya.json").read_text(encoding="utf-8"))
+    check("改完的值落了盘", saved["ack"], "我在，博士。")
+    check("★表单管不着的键原样保住★", saved.get("enabled"), True)
+    check("参考音那栏没被动过", saved.get("voice_ref"), "data/personas/amiya/交谈1.wav")
+    # ★空的键会被顺手收拾掉★：`"voice_model": ""` 与「压根没这一栏」是同一件事，
+    # 表单里它本来就是空的 → 写回时这一栏被去掉（语义不变，文件更干净）。
+    check("空的声线栏只是被收拾掉（空 = 没这一栏）", saved.get("voice_model") or "", "")
+    code, miss = request(base, "POST", "/api/persona/update",
+                         {"fields": {**fields, "id": "nobody"}, "apply": True})
+    check("改不存在的角色 → 400（指路去创建）", (code, "创建" in str(miss.get("detail", ""))), (400, True))
 
     code, tail = request(base, "GET", "/api/logs/tail?lines=50")
     check("日志接口 200", code, 200)
@@ -229,7 +250,7 @@ def section_misc(base: str, tmp: Path) -> None:
 
     code, health = request(base, "GET", "/api/health")
     check("健康检查 200", code, 200)
-    check("面板清单一致", len(health["panels"]), 7)
+    check("面板清单一致（六个）", len(health["panels"]), 6)
 
     code, chars = request(base, "GET", "/api/chat/characters")
     check("聊天角色列表 200", code, 200)

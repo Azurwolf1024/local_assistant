@@ -1,24 +1,24 @@
-"""面板：角色与声线。
+"""角色与声线的**路由**（★2026-10-01 起不再是独立标签页★）。
 
 能做的事：看每个角色的人设要点、唤醒词、参考音频与专属模型目录；
-**切过去**（服务里真的换声线）；**试听一句**（用服务已加载的 TTS 念出来）。
+**切过去**（服务里真的换声线）；**试听一句**（用服务已加载的 TTS 念出来）；
+★只用一条语音就能克隆★（挑/传一条音频当参考）。
+
+★为什么它没有 `PANEL`★：用户看到的是「角色」**一个**标签页，
+资料卡（写文件）与声线（让服务出声）是同一件事的两半，分成两个标签反而割裂。
+所以本模块只提供 `register(app, ctx)`，由 `panels/persona.py` 一并挂上；
+`panels/__init__.py` 的 `ALL` 里只有 `persona`。
+（要是谁把 "voices" 又加回 `ALL`，`load_panels` 会当场报「PANEL 必须是一个 Panel」，不会静默双重注册。）
 
 ★真正出声的一定是服务★：控制台自己加载 ZipVoice 要好几百 MB 到几 GB，
 而且两个进程抢同一张声卡没好处。所以这里全部走信箱（``voice_loop/control.py``），
 服务没在跑时如实报错，不假装成功。
+
+★路由路径仍是 `/api/voices/*`★：它说的是「声线」这件事，与标签页怎么分无关，
+所以合并面板时**一个字都不用改**（测试、脚本、README 里的引用也不用跟着变）。
 """
 
 from __future__ import annotations
-
-from ..registry import Panel
-
-PANEL = Panel(
-    id="voices",
-    title="角色 / 声线",
-    order=50,
-    hint="看角色、切声线、试听（需要服务在跑）",
-    needs_service=True,
-)
 
 
 def register(app, ctx) -> None:

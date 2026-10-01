@@ -1,4 +1,4 @@
-"""角色资料卡：在控制台里**按格式填**一个人格文件，或者**选个文件导进来**。
+"""角色资料卡：在控制台里**按格式新建**或**修改**一个人格文件，也可以**选个文件导进来**。
 
 为什么要有它：新加一个角色原来得手写 JSON（README 第 14 节那一大段字段），
 而人格文件是★白名单式解析★（`Character.from_dict`）—— 字段名写错、或者写到
@@ -6,8 +6,12 @@
 所以这里把「格式」变成唯一真相源：后端校验、前端表单、导出的模板都用同一份 `SPEC`。
 
 写文件只有两处（都带 `.bak` + 写完当场校验 JSON）：
-1. ``data/personas/<id>.json`` —— 资料卡本体；
+1. ``data/personas/<id>.json`` —— 资料卡本体（新建 :func:`create` / 修改 :func:`update`）；
 2. ``data/characters.json`` —— 索引里追加一行（★只有索引里有的角色才会被唤醒★）。
+
+★改（update）和覆盖（create+overwrite）不是一回事★：表单只覆盖它自己那几栏，
+`enabled` / `default` / `voice_dir` 这些「表单不暴露」的键必须原样保住 ——
+见 :func:`merge_into`。
 
 ★默认 dry-run★：`create()` 先报告「会写哪两个文件、加哪一行、有没有问题」，
 控制台点「创建」才真写。id 必须是安全文件名（不能带 `/`、`\\`、`..` 这类）——
@@ -125,6 +129,8 @@ SPEC: list[dict] = [
 
 # 白名单之外的字段：解析阶段会被吞掉，所以提交时明确报出来（别让人以为写进去了）
 KNOWN_KEYS = {f["key"] for group in SPEC for f in group["fields"]}
+# 同上，但保留「表单里的顺序」（合并写回时要按它逐栏对账）
+KNOWN_KEYS_LIST = [f["key"] for group in SPEC for f in group["fields"]]
 # 这几个字段允许写在人格文件里，但表单不暴露（索引/工具在管）
 QUIET_KEYS = {"enabled", "default", "voice_dir", "knowledge_all", "knowledge_title", "world"}
 
@@ -172,6 +178,36 @@ def persona_path(settings: Any, char_id: str) -> Path:
 
 def index_path(settings: Any) -> Path:
     return settings.resolve(settings.persona.file)
+
+
+def file_of(settings: Any, char_id: str) -> Path:
+    """这个角色的人格文件在哪：★索引里写的那条为准★（索引不在项目根下也照样找得到）。
+
+    索引里没写、或者写的那份不在 → 退回约定路径 `personas/<id>.json`
+    （**不保证存在**，调用方自己 `is_file()`）。克隆那边也用这一份实现。
+    """
+    index = index_path(settings)
+    try:
+        raw = json.loads(index.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raw = {}
+    for item in raw.get("characters") or []:
+        entry = item if isinstance(item, dict) else {"file": item}
+        cid = str(entry.get("id") or Path(str(entry.get("file") or "")).stem)
+        if cid == char_id:
+            target = (index.parent / str(entry.get("file") or "")).resolve()
+            if target.is_file():
+                return target
+    return persona_path(settings, char_id)
+
+
+def fields_of(char: Any) -> dict:
+    """把一个**已有的**角色整理成表单字段（编辑时用它把表单填满）。
+
+    ★只有一份实现★：跟「点填模板」用的是同一份 `example()` ——
+    区别只是传的是真角色而不是样板，免得两处各写一套映射、加了字段忘一边。
+    """
+    return example(char)
 
 
 def existing_ids(settings: Any) -> list[str]:
@@ -307,12 +343,62 @@ def _write_json(path: Path, data: dict, *, backup: bool = True) -> str:
     return bak
 
 
+def _empty(value: Any) -> bool:
+    """「这一栏是空的」统一判定（表单里清空的栏 = ''/[]/{}/False）。"""
+    return value is None or value == "" or value == [] or value == {} or value is False
+
+
+def _normalized(raw: dict) -> dict:
+    """把人格文件里的原始 JSON 过一遍真解析器（只用于「跟表单比一比」）。
+
+    ★为什么必须归一化再比★：解析器是有默认值的 —— 比如 `user_title` 缺省就是「你」。
+    拿原始 JSON 直接跟表单比，会得出「你改了 user_title」这种假改动，
+    而且会把那个默认值真的写进文件（看着像没改什么，文件却变了）。
+    """
+    return preview(None, raw)
+
+
+def merge_into(raw: dict, form: dict) -> tuple[dict, list[str], list[str]]:
+    """把表单结果合进一张**已存在**的资料卡：★只动表单管得着的键★。
+
+    返回 ``(合并后的 JSON, 改动的键, 被清掉的键)``。
+
+    ★为什么不能整份替换★：`Character.from_dict` 是白名单解析 —— 表单里没有的键
+    （`enabled` / `default` / `voice_dir` / `world` / 以及以后新加的字段）**不会报错，
+    只会被静默丢掉**。直接覆盖的后果就是「我就改了个称呼，怎么喊不醒了」。
+    所以：表单里有值的按键写进去；表单里**清空**了的键真的删掉（那是用户的意图）。
+
+    ★只写真的变了的★：跟归一化后的当前值一样就不写（见 :func:`_normalized`），
+    否则报告里会刷出一大片假的「改了 user_title」。
+    """
+    merged = dict(raw)
+    base = _normalized(raw)
+    changed: list[str] = []
+    removed: list[str] = []
+    for key in KNOWN_KEYS_LIST:
+        if key in form:
+            if base.get(key) != form[key]:
+                changed.append(key)
+                merged[key] = form[key]
+        elif key in merged:
+            if not _empty(base.get(key)):
+                removed.append(key)
+            merged.pop(key)
+    ordered = {k: merged[k] for k in ("id", "name") if k in merged}
+    ordered.update({k: v for k, v in merged.items() if k not in ordered})
+    return ordered, changed, removed
+
+
 def create(settings: Any, fields: dict, *, overwrite: bool = False,
            dry_run: bool = True) -> dict:
     """把资料卡落地：写 `personas/<id>.json` + 往索引里追加一行。
 
     ★只动这两个文件★：不动别的人格文件、不重排索引里已有的行、
     也不写 `voice_ref` 指向的音频（那是素材的事）。
+
+    ★控制台不再用 `overwrite` 改角色★（改用 :func:`update`）——这里留着是给脚本用；
+    真走到覆盖时也**合并**而不是整份替换（见 :func:`merge_into`），
+    免得「覆盖」把 `enabled` / `voice_dir` 这些静默删掉。
     """
     fields, problems, warnings = parse(fields)
     if problems:
@@ -334,11 +420,21 @@ def create(settings: Any, fields: dict, *, overwrite: bool = False,
     new_index = {**raw_index, "characters": entries}
 
     data = preview(settings, fields)
+    changed: list[str] = []
+    removed: list[str] = []
+    overwriting = char_id in ids and overwrite
+    if overwriting and target.is_file():
+        try:
+            data, changed, removed = merge_into(
+                json.loads(target.read_text(encoding="utf-8")), data)
+        except (OSError, ValueError):          # 旧文件坏了：那就只能按表单写
+            pass
     report = {
         "id": char_id, "name": fields.get("name"),
         "file": str(target), "file_rel": rel(settings, target),
         "index": str(index), "index_rel": rel(settings, index),
-        "added_index_row": will_add, "overwrote": bool(char_id in ids and overwrite),
+        "added_index_row": will_add, "overwrote": overwriting,
+        "changed": changed, "removed": removed,
         "fields": data, "warnings": warnings, "dry_run": bool(dry_run),
         "backup": "", "index_backup": "",
     }
@@ -347,6 +443,42 @@ def create(settings: Any, fields: dict, *, overwrite: bool = False,
     report["backup"] = _write_json(target, data)
     if will_add:
         report["index_backup"] = _write_json(index, new_index)
+    return report
+
+
+def update(settings: Any, fields: dict, *, dry_run: bool = True) -> dict:
+    """★改一个已经存在的角色★：以表单为准，但保住表单管不着的键。
+
+    跟 :func:`create` 的区别（也是为什么上一个「覆盖」不够用）：
+
+    - **不会建文件**：索引里没有这个 id 就报错（编辑不会偷偷造一个角色）；
+    - **不会丢字段**：`enabled` / `default` / `voice_dir` / `world` 与不认识的键原样保留；
+    - **不会动索引**：索引里那一行本来就在，重写它反而多一次风险。
+    """
+    fields, problems, warnings = parse(fields)
+    if problems:
+        raise ValueError("；".join(problems))
+    char_id = str(fields["id"])
+    if char_id not in existing_ids(settings):
+        raise ValueError(f"索引里没有 {char_id} —— 要建一个新的就用「创建」（编辑不会悄悄建文件）")
+    target = file_of(settings, char_id)
+    if not target.is_file():
+        raise ValueError(f"找不到 {char_id} 的人格文件（{rel(settings, target)}）")
+    try:
+        raw = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"{rel(settings, target)} 读不动（{exc}）——先修好它再编辑") from exc
+    data, changed, removed = merge_into(raw, preview(settings, fields))
+    report = {
+        "id": char_id, "name": fields.get("name"), "updated": True,
+        "file": str(target), "file_rel": rel(settings, target),
+        "index_rel": rel(settings, index_path(settings)),
+        "changed": changed, "removed": removed,
+        "fields": data, "warnings": warnings, "dry_run": bool(dry_run), "backup": "",
+    }
+    if dry_run:
+        return report
+    report["backup"] = _write_json(target, data)
     return report
 
 

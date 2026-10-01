@@ -88,6 +88,11 @@ def test_spec() -> None:
     real = CharacterRegistry(ROOT / "data" / "characters.json").get("kaltsit")
     got = card.example(real)
     check("能从真角色抄一份样板", got["name"], "凯尔希")
+    # ★编辑时用的是同一份映射★（fields_of 就是 example 的同义名，只有一份实现）
+    same = card.fields_of(real)
+    check("编辑表单字段 = SPEC 全集", sorted(same), sorted(card.KNOWN_KEYS))
+    check("字段里带着她当前的值", (same["id"], same["name"], same["wake_words"]),
+          ("kaltsit", "凯尔希", got["wake_words"]))
 
 
 def test_parse() -> None:
@@ -263,9 +268,82 @@ def test_endpoints(tmp: Path) -> None:
     check("POST import 回填字段、不落盘", (imp.status_code, len(imp.json()["fields"]["lines"])), (200, 1))
     exp = client.get("/api/persona/export", params={"cid": "keeper"})
     check("GET export 导出人格内容", (exp.status_code, exp.json()["json"]["name"]), (200, "守卫"))
+
+    # ★编辑★：读回表单字段 → 改一栏 → 写回
+    got = client.get("/api/persona/get", params={"cid": "keeper"})
+    body = got.json()
+    check("GET get 回表单字段（形状与建角色一致）",
+          (got.status_code, sorted(body["fields"]), body["fields"]["name"]),
+          (200, sorted(card.KNOWN_KEYS), "守卫"))
+    check("GET get 报告改的是哪个文件", _posix(body["file"]).endswith("personas/keeper.json"), True)
+    check("GET get 没这个角色 → 404", client.get("/api/persona/get", params={"cid": "无"}).status_code, 404)
+    fields = dict(body["fields"])
+    fields["ack"] = "在的"
+    upd = client.post("/api/persona/update", json={"fields": fields, "apply": True})
+    check("POST update 真改一栏", (upd.status_code, upd.json()["changed"]), (200, ["ack"]))
+    check("改完还是能读回来的角色",
+          json.loads((tmp / "personas" / "keeper.json").read_text(encoding="utf-8"))["ack"], "在的")
+    check("改不存在的人 → 400 + 人话",
+          (lambda r: (r.status_code, "创建" in r.json()["detail"]))(
+              client.post("/api/persona/update", json={"fields": {**GOOD, "id": "nobody"}, "apply": True})),
+          (400, True))
     check("导出不存在的角色 → 404", client.get("/api/persona/export", params={"cid": "无"}).status_code, 404)
     over = client.post("/api/persona/import", json={"filename": "x.json", "data": _b64("x" * 10)})
     check("不是 JSON 的文件给 200 + problems", len(over.json()["problems"]), 1)
+
+
+def test_update(tmp: Path) -> None:
+    print("\n[8] 修改已有角色：只动表单那几栏（★不是整份覆盖★）")
+    settings = setup(tmp)
+    card.create(settings, GOOD, dry_run=False)
+    target = tmp / "personas" / "shining.json"
+    # 塞进「表单管不着」的键：索引级的 + 将来新加的字段。它们必须活下来。
+    raw = json.loads(target.read_text(encoding="utf-8"))
+    raw.update({"enabled": False, "voice_dir": "data/personas/shining",
+                "world": "卡西米尔", "future_field": "以后才有的字段"})
+    target.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+    index_before = (tmp / "characters.json").read_bytes()
+
+    plan = card.update(settings, {**GOOD, "title": "改过的身份"}, dry_run=True)
+    check("试运行不写文件", json.loads(target.read_text(encoding="utf-8"))["title"], "罗德岛干员")
+    check("试运行也说改了哪几栏", plan["changed"], ["title"])
+
+    got = card.update(settings, {**GOOD, "title": "改过的身份", "style": []}, dry_run=False)
+    saved = json.loads(target.read_text(encoding="utf-8"))
+    check("改动写进去了", saved["title"], "改过的身份")
+    check("★表单里清空的栏真的被清掉★", "style" in saved, False)
+    check("报告了改动 / 被清掉的键", (got["changed"], got["removed"]), (["title"], ["style"]))
+    check("★enabled / voice_dir / world / 不认识的键都原样保住★",
+          (saved.get("enabled"), saved.get("voice_dir"), saved.get("world"), saved.get("future_field")),
+          (False, "data/personas/shining", "卡西米尔", "以后才有的字段"))
+    check("索引一个字节没动（改角色不动索引）", (tmp / "characters.json").read_bytes(), index_before)
+    check("留了备份", Path(got["backup"]).is_file(), True)
+    check("★改完能被真解析器读出新的值★",
+          CharacterRegistry(tmp / "characters.json").get("shining").title, "改过的身份")
+    check("没真改动时如实报「内容没变」",
+          card.update(settings, {**GOOD, "title": "改过的身份", "style": []})["changed"], [])
+    check("改别人的角色不误伤",
+          json.loads((tmp / "personas" / "keeper.json").read_text(encoding="utf-8"))["notes"], "别动我")
+    # ★归一化才是真相★：解析器有默认值（user_title 缺省是「你」），
+    # 表单里空着的栏跟「文件里压根没这个键」是同一件事 —— 不该报成改动，更不该写进文件。
+    keeper = tmp / "personas" / "keeper.json"
+    kf = dict(card.fields_of(CharacterRegistry(tmp / "characters.json").get("keeper")))
+    kf["notes"] = "别动我（改过）"
+    rep = card.update(settings, kf, dry_run=False)
+    check("★空着的栏不算改动（否则会刷一片假的 user_title）★", rep["changed"], ["notes"])
+    check("★解析器的默认值不会被顺手写进她的文件★",
+          "user_title" in json.loads(keeper.read_text(encoding="utf-8")), False)
+    check("改了 notes、没动唤醒词",
+          (json.loads(keeper.read_text(encoding="utf-8"))["notes"],
+           json.loads(keeper.read_text(encoding="utf-8"))["wake_words"]),
+          ("别动我（改过）", ["守卫"]))
+    try:
+        card.update(settings, {**GOOD, "id": "nobody"})
+        check("★编辑不会偷偷建角色★", False)
+    except ValueError as exc:
+        check("★编辑不会偷偷建角色（并指路去「创建」）★", "创建" in str(exc), True)
+    check("坏输入（id 非法）什么都不写",
+          _raises(lambda: card.update(settings, {**GOOD, "id": "../x"})), True)
 
 
 def test_gate(tmp: Path) -> None:
@@ -292,6 +370,7 @@ def main() -> int:
         test_create(tmp / "b")
         test_import()
         test_endpoints(tmp / "c")
+        test_update(tmp / "e")
         test_gate(tmp / "d")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
