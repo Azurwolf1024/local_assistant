@@ -26,48 +26,31 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-# 声母表（长的在前，zh/ch/sh 优先于 z/c/s）
-_INITIALS = (
-    "zh", "ch", "sh", "b", "p", "m", "f", "d", "t", "n", "l", "g", "k", "h",
-    "j", "q", "x", "r", "z", "c", "s", "y", "w",
-)
-_CJK = re.compile(r"[\u4e00-\u9fff]")
-NEAR_THRESHOLD = 0.7   # 首音节的相似度门槛（其余音节必须精确相同）
+from . import phonetic as _ph
+
+# ★音近规则收在 voice_loop/phonetic.py 一份★（人名与唤醒词共用）。
+# 原来这套逻辑就长在本文件里，2026-10-01 抽出去给唤醒词用 —— 别再抄回来。
+_INITIALS = _ph.INITIALS
+_CJK = _ph.CJK
+NEAR_THRESHOLD = _ph.NEAR       # 首音节的相似度门槛（其余音节必须精确相同）
 _PUNCT = "，。、；：！？,.!?;: \t\n「」『』（）()\"'“”‘’"
 # 只在句首认名字（「凯尔西，现在几点」）。允许前面有个语气词：「呃，凯尔西」
-_FILLERS = set("呃嗯诶欸哎唉呀哦噢那我说喂")
-# ★实测踩到的常见词，绝不能改★：它们和某个听错写法在拼音上一模一样
-#   「海尔西」= 听错写法（所以会被认成凯尔希），可「海尔洗」是洗衣机的品牌
-#   「开尔文」= kai-er-wen，只有一个音节不同，但那是个人名/单位
-_BLOCK = ("海尔洗", "开尔文")
+_FILLERS = _ph.FILLERS
+# ★实测踩到的常见词，绝不能改★（名单在 phonetic.BLOCK 里统一维护）
+_BLOCK = _ph.BLOCK
 
 
 def _split(syllable: str) -> tuple[str, str]:
     """把一个拼音音节拆成（声母, 韵母）。"""
-    for ini in _INITIALS:
-        if syllable.startswith(ini):
-            return ini, syllable[len(ini) :]
-    return "", syllable
+    return _ph.split(syllable)
 
 
 def syllable_similarity(a: str, b: str) -> float:
     """两个音节的相似度：全同 1.0；同声母或同韵母 0.7；否则 0。
 
-    「同韵母」要求韵母至少两个字母：单人韵母（a/i/u）太常见，拿它当相似
-    会把「阿米**巴**」认成「阿米**娅**」（韵母都是 a）。只比较 ai/en/ian 这种
-    有信息量的韵母，就能收 泰(tai)/海(hai) 对 凯(kai)，而放过上面那种。
+    实现在 :mod:`voice_loop.phonetic`（唤醒词也用那一份），这里只保留旧名字。
     """
-    if not a or not b:
-        return 0.0
-    if a == b:
-        return 1.0
-    ia, fa = _split(a)
-    ib, fb = _split(b)
-    if ia and ia == ib:
-        return 0.7
-    if len(fa) >= 2 and fa == fb:
-        return 0.7
-    return 0.0
+    return _ph.similarity(a, b)
 
 
 @dataclass(frozen=True)
@@ -125,18 +108,7 @@ class NameCorrector:
     @staticmethod
     def _syllables(text: str) -> tuple[str, ...]:
         """取每字的拼音音节（不带声调）。没装 pypinyin 就返回空（功能自动降级）。"""
-        try:
-            from pypinyin import Style, lazy_pinyin  # noqa: PLC0415
-        except Exception:  # noqa: BLE001
-            return ()
-        out: list[str] = []
-        for ch in text:
-            if _CJK.match(ch):
-                py = lazy_pinyin(ch, style=Style.NORMAL, errors="ignore")
-                out.append((py[0] if py else "").lower())
-            else:
-                out.append("")
-        return tuple(out)
+        return _ph.syllables(text)
 
     def _register(self, text: str, target: str, *, exact: bool = False, primary: bool = False) -> None:
         syl = tuple(s for s in self._syllables(text) if s)
@@ -221,13 +193,11 @@ class NameCorrector:
         # 近音推广：**只有第一个音节允许不同**（实测听错都错在第一个字：
         # 凯/开/海/太/台/泰/卡/费/佩/尔），其余必须精确相同。
         # 这条规则同时挡住了「胎儿心率」（末字 心(xin) ≠ 希(xi)）。
+        # 规则实现在 phonetic.compare（唤醒词那边是同一份，只是放宽到“恰好一个不同”）。
         for pattern, target in self._near.items():
-            if len(pattern) != len(window):
-                continue
-            if window[1:] != pattern[1:]:
-                continue
-            if syllable_similarity(window[0], pattern[0]) >= NEAR_THRESHOLD:
-                return target, syllable_similarity(window[0], pattern[0])
+            score = _ph.compare(window, pattern, allow_diff=1, only_first=True)
+            if score:
+                return target, score
         return "", 0.0
 
     def correct(self, text: str) -> tuple[str, list[NameHit]]:

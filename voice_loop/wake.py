@@ -27,6 +27,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import phonetic
+
 _PUNCT = re.compile(r"[\s，。、；：！？,.!?;:\"'“”‘’()（）\[\]【】~—\-]")
 _LATIN = re.compile(r"[a-zA-Z]+")
 
@@ -52,6 +54,10 @@ DEFAULT_CONFIG: dict = {
     # 对话进行中放宽一点：待唤醒时宁可漏听也不能被环境杂音叫醒；
     # 已经在对话里时上下文已经确定了，认出来（尤其想中途换人）更划算。
     "session_fuzzy_ratio": 0.7,
+    # ★拼音近音（2026-10-01）★：不用再手攒别名 —— 把唤醒词转成拼音串，
+    # 允许「恰好一个音节听错」（能天**史**、开尔**信**、阿**宁**）。
+    # 规则与实测数据见 voice_loop/phonetic.py；关掉它就回到「只能靠别名」的老行为。
+    "phonetic": True,
 }
 
 
@@ -152,6 +158,7 @@ class WakeSettings:
     min_silence: float = 0.3
     fuzzy_ratio: float = 0.75
     session_fuzzy_ratio: float = 0.7   # ★对话进行中★用的阈值（比待唤醒宽一点）
+    phonetic: bool = True              # 拼音近音匹配（不用手攒别名；见 phonetic.py）
 
 
 class WakeWordMatcher:
@@ -160,6 +167,8 @@ class WakeWordMatcher:
         self._mtime: float = 0.0
         self._settings = WakeSettings()
         self._patterns: list[tuple[str, list[str]]] = []  # (主唤醒词, [所有变体])
+        # ★拼音近音表★：(主唤醒词, 音节序列, 角色 id)；与 _patterns 同步清空/重建
+        self._phonetic: list[tuple[str, tuple[str, ...], str]] = []
         self.load()
 
     # ------------------------------------------------------------------ 配置
@@ -211,8 +220,10 @@ class WakeWordMatcher:
                     DEFAULT_CONFIG.get("session_fuzzy_ratio", 0.7),
                 )
             ),
+            phonetic=bool(raw.get("phonetic", DEFAULT_CONFIG.get("phonetic", True))),
         )
         self._patterns = []
+        self._phonetic = []
         self._build_patterns(self._settings.words, self._settings.aliases, "")
         self._mtime = mtime
         return self._settings
@@ -232,6 +243,11 @@ class WakeWordMatcher:
                 {normalize(v) for v in variants if normalize(v)}, key=len, reverse=True
             )
             self._patterns.append((word, norm_variants, character))
+            # ★拼音近音用**主唤醒词**建表（不是每个别名）★：别名是「已经知道的听错」，
+            # 近音推广要管的是「还没见过的听错」，两者互补。
+            syl = phonetic.syllables(word)
+            if len(syl) >= 2 and all(syl):        # 单音节词不做近音（太容易误触发）
+                self._phonetic.append((word, syl, character))
 
     def set_characters(self, chars: list) -> None:
         """★多角色★：用角色们的唤醒词重建匹配表（每个词带上它属于谁）。
@@ -243,10 +259,12 @@ class WakeWordMatcher:
         enabled = [c for c in chars if getattr(c, "enabled", True)]
         if not enabled:
             self._patterns = []
+            self._phonetic = []
             self._char_words = []
             self._build_patterns(self._settings.words, self._settings.aliases, "")
             return
         self._patterns = []
+        self._phonetic = []
         seen: set[str] = set()
         self._char_words = []
         for char in enabled:
@@ -318,7 +336,14 @@ class WakeWordMatcher:
                 if idx >= 0:
                     return hit_of(word, idx, idx + len(variant) - 1, False, character)
 
-        # 2) 模糊匹配：滑窗逐段比对，取最像的那一段
+        # 2) ★拼音近音★（2026-10-01）：不用手攒别名也能认「能天史 / 开尔信 / 阿宁」。
+        #    放在字符模糊之前 —— 字符级 SequenceMatcher 对「能天使→能天史」只有
+        #    2/3 = 0.667，天生够不到 0.75 阈值（这就是当初必须攒别名的原因）。
+        score, word, a, b, character = self._phonetic_hit(norm)
+        if score:
+            return hit_of(word, a, b, True, character)
+
+        # 3) 模糊匹配：滑窗逐段比对，取最像的那一段
         #    窗口最小长度取 主唤醒词长度-1（但不能少于 3），
         #    否则「凯尔希」这种 3 字词会被任意两字窗口误命中。
         #    ★注意别把 best 的值写回 ratio★：那样条件会变成 x >= x，永远成立（踩过）。
@@ -327,6 +352,37 @@ class WakeWordMatcher:
         if best_ratio >= threshold:
             return hit_of(word, a, b, True, character)
         return None
+
+    def _phonetic_hit(self, norm: str) -> tuple[float, str, int, int, str]:
+        """拼音近音：在**句首附近**找「恰好一个音节听错」的唤醒词。
+
+        返回 ``(相似度, 主唤醒词, 起, 止, 角色)``（下标是在 norm 里的；没命中就空）。
+
+        ★为什么只在句首附近★：和人名那边同一条实测结论（见 ``phonetic`` 模块）——
+        放开到全句，日常词会立刻被误认：「海尔洗衣机」的「海尔洗」与「凯尔希」
+        拼音全同。句首 + 允许前面的语气词（「呃，能天史」）就够用，
+        实测的听错都是「名字 + 请求」这种形式。
+        """
+        if not self._phonetic or not self._settings.phonetic or not norm:
+            return (0.0, "", 0, 0, "")
+        starts = [0]
+        lead = 0
+        while lead < min(2, len(norm) - 1) and norm[lead] in phonetic.FILLERS:
+            lead += 1
+            starts.append(lead)
+        best: tuple[float, str, int, int, str] = (0.0, "", 0, 0, "")
+        for start in starts:
+            for word, pattern, character in self._phonetic:
+                end = start + len(pattern)
+                if end > len(norm):
+                    continue
+                window = norm[start:end]
+                if phonetic.blocked(window):
+                    continue
+                score = phonetic.compare(phonetic.syllables(window), pattern, allow_diff=1)
+                if score and score > best[0]:
+                    best = (score, word, start, end - 1, character)
+        return best
 
     def _best_window(self, norm: str) -> tuple[float, str, int, int, str]:
         """在 norm 里找与唤醒词最像的窗口，返回 (相似度, 主唤醒词, 起, 止, 角色)。"""
@@ -349,11 +405,13 @@ class WakeWordMatcher:
     def best_ratio(self, text: str) -> float:
         """这句话与唤醒词最接近的相似度（0~1）。
 
-        和 :meth:`match` 用同一套滑窗，所以「相似度 ≥ fuzzy_ratio 却没命中」
-        这种情况不会出现，提示用户调阈值时不会自相矛盾。
+        和 :meth:`match` 用同一套规则（含拼音近音），所以「相似度 ≥ fuzzy_ratio
+        却没命中」这种情况不会出现，提示用户调阈值时不会自相矛盾。
         """
         norm = normalize(text)
-        return self._best_window(norm)[0] if norm else 0.0
+        if not norm:
+            return 0.0
+        return max(self._best_window(norm)[0], self._phonetic_hit(norm)[0])
 
     def best_target(self, text: str) -> tuple[float, str, str]:
         """最像的那个唤醒词：``(相似度, 主唤醒词, 角色 id)``。
