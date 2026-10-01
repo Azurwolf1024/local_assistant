@@ -288,6 +288,21 @@ def create_app(settings: Settings, logger: logging.Logger | None = None):
             content={"ok": False, "error": f"{type(exc).__name__}: {exc}", "path": request.url.path},
         )
 
+    @app.middleware("http")
+    async def fresh_static(request: Request, call_next):
+        """★静态文件一律「先校验再用」★（no-cache，不是不缓存）。
+
+        这个控制台是本地工具，代码随时在改 —— 默认的启发式缓存会让浏览器拿着旧
+        `app.js` / `style.css` 不放（实测：改了 CSS 刷新页面还是老样子，而 JS 是新的，
+        最难查的就是这种「有的新有的旧」）。加上 no-cache 之后浏览器每次都会带
+        `If-None-Match` 来问一句，没变就是 304（几毫秒），变了立刻是新内容。
+        """
+        response = await call_next(request)
+        path = request.url.path
+        if path == "/" or path.endswith((".js", ".css", ".html", ".json", ".svg")):
+            response.headers.setdefault("Cache-Control", "no-cache")
+        return response
+
     # ------------------------------------------------------------------ 生命周期
     @app.on_event("startup")
     async def on_startup():

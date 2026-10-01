@@ -134,6 +134,18 @@ def section_meta(base: str, app) -> None:
     code, _ = request(base, "GET", "/panels/voices.js")
     check("旧的面板脚本 voices.js 已经删了", code, 404)
 
+    # ★本地工具：静态文件必须「先校验再用」★
+    # 默认的启发式缓存会让浏览器抱着旧 app.js/style.css 不放（实测过：改了 CSS
+    # 刷新还是老样子，而面板 JS 是新的 —— 最难查的就是这种「有的新有的旧」）。
+    import urllib.request  # noqa: PLC0415
+
+    with urllib.request.urlopen(urllib.request.Request(base + "/style.css"), timeout=10) as resp:
+        check("style.css 带 Cache-Control: no-cache", resp.headers.get("Cache-Control"), "no-cache")
+        check("style.css 内容能拿到", "persona-card" in resp.read().decode("utf-8"), True)
+    with urllib.request.urlopen(urllib.request.Request(base + "/api/meta"), timeout=10) as resp:
+        check("接口不掺这个头（api 本来就不该被缓存）",
+              resp.headers.get("Cache-Control") in (None, ""), True)
+
 
 def section_events(base: str) -> str:
     print("\n[2] 日程/闹钟：一句话添加 → 列表 → 改 → 跳过 → 完成")

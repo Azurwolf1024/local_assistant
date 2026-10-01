@@ -17,6 +17,7 @@
       const inputs = {};            // key -> {kind, el}
       let editing = "";             // 正在编辑的 id（空串 = 新建）
       let editFile = "";            // 编辑中的人格文件（索引里写的那条，不一定是 personas/<id>.json）
+      let lastRows = null;          // 上一次拿到的 /api/voices（重画列表时不再请求一遍）
 
       // ---------------------------------------------------------------- 上半页：声线
       const sayText = h("input", { value: "你好呀，我是本地语音助手。", placeholder: "要念的话（可留空用默认）" });
@@ -200,6 +201,7 @@
         template = d.fields || {};          // 编辑时「填模板」= 她当前的值
         fill(d.fields || {});
         setMode();
+        if (lastRows) renderList(lastRows);  // 让那张卡片当场标上「★正在编辑★」（不再请求一遍）
         await doPreview(true);
         const quiet = Object.keys(d.quiet || {});
         status.textContent = "正在编辑「" + d.name + "」（" + (d.file || "?") + "）"
@@ -384,7 +386,7 @@
           refresh();
         }
 
-        return h("details", {}, [
+        return h("details", { "data-clone": "1" }, [
           h("summary", { class: "muted", text: "★只用一条语音就能克隆★（现在参考：" + (c.voice_ref || "用全局") + "）" }),
           h("div", { style: "padding:6px 0" }, [
             h("p", { class: "muted", text: "素材目录 " + (c.materials_dir || "—") + "：" + (c.materials_count || 0)
@@ -405,15 +407,15 @@
 
       function charCard(c) {
         const isEditing = editing === c.id;
-        return card(c.name + (c.is_default ? " ·默认" : "") + (isEditing ? " ·★正在编辑★" : ""), [
-          h("p", { class: "mono", text: "id " + c.id + (c.title ? " · " + c.title : "") }),
+        const node = card(c.name + (c.is_default ? " ·默认" : "") + (isEditing ? " ·★正在编辑★" : ""), [
+          h("p", { class: "mono wrap-path", text: "id " + c.id + (c.title ? " · " + c.title : "") }),
           h("p", { class: "muted", text: "唤醒词：" + ((c.wake_words || []).join("、") || "—") }),
           h("p", { class: "muted", text: "称呼你：「" + (c.user_title || "你") + "」"
             + (c.ack ? " · 应答语：" + c.ack : "") }),
           c.style && c.style.length ? h("p", { class: "muted", text: "风格：" + c.style.join(" / ") }) : null,
-          h("p", { class: "mono", text: "参考音：" + (c.voice_ref || "（用全局）")
+          h("p", { class: "mono wrap-path", text: "参考音：" + (c.voice_ref || "（用全局）")
             + (c.voice_ref ? (c.voice_ref_exists ? " ✓" : " ✗ 文件不在") : "") }),
-          c.voice_model ? h("p", { class: "mono", text: "专属模型：" + c.voice_model
+          c.voice_model ? h("p", { class: "mono wrap-path", text: "专属模型：" + c.voice_model
             + (c.voice_model_exists ? " ✓" : " ✗ 目录不在") }) : null,
           c.ref_candidates && c.ref_candidates.length
             ? h("details", {}, [
@@ -441,15 +443,38 @@
           ]),
           cloneBlock(c),
         ]);
+        // ★整张卡片可点 = 进编辑★（用户要的：想改哪个就直接点它，不用去底下找表单）
+        node.classList.add("persona-card");
+        if (isEditing) node.classList.add("editing");
+        node.tabIndex = 0;
+        // 手型光标写两份：样式表里一份（.persona-card），这里再 inline 一份 ——
+        // 浏览器的 CSS 缓存有可能还是旧的，而「能点」这件事最好别依赖缓存。
+        node.style.cursor = "pointer";
+        node.title = isEditing ? "正在编辑她" : "点这张卡片就能改她的资料（也可以按回车）";
+        const open = () => { if (!isEditing) startEdit(c.id); };
+        node.addEventListener("click", (e) => {
+          // 卡里的按钮/下拉/输入框/details（克隆那块）自己有行为，别抢
+          if (e.target.closest("button, input, select, textarea, summary, label, a, [data-clone]")) return;
+          open();
+        });
+        node.addEventListener("keydown", (e) => {
+          if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); }
+        });
+        return node;
       }
 
       function renderList(d) {
+        lastRows = d;
         listBox.innerHTML = "";
         if (d.error) listBox.appendChild(card("角色文件有问题", UI.line(d.error, "mono")));
         const chars = d.characters || [];
         listBox.appendChild(card(
           "角色（默认 " + (d.resolved_default || d.default || "—") + " · 人格文件 " + d.persona_file + "）",
-          h("div", { class: "grid" }, chars.map(charCard))));
+          [
+            h("p", { class: "muted", text: "★想改哪个就直接点她那张卡片★（表单会带出她现在的资料并滚到下面；"
+              + "卡里的按钮、下拉、克隆那块仍然是各自的功能）" }),
+            h("div", { class: "grid" }, chars.map(charCard)),
+          ]));
         listBox.appendChild(card("全局声线配置（只读；要改去 config.toml 或角色 json）", table(
           [{ key: "k", label: "项", cls: "num" }, { key: "v", label: "值" }],
           [
