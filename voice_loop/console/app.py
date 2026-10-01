@@ -26,7 +26,33 @@ from .follow import Watcher
 from .registry import Panel, Registry
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+PANELS_DIR = Path(__file__).resolve().parent / "panels"
 PANELS_PACKAGE = "voice_loop.console.panels"
+
+
+def panel_stamp() -> str:
+    """面板代码的指纹：``panels/*.py`` + ``static/panels/*.js`` + ``registry.py`` 的哈希。
+
+    ★为什么需要它★：控制台的静态脚本是**每次；请求从磁盘现取**的，而路由/接口是
+    **进程启动时装载**的。只改代码不重启，就会出现「页面是新的、后端是旧的」
+    这种半新半旧状态（新面板去调一个旧进程里不存在的接口）——
+    现象往往只是一个空荡荡的页面，还什么都不报。
+    所以 ``/api/meta`` 同时给「启动时的指纹」与「现在的指纹」，不一致就是该重启了。
+    """
+    import hashlib  # noqa: PLC0415
+
+    try:
+        files = sorted(PANELS_DIR.glob("*.py")) + sorted((STATIC_DIR / "panels").glob("*.js"))
+        files.append(Path(__file__).resolve().parent / "registry.py")
+        digest = hashlib.sha1()
+        for path in files:
+            if not path.is_file():
+                continue
+            digest.update(path.name.encode("utf-8"))
+            digest.update(path.read_bytes())
+        return digest.hexdigest()[:12]
+    except OSError:                      # 读不动就不报不一致（宁可没提示，也别瞎报）
+        return ""
 
 
 @dataclass
@@ -164,6 +190,10 @@ def create_app(settings: Settings, logger: logging.Logger | None = None):
     if failed:
         log.warning(f"有 {len(failed)} 个面板装不上：{failed}")
 
+    # 启动时记一份面板代码指纹：以后 /api/meta 里跟「现在磁盘上的」对不上，
+    # 就说明这份代码改过而进程没重启（前端会当场提醒）。
+    startup_stamp = panel_stamp()
+
     # ------------------------------------------------------------------ 基础接口
     @app.get("/api/meta")
     def api_meta():
@@ -176,6 +206,9 @@ def create_app(settings: Settings, logger: logging.Logger | None = None):
             "log_file": str(watcher.log_path),
             "panels": [p.as_dict() for p in registry.all()],
             "panels_failed": failed,
+            # ★两个指纹不一样 = 面板代码改过、但这个进程没重启★（前端会弹一句提醒）
+            "panels_stamp": startup_stamp,
+            "panels_stamp_now": panel_stamp(),
             "started_at": ctx.started_at,
             "python": f"{__import__('sys').version.split()[0]}",
         }

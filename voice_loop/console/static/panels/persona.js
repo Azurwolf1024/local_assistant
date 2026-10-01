@@ -465,10 +465,49 @@
         chars.forEach((c) => exportPick.appendChild(h("option", { value: c.id, text: c.id })));
       }
 
-      function refresh() {
+      function refresh(attempt) {
+        const n = attempt || 0;
+        if (!listBox.childElementCount) listBox.appendChild(emptyHint("正在读角色与声线…"));
         return ctx.api.get("/api/voices")
-          .then(renderList)
-          .catch((err) => ctx.toast("读取角色失败：" + err.message, "err"));
+          .then((d) => { dropHint(); renderList(d); return d; })
+          .catch((err) => {
+            dropHint();
+            // ★失败必须看得见★：只弹一个几秒就消失的提示，会让「列表空白」变成一个说不清的谜
+            //（真实案例：控制台进程还是旧的 → /api/voices 不存在 → 404，页面就永远空着）。
+            if (n < 1) { setTimeout(() => refresh(n + 1), 1200); return null; }   // 自己再试一次
+            showListError(err);
+            return null;
+          });
+      }
+
+      function emptyHint(text) {
+        return h("p", { class: "muted", id: "persona-loading", text });
+      }
+
+      function dropHint() {
+        const got = listBox.querySelector("#persona-loading");
+        if (got) got.remove();
+      }
+
+      function showListError(err) {
+        if (listBox.childElementCount) {      // 已经有上一次的好数据：留着，只弹个提示
+          ctx.toast("刷新角色失败：" + err.message, "err");
+          return;
+        }
+        // ★404 有专属解辞★：这个项目的控制台是「静态脚本从磁盘现取、路由却在进程里」，
+        // 改了面板代码但没重启控制台时，就会正好撞上这种情况。
+        const stale = /not found|404/i.test(String(err.message || ""));
+        listBox.appendChild(card("读不到角色列表", [
+          h("p", { style: "color:var(--err,#c00);margin:2px 0", text: "✗ " + err.message }),
+          h("p", { class: "muted", text: stale
+            ? "接口不在这台控制台上 —— 十有八九是这个控制台进程在改代码之前就启动了"
+              + "（页面脚本是现取的新的，路由却还在旧进程里）。重启控制台（Ctrl+C 再 python main.py ui）"
+              + "后点下面的「重试」就行，不必刷新页面。"
+            : "去「日志」标签页看背面的报错，再点「重试」。" }),
+          h("div", { class: "row" }, [
+            h("button", { class: "btn small primary", text: "重试", onclick: () => refresh() }),
+          ]),
+        ]));
       }
 
       function loadSpec() {
@@ -482,7 +521,11 @@
             blank();
           }
           setMode();
-        }).catch((err) => { status.textContent = "读不到表单规范：" + err.message; });
+        }).catch((err) => {
+          status.textContent = "读不到表单规范：" + err.message;
+          showProblems(["读不到表单规范：" + err.message
+            + "（若是「Not Found」，说明这个控制台进程还是旧的 —— 重启它后刷新本页）"], []);
+        });
       }
 
       // ---------------------------------------------------------------- 组装
@@ -500,6 +543,8 @@
                 r.ok ? "ok" : "err");
             },
           }),
+          h("button", { class: "btn small", text: "重新读一遍",
+            onclick: () => { listBox.innerHTML = ""; refresh(); } }),
         ]),
         h("p", { class: "muted", text: "点某个角色的「切过去并试听」= 先切声线再念这句（两步都走信箱，服务最多 5 秒内响应）。服务没启动会失败。" }),
       ]));

@@ -119,6 +119,10 @@ def section_meta(base: str, app) -> None:
     check("六个面板都在（★voices 已并入角色★）", ids,
           ["overview", "schedule", "memos", "logs", "persona", "chat"])
     check("没有面板装载失败", meta.get("panels_failed"), {})
+    # ★半新半旧的守卫★：静态脚本现取、路由启动时装载 → 两个指纹不一样就说明该重启了
+    check("面板代码指纹：启动时 = 现在（没人改代码）",
+          bool(meta.get("panels_stamp")) and meta.get("panels_stamp") == meta.get("panels_stamp_now"),
+          True, detail=str(meta.get("panels_stamp")))
 
     for path in ("/", "/index.html", "/style.css", "/app.js", "/ui.js",
                  "/panels/overview.js", "/panels/schedule.js", "/panels/memos.js",
@@ -343,6 +347,24 @@ def section_registry(tmp: Path) -> None:
         check("重复 id 会报错", False, detail="没报错")
     except ValueError as exc:
         check("重复 id 会报错（并指出是谁）", "a" in str(exc), True, detail=str(exc))
+
+    # ★面板指纹能不能真的发现「改了代码」★（真机上最容易踩：页面是新的、后端是旧的）
+    from voice_loop.console import app as console_app
+
+    stamp = console_app.panel_stamp()
+    check("指纹是短的稳定哈希",
+          (len(stamp) == 12, stamp == console_app.panel_stamp()), (True, True))
+    original_dir = console_app.PANELS_DIR
+    try:
+        fake = tmp / "fake_panels"
+        fake.mkdir(parents=True, exist_ok=True)
+        (fake / "who.py").write_text("PANEL = None\n", encoding="utf-8")
+        console_app.PANELS_DIR = fake
+        check("★面板代码一变，指纹就变★（这就是「该重启了」的判据）",
+              console_app.panel_stamp() != stamp, True)
+    finally:
+        console_app.PANELS_DIR = original_dir
+    check("改回来之后指纹又一致", console_app.panel_stamp(), stamp)
 
 
 def main() -> int:

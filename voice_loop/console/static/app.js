@@ -198,6 +198,13 @@ window.Console = (function () {
       if (info.panels_failed && Object.keys(info.panels_failed).length) {
         toast("有面板装载失败：" + JSON.stringify(info.panels_failed), "warn", 12000);
       }
+      // ★半新半旧的进程★：静态脚本是现取的（新），路由/接口是启动时装载的（旧）。
+      // 两个指纹不一样就说明改过代码没重启——不提醒的话，人只会看到一个空页面。
+      if (info.panels_stamp && info.panels_stamp_now
+          && info.panels_stamp !== info.panels_stamp_now) {
+        toast("面板代码改过了，但这个控制台进程还是旧的（后端路由没跟着变）"
+          + "—— Ctrl+C 停掉它、重新 python main.py ui，再刷新本页", "warn", 30000);
+      }
       const want = (location.hash || "").replace("#", "") || (info.panels[0] || {}).id;
       await show(want);
       refreshStatus();          // 先把状态条填上，别等 SSE 那一轮
