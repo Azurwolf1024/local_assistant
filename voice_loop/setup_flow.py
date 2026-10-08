@@ -37,7 +37,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+from .paths import app_root
+
+ROOT = app_root()
+"""项目根（exe 旁边 / 源码根）—— 冻结之后 ``__file__`` 是临时解包目录，不能用。"""
 
 
 def child_env() -> dict:

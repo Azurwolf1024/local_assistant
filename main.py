@@ -190,11 +190,21 @@ def cmd_ui(settings: Settings, args: argparse.Namespace) -> int:
             "    pip install fastapi uvicorn\n"
             f"（导入失败：{exc}）"
         ) from exc
+    window = getattr(args, "window", "") or ""
+    if window and window != "browser":
+        from voice_loop.console import window as window_mod  # noqa: PLC0415
+
+        picked = window_mod.choose(window)
+        if picked != window and window != "auto":
+            print(f"★要的窗口后端（{window}）用不了★，这台机器上会用 {picked}：")
+            for item in window_mod.backends():
+                print(f"    {item['id']:9s} {'可用' if item['ok'] else '不可用'} · {item['detail']}")
     return console_serve(
         settings,
         host=args.host,
         port=int(args.port),
         open_browser=not args.no_browser,
+        window=window if window != "browser" else "",
         logger=logging.getLogger("voice_loop.console"),
     )
 
@@ -1340,6 +1350,10 @@ def cmd_upgrade(settings: Settings, args: argparse.Namespace) -> int:
     """`python main.py upgrade`：默认只检查；`--apply` 才真升；`--restore` 还原数据备份。"""
     if args.restore is not None:
         return _upgrade_restore(args)
+    if not setup_flow.is_git(settings.root):
+        # ★压缩包/exe 安装的「升级」不是 git pull★（以前这里只打印一段说明，
+        # 让用户自己去下 zip）—— 现在直接走 voice_loop.update：下载 → 校验 → 合并。
+        return cmd_update(settings, args)
     print("=" * 66)
     print(f" 升级　当前 v{__version__}" + ("" if args.apply else "　（试运行：只检查）"))
     print("=" * 66)
@@ -1352,6 +1366,54 @@ def cmd_upgrade(settings: Settings, args: argparse.Namespace) -> int:
     print(rep.render())
     print("=" * 66)
     return 0 if rep.ok else 1
+
+
+def cmd_update(settings: Settings, args: argparse.Namespace) -> int:
+    """`python main.py update`：对**非 git**安装（压缩包 / exe）的更新。
+
+    ★默认什么都不写★（只检查）；``--apply`` 才真更新，_apply 之前先备份用户数据。
+    """
+    from voice_loop import update as upd  # noqa: PLC0415
+
+    repo = getattr(args, "repo", "") or ""
+    url = getattr(args, "url", "") or ""
+    if getattr(args, "refresh", False):
+        upd.forget_cache()
+    got = upd.check(settings.root, repo=repo, url=url)
+    print("=" * 66)
+    print(f" 更新　当前 v{got.current}（{upd.env_hint()}）")
+    print("=" * 66)
+    print(f"  检查：{got.reason}")
+    if got.error:
+        print(f"  细节：{got.error}")
+    if got.release:
+        if got.release.notes:
+            print(f"  说明：{got.release.notes}")
+        if got.release.date:
+            print(f"  发布：{got.release.date}")
+    if not got.ok:
+        return 1
+    if not got.behind:
+        print("  （不用做任何事）")
+        return 0
+    if not getattr(args, "apply", False):
+        print("  → 要真更新：python main.py update --apply")
+        print("    （它会先把你 data/ 与 config.toml 备份到 data/backup/）")
+        return 0
+    result = upd.apply(settings.root, release=got.release, repo=repo,
+                       progress=lambda line: print(f"  {line}", flush=True),
+                       backup=not getattr(args, "no_backup", False),
+                       update_exe=not getattr(args, "no_exe", False),
+                       install_deps=not getattr(args, "skip_deps", False))
+    print("=" * 66)
+    if result.ok:
+        print(f" 完成：{result.before} → {result.after or '（版本号没变）'}")
+        print(" 重启控制台（和语音服务）才生效。")
+    else:
+        print(f" 没成功：{result.error}")
+        if result.backup:
+            print(f" 你的数据在 {result.backup}（照里面的 RESTORE.txt 可还原）")
+    return 0 if result.ok else 1
 
 
 def _upgrade_restore(args: argparse.Namespace) -> int:
@@ -1520,7 +1582,20 @@ def build_parser() -> argparse.ArgumentParser:
                    help="监听地址，默认只给本机；填 0.0.0.0 会让同局域网的人也能进来（能改你的日程，慎用）")
     p.add_argument("--port", type=int, default=8765, help="端口，默认 8765")
     p.add_argument("--no-browser", action="store_true", help="不要自动开浏览器")
+    p.add_argument("--window", default="", choices=["", "auto", "pywebview", "edge", "browser"],
+                   help="用应用窗口而不是浏览器标签页：auto = 有 pywebview 就用它、"
+                        "否则 Edge 应用窗口（细节见 voice_loop/console/window.py）")
     p.set_defaults(func=cmd_ui)
+
+    p = sub.add_parser("update", help="更新（压缩包/exe 安装：下载新版并安全合并，先备份）")
+    p.add_argument("--apply", action="store_true", help="真更新（不带它就是只检查）")
+    p.add_argument("--repo", default="", help="owner/name（默认从 install.ps1 里读）")
+    p.add_argument("--url", default="", help="直接给 latest.json 的地址（自建下载站/内网）")
+    p.add_argument("--refresh", action="store_true", help="绕过缓存重新检查")
+    p.add_argument("--no-backup", action="store_true", help="★不推荐★ 更新前不备份用户数据")
+    p.add_argument("--no-exe", action="store_true", help="更新里不带控制台 exe")
+    p.add_argument("--skip-deps", action="store_true", help="不跑 pip install")
+    p.set_defaults(func=cmd_update)
 
     p = sub.add_parser("memory", help="模型记忆：看 / 检索 / 巩固 / 清理（按角色隔离）")
     p.add_argument("--who", default=None, help="哪个角色的记忆（默认用默认角色）")

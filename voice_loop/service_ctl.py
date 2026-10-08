@@ -23,10 +23,50 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from .paths import ENV_PYTHON, app_root, find_python
 from .settings import Settings
 
 PYTHON_EXE = Path(sys.executable)
 """普通解释器（控制台用；起服务用 pythonw 才没窗口，见 :func:`start_command`）。"""
+
+
+def python_exe(root: str | Path | None = None) -> Path:
+    """跑 ``main.py`` 用的解释器。
+
+    ★控制台冻成 exe 之后这一条变成必需★：那时 ``sys.executable`` 是**控制台 exe 自己**，
+    拿它去跑 `main.py listen` 等于让 exe 再启动一遍自己（参数全被吃掉、服务起不来）。
+    所以 exe 场景一律走 :func:`voice_loop.paths.find_python`：先 ``.venv``，
+    再 ``LOCAL_AI_PYTHON``，最后 PATH 上的 python。
+    """
+    found = find_python(root)
+    if found:
+        return found
+    return Path(sys.executable)
+
+
+def service_python(*, console: bool = False, root: str | Path | None = None) -> Path:
+    """起服务用的解释器：默认换成 **pythonw.exe**（无窗口，不会被关窗口带走）。"""
+    exe = python_exe(root)
+    if console:
+        return exe
+    windowless = exe.with_name("pythonw.exe") if os.name == "nt" else exe
+    return windowless if windowless.exists() else exe
+
+
+def main_script(root: str | Path | None = None) -> Path:
+    """``main.py`` 在哪：★安装根★（不是 ``__file__`` 上层，也不是 ``settings.root``）。
+
+    ★两个「根」不是一回事★（这是沙盒与 exe 都会踩的地方）：
+
+        ``paths.app_root()``   **代码+解释器**在哪 —— main.py、voice_loop/、exe 旁边
+        ``settings.root``      **数据**在哪 —— config.toml 里的 ``[app] project_root``
+
+    沙盒（``project_root = sessions/sandbox_ui``）里数据根和安装根就不是同一个，
+    服务却仍然要从安装根起（那里才有 main.py）。照 ``settings.root`` 找会找到
+    「找不到 main.py」—— 所以这里默认取安装根。
+    """
+    return (Path(root) if root else app_root()) / "main.py"
+
 
 
 def pid_alive(pid: int) -> bool:
@@ -177,17 +217,13 @@ def start_command(settings: Settings, *, console: bool = False) -> list[str]:
     ``console=False``（默认）用 **pythonw.exe**：没有控制台窗口，不会被关窗口时的
     CTRL 事件带走。控制台 UI 点「启动」走的就是这条。
     """
-    exe = PYTHON_EXE if console else PYTHON_EXE.with_name("pythonw.exe")
-    if not exe.exists():
-        exe = PYTHON_EXE
-    main_py = Path(__file__).resolve().parents[1] / "main.py"
-    return [str(exe), str(main_py), "listen", "-B"]
+    exe = service_python(console=console)
+    return [str(exe), str(main_script()), "listen", "-B"]
 
 
-def stop_command() -> list[str]:
+def stop_command(settings: Settings | None = None) -> list[str]:
     """停服务的命令行（走 `main.py stop`：带优雅退出 + 超时强杀，逻辑不在这里重写）。"""
-    main_py = Path(__file__).resolve().parents[1] / "main.py"
-    return [str(PYTHON_EXE), str(main_py), "stop"]
+    return [str(python_exe()), str(main_script()), "stop"]
 
 
 def spawn(command: list[str], cwd: Path) -> int:
@@ -254,7 +290,7 @@ def _clean_leftovers(settings: Settings) -> str:
     """
     try:
         proc = subprocess.run(
-            stop_command(),
+            stop_command(settings),
             cwd=str(settings.root),
             capture_output=True,
             text=True,
@@ -289,6 +325,21 @@ def start_service(
         # 确认过没在跑，所以这里的残留文件可以安心清掉
         note = f"（已清理上次的残留文件：{_clean_leftovers(settings)}）"
 
+    # ★先确认有真的解释器与 main.py★：控制台是 exe 时，「跑服务」得靠系统里的 Python。
+    # 没有就当场说清楚，而不是 spawn 一个 exe 自己（以前那会得到一句莫名的「启动失败」）。
+    runner = python_exe()
+    if not main_script().is_file():
+        return False, (
+            f"找不到 {main_script()} —— 控制台只负责界面，"
+            f"语音服务的代码得在安装目录里（安装根：{app_root()}）{note}"
+        )
+    if runner == Path(sys.executable) and getattr(sys, "frozen", False):
+        return False, (
+            "控制台是 exe，但找不到能跑语音服务的 Python。"
+            "先建虚拟环境（powershell -File install.ps1）或设 LOCAL_AI_PYTHON 指到 python.exe"
+            f"{note}"
+        )
+
     try:
         spawn_pid = spawn(start_command(settings), settings.root)
     except OSError as exc:
@@ -318,7 +369,7 @@ def stop_service(settings: Settings, *, timeout: float = 20.0) -> tuple[bool, st
     was_running = st.running
     try:
         proc = subprocess.run(
-            stop_command(),
+            stop_command(settings),
             cwd=str(settings.root),
             capture_output=True,
             text=True,

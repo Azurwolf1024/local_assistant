@@ -18,6 +18,9 @@ models/tts/piper/*.ckpt
 models/tts/piper/*.pth
 build/
 dist/
+# 打包产物可能被起别的名字（`make_console_exe.py --out dist-wv` 之类），一律别进 git
+build-*/
+dist-*/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

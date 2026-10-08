@@ -8,7 +8,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+from .paths import app_root
+
+PROJECT_ROOT = app_root()
+"""项目根：exe 旁边（冻结时）/ 源码根（源码运行时）/ ``LOCAL_AI_ROOT`` 覆盖。
+
+★别退回 ``Path(__file__).parents[1]``★：冻结之后那是 PyInstaller 的解包临时目录，
+每次启动都换一个名字，配置与 data/ 会「找不到」（见 ``voice_loop/paths.py`` 的说明）。
+"""
 
 
 @dataclass

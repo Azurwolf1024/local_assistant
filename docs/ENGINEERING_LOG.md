@@ -71,6 +71,10 @@
     + 54.5 上线当天那个「角色列表空白」：★半新半旧的进程★（改成看得见的报错 + 指纹提醒）
     + 54.6 ★点卡片就能改★ + 卡片并列（含静态文件不再被浏览器缓存坑）
   - **55. 可交付化**：从「只有源码」到「能一键装（install.ps1）、能安全升（备份+回滚）」
+  - **56. 控制台做成 exe**：★原生窗口 + 更新功能★（先 spike 量出体积/启动/依赖闭包，再动手）
+    + 56.2 两个「根」分开：`app_root` / `resource_root` / `find_python`（冻结后 `__file__` 不可信）
+    + 56.4 打包脚本要钉住的四类坑（面板动态加载 → AST 扫 hidden-import；不排除就 354 MB）
+    + 56.5 更新的五个安全边界（不覆盖数据 / sha256 不过就不动 / 拒 zip-slip / 只报告上游删除 / 幂等）
 
 
 ---
@@ -4168,10 +4172,14 @@ grep 整个 `voice_loop/memory/`：`image / shot / vision / jpg / base64` **零�
   模型挂载）。**只有控制台是天然可容器化的**（纯网页 + 读写 json）—— 想做的话那是最值得的一步。
 - **内置自动更新**：自托管工具不该偷偷换自己的代码。现在是「默认只检查、`--apply` 才升、
   升级前先备份」，把决定权留给人。真要做也应该是「通知 + 一键」，不是静默。
+  → ★第 56 节已按这个原则做了★：`python main.py update` 与非 git 安装的控制台「更新」标签
+  （先备份 → 校验 sha256 → 只覆盖程序文件），仍然默认**只检查**，动手要显式确认。
 - **签名 / SBOM**：现在有 sha256 与 `latest.json`，够本机自用与「下载后核对一下」。
   要对外分发再上 `cosign`/Sigstore——那需要发布渠道稳定下来才值得。
 - **单文件 exe（PyInstaller/Tauri 壳）**：能省掉「装 Python」这一步，但模型路径、原生库
   （PortAudio/onnxruntime）、以及「代码随时改」的开发习惯都要重新设计，是另一个量级的事。
+  → ★第 56 节把「控制台」这一半做了★（50 MB、不加载模型、不碰音频设备）；
+  **语音服务仍然不冻**（几 GB 模型 + 外部 Ollama + 音频设备），理由见 56.9。
 
 ### 55.5 现在的交付面（对照「L0~L5」那套分层）
 
@@ -4183,3 +4191,194 @@ grep 整个 `voice_loop/memory/`：`image / shot / vision / jpg / base64` **零�
 | L3 自检 | ★`main.py setup / doctor`★ + `check_deploy.py`（同一份判断） |
 | L4 生命周期 | ★`main.py upgrade`（备份→拉取→依赖→模型→自检→回滚指令）、`--restore`★ |
 | L5 自动更新通道 | 有意**不做**（见 55.4）；`latest.json` 已经是将来做它的地基 |
+
+---
+
+## 56. 控制台做成 exe：原生窗口 + 更新功能（2026-10-08）
+
+用户的话：「**控制台做成 exe 加原生窗口，这个可以先做，同时做好更新功能，以便后续更新**」。
+
+这是第 55 节（可交付化）的直接续集。55 节末尾的诚实清单里有两条现在是「未做」：
+
+> - **内置自动更新**：自托管工具不该偷偷换自己的代码 …… 真要做也应该是「通知 + 一键」，不是静默。
+> - **单文件 exe（PyInstaller/Tauri 壳）**：能省掉「装 Python」这一步 …… 是另一个量级的事。
+
+这一节把「exe」这半件做了 —— 但只做**控制台**（理由见 56.9）。
+
+### 56.1 先量，再估：把「工作量」变成数字
+
+动手前先做了一次 spike（真冻一个 exe 出来跑），因为「工作量大不大」这种问题
+猜出来的答案没有价值。实测数据（本机 Python 3.13.7 / PyInstaller / Windows）：
+
+| 量 | 结果 | 说明 |
+| --- | --- | --- |
+| 控制台的第三方依赖闭包 | `fastapi` `starlette` `pydantic(+core)` `anyio` `sniffio` `typing_*` ≈ **14 MB** | ★一个重库都不进来★：不碰 numpy / sherpa / openvino / torch / sounddevice |
+| onedir 产物 | **50.4 MB**（4154 个文件） | 启动 **1.6 s** |
+| onefile 产物 | **65 MB** | 启动 **6.6 s**（每次双击都要解包，实测） |
+| 带 pywebview | **54.1 MB** | 只多 3.7 MB（pythonnet 那一串） |
+| 不排除重库时 | **354 MB** | 见 56.4：一放行面板的懒导入，语音栈就跟着进来 |
+| 冻好的 exe 自检 | 7 个面板全装上、`/api/meta` `/style.css` `/panels/persona.js` `/api/service` 全 **200** | 见 56.8 |
+
+结论：**控制台是这个项目里唯一「冻了真划算」的部分**（它本来就不加载模型、不碰音频设备）。
+
+### 56.2 两个「根」必须分开：`voice_loop/paths.py`（这一节的重点）
+
+冻结之后 `__file__` 指向 PyInstaller 的解包临时目录（`C:\...\Temp\_MEIxxxx`，
+**每次启动都换名字**）。而仓库里有 **15 处**「拿 `__file__` 往上推根」：
+
+```
+voice_loop/settings.py:11      PROJECT_ROOT = parents[1]        ← config.toml、data/、models/ 全靠它
+voice_loop/__init__.py:19      parents[1] / "VERSION"
+voice_loop/setup_flow.py:40    ROOT = parents[1]                ← 备份/升级/体检
+voice_loop/service_ctl.py:183   parents[1] / "main.py"           ← 起服务
+voice_loop/console/app.py:28   static/ panels/（这两个其实是对的，见下）
+main.py:265                    [pythonw, __file__]              ← 后台服务
+```
+
+留着它们，exe 的现象会是**看起来毫不相干的三件事**：说找不到 `config.toml`、数据写到临时目录、
+点「启动服务」起来的是 exe 自己。所以新增 `voice_loop/paths.py` 把「路径从哪来」收成一份：
+
+| 函数 | 含义 | 冻结时 | 源码运行时 |
+| --- | --- | --- | --- |
+| `app_root()` | **用户的东西**在哪（config.toml / data/ / models/ / sessions/） | exe 附近能找到的项目 → exe 目录 | 源码根 |
+| `resource_root()` | **随程序走的东西**在哪（static/ panels/ VERSION） | `sys._MEIPASS` | 源码根 |
+| `find_python()` | **跑服务的解释器** | `.venv` → `LOCAL_AI_PYTHON` → PATH | 同上 + `sys.executable` |
+
+三个设计决定，都是被具体问题逼出来的：
+
+1. **`app_root()` 会从 exe 往上找 `config.toml` + `main.py`**（`find_project_root`）：
+   onedir 的常见摆法是 `<项目>/console/local-assistant-console.exe`，exe 自己那一层没有配置。
+   ★两个文件都在才算数★：只看一个会把用户的下载目录误判成项目。
+2. **`service_ctl` 里 `settings.root` 与「代码根」是两回事**：`settings.root` 是**数据根**
+   （配置里 `[app] project_root` 可以指到别处，沙盒就是这么干的），而 `main.py` 在**安装根**。
+   改错这一步的直接后果：`test_service_ctl` 里那批「起服务用的是 pythonw + 绝对路径 main.py」
+   立刻失败 —— **自测当住了这个设计错误**（我自己第一版就是改错的）。
+3. **`service_ctl.python_exe()` 不再用 `sys.executable`**：冻结时它是 exe 自己，
+   拿它去跑 `main.py listen` 等于让 exe 再启动一遍自己。找不到真 Python 时
+   `start_service` 会直接说「控制台是 exe，但找不到能跑语音服务的 Python ……」，
+   而不是 spawn 一下然后报「启动失败」。
+
+**防回退**：`scripts/test_paths.py` 用 **AST**（不是 grep）扫上表里那几个文件，
+不允许再出现 `parents[N]` —— 第一版用文本搜，结果把我自己 docstring 里
+「别退回 `parents[1]`」这句说明也算成违规，所以改成看语法树。
+
+### 56.3 原生窗口：为什么是「三级后端」而不是只做 pywebview
+
+| 后端 | 是什么 | 依赖 |
+| --- | --- | --- |
+| `pywebview` | 真窗口（Edge WebView2 内核，无地址栏无标签栏） | `pip install pywebview`（Windows 上带 pythonnet） |
+| `edge` | Edge 的 `--app=<url>` 模式：看起来就是个应用窗口 | 机器上有 Edge（Win10/11 都有） |
+| `browser` | 老行为：系统浏览器开一个标签页 | 什么都没有 |
+
+`choose("auto")` 按上表挑第一个**确实能用**的，`open_window` 起不来时 `serve()` 退回浏览器 ——
+「打不开窗口」不该变成「界面打不开」。三条实测结论：
+
+1. **pywebview 要求主线程**：所以窗口模式下结构是「uvicorn 在后台线程 + 窗口占主线程」
+   （正好与浏览器模式相反）。窗口关掉 → `server.should_exit = True` → SSE 被 `bus.close()`
+   叫醒、干净退出（`ConsoleServer` 那层是第 55 节之前就有的，这次只是把它从 `serve()` 里提出来共用）。
+2. **`edge --app` 必须带独立的 `--user-data-dir`**：不加的话 Edge 会把窗口交给
+   **已经在运行的那个 Edge 进程**，我们启动的进程立刻退出 —— 于是「关了窗口 = 结束控制台」
+   这条就断了（服务还在后台跑，用户以为关了）。实测：加了独立 profile 后进程一直活着（探针验过）。
+3. **关窗口 = 退出控制台**，语音服务不受影响（它有自己的启停）。
+
+### 56.4 `console_exe.py` + `make_console_exe.py`：四类必须记住的坑
+
+打包脚本的存在理由就是把下面四条钉死（README 里写一行 PyInstaller 命令，忘一条就是一个
+「能跑但残废」的 exe）：
+
+1. ★**面板是「按文件路径动态加载」的**★ → PyInstaller 静态分析看不到面板内部的懒导入。
+   第一次冻结时 `schedule` 与 `persona` **静悄悄装不上**（报的是
+   `cannot import name 'event_text' from 'voice_loop'`）。修法不是手工列清单，而是
+   **用 AST 把 `console/panels/*.py` 与 `console/*.py` 里的 `from ... import ...` 全扫出来**
+   当 hidden-import（本次自动扫出 19 个，含 `event_text` / `persona_card` / `panels.voices` / `clone`）。
+2. ★**一放行就 354 MB**★：面板经 `clone` 摸到语音栈。控制台**永远不执行**它们
+   （它只读 json/toml、往信箱投命令、发静态文件），所以按清单 `--exclude-module`
+   显式排除 numpy/scipy/cv2/sounddevice/sherpa_onnx/onnxruntime/openvino/torch/transformers…
+   → 354 MB 回到 50 MB，启动也快一截。
+3. **static / panels / VERSION 不在 import 图里**，得 `--add-data` 带进去；
+   ★panels 必须以**数据文件**躺在原相对位置★（它们是被路径加载的）—— 这是「面板热插拔」
+   这个设计在 exe 里的代价，值得付。
+4. **`--windowed` 的 exe 里 `sys.stdout` 是 None**：`console_exe.py` 的第一件事就是把
+   stdout/stderr 接进 `sessions/console-exe.log`（这正是 `main.py` 里
+   `ensure_std_streams()` 早见过的坑）。另外：**双击时没有参数**，所以 exe 还要自己找项目根
+   （第 56.2 条）、清理上次更新留下的 `*.old`、以及**端口上已经有控制台时直接把它打开**
+   （双击两次是最常见的动作，那时用户要的是界面，不是一句「端口被占」）。
+
+默认 **onedir**：onefile 每次启动要解包 65 MB（实测 6.6 s vs 1.6 s）。
+`--onefile` 仍然提供（有人就是要一个文件），`--check` 只打印计划与命令，便于先看再打。
+
+### 56.5 更新：两条路，五个安全边界
+
+`voice_loop/update.py`（★只依赖标准库★，网络可注入 → 自测全程离线）：
+
+- **git 检出**：沿用第 55 节的 `setup_flow.run_upgrade`（备份 → `git pull --ff-only` → 依赖 → 自检）。
+- **压缩包 / exe 安装**：读 GitHub Release 的 `latest.json`（走 `releases/latest/download/`，
+  不用 API、**没有限流**）→ 备份 → 下载 zip → **校验 sha256** → 合并 → 依赖 → 报告。
+
+五个边界，每一个都是「升级会毁数据」的具体形态：
+
+1. **绝不覆盖用户的东西**：`data/`、`models/`、`sessions/`、`.venv/`、`config.toml` 整块跳过
+   （自测里**故意往发布包里塞了 `data/memos.json` 与 `config.toml`**，验证它们一个字节都没被覆盖）。
+2. **校验不过就不动**：sha256 不对 → 停手，★连一个文件都不写★（测试同时验「main.py 没被动」）。
+3. **拒绝可疑路径**：成员名带 `../` 的包直接拒（zip-slip，不然解压能写到项目外面）。
+4. **上游删掉的文件只报告、不删除**：自动删用户目录里的文件太危险（他可能自己加过东西）。
+5. **幂等**：同一个包再合一次，报告必须是「新增 0 · 更新 0」（否则每次更新看起来都像动了几百个文件）。
+
+另外两件顺手做对的事：
+
+- **清单里 url 为空时自己拼**（发布时没配 GitHub remote 也不会变成死路）；
+- **版本比较按数字**（`1.10 > 1.9`；`1.1.0+unknown == 1.1.0` —— 字符串比会错）。
+
+### 56.6 更新 exe 自己：Windows 允许改名，不允许覆盖
+
+运行中的 exe **不能被覆盖**，但**可以被改名**。所以顺序是「先把自己改名成 `.old`，
+再把新内容写到原来的名字上」，不需要批处理、不需要重启管理器那一套；
+下次启动时 `cleanup_old_exe()` 顺手清掉。自测用一个假文件验证顺序与清理
+（真 exe 的替换要在真机上发布新版本才走一遍，这条是**已知未做真机验证**的一项）。
+
+### 56.7 界面上的「更新」标签（第 7 个面板）
+
+`GET /api/update/check`（只读：当前/远端版本、git 还是 zip、能不能升）、
+`POST /api/update/start`（**必须带 `confirm: true`** 才动手，防手滑）、
+`GET /api/update/status?since=N`（增量吐进度）、`POST /api/update/restore`（默认只列会覆盖什么）。
+
+★`start` 与 `status` 为什么分开★：下载 + 解压 + `pip install` 可能好几分钟，
+同步接口会让浏览器先超时（用户以为坏了，其实正在装）。所以 `start` 立刻返回，
+进度由 `Updater` 这个后台线程状态机一点点吐出来 —— 界面上那个日志框就是这么来的。
+
+### 56.8 怎么验的（都是真跑，不是「应该能用」）
+
+| 验的东西 | 怎么验的 | 结果 |
+| --- | --- | --- |
+| 冻结能不能成 | 真打 onedir + onefile | 50.4 MB / 65 MB |
+| 冻出来的控制台能不能用 | `local-assistant-console.exe --selftest`（起服务 + 自己请求 4 个地址） | 7 个面板、4 个 200、**通过** |
+| 原生窗口 | 源码模式：pywebview 开窗 → 定时 `destroy()` → 看日志与退出码 | 窗口开、关、`控制台已退出（窗口已关闭）`、退出码 0 |
+| 双击 exe 的完整流程 | 起 exe → 用 `FindWindowW` 找窗口 → 发 `WM_CLOSE`（等于点 ×） | 找到窗口、进程**自己退出**、退出码 0 |
+| Edge 后端 | 真起 `msedge --app=`（独立 profile） | 进程**一直活着**（`proc.wait()` 的前提成立） |
+| 更新核心 | `scripts/test_update.py`（9 节，★不联网★：下载与取清单都是假函数） | 全过 |
+| 路径/冻结/解释器 | `scripts/test_paths.py`（8 节，假装的 `sys.frozen` + 真子进程） | 全过 |
+| 控制台接口 | `scripts/test_console.py` 第 8 节（把 `update.check` 换成假的，不联网） | 全过 |
+| 回归 | 全量 `sessions\run_tests.cmd`（**40 个脚本**） | 全 EXIT=0 |
+
+### 56.9 诚实清单：没做的、以及一个偶发
+
+- **exe 里不含语音服务**：服务要几 GB 模型 + 外部 Ollama + 真实音频设备，冻进去是
+  2~4 GB 的怪物，还得给用户装驱动。所以 exe 定位是**控制台/界面**，服务仍由系统 Python 跑；
+  exe 点「启动服务」会自己找 `.venv` 或 `LOCAL_AI_PYTHON`，找不到会明说。
+- **没有签名**：未签名的 exe 首次运行会被 SmartScreen 拦一下（「更多信息 → 仍要运行」）。
+  自托管工具上证书（每年百来美元）不划算，README 里如实说。
+- **默认不打包 pywebview**：不打包时窗口走 Edge `--app`（效果接近、零体积代价）。
+  想要「连窗口内核一起打包」用 `--with-webview`（实测 54.1 MB，能跑）。
+- **exe 自更新没有真机验证过**：逻辑与顺序有测试，但「真的发布一个新版本再让旧 exe 换掉自己」
+  要下次发版才有机会走一遍。
+- **`test_offline` 偶发失败**：全量跑时撞过一次 `PermissionError: os.replace(... .json.tmp →
+  .json)`（临时目录里），单独重跑就过 —— Windows 上文件被占用/被杀软扫的常见竞态，
+  与本节改动无关，先记在这里。
+
+### 56.10 分给了多久（事后对照）
+
+当时的估算是「MVP 约 1.5 人日、推荐档 3~4 人日」。实际做下来的分布：
+根目录单点化 ~1 h、窗口 ~1 h（含 pywebview 安装与两种后端的真机验证）、
+打包脚本 ~1 h（含两次真打）、更新核心 ~1.5 h、面板与命令行 ~1 h、
+测试 ~1.5 h（三个脚本 + 全量回归）、文档 ~0.5 h —— 落在推荐档的下沿，
+省下来的时间主要是 spike 阶段已经把「体积/启动/依赖闭包」摸清了。

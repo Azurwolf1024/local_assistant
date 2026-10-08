@@ -20,7 +20,9 @@ from pathlib import Path
 
 from ..control import ControlChannel
 from .. import service_ctl
+from ..paths import describe as describe_paths
 from ..settings import Settings
+from . import window as window_mod
 from .bus import EventBus
 from .follow import Watcher
 from .registry import Panel, Registry
@@ -211,6 +213,10 @@ def create_app(settings: Settings, logger: logging.Logger | None = None):
             "panels_stamp_now": panel_stamp(),
             "started_at": ctx.started_at,
             "python": f"{__import__('sys').version.split()[0]}",
+            # ★「我是被谁起的」★：exe 还是源码、项目根在哪、能选哪个窗口后端 ——
+            # 这几条不写在界面上，出问题时（找不到配置、服务起不来）就得靠猜。
+            "paths": describe_paths(settings.root),
+            "window": window_mod.describe(),
         }
 
     @app.get("/api/panels")
@@ -346,9 +352,15 @@ def serve(
     host: str = "127.0.0.1",
     port: int = 8765,
     open_browser: bool = True,
+    window: str = "",
     logger: logging.Logger | None = None,
 ) -> int:
-    """起控制台（阻塞）。返回进程退出码。"""
+    """起控制台（阻塞）。返回进程退出码。
+
+    ``window`` 决定「用什么壳把它显示出来」：空/``browser`` = 老样子（浏览器开标签页），
+    ``auto`` = 有 pywebview 就用它、否则 Edge 应用窗口、再否则浏览器，
+    也可以写死 ``pywebview`` / ``edge``（见 :mod:`voice_loop.console.window`）。
+    """
     try:
         import uvicorn
     except ImportError as exc:  # pragma: no cover
@@ -377,6 +389,26 @@ def serve(
               f"| Select-Object OwningProcess")
         return 2
 
+    want_window = (window or "").strip().lower()
+    if want_window:
+        picked = window_mod.choose(want_window)
+        if picked == "browser":
+            if want_window not in ("auto", "browser", "off", "none"):
+                print(f"★要的窗口后端（{want_window}）用不了★，退回浏览器：")
+                for item in window_mod.backends():
+                    print(f"    {item['id']:9s} {'可用' if item['ok'] else '不可用'} · {item['detail']}")
+            return _serve_with_server(uvicorn, app, host, port, url, log,
+                                      open_browser=True, settings=settings)
+        print(f"  窗口后端：{picked}（关掉窗口 = 退出控制台，语音服务不受影响）\n", flush=True)
+        return _serve_in_window(uvicorn, app, host, port, url, log, picked, settings)
+
+    return _serve_with_server(uvicorn, app, host, port, url, log,
+                              open_browser=open_browser, settings=settings)
+
+
+def _serve_with_server(uvicorn, app, host, port, url, log, *, open_browser: bool,
+                       settings: Settings) -> int:
+    """老路径：uvicorn 占主线程，另起一个线程去开浏览器（可选）。"""
     if open_browser:
         def _open() -> None:
             time.sleep(1.0)                       # 等 uvicorn 起来再开，免得看到「无法连接」
@@ -390,18 +422,74 @@ def serve(
         threading.Thread(target=_open, name="console-open", daemon=True).start()
 
     print("（网页开着的时候，在终端里按 Ctrl+C 也能退出）\n", flush=True)
+    return _run_server(uvicorn, app, host, port, log)
 
-    # ★为什么要自己接一层 Server★：uvicorn 的关闭顺序是
-    #   ① 停止收新连接 → ② **等活跃连接自己结束** → ③ 跑 lifespan shutdown。
-    # 而 SSE 是「永不结束的响应」，② 会一直等下去；等轮不到 ③ 里的 `bus.close()`
-    # 叫醒订阅者，结果就是用户看到的「终端 Ctrl+C 退不出、只能关网页」。
-    # 所以在 ① 之前就先叫醒订阅者，让 SSE 干净收尾（timeout_graceful_shutdown 只当兵底）。
+
+def _serve_in_window(uvicorn, app, host, port, url, log, backend: str,
+                     settings: Settings) -> int:
+    """窗口路径：★uvicorn 在后台线程、窗口占主线程★（pywebview 要求主线程）。"""
+    server = _make_server(uvicorn, app, host, port)
+    thread = threading.Thread(target=server.run, name="console-uvicorn", daemon=True)
+    thread.start()
+
+    deadline = time.time() + 20.0
+    while not server.started and time.time() < deadline:
+        if not thread.is_alive():
+            print("★控制台没能起来★（uvicorn 线程已经退出，看上面一行报错）")
+            return 1
+        time.sleep(0.05)
+    if not server.started:
+        print("★控制台 20 秒内没起来★ —— 先别开窗口，看终端里的报错")
+        return 1
+
+    profile = settings.sessions_dir / "window"
+    ok, note = window_mod.open_window(url, title="本地语音助手 · 控制台", backend=backend,
+                                     profile_dir=profile)
+    if not ok:
+        # 窗口起不来不能变成「控制台起不来」：退回去开浏览器，服务继续跑
+        print(f"★{note}★ 改用浏览器显示。", flush=True)
+        try:
+            import webbrowser  # noqa: PLC0415
+
+            webbrowser.open(url)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(f"浏览器也打不开（{exc}），请手动访问 {url}")
+        print("（这个终端按 Ctrl+C 退出）")
+        try:
+            while thread.is_alive():
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            pass
+
+    # 窗口关掉 → 让 uvicorn 收尾（bus.close 会叫醒挂着的 SSE，见 ConsoleServer）
+    server.should_exit = True
+    thread.join(timeout=8.0)
+    print(f"\n控制台已退出（{note}）。语音服务不受影响，要停服务用 python main.py stop")
+    return 0
+
+
+def _make_server(uvicorn, app, host: str, port: int):    # noqa: ANN001, ANN201
+    """建 uvicorn 服务器。
+
+    ★子类在这里现定义，不在模块顶层★：``create_app`` 不该因为「没装 uvicorn」
+    就 import 不进来（自测里只用 create_app 起 App，不需要真监听端口）。
+
+    ★为什么要接这一层★：uvicorn 的关闭顺序是
+
+        ① 停止收新连接 → ② **等活跃连接自己结束** → ③ 跑 lifespan shutdown。
+
+    而 SSE 是「永不结束的响应」，② 会一直等下去；等轮不到 ③ 里的 ``bus.close()``
+    叫醒订阅者，结果就是用户看到的「终端 Ctrl+C 退不出、只能关网页」。
+    所以在 ① 之前就先叫醒订阅者，让 SSE 干净收尾（``timeout_graceful_shutdown`` 只当兵底）。
+    """
+
     class ConsoleServer(uvicorn.Server):
-        async def shutdown(self, sockets=None):
+        async def shutdown(self, sockets=None):         # noqa: ANN001 - uvicorn 的签名
             try:
                 app.state.ctx.bus.close()
             except Exception as exc:  # noqa: BLE001 - 关不掉也得让它继续退
-                log.warning(f"关闭实时通道失败（继续退出）：{exc}")
+                logging.getLogger("voice_loop.console").warning(
+                    f"关闭实时通道失败（继续退出）：{exc}")
             await super().shutdown(sockets)
 
     config = uvicorn.Config(
@@ -412,8 +500,13 @@ def serve(
         access_log=False,
         timeout_graceful_shutdown=3.0,
     )
+    return ConsoleServer(config)
+
+
+def _run_server(uvicorn, app, host: str, port: int, log) -> int:    # noqa: ANN001
+    server = _make_server(uvicorn, app, host, port)
     try:
-        ConsoleServer(config).run()
+        server.run()
     except KeyboardInterrupt:      # 有些终端下 Ctrl+C 会直接抛到这里
         pass
     except SystemExit as exc:      # 竞态：刚查完端口就被别人抢了

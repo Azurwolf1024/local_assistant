@@ -111,14 +111,22 @@ def start_server(settings, port: int):
 # ---------------------------------------------------------------- 各节
 
 
-def section_meta(base: str, app) -> None:
+def section_meta(base: str, app, tmp: Path) -> None:
     print("\n[1] 元信息与静态文件")
     code, meta = request(base, "GET", "/api/meta")
     check("GET /api/meta 是 200", code, 200)
     ids = [p["id"] for p in meta.get("panels", [])]
-    check("六个面板都在（★voices 已并入角色★）", ids,
-          ["overview", "schedule", "memos", "logs", "persona", "chat"])
+    check("七个面板都在（★voices 已并入角色，update 是新的★）", ids,
+          ["overview", "schedule", "memos", "logs", "persona", "chat", "update"])
     check("没有面板装载失败", meta.get("panels_failed"), {})
+    # ★「我是被谁起的」★：exe 还是源码、项目根在哪、窗口后端挑哪个 ——
+    # 这几条不写出来的话，「exe 说找不到配置」这类问题只能靠猜。
+    check("元信息报告了路径来源", bool((meta.get("paths") or {}).get("app_root")), True,
+          detail=str((meta.get("paths") or {}).get("app_root")))
+    check("路径指向这个临时工作区", (meta.get("paths") or {}).get("app_root"), str(tmp))
+    check("报告了窗口后端", (meta.get("window") or {}).get("chosen") in
+          ("pywebview", "edge", "browser"), True,
+          detail=str((meta.get("window") or {}).get("chosen")))
     # ★半新半旧的守卫★：静态脚本现取、路由启动时装载 → 两个指纹不一样就说明该重启了
     check("面板代码指纹：启动时 = 现在（没人改代码）",
           bool(meta.get("panels_stamp")) and meta.get("panels_stamp") == meta.get("panels_stamp_now"),
@@ -127,7 +135,7 @@ def section_meta(base: str, app) -> None:
     for path in ("/", "/index.html", "/style.css", "/app.js", "/ui.js",
                  "/panels/overview.js", "/panels/schedule.js", "/panels/memos.js",
                  "/panels/logs.js", "/panels/persona.js",
-                 "/panels/chat.js"):
+                 "/panels/chat.js", "/panels/update.js"):
         code, _ = request(base, "GET", path)
         check(f"静态文件 {path}", code, 200)
     # ★合并后旧脚本必须真的没了★：留着它只会让人以为还分两个标签页
@@ -266,7 +274,7 @@ def section_misc(base: str, tmp: Path) -> None:
 
     code, health = request(base, "GET", "/api/health")
     check("健康检查 200", code, 200)
-    check("面板清单一致（六个）", len(health["panels"]), 6)
+    check("面板清单一致（七个）", len(health["panels"]), 7)
 
     code, chars = request(base, "GET", "/api/chat/characters")
     check("聊天角色列表 200", code, 200)
@@ -329,6 +337,54 @@ def section_memo_words() -> None:
     check("两边剥出来的一样", mismatched, [])
     check("「记一下买牛奶」→「买牛奶」", et.clean_memo_content(strip_trigger("记一下买牛奶")), "买牛奶")
     check("不带触发词的「买牛奶」原样", et.clean_memo_content(strip_trigger("买牛奶")), "买牛奶")
+
+
+def section_update(base: str, tmp: Path) -> None:
+    print("\n[8] 更新面板：接口形状（★把检查函数换成假的：这条测试不联网★）")
+    from voice_loop import update as upd
+
+    fake_release = upd.Release(
+        version="9.9.9", date="2026-10-08T12:00:00", notes="测试用",
+        zip_name="local_assistant-9.9.9-source.zip",
+        zip_url="https://example.invalid/local_assistant-9.9.9-source.zip",
+        zip_bytes=1234, zip_sha256="a" * 64,
+    )
+
+    def fake_check(root=None, **kwargs):       # noqa: ANN202
+        return upd.Check(ok=True, current="1.1.0", latest="9.9.9", behind=True, mode="zip",
+                         reason="有新版本 9.9.9（当前 1.1.0）", release=fake_release,
+                         checked_at=time.time())
+
+    real_check = upd.check
+    upd.check = fake_check
+    try:
+        code, got = request(base, "GET", "/api/update/check")
+        check("GET /api/update/check 200", code, 200)
+        check("报告有新版本", (got.get("check") or {}).get("behind"), True)
+        check("带上了安装方式（zip / git）", (got.get("check") or {}).get("mode"), "zip")
+        check("给了环境提示（exe 还是源码）", bool(got.get("hint")), True, detail=got.get("hint"))
+        check("带上了路径快照", bool((got.get("env") or {}).get("app_root")), True)
+
+        code, dry = request(base, "POST", "/api/update/start", {"dry_run": True})
+        check("试运行 200", code, 200)
+        check("试运行列出了步骤", len(dry.get("plan") or []) >= 4, True,
+              detail=str(len(dry.get("plan") or [])))
+        check("试运行没有真启动", dry.get("started"), False)
+
+        code, bad = request(base, "POST", "/api/update/start", {})
+        check("★不确认就更新 → 400★（防手滑覆盖程序文件）", code, 400)
+
+        code, st = request(base, "GET", "/api/update/status")
+        check("状态 200", code, 200)
+        check("running 是布尔", isinstance(st.get("running"), bool), True)
+        check("带上了总行数（前端靠它增量取）", "total_lines" in st, True)
+        check("一开始没在更新", st.get("running"), False)
+
+        code, res = request(base, "POST", "/api/update/restore", {})
+        check("还原接口能答（没有备份时给 404 而不是崩）", code in (200, 404), True,
+              detail=str(code))
+    finally:
+        upd.check = real_check
 
 def section_registry(tmp: Path) -> None:
     from voice_loop.console.app import create_app
@@ -394,12 +450,13 @@ def main() -> int:
         base = f"http://127.0.0.1:{port}"
         try:
             check("uvicorn 起来了", server.started)
-            section_meta(base, app)
+            section_meta(base, app, tmp)
             section_events(base)
             section_week(base)
             section_memos(base)
             section_misc(base, tmp)
             section_sse(base, tmp)
+            section_update(base, tmp)
         finally:
             server.should_exit = True
             thread.join(timeout=10)

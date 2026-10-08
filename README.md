@@ -381,9 +381,11 @@ python main.py selftest                   # 真加载一遍模型，端到端 10
 python main.py upgrade            # 只检查：和远端差几个提交、能不能升（不动工作区）
 python main.py upgrade --apply    # 真升级：备份 → git pull --ff-only → 依赖 → 模型 → 自检
 python main.py upgrade --restore  # 看能还原什么（默认只列，加 --apply 才真写）
+python main.py update             # 压缩包/exe 安装的升级（下载新版并安全合并，见下）
+python main.py update --apply     # 真更新（先备份，再覆盖程序文件）
 ```
 
-规矩写在代码里，也写在工程日志第 55 节：
+规矩写在代码里，也写在工程日志第 55 节与第 56 节：
 
 | 事 | 怎么做 |
 | --- | --- |
@@ -391,7 +393,8 @@ python main.py upgrade --restore  # 看能还原什么（默认只列，加 --ap
 | **工作区脏就停** | 有未提交改动时 `git pull` 的结果不可预测，直接拦下并告诉你怎么保命（`git stash push -u`）；硬来要显式 `--allow-dirty` |
 | **失败给回去的路** | 任何一步失败都打印 `git reset --hard <升级前的 sha>` 与备份目录 |
 | **只换程序，不碰数据** | 升级改的是源码与配置模板；`data/` 里的日程、备忘、人格、记忆、素材都不在升级范围内 |
-| 压缩包安装的怎么升 | 下载新版 zip，解压覆盖程序文件即可 —— ★`config.toml` 与 `data/` 是你的，覆盖时别删★ |
+| 压缩包安装的怎么升 | 走 `python main.py update`（或控制台「更新」标签页）：读 GitHub Release 里的 `latest.json` → 备份 → 下载 zip → **校验 sha256** → 只覆盖程序文件（`data/`、`models/`、`sessions/`、`.venv/`、`config.toml` 一律跳过） |
+| **界面上也能升** | 控制台「更新」标签页：看当前/远端版本 → 试运行（只列步骤）→ 现在更新（进度实时刷出来）；出问题可以一键还原备份 |
 
 ```powershell
 python --version  # 顺带一提：项目要求 Python ≥ 3.11（settings.py 用标准库 tomllib）
@@ -401,6 +404,32 @@ python --version  # 顺带一提：项目要求 Python ≥ 3.11（settings.py �
 > 要发版：改它 → `python scripts/make_release.py`（产出源码 zip + sha256 + `latest.json`）→
 > 按它打印的 `git tag` / `gh release create` 两条命令发布。
 > 发布包里只有 **git 跟踪的文件**（`data/`、`models/`、`sessions/`、`.venv*` 天然不进包）。
+> 想连控制台 exe 一起发：`python scripts/make_console_exe.py`（见第 4 节末尾）。
+
+### 3.5 控制台 exe（不想开命令行的话）
+
+把控制台冻成**双击就能用**的 exe（原生窗口，不再是浏览器标签页）：
+
+```powershell
+python scripts/make_console_exe.py                  # 产出 dist/local-assistant-console/（约 50 MB，启动 1~2 秒）
+python scripts/make_console_exe.py --with-webview    # 连 pywebview 一起打（真原生窗口，约 54 MB）
+python scripts/make_console_exe.py --onefile         # 单个 exe（好分发，但每次启动要解包：约 6 秒）
+python scripts/make_console_exe.py --check           # 只打印计划与要补的 hidden-import
+```
+
+把产物（`dist/local-assistant-console/` 整个文件夹，或单个 exe）放进项目根，双击即可：
+
+- exe 会**自己往上找** `config.toml` + `main.py` 定位项目（也可以 `--root` 或环境变量 `LOCAL_AI_ROOT` 指定）
+- 窗口按「pywebview → Edge 应用窗口 → 系统浏览器」挑第一个能用的（`--window` 可写死）
+- ★关窗口 = 退出控制台★；语音服务不受影响（它有自己的一套启停，见顶栏）
+- 同一个端口已经有控制台在跑时，双击**不再报错**，直接把那个窗口打开
+- 出问题时看 `sessions/console-exe.log`；`local-assistant-console.exe --selftest` 会把
+  「面板装上了吗、接口答不答」写进同一份日志
+
+> **为什么不把语音服务也打进 exe**：服务要几 GB 模型 + 外部 Ollama + 真实音频设备，
+> 冻进去会是 2~4 GB 的怪物，还得给用户装驱动。所以 exe 是**控制台/界面**，服务仍旧用
+> 系统 Python 跑（exe 点「启动服务」时会自己找 `.venv` 或 `LOCAL_AI_PYTHON`，找不到会明说）。
+
 
 ---
 
@@ -490,7 +519,7 @@ python main.py ui --host 0.0.0.0   # ★让同一局域网的手机也能看★�
 > 按第 3 节装完就有了；万一没装，`python main.py ui` 会把该跑的那行 `pip install` 直接打给你，
 > 而且**不装只影响控制台** —— 语音链路（`listen` / `chat` / `text`）完全不依赖它们。
 
-它有六个标签页：
+它有七个标签页：
 
 | 标签 | 能干什么 |
 | --- | --- |
@@ -500,6 +529,7 @@ python main.py ui --host 0.0.0.0   # ★让同一局域网的手机也能看★�
 | **日志** | 实时跟随 `sessions/listen.log`（打开页面就有最近几百行），报错标红、警告标黄，可暂停跟随/只看报错 |
 | **角色** | ★一个标签页管两件事★。上半：角色卡片**并排**排开（默认那个标了「·默认」），每张写着她的人设要点、唤醒词、参考音与专属模型目录（文件在不在如实标出），卡上有**切过去**、**切过去并试听**、★**只用一条语音就能克隆**★（见第 14 节）。★**想改哪个就点她那张卡片**★（整张都能点，回车也行）—— 下面那张资料卡表单会带出她现在的资料、锁住 id，只让你改该改的。底下：**资料卡表单**（填表新建；也能导入 `.json` / `.txt`、导出她的人格文件）。改资料卡不需要服务在跑，切声线/试听要在跑 |
 | **文字对话** | 在网页里打字，走**完整链路**（技能/工具 → LLM → 说出来）：发一句话，她回答并念出来；**可以选角色**（用谁的设定与声线答，选项里会标出「现在是她」）；也能「只念不答」当试听用 |
+| **更新** | 当前版本 / 远端版本 / 装法（git 还是压缩包）/ 检查更新；**试运行**（只列会做什么）与**现在更新**（进度实时刷出来，动手前自动备份）；升级完可以一键还原备份（见第 3.4 节） |
 
 **它是独立进程**，这点很重要：
 
@@ -528,6 +558,17 @@ python main.py ui --host 0.0.0.0   # ★让同一局域网的手机也能看★�
 
 **安全**：默认只监听 `127.0.0.1`（只有本机能访问），**没有登录也没有密码**——
 它就是个本机工具。填 `--host 0.0.0.0` 会让同一局域网里任何人**都能改你的日程**，自己权衡。
+
+**想要「像软件」而不是「一个浏览器标签页」**（第 3.5 节做的那个 exe 默认就是这么起的）：
+
+```powershell
+python main.py ui --window auto   # 自己挑：pywebview → Edge 应用窗口 → 系统浏览器
+python main.py ui --window edge   # 强制用 Edge 的 --app 模式（无地址栏无标签栏）
+python main.py ui                 # 老行为：浏览器开一个标签页
+```
+
+窗口模式下 **关掉窗口 = 退出控制台**（和 Ctrl+C 等价，语音服务不受影响）。
+三个后端的区别、为什么不是只做 pywebview，写在 `voice_loop/console/window.py` 的模块说明里。
 
 > 想知道「加一个新标签页要动哪些文件」「为什么用文件信箱而不是 socket」「启停/退出那两个
 > bug 是怎么修的」，看 [`docs/ENGINEERING_LOG.md`](docs/ENGINEERING_LOG.md)

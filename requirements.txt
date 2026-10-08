@@ -38,3 +38,10 @@ opencv-python>=4.10       # 摄像头取帧（不装就只有截屏，摄像头�
 # 控制台是独立进程：不用麦克风、也不加载模型，靠读写同一批 json + 服务信箱工作。
 fastapi>=0.115
 uvicorn>=0.30
+# 可选：控制台用**应用窗口**打开（而不是浏览器标签页）。
+# 不装的话 `main.py ui --window auto` 会自动退到 Edge 的 --app 模式（效果接近，
+# 见 voice_loop/console/window.py 的三个后端）；装了就是真窗口（WebView2 内核）。
+# ★它只在 Windows 上有意义★（Windows 上会拉 pythonnet，需要 .NET）。
+# 控制台 exe 默认不带它（体积 + 复杂度），要带就打：
+#   python scripts/make_console_exe.py --with-webview
+# pywebview>=5.0
