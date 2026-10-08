@@ -35,9 +35,23 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from voice_loop.audio import list_devices, load_wav, save_wav, segment_audio  # noqa: E402
-from voice_loop import service_ctl  # noqa: E402
+from voice_loop import __version__, service_ctl  # noqa: E402
+from voice_loop import setup_flow  # noqa: E402  （只用标准库，见它的模块说明）
 from voice_loop.settings import Settings, load_settings  # noqa: E402
+
+# ★依赖没装齐时也要能跑 setup / doctor / upgrade★：那几条命令只用标准库，
+# 而这条 `voice_loop.audio` 会拉进 sounddevice/numpy —— venv 还没建好时它必挂，
+# 而那正是用户第一次跑 setup 的时刻。所以把重导入包起来：真需要它的命令在 main() 里拦下。
+try:
+    from voice_loop.audio import list_devices, load_wav, save_wav, segment_audio  # noqa: E402
+
+    IMPORT_ERROR = ""
+except Exception as _exc:  # noqa: BLE001 - 缺依赖是「预期内」的状态，不是意外
+    list_devices = load_wav = save_wav = segment_audio = None  # type: ignore[assignment]
+    IMPORT_ERROR = f"{type(_exc).__name__}: {_exc}"
+
+BOOTSTRAP_COMMANDS = ("setup", "doctor", "upgrade")
+"""这几条只要标准库 —— 它们正是用来「把依赖装齐」的。"""
 
 LOG_LEVELS = {"debug": logging.DEBUG, "info": logging.INFO, "warning": logging.WARNING}
 
@@ -1285,6 +1299,82 @@ def cmd_memory(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def _model_groups() -> tuple[str, ...]:
+    """模型组名从 `download_models.py` 里读（★两边不会跑偏★）。"""
+    return setup_flow.model_groups_known()
+
+
+def cmd_setup(settings: Settings, args: argparse.Namespace) -> int:
+    """`python main.py setup`：把机器准备好（★幂等★，随时可以再跑一遍）。"""
+    print("=" * 66)
+    print(f" 本地语音助手 · 安装 / 体检　v{__version__}")
+    print("=" * 66)
+    rep = setup_flow.run_setup(
+        model_groups=args.models or None,
+        skip_deps=args.skip_deps, skip_models=args.skip_models, strict=args.strict,
+        echo=lambda line: print(line, flush=True),
+    )
+    print(rep.render())
+    print("=" * 66)
+    print(" 结论：" + ("可以用了。" if rep.ok else f"还有 {len(rep.failed)} 项要处理。"))
+    return 0 if rep.ok else 1
+
+
+def cmd_doctor(settings: Settings, args: argparse.Namespace) -> int:
+    """`python main.py doctor`：只读体检（不下载、不写文件、不起进程）。"""
+    rep = setup_flow.Report()
+    rep.steps.append(setup_flow.python_state())
+    rep.steps.append(setup_flow.path_state(setup_flow.ROOT))
+    rep.steps.extend(setup_flow.doctor_report(strict=args.strict).steps)
+    print("=" * 66)
+    print(" 体检（只读，不改任何东西）")
+    print("=" * 66)
+    print(rep.render())
+    print("=" * 66)
+    print(" 结论：" + ("没发现问题。" if rep.ok else
+                    f"{len(rep.failed)} 项要处理（细节：python scripts/check_deploy.py）"))
+    return 0 if rep.ok else 1
+
+
+def cmd_upgrade(settings: Settings, args: argparse.Namespace) -> int:
+    """`python main.py upgrade`：默认只检查；`--apply` 才真升；`--restore` 还原数据备份。"""
+    if args.restore is not None:
+        return _upgrade_restore(args)
+    print("=" * 66)
+    print(f" 升级　当前 v{__version__}" + ("" if args.apply else "　（试运行：只检查）"))
+    print("=" * 66)
+    rep = setup_flow.run_upgrade(
+        apply=args.apply, remote=args.remote, branch=args.branch,
+        skip_deps=args.skip_deps, allow_dirty=args.allow_dirty,
+        model_groups=args.models or None,
+        echo=lambda line: print(line, flush=True),
+    )
+    print(rep.render())
+    print("=" * 66)
+    return 0 if rep.ok else 1
+
+
+def _upgrade_restore(args: argparse.Namespace) -> int:
+    """`upgrade --restore [目录]`：默认只列「会覆盖什么」，加 `--apply` 才真写。"""
+    target = args.restore or None
+    try:
+        changed = setup_flow.restore_user_data(setup_flow.ROOT, target, dry_run=not args.apply)
+    except ValueError as exc:
+        print(f"✗ {exc}")
+        return 1
+    where = setup_flow.latest_backup(setup_flow.ROOT) if not target else target
+    if not changed:
+        print(f"  {where} 里的东西和现在一样，没什么要还原的。")
+        return 0
+    print(f"  {'已还原' if args.apply else '会覆盖'} {len(changed)} 个文件"
+          + ("" if args.apply else "（加 --apply 才真的写）") + f"：来自 {where}")
+    for rel in changed[:20]:
+        print("   · " + rel)
+    if len(changed) > 20:
+        print(f"   …… 还有 {len(changed) - 20} 个")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="main.py",
@@ -1293,11 +1383,42 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=__doc__,
     )
     ap.add_argument("-c", "--config", default=None, help="配置文件路径（默认 config.toml）")
+    ap.add_argument("--version", action="version",
+                    version=f"local_assistant {__version__}"
+                            f"（Python {sys.version.split()[0]} · {sys.platform}）",
+                    help="打印版本号")
     ap.add_argument("--log-level", choices=["debug", "info", "warning"], default=None)
     ap.add_argument("--log-file", default=None, help="把日志与输出同时写进文件（后台运行需要）")
     ap.add_argument("--character", default=None,
                     help="临时指定角色（id 或名字，见 python main.py persona）")
     sub = ap.add_subparsers(dest="command")
+
+    # ★三条和「部署」有关的命令放在最前面★：新用户第一眼就该看到它们。
+    # 它们 `needs_config=False`：机器还没装好时 config.toml 可能都还没有。
+    p = sub.add_parser("setup", help="一条命令把机器准备好（环境/依赖/配置/模型/自检）")
+    p.add_argument("--models", nargs="*", choices=list(_model_groups()),
+                   help="只下这几组模型（默认：sensevoice vad piper）")
+    p.add_argument("--skip-deps", action="store_true", help="不动依赖（已经装好了）")
+    p.add_argument("--skip-models", action="store_true", help="不下模型（只想体检一遍）")
+    p.add_argument("--strict", action="store_true", help="把「警告」也算失败（做镜像/CI 时用）")
+    p.set_defaults(func=cmd_setup, needs_config=False)
+
+    p = sub.add_parser("doctor", help="只读体检：环境/依赖/配置/模型/服务/平台/磁盘")
+    p.add_argument("--strict", action="store_true", help="把「警告」也算失败")
+    p.set_defaults(func=cmd_doctor, needs_config=False)
+
+    p = sub.add_parser("upgrade", help="升级到远端最新版（★动手前先备份你的数据★）")
+    p.add_argument("--apply", action="store_true",
+                   help="真升级（不带它就是试运行：只检查、只报告）")
+    p.add_argument("--remote", default="origin", help="远端名（默认 origin）")
+    p.add_argument("--branch", default="", help="分支（默认当前分支）")
+    p.add_argument("--skip-deps", action="store_true", help="不跑 pip install")
+    p.add_argument("--allow-dirty", action="store_true", help="工作区有未提交改动也硬升")
+    p.add_argument("--models", nargs="*", choices=list(_model_groups()),
+                   help="顺带补下这几组模型（默认不下）")
+    p.add_argument("--restore", nargs="?", const="", default=None, metavar="目录",
+                   help="还原数据备份（默认最近一次）；不带 --apply 时只列会覆盖什么")
+    p.set_defaults(func=cmd_upgrade, needs_config=False)
 
     p = sub.add_parser("chat", help="语音对话")
     p.add_argument("--mode", choices=["vad", "ptt"], default=None)
@@ -1426,10 +1547,44 @@ def main(argv: list[str] | None = None) -> int:
         ap.print_help()
         return 0
 
-    settings = load_settings(args.config)
-    settings = apply_overrides(settings, args)
+    # 依赖没装齐 + 这条命令需要它们 → 直接指路去 setup，而不是甩一个 ImportError 栈
+    if IMPORT_ERROR and args.command not in BOOTSTRAP_COMMANDS:
+        print("✗ 依赖还没装齐，这条命令跑不了：")
+        print(f"    {IMPORT_ERROR}")
+        print("  先跑：python main.py setup     （检查并安装依赖、下载模型，可反复跑）")
+        print("  或者：powershell -File install.ps1 -Dir .")
+        return 2
+
+    if getattr(args, "needs_config", True):
+        settings = load_settings(args.config)
+        settings = apply_overrides(settings, args)
+    else:
+        # setup/doctor/upgrade 要能在「还没装好」时跑，所以缺 config.toml 不算错
+        settings = settings_or_default(args.config)
     setup_logging(args.log_level or settings.app.log_level, args.log_file)
-    return args.func(settings, args)
+    try:
+        return args.func(settings, args)
+    except RuntimeError as exc:
+        # ★能自救的错就好好说★：这个代码库里有一条约定 ——
+        # 可选依赖没装时抛的 RuntimeError 会自带一行 `pip install xxx`
+        # （见 audio.require_sounddevice / vision 里的同类）。
+        # 那就别甩 traceback，给一行提示 + 一条根治的路。
+        text = str(exc)
+        if "pip install" in text:
+            print(f"× {text}")   # 不用 ✗：GBK 控制台里它会变成问号
+            print("  或者一把装齐：python main.py setup --skip-models")
+            return 2
+        raise
+
+
+def settings_or_default(config: str | None = None) -> Settings:
+    """拿配置；★缺 config.toml 时不报错★（setup/doctor 正是要在那种状态下能跑）。"""
+    try:
+        return load_settings(config)
+    except FileNotFoundError:
+        blank = Settings()
+        blank.path = Path(config) if config else (Path(__file__).resolve().parent / "config.toml")
+        return blank
 
 
 if __name__ == "__main__":

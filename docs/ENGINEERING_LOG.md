@@ -54,7 +54,7 @@
 
 > 加一节就顺手在这里加一行 —— 之前这份目录停在 17 节，后半本等于没索引（第 42 节记了这件事）。
 
-**从记忆到多模态与体验（43~54）**
+**从记忆到多模态与体验（43~55）**
 
   - 43. B 的结局 + ★更正 §37 的归因★
   - 44. 路线 C 的 B 组验收：★问题不在训多久，在数据配比★
@@ -69,6 +69,8 @@
   - **53. 唤醒词不再靠手攒别名**：拼音近音层（业界怎么做也一起查了）
   - **54. 控制台「角色」一栏**：资料卡与声线合并，★能改已有角色（不是整份覆盖）★
     + 54.5 上线当天那个「角色列表空白」：★半新半旧的进程★（改成看得见的报错 + 指纹提醒）
+    + 54.6 ★点卡片就能改★ + 卡片并列（含静态文件不再被浏览器缓存坑）
+  - **55. 可交付化**：从「只有源码」到「能一键装（install.ps1）、能安全升（备份+回滚）」
 
 
 ---
@@ -4096,3 +4098,88 @@ grep 整个 `voice_loop/memory/`：`image / shot / vision / jpg / base64` **零�
    现在静态文件统一带 **`Cache-Control: no-cache`**（★不是不缓存★：浏览器每次仍会带
    `If-None-Match` 来问一句，没变就是 304，几毫秒）。自测里钉了 `style.css` 必须带这个头、
    而 `/api/*` 不许掺进来。
+
+---
+## 55. 可交付化：从「只有源码」到「能一键装、能安全升」（2026-10-08）
+
+用户贴了一篇「GitHub 上的源码项目 vs 一键安装的软件，本质区别是什么、怎么让自己更像软件」
+的长文，然后说：**对我们的项目做可用性优化**。这一节就是这件事，以及为这个项目做的取舍。
+
+### 55.1 先量家底：我们有什么、缺什么
+
+| 维度 | 动手之前 | 缺口 |
+| --- | --- | --- |
+| 版本 | `voice_loop/__init__.py` 里一个 `1.0.0`，**没有 tag** | 没人知道手上是哪一版；发布包无从命名 |
+| 安装 | README 里六条手工命令（pip → 下模型 → ollama pull → selftest） | 新人第一步就要读完整节，错一条就卡住 |
+| 依赖 | `requirements.txt`（必需/可选混在一份里） | 缺了哪个包只能等运行时报错 |
+| 模型 | `scripts/download_models.py` 能按组下 | 与「装依赖」「体检」之间没有串联 |
+| 配置 | `config.toml` 在 git 里，`load_settings` 缺文件直接抛 | 没装好的机器上什么都跑不起来 |
+| 升级 | **没有**，只能手工 `git pull` + 猜要不要重装依赖 | 「升级会不会把我日程弄没」没答案 |
+| 制品 | **没有**，只有仓库 | 用户没有「下载一个包」的入口，也没有校验和 |
+| 自检 | `scripts/check_deploy.py`（很好用） | 藏在一个脚本路径里，新人找不到 |
+
+一句话：**开发架构齐全，交付面为零**。这正是那篇长文说的「源码分发 vs 制品分发」。
+
+### 55.2 做了什么
+
+1. **版本号只有一个地方写**：根目录 `VERSION` → `voice_loop.__version__` → `main.py --version` →
+   发布包名 → `latest.json`。四处引用一处定义（写四遍迟早对不上）。
+2. **三条命令**（`python main.py setup | doctor | upgrade`），逻辑全在
+   `voice_loop/setup_flow.py`：★只依赖标准库★，因为它的第一个用途就是「依赖还没装齐」。
+   为此 `main.py` 把 `voice_loop.audio` 那串重导入包进 try，并允许
+   `setup/doctor/upgrade` **缺 config.toml 也能跑**（`settings_or_default`）。
+3. **升级的三条安全边界**（写进代码，也写进 README 3.4）：
+   ① 动手前**先备份**（`data/*.json`、`personas`、`knowledge`、`memory`、`config.toml` →
+   `data/backup/upgrade-<时间>-<sha>/`，附 `MANIFEST.txt`（逐文件 sha256）与 `RESTORE.txt`
+   （不依赖本工具的还原命令））；② 工作区脏就**停**（`git pull` 结果不可预测，叫你先 stash）；
+   ③ 任何一步失败都打印 `git reset --hard <升级前 sha>` 与备份路径。
+   `upgrade` 默认**只检查**，`--apply` 才动；`--restore` 默认也**只列**。
+4. **`install.ps1`（Windows 一键）**：只做三件事 —— 拿到代码 / 建 `.venv` + `pip install` /
+   回调 `main.py setup`。★壳里故意只有这么点逻辑★：`.ps1`/`.cmd` 是这个仓库的坑王
+   （中文、引号、编码，五次以上），所以判断全在能被离线自测钉住的 Python 里。
+   它**必须带 UTF-8 BOM**（PowerShell 5.1 否则按 GBK 解析中文），文件头写了警告，
+   另给 `-DryRun` 让人先看它要干什么。
+5. **`scripts/make_release.py`：制品 = zip + sha256 + `latest.json`**。
+   文件清单来自 `git ls-files --cached --others --exclude-standard` —— 于是
+   `data/`（用户数据）、`models/`、`sessions/`、`.venv*` 天然不进包，**与 `.gitignore`
+   永远是同一套规则**，不会两处打架；打包前还会拦「缺关键文件」。
+6. **离线自测 `scripts/test_setup_flow.py`（7 节）**：钉的不是「功能好用」，是**边界**——
+   非 git 目录里升级要好好说话、拉不到远端时**一个字节都不许写**（连备份目录都不建）、
+   备份不许漏也不许把 `models/` 卷进来、还原默认必须 dry-run、发布包里不许混进
+   `models/sessions/.venv`、以及最后那道闸门「真实仓库没被动过」。
+
+### 55.3 实测抓到的四个真东西
+
+1. ★**子进程编码**★：接上 `doctor` 后，体检里那条中文警告在我这儿变成了 `????`。
+   原因见工程日志反复写过的那条 —— **Windows 上子进程的 stdout 接进管道时按 GBK 编码**，
+   父进程按 UTF-8 解码，中文静悄悄坏掉（不报错）。我自己的记忆里就写着这条，还是又踩了一遍。
+   修法：`child_env()` 统一给子进程 `PYTHONIOENCODING=utf-8` + `PYTHONUTF8=1`。
+2. ★`git tag --list <不存在的 tag>` 退出码是 0★：第一版发布脚本拿退出码判断「tag 打没打过」，
+   于是它对新 tag 说「**这个 tag 已经存在**」——反了。改成看输出，并写进自测。
+3. `Set-Content -Encoding utf8` 给 `sessions\run_tests.cmd` 加了个 BOM：`.cmd` 第一行会因此解析
+   失败（这条也在记忆里）。已去掉 —— 动 `.cmd` 之后**必须**检查一遍头三个字节。
+4. `load_settings` 缺 `config.toml` 直接抛：而「还没装好」正是 `setup` 要处理的状态，
+   所以给 bootstrap 命令单独开了一条「读不到就用默认值」的路。
+
+### 55.4 没做的，以及为什么不（诚实清单）
+
+- **Docker / Compose / Helm**：这个项目要**麦克风 + 声卡**、要 3~4 GB 本地模型、要 Ollama、
+  要 Windows 的关屏/字幕点穿；容器化收益小、坑多（`/dev/snd` 透传、镜像体积、
+  模型挂载）。**只有控制台是天然可容器化的**（纯网页 + 读写 json）—— 想做的话那是最值得的一步。
+- **内置自动更新**：自托管工具不该偷偷换自己的代码。现在是「默认只检查、`--apply` 才升、
+  升级前先备份」，把决定权留给人。真要做也应该是「通知 + 一键」，不是静默。
+- **签名 / SBOM**：现在有 sha256 与 `latest.json`，够本机自用与「下载后核对一下」。
+  要对外分发再上 `cosign`/Sigstore——那需要发布渠道稳定下来才值得。
+- **单文件 exe（PyInstaller/Tauri 壳）**：能省掉「装 Python」这一步，但模型路径、原生库
+  （PortAudio/onnxruntime）、以及「代码随时改」的开发习惯都要重新设计，是另一个量级的事。
+
+### 55.5 现在的交付面（对照「L0~L5」那套分层）
+
+| 层次 | 这个项目 |
+| --- | --- |
+| L0 源码 | `git clone` + 六条命令（仍在，README 3.2） |
+| L1 脚本 | ★`install.ps1`（幂等、`-DryRun`、BOM、只碰 venv/pip）★ |
+| L2 制品 | ★`make_release.py` → 源码 zip + sha256 + `latest.json`★（下载即用，含 `config.toml`） |
+| L3 自检 | ★`main.py setup / doctor`★ + `check_deploy.py`（同一份判断） |
+| L4 生命周期 | ★`main.py upgrade`（备份→拉取→依赖→模型→自检→回滚指令）、`--restore`★ |
+| L5 自动更新通道 | 有意**不做**（见 55.4）；`latest.json` 已经是将来做它的地基 |

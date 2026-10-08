@@ -16,7 +16,8 @@
 
 | 想干什么 | 去哪看 |
 | --- | --- |
-| 装起来、跑起来 | 下面第 3 节「安装」、第 4 节「使用」 |
+| 装起来、跑起来 | 第 3 节「安装」（**3.1 一键** / 3.2 手动 / 3.3 自检） |
+| **以后怎么升级、数据会不会丢** | 第 3.4 节「升级与备份」 |
 | **在网页上改日程/闹钟、看日志、试听声线、打字聊天** | 第 4 节里的「可视化控制台」 |
 | 改配置 / 改唤醒词 / 加事件 | 第 5 节「两个可配置的 json」 |
 | 加一个角色 / 换音色 / 训专属声线 | 第 14 节「角色设定」 |
@@ -156,21 +157,26 @@ flowchart LR
 
 ```
 <项目目录>\
-├─ main.py                     # 入口：listen / stop / chat / text / ask / see / skills / asr / tts
-│                              #       / ui（可视化控制台）/ devices / gpu / persona / mcp / memory
-│                              #       / selftest
-├─ config.toml                 # 全部可调参数
-├─ requirements.txt            # 依赖（Python 3.13）
-├─ data/                       # ← 可以直接用编辑器改
+├─ main.py                     # 入口：setup / doctor / upgrade / listen / stop / chat / text / ask
+│                              #       / see / skills / asr / tts / ui（可视化控制台）
+│                              #       / devices / gpu / persona / mcp / memory / selftest
+├─ VERSION                     # ★版本号只写在这一个地方★（--version / 发布包 / 更新清单都用它）
+├─ install.ps1                 # ★Windows 一键安装★（建 venv + pip install + 回调 main.py setup）
+├─ config.toml                 # 全部可调参数（★也是你的数据★：升级时不会被覆盖）
+├─ requirements.txt            # 依赖（Python ≥ 3.11，参考环境 3.13）
+├─ dist/                       # 发布产物（scripts/make_release.py 生成，不进 git）
+├─ data/                       # ← 可以直接用编辑器改；★升级不动这里★
 │  ├─ characters.json          #   ★角色索引★：挂上谁（= 谁可被唤醒）+ 默认角色
 │  ├─ personas/                #   ★独立人格文件★：一个角色一个 json（没挂上的不会被唤醒）
 │  ├─ knowledge/               #   ★知识库（L4）★：顶层=所有角色 / <角色id>/=专属 /
-│  │                           #     _worlds/<世界观>/*=挂了它的角色共享；详见第 15 节
+│  │                           #     _worlds/<世界观>/*=挂了它的共享；详见第 15 节
 │  ├─ memory/                  #   ★记忆（L1~L3）★：一个角色一个目录（不进 git，是隐私）
+│  ├─ backup/                  #   ★升级前自动备份到这里★（带 MANIFEST.txt 与 RESTORE.txt）
 │  ├─ wakewords.json           #   唤醒词调参（唤醒词本身在人格文件里）
 │  ├─ events.json              #   ★全部事件★：提醒 / 闹钟 / 课 / 会议 / 约会都是一条
 │  └─ memos.json               #   备忘
 ├─ voice_loop/
+│  ├─ setup_flow.py            # ★安装/体检/升级的逻辑★（只依赖标准库；install.ps1 调它）
 │  ├─ pipeline.py              # 会话编排（唤醒服务、连续对话、打断、提醒播报）
 │  ├─ wake.py                  # 唤醒词匹配（精确 + 别名 + 模糊）、「没事了」收回唤醒
 │  ├─ events.py                # ★事件层★：一条事件的模型、发生时间引擎、到点判定、去重
@@ -306,15 +312,37 @@ flowchart LR
 
 ## 3. 安装
 
+### 3.1 一键（推荐）
+
+```powershell
+cd <项目目录>                                   # 已经有代码的话
+powershell -ExecutionPolicy Bypass -File install.ps1
+```
+
+它只做三件事，每件都**先检查再动手**，所以随时可以再跑一遍：
+
+1. 拿到代码（当前目录有 `main.py` 就用现成的；没有就 `git clone`；也可以用 `-Zip <压缩包>` 从 Releases 的包装）
+2. 建 `.venv` 并 `pip install -r requirements.txt`
+3. 剩下的交给 `python main.py setup`（下模型 → 体检 → 告诉你下一步）
+
+先看看它要干什么（**不动机器**）：`... -File install.ps1 -DryRun`。
+其它开关：`-Dir D:\local_AI`（装到哪）、`-Zip .\local_assistant-1.1.0-source.zip`、
+`-Mirror https://pypi.tuna.tsinghua.edu.cn/simple`（国内加速）、`-NoModels`（先不下模型）。
+
+### 3.2 手动（和上面等价，六条命令）
+
 ```powershell
 cd <项目目录>
 pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
-python scripts/download_models.py     # 补上 SenseVoice / Silero VAD / Piper 中文女声（约 300 MB）
+python main.py setup                  # 环境/依赖/配置/模型/自检一条龙（幂等，可反复跑）
+ollama pull qwen3.5:4b                # 主模型：文本 + 看图 + 工具（3.4 GB）
 python scripts/download_models.py --only zipvoice   # 可选：ZipVoice 音色克隆（约 156 MB；不装就退回 Piper）
 python scripts/download_models.py --only speaker    # 可选：声纹尺子（27 MB，量「像不像她」，不参与合成）
-ollama pull qwen3.5:4b                # 主模型：文本 + 看图 + 工具（3.4 GB）
-python main.py selftest               # 10 项检查，全过就能用了
 ```
+
+`python main.py setup` 会在最后给你一句结论：**「可以用了」** 或「还有 N 项要处理」，
+每一条都带「怎么办」。等价的手工命令是
+`pip install -r requirements.txt` + `python scripts/download_models.py` + `python main.py selftest`。
 
 > **Whisper（高精度 ASR）的权重是导出来的，不是下载的**——`download_models.py` 不管它。
 > 想让 `[asr] strategy = "hybrid"` 真的能复核，按下面这条导出一次（约 930 MB，要装
@@ -334,22 +362,55 @@ python main.py selftest               # 10 项检查，全过就能用了
 pip install pypdf                 # 可选：读 PDF（Word 靠已装的 python-docx）
 ```
 
-> **换了机器 / 换了系统，先跑一遍自检**（只读，几秒）：
->
-> ```powershell
-> python scripts/check_deploy.py            # 环境/依赖/配置路径/模型/服务/平台能力/磁盘 七项
-> python scripts/check_deploy.py --json     # 给脚本或 CI 看
-> python scripts/check_deploy.py --strict   # 连「警告」也算失败（做部署镜像时用）
-> ```
->
-> 它会把每个问题连「怎么办」一起说清楚（缺哪个包、哪条路径不对、当前系统会少哪个功能），
-> 而且**只读**：不改配置、不下载、不加载模型。搬家后会坏的东西基本都能在这儿暴露出来。
+### 3.3 装完先自检（换机器 / 换系统也一样）
+
+```powershell
+python main.py doctor                     # 只读体检：环境/依赖/配置/模型/服务/平台/磁盘（几秒）
+python scripts/check_deploy.py            # 同一套检查的原始输出（更啰嗦）
+python scripts/check_deploy.py --json     # 给脚本或 CI 看
+python main.py selftest                   # 真加载一遍模型，端到端 10 项
+```
+
+`doctor` 与 `setup` 都**只读**（不改配置、不下载、不加载模型），
+它们会把每个问题连「怎么办」一起说清楚（缺哪个包、哪条路径不对、当前系统会少哪个功能）。
+搬家后会坏的东西基本都能在这儿暴露出来。
+
+### 3.4 升级与备份（★你的数据不会被碰★）
+
+```powershell
+python main.py upgrade            # 只检查：和远端差几个提交、能不能升（不动工作区）
+python main.py upgrade --apply    # 真升级：备份 → git pull --ff-only → 依赖 → 模型 → 自检
+python main.py upgrade --restore  # 看能还原什么（默认只列，加 --apply 才真写）
+```
+
+规矩写在代码里，也写在工程日志第 55 节：
+
+| 事 | 怎么做 |
+| --- | --- |
+| **动手前先备份** | `data/` 下的 json / personas / knowledge / memory + `config.toml` 一起拷进 `data/backup/upgrade-<时间>-<sha>/`，附 `MANIFEST.txt`（每个文件的 sha256）与 `RESTORE.txt`（不依赖本工具的还原命令） |
+| **工作区脏就停** | 有未提交改动时 `git pull` 的结果不可预测，直接拦下并告诉你怎么保命（`git stash push -u`）；硬来要显式 `--allow-dirty` |
+| **失败给回去的路** | 任何一步失败都打印 `git reset --hard <升级前的 sha>` 与备份目录 |
+| **只换程序，不碰数据** | 升级改的是源码与配置模板；`data/` 里的日程、备忘、人格、记忆、素材都不在升级范围内 |
+| 压缩包安装的怎么升 | 下载新版 zip，解压覆盖程序文件即可 —— ★`config.toml` 与 `data/` 是你的，覆盖时别删★ |
+
+```powershell
+python --version  # 顺带一提：项目要求 Python ≥ 3.11（settings.py 用标准库 tomllib）
+```
+
+> 版本号只有一个地方写：根目录的 [`VERSION`](VERSION)。
+> 要发版：改它 → `python scripts/make_release.py`（产出源码 zip + sha256 + `latest.json`）→
+> 按它打印的 `git tag` / `gh release create` 两条命令发布。
+> 发布包里只有 **git 跟踪的文件**（`data/`、`models/`、`sessions/`、`.venv*` 天然不进包）。
 
 ---
 
 ## 4. 使用
 
 ```powershell
+python main.py selftest      # ★ 端到端自检（真加载模型，10 项）
+python main.py doctor        # ★ 只读体检：环境/依赖/配置/模型/服务/平台/磁盘（几秒）
+python main.py setup         # ★ 检查并补全依赖/模型（幂等，装完/换机器后都可以再跑）
+python main.py upgrade       # ★ 看有没有新版本（--apply 才真升，升级前自动备份数据）
 python main.py listen        # ★ 唤醒词服务（前台，推荐先这么跑，看得见日志）
 python main.py listen -B     # 唤醒词服务（后台，无窗口，日志写 sessions/listen.log）
 python main.py stop          # 停止后台服务（先发信号优雅退出，超时才强杀）
