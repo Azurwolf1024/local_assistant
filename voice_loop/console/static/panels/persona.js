@@ -602,6 +602,131 @@
         ]),
       ]));
 
+      // ---------------------------------------------------------------- 批量导入素材
+      // ★和命令行 `scripts/import_persona.py` 同一份实现★（后端 /api/persona/scan|batch）：
+      // 这里只是把「扫到了什么 → 会做什么 → 做」摆出来。默认试运行，写盘要按两次。
+      const batchBox = h("div", {});
+      const batchOpts = {
+        profile_only: h("input", { type: "checkbox" }),
+        lines_only: h("input", { type: "checkbox" }),
+        create: h("input", { type: "checkbox" }),
+        add_index: h("input", { type: "checkbox" }),
+        keep_gates: h("input", { type: "checkbox" }),
+      };
+      const batchWorld = h("input", { placeholder: "留空 = 档案放 data/knowledge/<id>/（只有她看得到）" });
+
+      function opt(label, node, hint) {
+        return h("label", { class: "row", style: "gap:6px;align-items:center", title: hint || "" },
+          [node, h("span", { text: label })]);
+      }
+      function kindTag(kind) {
+        return h("span", { class: "tag " + (kind === "profile" ? "warn" : "ok"),
+          text: kind === "profile" ? "档案" : "台词" });
+      }
+
+      function renderScan(d) {
+        batchBox.innerHTML = "";
+        const items = (d.items || []).filter((x) => x.has_work);
+        if (!items.length) {
+          batchBox.appendChild(h("p", { class: "muted", text: "没扫到可导入的素材。" +
+            "把台词清单（" + "<角色>.txt" + "）或档案（profile.txt）放进 data/personas/<角色目录>/ 再点一次。" }));
+          return;
+        }
+        items.forEach((item) => {
+          const rows = item.sources.map((s) => h("div", { class: "row" }, [
+            kindTag(s.kind),
+            h("span", { class: "mono grow", text: s.file }),
+            h("span", { class: "muted", text: s.kind === "profile"
+              ? (s.entries + " 个章节") : (s.entries + " 条") }),
+          ]));
+          const notes = [];
+          if (!item.json_exists) notes.push("还没有人格文件（下面可以勾「生成骨架」）");
+          if (!item.in_index) notes.push("不在索引里（勾「加进索引」才会被唤醒）");
+          (item.problems || []).forEach((p) => notes.push(p));
+          batchBox.appendChild(h("div", { class: "card" }, [
+            h("div", { class: "row" }, [
+              h("b", { class: "grow", text: (item.name || item.id) + "（" + item.id + "）" }),
+            ]),
+            ...rows,
+            notes.length ? h("p", { class: "muted", text: notes.join(" · ") }) : null,
+          ]));
+        });
+      }
+
+      async function scan() {
+        batchBox.innerHTML = "";
+        batchBox.appendChild(h("p", { class: "muted", text: "正在扫 data/personas/…" }));
+        const r = await ctx.api.safe(() => ctx.api.get("/api/persona/scan"));
+        if (r) renderScan(r);
+      }
+
+      async function runBatch(apply) {
+        if (apply && !confirm("真的导入？\n\n· 台词会追加到人格文件的 lines（已有的不动，写前备份 .bak）\n"
+          + "· 档案会写成知识库的 markdown（同名文件会被新版覆盖，旧版留 .bak）\n"
+          + "· 不会删任何东西")) return;
+        const body = {
+          apply: apply,
+          profile_only: batchOpts.profile_only.checked,
+          lines_only: batchOpts.lines_only.checked,
+          create: batchOpts.create.checked,
+          add_index: batchOpts.add_index.checked,
+          keep_gates: batchOpts.keep_gates.checked,
+          world: batchWorld.value.trim(),
+        };
+        const r = await ctx.api.safe(() => ctx.api.post("/api/persona/batch", body));
+        if (!r) return;
+        batchBox.innerHTML = "";
+        (r.items || []).forEach((item) => {
+          const bits = [];
+          if (item.lines_added) bits.push("台词 +" + item.lines_added);
+          if (item.lines_dup) bits.push("跳过已有的 " + item.lines_dup);
+          if (item.created_json) bits.push("已生成骨架");
+          if (item.index_added) bits.push("已加进索引");
+          if (item.profile) bits.push("档案 → " + item.profile
+            + (item.profile_changed ? "" : "（没变）"));
+          if (item.prompt_before != null && item.prompt_after != null) {
+            bits.push("提示词 " + item.prompt_before + " → " + item.prompt_after);
+          }
+          batchBox.appendChild(h("div", { class: "card" }, [
+            h("div", { class: "row" }, [
+              h("b", { class: "grow", text: (item.name || item.id) + "（" + item.id + "）" }),
+              h("span", { class: item.ok ? "ok" : "err", text: item.ok
+                ? (apply ? "已导入" : "将导入") : "有问题" }),
+            ]),
+            h("p", { class: "muted", text: bits.join(" · ") || "（没有新内容）" }),
+            (item.problems || []).length ? h("p", { class: "err", text: item.problems.join("；") }) : null,
+            (item.notes || []).length ? h("p", { class: "muted", text: item.notes.join(" · ") }) : null,
+          ]));
+        });
+        ctx.toast(apply ? ("导入完成（" + (r.changed || 0) + " 个角色有变化）")
+          : "这是试运行：一个文件都没写", apply ? "ok" : "warn", 9000);
+        if (apply) { ctx.api.get("/api/persona/spec").then((d) => { spec = d; }); refresh(); }
+      }
+
+      root.appendChild(card("批量导入素材（角色文件夹里的 txt）", [
+        h("p", { class: "muted", text: "把素材放进 data/personas/<角色目录>/ 再扫一次：" +
+          "① <角色>.txt（一行名字 + 一段正文的台词清单）→ 追加到她的「示例台词」；" +
+          "② profile.txt（角色档案 / 角色卡 / 设定，任何排版都行）→ 写成知识库，" +
+          "回答时按需检索（不会塞进提示词）。★判断看内容结构，不看是哪个游戏★" }),
+        h("div", { class: "row" }, [
+          h("button", { class: "btn", text: "扫描角色文件夹", onclick: scan }),
+          h("button", { class: "btn", text: "试运行", onclick: () => runBatch(false) }),
+          h("button", { class: "btn primary", text: "导入", onclick: () => runBatch(true) }),
+        ]),
+        h("div", { class: "row" }, [
+          opt("只导档案", batchOpts.profile_only),
+          opt("只导台词", batchOpts.lines_only),
+          opt("给没有人格文件的角色生成骨架", batchOpts.create,
+            "骨架里的 name/title/background 从档案里尽量填，风格那几栏要人补"),
+          opt("加进索引", batchOpts.add_index, "加进去才会被唤醒"),
+          opt("保留「提升信赖以查看」这类门槛行", batchOpts.keep_gates),
+        ]),
+        h("div", { class: "row" }, [
+          h("span", { class: "muted", text: "档案放哪：" }), h("div", { class: "grow" }, batchWorld),
+        ]),
+        batchBox,
+      ]));
+
       loadSpec();
       refresh();
 

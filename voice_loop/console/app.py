@@ -44,8 +44,14 @@ def panel_stamp() -> str:
     import hashlib  # noqa: PLC0415
 
     try:
+        base = Path(__file__).resolve().parent
         files = sorted(PANELS_DIR.glob("*.py")) + sorted((STATIC_DIR / "panels").glob("*.js"))
-        files.append(Path(__file__).resolve().parent / "registry.py")
+        files += sorted(base.glob("*.py"))            # registry / persona_card / window / bus…
+        # ★面板 register() 里 import 过、或路由会走到的包内模块★：它们在进程里只加载一次，
+        # 改了不重启就会出现「后端还是旧的」（`voice_loop/persona_import.py` 就是这么加进来的：
+        # 界面上的批量导入跟着旧逻辑跑，页面却看不出哪里不对）。
+        for rel in ("persona_import.py", "update.py", "manifest.py", "persona.py"):
+            files.append(base.parent / rel)
         digest = hashlib.sha1()
         for path in files:
             if not path.is_file():

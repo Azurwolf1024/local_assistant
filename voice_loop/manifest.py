@@ -29,6 +29,33 @@ _END_PUNCT = "。！？!?…；;，,、"
 # 行内分隔符（名字 + 正文写在一行时）
 _INLINE_SEP = re.compile(r"^(.{1,%d}?)\s*(?:\t|：|:|\|)\s*(.+)$" % NAME_MAX_CHARS)
 
+# 同一个目录里的**其它** txt 不是台词清单
+# ★这一条很要紧★：``profile.txt``（角色档案）就住在角色文件夹里，
+# 它是「短行标题 + 大段正文」的结构，跟清单长得一模一样 —— 不排除的话，
+# 它里面的标题（档案资料一/客观履历…）会被当成台词名。平时只是噪声，
+# 一旦某个标题碰巧和音频同名（比如「问候」），就会把**错的文本**喂给零样本克隆
+# 当参考文本 —— 音色会明显退化（README 第 14 节：必须逐字一致）。
+SKIP_STEMS = ("profile", "readme", "license", "changelog", "notes", "index",
+              "档案", "角色档案", "干员档案", "资料", "设定", "角色卡",
+              "about", "bio", "card", "desc", "setting", "settings")
+SKIP_PREFIXES = ("_", ".")
+
+
+def is_manifest_file(path):
+    """这个 txt 该不该当台词清单读（只看文件名，不看内容）。
+
+    排除两类：``profile.txt`` / ``档案.txt`` 这种**素材说明**，以及 ``_notes.txt``。
+    需要的命时用 ``parse_manifest_file`` 直接指到那个文件即可，不受影响。
+    """
+    name = getattr(path, "name", str(path))
+    stem = getattr(path, "stem", name.rsplit(".", 1)[0])
+    lowered = stem.lower()
+    if name.startswith(SKIP_PREFIXES):
+        return False
+    if lowered in SKIP_STEMS:
+        return False
+    return not any(lowered.startswith(s + "_") for s in SKIP_STEMS)
+
 # 带 mtime 的缓存：{(目录,): ((文件, mtime, size)..., {名字: 文本})}
 _CACHE: dict[Path, tuple[tuple, dict[str, str]]] = {}
 
@@ -120,12 +147,14 @@ def parse_manifest_file(path: Path, plain: bool = False) -> list[tuple[str, str]
 
 
 def manifest_pairs(directory: Path) -> dict[str, str]:
-    """把目录下所有 ``*.txt`` 当清单读进来，合并成 ``{名字(小写): 文本}``（先到先得）。
+    """把目录下所有（（算得上的）``*.txt`` 当清单读进来，合并成 ``{名字(小写): 文本}``（先到先得）。
 
-    带 mtime 缓存：文件没动就不重复解析。**不**做「必须是音频文件名」这类过滤，
-    调用方自己按需筛（TTS 那边只认目录里真有的音频）。
+    带 mtime 缓存：文件没动就不重复解析。
+    ★不要当素材的文件自己会跳过★（见 :func:`is_manifest_file` —— 比如 ``profile.txt``），
+    否则角色档案里的小标题会被当成台词名。
+    ``不`` 做「必须是音频文件名」这类过滤，调用方自己按需筛。
     """
-    files = sorted(p for p in directory.glob("*.txt") if p.is_file())
+    files = sorted(p for p in directory.glob("*.txt") if p.is_file() and is_manifest_file(p))
     if not files:
         return {}
     try:

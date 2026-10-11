@@ -34,6 +34,12 @@
       "file": "personas/exusiai.json",
       "enabled": true,
       "default": false
+    },
+    {
+      "id": "clementia",
+      "file": "personas/clementia.json",
+      "enabled": true,
+      "default": false
     }
   ]
 }

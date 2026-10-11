@@ -37,8 +37,25 @@ MAX_IMPORT_MB = 2.0
 def register(app, ctx) -> None:
     from fastapi import Body, HTTPException  # noqa: PLC0415
 
+    from ... import persona_import as imp  # noqa: PLC0415
     from .. import persona_card as card  # noqa: PLC0415
     from . import voices as voice_routes   # noqa: PLC0415
+
+    def plan_dict(plan) -> dict:  # noqa: ANN001 - persona_import.CharPlan
+        """把扫描计划变成前端好渲染的结构（路径都相对项目根）。"""
+        return {
+            "id": plan.char_id,
+            "name": plan.name,
+            "json_exists": plan.json_exists,
+            "in_index": plan.in_index,
+            "has_work": plan.has_work,
+            "problems": list(plan.problems),
+            "sources": [
+                {"file": src.rel(ctx.root), "name": src.path.name, "kind": src.kind,
+                 "reason": src.reason, "entries": src.entries, "chars": src.chars}
+                for src in plan.sources
+            ],
+        }
 
     # ★同一个标签页的另一半★：声线路由（切过去/试听/克隆）也挂在这个面板下。
     # 路径仍是 `/api/voices/*` ——「声线」是功能名，跟标签页怎么分无关。
@@ -128,6 +145,60 @@ def register(app, ctx) -> None:
         if char is None:
             raise HTTPException(status_code=404, detail=f"没有角色 {cid!r}")
         return {"id": char.id, "filename": f"{char.id}.json", "json": char.to_dict()}
+
+    # ------------------------------------------------------------------ 批量导入素材
+    # ★和命令行 `scripts/import_persona.py` 是同一份实现★（voice_loop/persona_import.py）：
+    # 界面只是把「扫描 → 计划 → 执行」三步摆出来，判断逻辑不在这里重写。
+    @app.get("/api/persona/scan")
+    def api_scan(only: str = "", assume: str = ""):
+        """扫一遍 ``data/personas/*/``：每个角色发现了什么素材、会做什么（只读）。"""
+        ids = [x for x in only.replace(",", " ").split() if x]
+        plans = imp.scan(ctx.root, only=ids, assume=assume)
+        return {
+            "root": str(ctx.root),
+            "personas_dir": imp.personas_dir(ctx.root).relative_to(ctx.root).as_posix(),
+            "items": [plan_dict(plan) for plan in plans],
+            "summary": {
+                "characters": len(plans),
+                "with_work": sum(1 for p in plans if p.has_work),
+                "lines": sum(len([s for s in p.sources if s.kind == "lines"]) for p in plans),
+                "profiles": sum(len([s for s in p.sources if s.kind == "profile"]) for p in plans),
+            },
+        }
+
+    @app.post("/api/persona/batch")
+    def api_batch(payload: dict = Body(default={})):
+        """照计划导（``apply=false`` 只试运行）。★默认就是试运行★，和命令行一致。"""
+        body = payload or {}
+        only = body.get("only") or []
+        if isinstance(only, str):
+            only = [x for x in only.replace(",", " ").split() if x]
+        plans = imp.scan(ctx.root, only=only, assume=str(body.get("assume") or ""))
+        wanted = {str(x) for x in only}
+        if wanted:
+            plans = [p for p in plans if p.char_id in wanted]
+        apply = bool(body.get("apply"))
+        results = []
+        for plan in plans:
+            if not plan.has_work:
+                continue
+            result = imp.import_char(
+                ctx.root, plan, apply=apply,
+                lines=body.get("profile_only") is not True,
+                profile=body.get("lines_only") is not True,
+                create=bool(body.get("create")),
+                add_index=bool(body.get("add_index")),
+                world=str(body.get("world") or "").strip(),
+                keep_gates=bool(body.get("keep_gates")),
+                profile_name=str(body.get("profile_name") or "").strip(),
+                assume=str(body.get("assume") or ""),
+            )
+            results.append(result.as_dict(ctx.root))
+        ctx.characters()          # 触一次注册表，让它自己热加载（新角色立刻能看见）
+        return {"ok": True, "apply": apply, "items": results,
+                "changed": sum(1 for r in results if r["ok"] and (r["lines_added"]
+                                                                  or r["profile_changed"]
+                                                                  or r["created_json"]))}
 
     @app.get("/api/persona/get")
     def api_get(cid: str = ""):

@@ -1659,6 +1659,45 @@ python main.py memory --who amiya            # 她记得什么、知识库读到
 }
 ```
 
+### 一次把一个角色导进来（台词 + 档案，可批量）
+
+一个角色一个文件夹，素材按下面三种命名放进去，然后跑一条命令：
+
+```powershell
+python scripts/import_persona.py                      # 先看会做什么（★默认试运行，什么都不写★）
+python scripts/import_persona.py --apply              # 真导入（写前自动 .bak）
+python scripts/import_persona.py --only clementia --apply
+python scripts/import_persona.py --create --add-index --apply   # 连新角色的骨架一起生成
+```
+
+```
+data/personas/clementia/
+    任命助理.wav  交谈1.wav  …   ← 语音素材（克隆参考、声线体检都用它）
+    clementia.txt              ← 台词清单（一行名字 + 一段正文）→ 追加到她的「示例台词」
+    profile.txt                ← 角色档案 / 角色卡 / 设定     → 写成知识库（检索命中才进提示词）
+```
+
+| 素材 | 去哪儿 | 什么时候用得上 |
+| --- | --- | --- |
+| `<角色>.txt` 台词清单 | 人格文件的 `lines`（示例台词） | 每一轮都在提示词里，学语气用；**只追加，已有的不动** |
+| `profile.txt` 档案 / 设定 | `data/knowledge/<id>/档案.md`（知识库） | 只在**检索命中**时进提示词（十几 KB 的档案塞进提示词会把首字拖慢，也稀释人设） |
+| 音频 | 不动（本来就在她的文件夹里） | 挑参考音：`python scripts/pick_voice_ref.py --who <id>` |
+
+★**不看是哪个游戏、也不要求模板**★：识别与解析只看**结构** ——
+`① 短行标题 + 后面有正文` 当章节、`② 【键】值` 或 `键：值` 当元信息、
+`③ 「提升信赖至 50% 以查看」这类解锁门槛行`按通用形状丢掉（`--keep-gates` 留着）。
+所以换成别的游戏、英文的 Markdown 角色卡、甚至一页**没有任何标题的散文**都能进来；
+判断错了可以用 `--as profile` / `--as lines` 强制指定（界面里也有这个开关）。
+判断依据写在 `voice_loop/persona_import.py` 的模块说明里，自测用**两套完全不同的排版**各走一遍。
+
+**控制台也能做**：「角色」页最下面那张 **批量导入素材** 卡片 —— 扫描角色文件夹 → 勾选项 →
+「试运行」/「导入」，和上面那条命令是**同一份实现**（`voice_loop/persona_import.py`）。
+新角色第一次导入时勾上「生成骨架」「加进索引」，然后就**点她的卡片**把风格那几栏补完。
+
+> 档案默认放 `data/knowledge/<角色id>/`：**只有她自己检索得到**（凯尔希查「阿戈尔」查不到她的档案）。
+> 想让同一个 IP 的角色共享一套，用 `--world 明日方舟` 放进 `data/knowledge/_worlds/明日方舟/`，
+> 同时会往人格文件的 `worlds` 追加那个名字（只加不减）。
+
 ### 默认角色是原创的（白泽）
 
 默认角色是一个**自己写的角色「白泽」**（神话里「知万物之名」的瑞兽 —— 刚好贴合

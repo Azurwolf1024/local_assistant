@@ -89,6 +89,21 @@ def make_workspace(tmp: Path) -> Path:
         "style": ["简短"], "lines": [{"scene": "s", "text": "我在，博士。"}],
         "voice_ref": "data/personas/amiya/交谈1.wav", "voice_model": "", "enabled": True,
     }, ensure_ascii=False), encoding="utf-8")
+    # 一个「素材还没导」的角色目录：台词清单 + 档案 + 对应音频（批量导入那一节用）
+    nova = tmp / "data" / "personas" / "nova"
+    nova.mkdir()
+    (nova / "nova.txt").write_text("任命助理\n你好，我是新来的。\n\n交谈1\n今天也一样。\n",
+                                   encoding="utf-8")
+    (nova / "profile.txt").write_text(
+        "基础档案\n\n初始开放\n【代号】诺瓦\n【出身地】轨道环三区\n\n"
+        "客观履历\n\n提升信赖至50%以查看\n她在环三区的维修通道里长大。\n", encoding="utf-8")
+    for name in ("任命助理", "交谈1"):
+        (nova / f"{name}.wav").write_bytes(b"RIFF")
+    (tmp / "data" / "personas" / "nova.json").write_text(json.dumps({
+        "id": "nova", "name": "诺瓦", "title": "", "background": "", "user_title": "你",
+        "wake_words": ["诺瓦"], "style": [], "rules": [], "avoid": [], "lines": [],
+        "worlds": [], "enabled": True,
+    }, ensure_ascii=False), encoding="utf-8")
     return tmp
 
 
@@ -435,6 +450,54 @@ def section_registry(tmp: Path) -> None:
     check("改回来之后指纹又一致", console_app.panel_stamp(), stamp)
 
 
+def section_batch(base: str, tmp: Path) -> None:
+    print("\n[9] 批量导入素材（扫描 → 试运行 → 导入；★命令行与界面的同一份实现★）")
+    code, scan = request(base, "GET", "/api/persona/scan")
+    check("GET /api/persona/scan 200", code, 200)
+    ids = [i["id"] for i in scan.get("items", [])]
+    check("扫到了有素材目录的角色", ids, ["nova"])
+    check("没有素材目录的角色不出现（索引里有也不算）", "amiya" in ids, False)
+    nova = [i for i in scan["items"] if i["id"] == "nova"][0]
+    check("认出 nova 的台词清单", [s["kind"] for s in nova["sources"] if s["name"] == "nova.txt"],
+          ["lines"])
+    check("认出 nova 的档案", [s["kind"] for s in nova["sources"] if s["name"] == "profile.txt"],
+          ["profile"])
+    check("汇总里有数字", scan["summary"]["with_work"], 1)
+
+    persona_json = tmp / "data" / "personas" / "nova.json"
+    before = persona_json.read_text(encoding="utf-8")
+
+    code, dry = request(base, "POST", "/api/persona/batch", {"only": ["nova"], "apply": False})
+    check("POST /api/persona/batch（试运行）200", code, 200)
+    check("试运行报告说会加台词", dry["items"][0]["lines_added"], 2)
+    check("★试运行没写人格文件★", persona_json.read_text(encoding="utf-8"), before)
+    check("试运行也没写知识库",
+          (tmp / "data" / "knowledge" / "nova").exists(), False)
+
+    code, done = request(base, "POST", "/api/persona/batch", {"only": ["nova"], "apply": True})
+    check("POST /api/persona/batch（真导）200", code, 200)
+    check("报告说导入了", done["items"][0]["ok"], True, detail=str(done["items"][0]["problems"]))
+    written = json.loads(persona_json.read_text(encoding="utf-8"))
+    check("台词进了人格文件", len(written["lines"]), 2)
+    check("原有字段没被动", written["name"], "诺瓦")
+    know = tmp / "data" / "knowledge" / "nova" / "档案.md"
+    check("档案进了知识库", know.is_file(), True)
+    check("档案里门禁行没了", "以查看" not in know.read_text(encoding="utf-8"), True)
+    check("还没进索引 → 角色列表里没有她（不会被唤醒）",
+          "nova" in [c["id"] for c in request(base, "GET", "/api/voices")[1]["characters"]], False)
+
+    # 再导一次：幂等（不该重复追加台词）；顺便勾上「加进索引」
+    code, indexed = request(base, "POST", "/api/persona/batch",
+                            {"only": ["nova"], "apply": True, "add_index": True})
+    check("加进索引这一步成功", indexed["items"][0]["index_added"], True)
+    again = json.loads(persona_json.read_text(encoding="utf-8"))
+    check("★再导一次不会重复追加★", len(again["lines"]), 2)
+    code, voices = request(base, "GET", "/api/voices")
+    check("★进索引后角色列表立刻能看到她（注册表热加载）★",
+          "nova" in [c["id"] for c in voices["characters"]], True,
+          detail=str([c["id"] for c in voices["characters"]]))
+
+
 def main() -> int:
     print("=" * 70)
     print(" 控制台端到端自测（真 HTTP，不碰真实数据）")
@@ -457,6 +520,7 @@ def main() -> int:
             section_misc(base, tmp)
             section_sse(base, tmp)
             section_update(base, tmp)
+            section_batch(base, tmp)
         finally:
             server.should_exit = True
             thread.join(timeout=10)
