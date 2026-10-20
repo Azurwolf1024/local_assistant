@@ -442,10 +442,14 @@ def test_no_imitation_prompt(tmp: Path) -> None:
     _settings, registry, _ = make_world(tmp)
     baize = registry.get("baize")
     prompt = render_system_prompt(baize)
-    check_text("写了「不要说成自己的身份」", "不要说成自己的身份" in prompt, prompt[-200:])
-    check_text("写了要旁观（据我所知）", "据我所知" in prompt, prompt[-200:])
+    # compact（默认）只有一句陈述句；rich 才是一整段
+    check_text("compact 里写了「那些是别人的东西」", "那些是别人的东西" in prompt,
+               prompt[-200:])
     check("全知角色才有这一段（凯尔希没有）",
-          "不要说成自己的身份" not in render_system_prompt(registry.get("kaltsit")), True)
+          "那些是别人的东西" not in render_system_prompt(registry.get("kaltsit")), True)
+    rich = render_system_prompt(baize, style="rich")
+    check_text("rich 里写了「不要说成自己的身份」", "不要说成自己的身份" in rich, rich[-200:])
+    check_text("rich 里写了要旁观（据我所知）", "据我所知" in rich, rich[-200:])
 
 
 def test_image_memory(tmp: Path) -> None:

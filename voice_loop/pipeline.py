@@ -28,7 +28,8 @@ from .control import ControlChannel, reap as reap_control, serve_once as serve_c
 from .llm import OllamaClient, OllamaError
 from .mcp import MCPHost
 from .names import NameCorrector
-from .persona import Character, CharacterRegistry, knowledge_spec_for, render_system_prompt
+from .persona import (Character, CharacterRegistry, TRUTH_HINT, knowledge_spec_for,
+                      plain_prompt, render_system_prompt, reply_problem)
 from .scheduler import ReminderScheduler
 from .settings import Settings
 from .skills import Skills
@@ -56,6 +57,11 @@ from .wake import WakeSession, WakeWordMatcher, is_standby
 
 # 未唤醒状态下滤掉纯语气词，否则「嗯。」「哎。」会淹没日志里有用的行
 _NOISE_STRIP = re.compile(r"[\s，。、,.!！？?…~～\-—]+")
+
+# 「出戏」兜底：攒够这么多字就先检查一次（判据见 persona.reply_problem）。
+# 太小（<10）判不准（拒绝/议论的句子还没成形）；太大则第一句已经能念了，
+# 攒着反而拖慢首字时延 —— 24 个字大约是中文的一整句。
+GUARD_MIN_CHARS = 24
 _FILLER_WORDS = {
     "嗯", "哎", "啊", "哦", "呃", "唉", "呀", "诶", "咦", "额", "唔", "嘿", "哈",
     "噢", "喔", "对", "是", "的", "了", "好", "嗯嗯", "哈哈", "呵呵", "好的",
@@ -837,7 +843,11 @@ class VoiceLoop:
             self.llm.temperature = None
             return
         extra = str(getattr(self.settings.persona, "extra_prompt", "") or "")
-        self.llm.system_prompt = render_system_prompt(char, extra)
+        self.llm.system_prompt = render_system_prompt(
+            char, extra,
+            lines_in_prompt=int(getattr(self.settings.persona, "lines_in_prompt", 0) or 0),
+            style=str(getattr(self.settings.persona, "prompt_style", "") or ""),
+        )
         self.llm.temperature = float(char.temperature) if char.temperature else None
         # 唤醒应答语跟着角色走（wakewords.json 里的 ack 只在没有角色时生效）
         if char.ack:
@@ -1553,8 +1563,19 @@ class VoiceLoop:
         # ★TOOL_HINT 要紧贴用户那一句★（而不是放在人设前面）。
         # 实测：放在最前面时 qwen3.5:4b 会当没看见，直接凭记忆答「下周有什么安排」；
         # 挪到用户话前面（extra_messages 插在最后一条之前）就稳定调工具了。
-        hint = [{"role": "system", "content": TOOL_HINT}] if tools else None
-        # ★记忆摘要在 TOOL_HINT 之前★：工具提示必须紧贴用户那一句（实测过），
+        #
+        # ★「此刻」和 TOOL_HINT 合成同一条 system★（§58）：以前是两条 system
+        # （一条时间、一条工具），加上记忆和情绪提示，一轮能堆三四条 system，
+        # 4B 会开始分不清哪条是「设定」哪条是「要办的事」，甚至把提示词当台词念出来。
+        # 时间和「别编造」都属于**每轮才成立**的运行时信息，跟工具提示天然是一类。
+        from .persona import now_block  # noqa: PLC0415
+
+        runtime = now_block()
+        if tools:
+            runtime = f"{runtime}\n{TOOL_HINT}\n{TRUTH_HINT}"
+        else:
+            runtime = f"{runtime}\n{TRUTH_HINT}"
+        hint = [{"role": "system", "content": runtime}]        # ★记忆摘要在 TOOL_HINT 之前★：工具提示必须紧贴用户那一句（实测过），
         # 记忆是背景信息，放前面正合适。没有记忆时这一层完全不存在。
         memory_block = self._memory_context(prompt)
         if memory_block:
@@ -1585,68 +1606,128 @@ class VoiceLoop:
             # ★从回答一开始就告诉字幕「这一轮要发声了」★：这样字幕不会先把
             # 全文（折叠后的末尾）闪一下，再跳回正在念的那句
             self._speech_begin()
+            # ★「出戏」兜底（§58）★：小模型时不时会在第一句就露馅 ——
+            # 拒绝扮演（「作为一个人工智能…」）、议论提示词（「您提供的这段文字…」）、
+            # 或者把人设复述出来。这些**必须在念出来之前**发现：第一句被 TTS 放出去就收不回。
+            # 所以第一遍先把开头攒着（GUARD_MIN_CHARS 个字）看一眼，有问题就整段丢掉、
+            # 换极简人设重答一次；第二遍不再拦（模型再出戏也只能认了，不能无限重试）。
+            persona_text = str(getattr(self.llm, "system_prompt", "") or "")
+            fallback = plain_prompt(self.character) if self.character else ""
+            can_override = hasattr(self.llm, "system_prompt")
             with self._speak_lock:
-                for ev in self.llm.chat_events(
-                    prompt,
-                    images=images,
-                    model=model,
-                    num_ctx=num_ctx,
-                    tools=tools,
-                    extra_messages=hint,
-                ):
-                    if "tool_calls" in ev:
-                        calls.extend(ev["tool_calls"])
-                        continue
-                    if calls:
-                        continue          # 已经在调工具了，后面的解释性文字不念
-                    delta = ev["delta"]
-                    if stripper is not None:
-                        # ★先剥标签，再走后面那套「像不像工具 JSON」的判断★：
-                        # 标签本身以 `<`/`[` 开头，不先剥掉会被当成可疑开头而攒住不念。
-                        delta = stripper.feed(delta)
-                        if stripper.style:
-                            self.set_style(stripper.style, reason="LLM 标签")
-                            stripper.style = ""          # 只换一次
+                for attempt in (0, 1):
+                    retry = False
+                    guard = bool(persona_text) and attempt == 0
+                    head: list[str] = []
+                    extra_kw = {"system_override": fallback} if (attempt and can_override) else {}
+                    for ev in self.llm.chat_events(
+                        prompt,
+                        images=images,
+                        model=model,
+                        num_ctx=num_ctx,
+                        tools=tools,
+                        extra_messages=hint,
+                        **extra_kw,
+                    ):
+                        if "tool_calls" in ev:
+                            calls.extend(ev["tool_calls"])
+                            continue
+                        if calls:
+                            continue          # 已经在调工具了，后面的解释性文字不念
+                        delta = ev["delta"]
+                        if stripper is not None:
+                            # ★先剥标签，再走后面那套「像不像工具 JSON」的判断★：
+                            # 标签本身以 `<`/`[` 开头，不先剥掉会被当成可疑开头而攒住不念。
+                            delta = stripper.feed(delta)
+                            if stripper.style:
+                                self.set_style(stripper.style, reason="LLM 标签")
+                                stripper.style = ""          # 只换一次
+                        if guard:
+                            head.append(delta)
+                            joined_head = "".join(head)
+                            if SUSPICIOUS_START.match(joined_head):
+                                guard = False             # 可能是工具 JSON，交给下面那套
+                            elif len(joined_head) < GUARD_MIN_CHARS:
+                                if self._interrupt.is_set():
+                                    break
+                                continue
+                            else:
+                                problem = reply_problem(joined_head, persona_text)
+                                if problem:
+                                    self.log.warning(
+                                        f"[人设] 第一句出戏（{problem}），换极简人设重答："
+                                        f"{joined_head.strip()[:60]}")
+                                    retry = True
+                                    break
+                                guard = False
+                            delta = "".join(head)
+                            head = []
                         if not delta:
                             if self._interrupt.is_set():
                                 break
                             continue
-                    if holding or SUSPICIOUS_START.match(delta):
-                        # 可能是「把工具调用写成 JSON」：先攒着，一个字都不念
-                        holding = True
-                        held.append(delta)
-                        joined = "".join(held)
-                        tool_text = looks_like_tool_text(joined)
-                        if (
-                            not hold_for_route
-                            and not tool_text
-                            and len(joined) > 8
-                            and not SUSPICIOUS_START.match(joined)
-                        ):
-                            # 看清了：只是一段普通 JSON（例如用户要的示例）→ 放行
-                            holding = False
-                        if holding:
-                            # 攒着不念，但回车打断还是要能生效（否则这一段话就只能干等）
-                            if self._interrupt.is_set():
-                                break
-                            continue
-                    if stats.llm_first_token == 0.0:
-                        stats.llm_first_token = time.perf_counter() - t0
-                    pieces.append(delta)
-                    if on_delta is not None:
-                        on_delta(delta)
-                    if self.subtitle is not None:
-                        self.subtitle.append(delta)
-                    if self._interrupt.is_set():
-                        break
-                    for sentence in chunker.feed(delta):
-                        speak(sentence)
+                        if holding or SUSPICIOUS_START.match(delta):
+                            # 可能是「把工具调用写成 JSON」：先攒着，一个字都不念
+                            holding = True
+                            held.append(delta)
+                            joined = "".join(held)
+                            tool_text = looks_like_tool_text(joined)
+                            if (
+                                not hold_for_route
+                                and not tool_text
+                                and len(joined) > 8
+                                and not SUSPICIOUS_START.match(joined)
+                            ):
+                                # 看清了：只是一段普通 JSON（例如用户要的示例）→ 放行
+                                holding = False
+                            if holding:
+                                # 攒着不念，但回车打断还是要能生效（否则这一段话就只能干等）
+                                if self._interrupt.is_set():
+                                    break
+                                continue
+                        if stats.llm_first_token == 0.0:
+                            stats.llm_first_token = time.perf_counter() - t0
+                        pieces.append(delta)
+                        if on_delta is not None:
+                            on_delta(delta)
+                        if self.subtitle is not None:
+                            self.subtitle.append(delta)
                         if self._interrupt.is_set():
                             break
-                    # 模型还在吐字、扬声器里也还在放：顺手听一下有没有人插话。
-                    # 不这样做的话，必须等整段生成完才轮到判断，长回答会变得很钝。
-                    if self._drain_playback(step=True):
-                        break
+                        for sentence in chunker.feed(delta):
+                            speak(sentence)
+                            if self._interrupt.is_set():
+                                break
+                        # 模型还在吐字、扬声器里也还在放：顺手听一下有没有人插话。
+                        # 不这样做的话，必须等整段生成完才轮到判断，长回答会变得很钝。
+                        if self._drain_playback(step=True):
+                            break
+
+                    if retry:
+                        # 这一遍一个字都没念（guard 阶段还没放行），清空状态重来
+                        held.clear()
+                        pieces.clear()
+                        chunker = SpeechChunker(
+                            max_chars=int(tts_cfg.max_chunk_chars),
+                            first_min_chars=int(tts_cfg.first_chunk_min_chars),
+                            min_chunk_chars=int(tts_cfg.min_chunk_chars),
+                            max_hold_seconds=float(tts_cfg.max_hold_seconds),
+                            first_chunk_max_chars=int(
+                                getattr(tts_cfg, "first_chunk_max_chars", 0) or 0),
+                        )
+                        continue
+                    if head:
+                        # 整段回答比 GUARD_MIN_CHARS 还短（「嗯。」这种）：直接放行
+                        leftover = "".join(head)
+                        head = []
+                        pieces.append(leftover)
+                        if on_delta is not None:
+                            on_delta(leftover)
+                        if self.subtitle is not None:
+                            self.subtitle.append(leftover)
+                        for sentence in chunker.feed(leftover):
+                            speak(sentence)
+                    break
 
                 if not self._interrupt.is_set() and not calls:
                     if stripper is not None:

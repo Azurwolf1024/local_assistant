@@ -315,6 +315,15 @@ class PersonaConfig:
     file: str = "data/characters.json"      # 角色文件（可热加载）
     default: str = ""                        # 没指定角色时用谁（id 或名字）；空 = 用文件里 default=true 的
     extra_prompt: str = ""                   # 追加到任何角色后面的附加要求
+    # 提示词里最多放几条「过往台词」（0 = 用 persona.DEFAULT_LINES_IN_PROMPT，现为 6）。
+    # ★为什么要有上限★：台词每轮都在提示词里；38 条会让提示词到 2232 tokens，
+    # 而 [llm] num_ctx 是 4096 —— 加上历史/工具提示/生成长度就越界，
+    # 溢出时 Ollama 从头截断，人设整段丢失（会说出「我不是克莱门莎」这种话）。
+    lines_in_prompt: int = 0
+    # 人设的写法：compact（默认，人设卡式一两百字）/ rich（分节文档式）。
+    # ★4B 小模型只能吃 compact★：给 rich 会拒绝扮演，或者把提示词当台词念出来。
+    # 换成 20B 以上的模型时可以试 rich（信息更多，但更容易「照着文档回答」）。
+    prompt_style: str = "compact"
 
 
 @dataclass

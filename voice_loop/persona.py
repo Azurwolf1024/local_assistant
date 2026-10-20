@@ -78,6 +78,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -97,6 +98,217 @@ DEFAULT_FILE = "data/characters.json"
 PERSONA_DIR = "personas"
 # 索引里除了 id/file/enabled/default 之外的键，都是「说明」，不该写进人格文件
 _INDEX_ONLY_KEYS = {"file", "enabled", "default", "_说明", "_用法", "_字段说明", "_note"}
+
+DEFAULT_LINES_IN_PROMPT = 6
+"""提示词里最多放多少条「过往台词」（默认 6 条，只放**短的**）。
+
+★不是越多越好★：台词每轮都在提示词里，而且 4B 模型对长提示词非常敏感 ——
+38 条会把它推成「文档模式」（拒绝扮演、或把提示词复述出来，见 §58 实测）。
+``[persona] lines_in_prompt`` 可覆盖；填 0 = 用这个默认值。
+"""
+
+COMPACT_BACKGROUND_CHARS = 160
+"""compact 提示词里背景最多留多少字（够交代身份与关系，不再往下铺）。
+
+★这条数字是实测调的★：160 字时八个角色的 compact 提示词都在 250~420 字之间；
+放到 220 字，克莱门莎就到 469 字，lint 也开始报「太长」（§58）。
+"""
+
+# ★跟角色无关的「别编」规则★：放在风格之前（小模型对靠后的内容不敏感）。
+# 每一条都对应一种实测出现过的幻觉（见 docs/ENGINEERING_LOG.md §58）。
+TRUTH_RULES = (
+    "【只说真话】这一节比下面的说话风格更重要，两者冲突时以本节为准：",
+    "- 你只知道这轮对话里出现过的事。对方刚做了什么、睡没睡、身体怎样、心情如何，"
+    "没提到就是不知道——不要猜，也不要用猜测去表达关心。",
+    "- 白天还是晚上、现在几点、今天星期几，只看系统给的【此刻】那一行。"
+    "没有【此刻】就别提时间；有就按它说，不要自己编。",
+    "- 日程、备忘、提醒、闹钟：【只说查回来的结果】。没查过就说「我看看」，不要凭印象报出"
+    "「今晚八点有会」这种具体安排。查回来是空的，就如实说空。",
+    "- 对方问起你的事（你在哪、在做什么），可以按人设答，但不要编造细节事实"
+    "（具体日期、编号、别人说过的话）。",
+    "- 一句话里最多带一个设定名词（地名、组织、档案、术语），且要跟这句话有关，别硬塞。",
+)
+
+# 提示词里「目标 token 预算」（粗略估计：中文约 0.65 token/字）
+PROMPT_TOKEN_BUDGET = 1800
+"""渲染后人设部分的建议上限（tokens）。超了就让 lint 提醒 —— 4096 的上下文很紧张。"""
+
+_WEEKDAY = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")
+
+
+def day_part(hour: int) -> str:
+    """几点 → 「凌晨/早上/上午/中午/下午/傍晚/夜里」。"""
+    if hour < 5:
+        return "凌晨"
+    if hour < 9:
+        return "早上"
+    if hour < 11:
+        return "上午"
+    if hour < 13:
+        return "中午"
+    if hour < 17:
+        return "下午"
+    if hour < 19:
+        return "傍晚"
+    return "夜里"
+
+
+def now_block(when: "datetime | None" = None) -> str:
+    """每一轮注入的「现在时间」——**一句白话，不带标签**。
+
+    ★为什么每轮都要给★：模型本身**没有时钟**。不给它，它就只能猜 ——
+    于是白天说「你又熬夜了」、把「明天」算成别的日子。
+    ★为什么不放在人设里★：人设是启动时算一次并缓存的，时间会过期。
+
+    ★为什么不再写成「【此刻】…」★：实测 4B 会把这个方括号词当成要复述的内容，
+    回答里直接冒出「现在【此刻】是…」。给时间就用平常的一句话，不加标记。
+    """
+    from datetime import datetime as _dt  # noqa: PLC0415
+
+    t = when or _dt.now()
+    return (f"现在是{t.year}年{t.month}月{t.day}日，{_WEEKDAY[t.weekday()]}，"
+            f"{t.hour:02d}:{t.minute:02d}（{day_part(t.hour)}）。")
+
+
+TRUTH_HINT = ("对方没说过的事你不知道，也别猜他刚才在做什么、睡没睡；"
+              "日程和备忘先用工具查，再按查到的说。")
+"""每轮随「此刻」一起发的那句「别编」。
+
+★为什么放在运行时而不是人设里（§58）★：写进人设时，4B 会把它当台词念出来
+（实测凯尔希答过「我甚至知道博士的日程和备忘录」）；放在紧贴用户那句的
+system 里，它才被当成规矩。人设只负责「她是谁、怎么说话」。
+"""
+
+# --------------------------------------------------------------------------- #
+# 回答质量的兜底：小模型偶尔会「出戏」
+#
+# ★这不是提示词能 100% 解决的事★（`qwen3.5:4b` 在 temperature 0.7 下同一份人设
+# 时而像人、时而交作业），所以除了把提示词写短写白，还要在**开口之前**看一眼：
+# 一旦露出下面这些毛病，就丢掉这段、换一份极简人设重答一次。
+#
+# 为什么必须在「念出来之前」判断：这几个毛病全都在**第一句**就暴露（拒绝扮演、
+# 议论提示词、复述人设），而第一句话一旦被 TTS 念出去就收不回来了。
+_BROKEN_REPLY: tuple[tuple["re.Pattern[str]", str], ...] = (
+    (re.compile(r"作为一个人工智能|作为一个 ?AI|作为一个语言模型|作为 AI 助手"
+                r"|我(无法|不能)(进行|参与|扮演|按照您(的)?要求)"), "拒绝扮演"),
+    (re.compile(r"[你您](提供|刚才|说的)[^。！？\n]{0,10}(文本|文字|字符|内容|输入|这段话)"
+                r"|系统提示|提示词|(指令|要求)拆解|按(用户|您)的(要求|指令)"), "议论提示词"),
+    (re.compile(r"^\s*(?:#+\s|\*\*\s*(?:结论|状态|安排|当前)|\|\s*时间)"), "交作业排版"),
+)
+
+
+def reply_problem(text: str, persona: str = "") -> str:
+    """这段回答「出戏」了吗？返回原因；没问题返回空串。
+
+    ``persona`` 是这次用的人设原文：模型偶尔会把**人设**当成素材复述出来
+    （「我甚至知道博士的日程和备忘录」），所以拿人设的 20 字片段去比对。
+    """
+    body = str(text or "")
+    for pattern, reason in _BROKEN_REPLY:
+        if pattern.search(body):
+            return reason
+    clean_answer = re.sub(r"\s+", "", body)
+    clean_persona = re.sub(r"\s+", "", str(persona or ""))
+    if len(clean_persona) >= 40 and len(clean_answer) >= 20:
+        grams = {clean_persona[i:i + 20] for i in range(0, len(clean_persona) - 19)}
+        if any(g in clean_answer for g in grams):
+            return "复述人设"
+    return ""
+
+
+def plain_prompt(char: "Character") -> str:
+    """兜底用的极简人设（一句话），重答时换上它。
+
+    ★为什么能兜住★：实测 4B 在 30~80 字的极简人设下几乎不会拒绝，也不会议论提示词。
+    代价是角色味淡一些 —— 但比「我是人工智能助手」强。
+    """
+    who = char.user_title or "对方"
+    head = f"你是{char.name}"
+    if char.title:
+        head += f"，{char.title}"
+    return f"{head}，正和{who}说话。话不长，一次一两句。"
+
+
+OMNISCIENT_NOTE = ("你还读过别的角色、别的作品的设定，那些是别人的东西，"
+                   "提起来就像在说别人家的事。")
+"""全知角色（``memory_all``）在 compact 提示词里的「旁观」提示。
+
+★为什么必须先提「这是别人的」★：资料库里混着别的作品的世界观，不写这句，小模型
+会把资料当成自己的身份（「我来自泰拉」）。rich 版写得长，compact 只能一句，
+而且要是**陈述句** —— 写「不要当成自己的身份」它就会把这句念出来。
+"""
+
+
+def work_name(char: "Character") -> str:
+    """角色属于哪个作品（提示词第一行用）。``work`` 优先，否则 ``worlds[0]``，否则空。
+
+    ★空的时候就不要写作品名★：原创角色被硬塞进某个游戏的世界观里，模型就会往那边扯
+    （以前写死「《明日方舟》里的白泽」——一个原创助手被要求按泰拉大陆的设定说话）。
+    """
+    return str(getattr(char, "work", "") or "").strip() or (
+        char.worlds[0] if char.worlds else "")
+
+
+_COPYABLE = re.compile(
+    r"[，,（(]?\s*(?:比如|例如|譬如|像是|好比)\s*[说]?\s*[：:]?\s*[「“\"]([^」”\"]{6,})[」”\"]"
+)
+"""「比如「博士，你又熬夜了」」这种**可以整句照抄**的示例。
+
+★为什么要剥掉★：4B 模型会把引号里那句当成台词，**在毫不相干的回合原样说出来**
+（用户反映的「白天莫名其妙说『你又熬夜了』」就是这条 style 直接导致的）。
+短引文（<6 字，比如「不用『哎呀』这种口气」）保留——那是词，不是句子换。
+"""
+
+
+def _strip_copyable(text: str) -> str:
+    """去掉风格/背景里「可整句照抄」的示例（渲染时做，改的是提示词而不是用户的数据）。"""
+    out = _COPYABLE.sub("", str(text or ""))
+    return re.sub(r"[，,；;]\s*$", "。", out.strip()) if out != text else out
+
+
+_DECOR = re.compile(r"[★☆]|\*\*|__|【|】|「|」|『|』")
+
+
+def _plain(text: str) -> str:
+    """把用户数据里的装饰符号抹平，只留能念出来的字。
+
+    ★为什么渲染时要洗一遍★：人格文件是手写的，里面会混进 `★`、`**`、`【】`
+    和书引号。4B 模型看到这些就当成「格式要求」，回答里开始出现星号和方括号，
+    或者干脆把这段话当成一份待分析的文档（§58 实测）。
+    """
+    out = _DECOR.sub("", str(text or ""))
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    return out.strip(" \n，,；;、")
+
+
+def pick_lines(lines: list[dict], limit: int = DEFAULT_LINES_IN_PROMPT) -> list[dict]:
+    """挑哪些台词进提示词：★优先「短而有代表性」的★，保持原来的先后顺序。
+
+    过长的（>90 字，多半是独白）排后面 —— 它们占 token 最多，对学语气的帮助反而最小。
+    """
+    if limit <= 0 or len(lines) <= limit:
+        return list(lines)
+    order = sorted(range(len(lines)),
+                   key=lambda i: (len(str(lines[i].get("text") or "")) > 90, i))
+    keep = sorted(order[:limit])
+    return [lines[i] for i in keep]
+
+
+def prompt_stats(char: "Character", extra: str = "", *, lines_in_prompt: int = 0) -> dict:
+    """人设提示词的「体积」：给 lint / CLI / 控制台看（别等溢出才发现）。"""
+    text = render_system_prompt(char, extra, lines_in_prompt=lines_in_prompt)
+    lines = pick_lines(char.lines, lines_in_prompt or DEFAULT_LINES_IN_PROMPT)
+    tokens = int(len(text) * 0.65)          # 中文经验值；只用来提醒，不当精确值
+    return {
+        "chars": len(text),
+        "tokens": tokens,
+        "over_budget": tokens > PROMPT_TOKEN_BUDGET,
+        "lines_total": len(char.lines),
+        "lines_in_prompt": len(lines),
+        "lines_chars": sum(len(str(x.get("text") or "")) for x in lines),
+        "work": work_name(char),
+    }
+
 
 
 @dataclass
@@ -153,6 +365,11 @@ class Character:
     # 它必须用**公开可商用的出厂 Piper 声线**，不能跟着全局的克隆后端去用某条参考音频。
     # 放在最后（而不是挪到 voice 旁边）：dataclass 的字段顺序会被位置构造依赖。
     backend: str = ""
+    # ★可选：属于哪个作品★（提示词第一行的「你是《X》里的…」）。
+    # 空 = 用 worlds[0]；再没有就**不提作品名**（原创角色不该被塞进某个游戏的世界观里 ——
+    # 以前这里是写死的「《明日方舟》」，白泽也被写成「《明日方舟》里的白泽」，
+    # 模型于是会往游戏设定上扯）。
+    work: str = ""
 
     # ------------------------------------------------------------------ 基础
     @property
@@ -204,6 +421,7 @@ class Character:
             # ★backend 要在这儿显式搬一次★：解析是「白名单式」的显式构造，
             # 新增字段只加 dataclass 不改这里 = 配置被静默忽略（test_persona [7] 就是守这个的）。
             backend=str(raw.get("backend") or "").strip(),
+            work=str(raw.get("work") or "").strip(),
             voice=str(raw.get("voice") or "").strip(),
             voice_ref=str(raw.get("voice_ref") or "").strip(),
             voice_ref_text=str(raw.get("voice_ref_text") or "").strip(),
@@ -276,25 +494,190 @@ def can_read_all_memory(registry: "CharacterRegistry | None", char_id: str) -> b
     return bool(char and char.memory_all)
 
 
-def render_system_prompt(char: Character, extra: str = "") -> str:
+def _clip(text: str, limit: int) -> str:
+    """截到 ``limit`` 字以内，尽量在句号/问号处断（不截成半句话）。"""
+    text = str(text or "").strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    for mark in ("。", "！", "？", "；"):
+        pos = cut.rfind(mark)
+        if pos >= limit // 2:
+            return cut[:pos + 1]
+    return cut.rstrip("，、,;；") + "。"
+
+
+_LINE_NOISE = re.compile(r"提升至|以查看|以解锁|信赖值|潜能|晋升|精英阶段|^\W*$")
+"""台词里的「图鉴噪音」：`(提升至精英阶段1以查看)` 这种，念出来莫名其妙。"""
+
+_LINE_SKIP = re.compile(
+    # 战斗 / 剧情 / 阴暗
+    r"接敌|阵型|布防|部署|全体单位|战场|迎敌|歼|战死|开火|撤退|作战计划"
+    r"|暴力|施暴|生死|杀|尸|血|牺牲|死|绝路|复仇|仇|报应|伤口|痛|发抖"
+    # ★作息 / 身体状况★：这是用户最先抱怨的那类「凭空关心」的源头。
+    # 「您又熬夜了……我也没睡」这种台词留在提示词里，模型白天也会照搬出来。
+    r"|熬夜|没睡|早点睡|睡得|作息|这么晚|深夜|失眠"
+)
+"""**不能**进提示词的台词。
+
+它们确实很像角色的「台词」，但作用相反：战斗台词把日常对话带成念战报，作息台词让模型
+白天也问「你又熬夜了」。台词是给人看剧情的，不是给人学闲聊的。
+"""
+
+_CHAT_CUE = re.compile(r"[你您吗呢吧？]")
+
+
+def _short_lines(lines: list[dict], limit: int,
+                 low: int = 8, high: int = 34) -> list[str]:
+    """挑几句台词当语气样本：★要「一句话」，不要「两个字」也不要独白★。
+
+    实测按长度从短往长挑，会挑到「可以。」这种没有信息量的；太长的又会把回答带成
+    演讲。所以先卡长度区间，再按「像不像聊天」排（有 你/您/吗/呢/吧/？ 的优先），
+    最后**按原来的先后顺序**输出 —— 那是人物自己的语序，打乱了反而不像。
+    """
+    texts = [_plain(x.get("text")) for x in lines]
+    texts = [t for t in texts if t and not _LINE_NOISE.search(t)]
+    texts = [t for t in texts if not _LINE_SKIP.search(t)]
+    band = [t for t in texts if low <= len(t) <= high]
+    if len(band) < limit:
+        band += sorted((t for t in texts if t not in band and len(t) <= 60), key=len)
+    scored = sorted(range(len(band)),
+                    key=lambda i: (-len(_CHAT_CUE.findall(band[i])), i))
+    keep = sorted(scored[:limit])
+    return [band[i].rstrip("。！？…") for i in keep]
+
+
+_NEG = re.compile(r"不|别|勿|没有|绝|避免|禁止")
+"""风格条目里的否定词。★compact 里尽量少用否定句★：4B 会把「不用『哎呀』这种口气」
+里的『哎呀』学走 —— 或者干脆照念整句否定。"""
+
+_META_WORDS = re.compile(r"这些词|这个词|提到|称呼|自称|结尾|习惯用|硬塞|句式|语气词|每句")
+"""风格条目里的**元词汇**（说的是「怎么用词」而不是「什么脾气」）。
+
+★这类条目在 compact 里最危险★：模型分不清「描述」和「要求」，会把它当台词念出来 ——
+凯尔希的实测回答是「你不需要硬塞，只要偶尔提一句罗德岛简报或档案，就能让我冷静地回应你」。
+"""
+
+
+def _tone_entries(char: "Character", count: int = 2) -> list[str]:
+    """compact 用哪几条风格：★优先「肯定句、第二人称、短」的那几条★，保持原顺序。
+
+    只取每条**第一个分句** —— 脾气写在前面（「冷静、克制、用词精准」），
+    而「怎么用词」的说明通常在后半句，那半句会被 4B 当成台词念出来。
+    """
+    entries = [(_plain(_strip_copyable(s)), str(s)) for s in char.style if str(s).strip()]
+    if not entries:
+        return []
+
+    def score(item: tuple[str, str]) -> int:
+        plain, raw = item
+        return (len(_META_WORDS.findall(raw)) * 3
+                + len(_NEG.findall(raw)) * 2
+                + len(re.findall(r"[她他]", plain)) * 2
+                + len(plain) // 40)
+
+    order = sorted(range(len(entries)), key=lambda i: (score(entries[i]), i))[:count]
+    picked: list[str] = []
+    for i in sorted(order):
+        first = re.split(r"[；;。]", entries[i][0])[0].strip(" ，,、")
+        if first:
+            picked.append(first)
+    return picked
+
+
+def render_system_prompt(char: Character, extra: str = "", *,
+                         lines_in_prompt: int = 0, style: str = "") -> str:
     """把角色字段拼成 system prompt。
 
     ★改这个函数就是在改「所有角色的提示词工程」★：用户只填字段，
     措辞、结构、以及「输出会被朗读」这类硬规则都在这儿统一维护。
+
+    ``style`` 两种（★默认 compact —— 这是实测出来的，不是审美偏好★）：
+
+    ==========  ============================================  ===========================
+    ``compact`` 口语化、没有装饰符号、一两百字                 ★4B 小模型只能用这种★
+    ``rich``    带 【】/★/**/编号的分节「文档」                 大模型（20B+）可以，小模型会翻车
+    ==========  ============================================  ===========================
+
+    ★compact 的五条硬规则（每一条都是 §58 里撞出来的，别顺手改回去）★
+
+    1. **短**。`qwen3.5:4b` 拿到 500 字以上的人设就会把提示词当成「用户送来的一段
+       混乱文本」来审阅：回一句「您提供的输入含有矛盾指令」就完了，或者干脆把提示词
+       复述出来（用户说的「强行扯到身份卡上的提示词」）。目标 200~300 字。
+    2. **像人设卡，不像指令书**。★「学那个语气」「你要做到以下几点」这类话本身
+       就是元指令★，模型读到的不是「你是谁」，而是「有人给我派了个任务」，于是它开始
+       交作业：拆解要求、列要点、注解「已按用户要求生成」。所以这里只写**陈述句**：
+       「你是阿米娅，罗德岛公开领袖，出自《明日方舟》，正和博士说话。」「话不长，一次一两句。」
+    3. **只说肯定句**。写「不要自称 AI」，它就在回答里冒出「我是白泽（AI 助手）」；
+       写「不要用符号和列表」，它就点评「你给的文本里有符号」。
+    4. **不带引号和标签**。`【此刻】` 会被念成「现在【此刻】是…」，
+       「这个我不知道」会被复述成「您刚才说的『这个我不知道』是指…」。
+    5. **不写「扮演 / AI / 助手」这类词**。一提，它就开始解释自己是个模型 ——
+       用户要的是「它就是她」，不是「她在演」。
+    6. **不写行为规则**（「不清楚就说不知道」「日程先查再报」）。这类句子同样会被
+       当成台词：实测凯尔希回过「我甚至知道博士的日程和备忘录」。真话与工具的规矩
+       属于**每轮的运行时提示**（`pipeline` 里的 hint），不属于人设。
     """
+    if style == "rich":
+        return _render_rich(char, extra, lines_in_prompt=lines_in_prompt)
+    who = char.user_title or "对方"
+    work = work_name(char)
+    # ★开头必须有「你」★：只写「凯尔希，罗德岛医疗主管……」，模型会以为这是在介绍
+    # 一个**别人**，于是用第三人称谈她（「关于您提到的那个凯尔希……她不在场」）。
+    head = f"你是{char.name}"
+    if char.title:
+        head += f"，{char.title}"
+    if work:
+        head += f"，出自《{work}》"
+    head += f"，正和{who}说话。"
+    parts: list[str] = [head]
+
+    tones = _tone_entries(char)
+    tone = "；".join(t.rstrip("。；，, ") for t in tones if t)
+    if tone:
+        parts.append(f"{tone}。")
+
+    background = _clip(_plain(_strip_copyable(char.background.strip())),
+                       COMPACT_BACKGROUND_CHARS)
+    if background:
+        parts.append(background)
+    # ★全知角色的「旁观」要求（compact 版）★：它的资料里混着**别人的**世界观和设定，
+    # 不写这一句，小模型会把资料当自己的身份（「我来自泰拉」）。
+    # rich 版写了一大段，compact 只能留一句 —— 而且必须是陈述句（否定句会被照念）。
+    if char.memory_all or char.knowledge_all:
+        parts.append(OMNISCIENT_NOTE)
+    parts.append("话不长，一次一两句。")
+
+    samples = _short_lines(char.lines, lines_in_prompt or DEFAULT_LINES_IN_PROMPT)
+    if samples:
+        parts.append("；".join(samples) + "。")
+    if extra.strip():
+        parts.append(extra.strip())
+    return "\n".join(p for p in parts if p.strip())
+
+
+def _render_rich(char: Character, extra: str = "", *,
+                 lines_in_prompt: int = 0) -> str:
+    """分节的「文档式」人设（只有大模型扛得住；小模型会拒绝或复述，见上）。"""
     who = char.user_title or "你"
-    head = f"你是《明日方舟》里的{char.name}" + (f"，{char.title}。" if char.title else "。")
+    work = work_name(char)
+    head = f"你是《{work}》里的{char.name}" if work else f"你是{char.name}"
+    head += (f"，{char.title}。" if char.title else "。")
     parts: list[str] = [head]
     if char.background:
-        parts.append(char.background.strip())
+        parts.append(_strip_copyable(char.background.strip()))
     parts.append(
         f"现在正通过语音和{who}对话——你就是{who}身边的那个{char.name}，"
         f"不是「扮演助手的 AI」，也不要自称 AI 或语言模型。称呼对方为「{who}」。\n"
         "★用第一人称说话（「我」）★：不要用第三人称描述自己，也不要念自己的头衔或自我介绍。"
     )
+    # ★真话规则放在风格**前面**★：小模型对越靠后的内容越不敏感，
+    # 而「不编造」比「像不像她」重要 —— 冲突时以这一节为准。
+    parts.append("\n".join(TRUTH_RULES))
 
     if char.style:
-        parts.append("【说话风格】\n" + "\n".join(f"{i}. {s}" for i, s in enumerate(char.style, 1)))
+        parts.append("【说话风格】\n" + "\n".join(
+            f"{i}. {_strip_copyable(s)}" for i, s in enumerate(char.style, 1)))
     if char.rules:
         parts.append("【必须做到】\n" + "\n".join(f"- {s}" for s in char.rules))
     if char.avoid:
@@ -309,7 +692,9 @@ def render_system_prompt(char: Character, extra: str = "") -> str:
             "除非对方明确问到，不要主动把别人的设定抡出来。你自己的身份只有一个：上面写着的那些。"
         )
     if char.lines:
-        shown = "\n".join(f"- 场景：{ln['scene']} → {ln['text']}" for ln in char.lines)
+        budget = lines_in_prompt or DEFAULT_LINES_IN_PROMPT
+        picked = pick_lines(char.lines, budget)
+        shown = "\n".join(f"- 场景：{ln['scene']} → {ln['text']}" for ln in picked)
         parts.append(
             "【过往台词】下面是你**以前说过的话**，只看它们的语气、用词和称呼：\n"
             "· ★不要原样重复★——同一件事每次都要换一种说法，否则就成了复读；\n"
@@ -573,11 +958,14 @@ class CharacterRegistry:
                 out.setdefault(word, char.id)
         return out
 
-    def prompt_for(self, key: str | None, extra: str = "") -> tuple[str, Character | None]:
+    def prompt_for(self, key: str | None, extra: str = "", *,
+                   lines_in_prompt: int = 0, style: str = "") -> tuple[str, Character | None]:
         """按 id/名字取角色并拼提示词；找不到就用默认角色。"""
         char = self.get(key) if key else None
         char = char or self.default()
-        return (render_system_prompt(char, extra) if char else "", char)
+        return (render_system_prompt(char, extra, lines_in_prompt=lines_in_prompt,
+                                     style=style)
+                if char else "", char)
 
     def stats(self) -> str:
         on = self.all(only_enabled=True)

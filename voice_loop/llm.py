@@ -142,9 +142,11 @@ class OllamaClient:
     def reset(self) -> None:
         self._history.clear()
 
-    def _build_messages(self, user_text: str, images: list[str] | None = None) -> list[dict]:
+    def _build_messages(self, user_text: str, images: list[str] | None = None,
+                        system_override: str | None = None) -> list[dict]:
         msgs: list[dict] = []
-        prompt = self._system_prompt().strip()
+        prompt = (self._system_prompt() if system_override is None
+                  else system_override).strip()
         if prompt:
             msgs.append({"role": "system", "content": prompt})
         keep = max(0, int(self.cfg.history_turns)) * 2
@@ -194,6 +196,7 @@ class OllamaClient:
         extra_messages: list[dict] | None = None,
         messages: list[dict] | None = None,
         prefix_messages: list[dict] | None = None,
+        system_override: str | None = None,
     ) -> Iterator[dict]:
         """流式返回事件：``{"delta": "文字"}`` 或 ``{"tool_calls": [...]}``。
 
@@ -202,11 +205,13 @@ class OllamaClient:
         模型要调工具 -> 一个字都没念，直接去执行」。
 
         ``extra_messages``：接在历史之后、本次输入之前（例如把工具结果喂回去）。
+        ``system_override``：临时换掉 system prompt（人设「出戏」时重答用，
+        见 ``pipeline`` 里的兜底重试）。
         """
         if messages is not None:
             msgs = [dict(m) for m in messages]
         else:
-            msgs = self._build_messages(user_text, images)
+            msgs = self._build_messages(user_text, images, system_override)
             if extra_messages:
                 msgs[-1:-1] = [dict(m) for m in extra_messages]
         if prefix_messages:

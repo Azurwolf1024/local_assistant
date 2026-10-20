@@ -22,7 +22,9 @@ from voice_loop.persona import (  # noqa: E402
     SPEECH_RULES,
     Character,
     CharacterRegistry,
+    plain_prompt,
     render_system_prompt,
+    reply_problem,
 )
 from voice_loop.settings import load_settings  # noqa: E402
 from voice_loop.wake import WakeWordMatcher  # noqa: E402
@@ -115,9 +117,9 @@ def test_registry(tmp: Path) -> CharacterRegistry:
 
 
 def test_render() -> None:
-    print("\n[2] 拼 system prompt：字段都要进得去")
+    print("\n[2] 拼 system prompt：字段都要进得去（rich 版）")
     char = Character.from_dict(sample()[0])
-    prompt = render_system_prompt(char, extra="今天是很忙的一天。")
+    prompt = render_system_prompt(char, extra="今天是很忙的一天。", style="rich")
 
     for piece in (char.name, char.title, char.background, char.user_title,
                   char.style[0], char.rules[0], char.avoid[0], char.lines[0]["text"]):
@@ -129,11 +131,67 @@ def test_render() -> None:
     check("换个人称，提示词跟着换",
           "指挥官" not in prompt
           and "指挥官" in render_system_prompt(
-              Character.from_dict({**sample()[0], "user_title": "指挥官"})))
+              Character.from_dict({**sample()[0], "user_title": "指挥官"}), style="rich"))
     # 字段留空也不能拼出奇怪的提示词
-    slim = render_system_prompt(Character(id="a", name="甲"))
+    slim = render_system_prompt(Character(id="a", name="甲"), style="rich")
     check("字段留空也能拼出干净提示词",
-          "你是《明日方舟》里的甲。" in slim and "\n\n\n" not in slim, slim[:40].replace("\n", "|"))
+          "你是甲。" in slim and "\n\n\n" not in slim, slim[:40].replace("\n", "|"))
+
+
+def test_compact() -> None:
+    """★compact 的六条硬规则都要有测试兜着★（§58：它们是实测撞出来的，很容易被改回去）。"""
+    print("\n[2b] compact 人设卡：短、干净、不带元指令")
+    data = {**sample()[0],
+            "background": "冷静的医疗主管。★档案齐全★",
+            "style": ["冷静、克制，像在做例行简报；偶尔可以提到档案这个词，但不要硬塞",
+                      "说话直接"],
+            "lines": [{"scene": "a", "text": "博士，你又熬夜了……我也没睡。"},
+                      {"scene": "b", "text": "全体单位，准备接敌。"},
+                      {"scene": "c", "text": "把今天的档案整理一下再走。"}]}
+    char = Character.from_dict(data)
+    prompt = render_system_prompt(char)
+
+    check("开头是第二人称，不然模型会把角色当别人谈论", prompt.startswith(f"你是{char.name}"),
+          prompt.split("\n")[0])
+    check("正文里没有装饰符号（★/**/【】/引号）",
+          not any(ch in prompt for ch in "★☆*【】「」『』"), prompt)
+    check("没有元指令（第一人称/自我介绍/学那个语气）",
+          not any(w in prompt for w in ("第一人称", "自我介绍", "学那个语气", "必须做到")), prompt)
+    check("够短（≤400 字，超了 4B 就开始议论提示词）", len(prompt) <= 400, f"{len(prompt)} 字")
+    check("作息类台词不进提示词（用户抱怨的「又熬夜了」源头）", "熬夜" not in prompt, prompt)
+    check("战斗类台词也不进", "接敌" not in prompt)
+    check("风格只取第一个分句（后半句是指令，会被念出来）",
+          "硬塞" not in prompt and "提到" not in prompt, prompt)
+    check("背景里的装饰符号被洗掉", "★" not in prompt)
+
+    # rich 版仍然保留给大模型用
+    rich = render_system_prompt(char, style="rich")
+    check("rich 版还能用（给 20B 以上的模型）", "【说话风格】" in rich and len(rich) > len(prompt))
+
+
+def test_reply_guard() -> None:
+    """开口前的「出戏」判定：这几类是 §58 里真的出现过的回答。"""
+    print("\n[2c] 出戏判定（念出来之前拦掉）")
+    persona = render_system_prompt(Character.from_dict(sample()[0]))
+    echo = "嗯。" + persona[:24]
+    bad_cases = [
+        ("作为一个人工智能助手，我无法扮演明日方舟中的角色。", "拒绝扮演"),
+        ("您提供的这段文字似乎是一段经过加密、错乱或故意拼凑的文本。", "议论提示词"),
+        ("我无法按照您的要求生成包含暴力内容的故事片段。", "拒绝扮演"),
+        ("**结论：** 现在不能休息。", "交作业排版"),
+        (echo, "复述人设"),
+    ]
+    for text, reason in bad_cases:
+        check(f"拦得住：{reason}", reply_problem(text, persona) == reason,
+              f"得到「{reply_problem(text, persona)}」")
+    good = ["醒了吗？还是还在梦里。", "我在。", "别急，先喝口水歇会儿。你卡在哪个段落了？",
+            "博士，您工作辛苦了。"]
+    for text in good:
+        check(f"正常回答放行：{text[:10]}", reply_problem(text, persona) == "")
+    check("空人设时不做复述比对", reply_problem("我甚至知道博士的日程和备忘录。", "") == "")
+
+    plain = plain_prompt(Character.from_dict(sample()[0]))
+    check("兜底人设够短", len(plain) <= 60 and "凯尔希" in plain, plain)
 
 
 def test_wake_attribution(tmp: Path) -> None:
@@ -444,6 +502,8 @@ def main() -> int:
     try:
         test_registry(tmp)
         test_render()
+        test_compact()
+        test_reply_guard()
         test_wake_attribution(tmp)
         test_pipeline(tmp)
         test_default_file()
