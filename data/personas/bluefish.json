@@ -73,5 +73,5 @@
   "enabled": true,
   "memory_all": false,
   "knowledge_all": false,
-  "notes": "★原生 API 角色（2026-11-18 加）★：engine=api，默认模型 deepseek-chat（DeepSeek）；backend=api 走 DeepSeek 官方 TTS（音色 stella），失败自动退回本地 Piper（voice 那一栏就是退路）。api_tools=[\"web\",\"files\"] 额外开放 harness 工具：web_search / web_fetch / read_file / list_dir（写文件和执行命令要 [agent] 里显式开启）；本地角色看不到这些工具。没有 API key 时流水线会自动退回本地模型，不会把嘴弄哑。"
+  "notes": "★原生 API 角色（2026-11-18 加）★：engine=api，默认模型 deepseek-chat（DeepSeek）；backend=api 走 DeepSeek 官方 TTS（音色 stella），失败自动退回本地 Piper（voice 那一栏就是退路）。api_tools=[\"web\",\"files\"] 额外开放 harness 工具：web_search / web_fetch / read_file / list_dir / glob / grep，外加内置的 ask_user（会反过来问你问题）和 update_plan（写步骤计划）；写文件和执行命令要 [agent] 里显式开启。本地角色看不到这些工具。没有 API key 时流水线会自动退回本地模型，不会把嘴弄哑。"
 }

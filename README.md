@@ -122,7 +122,8 @@ flowchart LR
 
 > 可选：某个角色可以在人格文件里改用**云端 API**（`"engine": "api"`，见第 14 节）。
 > 默认工具还是这 10 个；API 角色在 `api_tools` 里按预设多开 harness 工具
-> （`web` = 联网搜索/读取，`files` = 工作区读/列目录，`harness` = 全部；
+> （`web` = 联网搜索/读取，`files` = 工作区读/列/glob/grep，`harness` = 全部；
+> 另外 `ask_user` / `update_plan` 是 harness 内置的，不用点名；
 > 见 `voice_loop/tool_presets.py`）。
 
 > ★合并前是 11 个★：`add_schedule`/`add_alarm` 是一回事，`change_schedule`/`cancel_alarm`
@@ -1496,7 +1497,8 @@ pipeline（会话编排）
 | `mcp/host.py` | 聚合工具清单、白名单、路由、服务器崩了自动重启 |
 | `mcp/servers/skills.py` | 第一个服务器：把现成的 `ToolRegistry`（事件/提醒/备忘）挂到协议后面 |
 | `mcp/servers/memory.py` | ★ 记忆服务器（第 15 节）：`recall` / `remember` / `memory_stats`，默认只露前两个 |
-| `mcp/servers/agent.py` | ★ harness agent：`web_search` / `web_fetch` / `read_file` / `list_dir`（+ 可选写/命令），默认 `hidden` |
+| `mcp/servers/agent.py` | ★ harness agent：`web_search` / `web_fetch` / `read_file` / `list_dir` / `glob` / `grep`（+ 可选 `write_file` / `edit_file` / `run_command`），默认 `hidden` |
+| `harness.py` | ★ harness 运行时：多轮工具循环 + 内置 `ask_user` / `update_plan`（进程内，不是 MCP 工具） |
 
 第一条命令：
 
@@ -1799,8 +1801,22 @@ max_tool_chars = 6000     # 单个工具结果喂回模型的上限
 | `web_fetch` | DeepSeek `POST /v1/tools/fetch` | `api_tools` 含 `web` |
 | `read_file` | 工作区文本文件（带行号） | `api_tools` 含 `files` |
 | `list_dir` | 工作区目录 | `api_tools` 含 `files` |
+| `glob` | 按通配符找文件（`**/*.py`） | `api_tools` 含 `files` |
+| `grep` | 在文件内容里搜正则 | `api_tools` 含 `files` |
 | `write_file` | 写工作区文件 | `[agent] allow_write = true` 且点名 |
+| `edit_file` | 精确替换文件里的一处文本 | `[agent] allow_write = true` 且点名 |
 | `run_command` | 工作区 shell | `[agent] allow_shell = true` 且点名 |
+| `ask_user` | ★内置★：向用户提问（可带选项） | 一律有（API 角色） |
+| `update_plan` | ★内置★：把步骤计划写进这一轮的状态 | 一律有（API 角色） |
+
+`ask_user` 的两种模式：
+
+- **语音**：先念出问题（`speak_text`），再用麦克风听、转写；期间会清掉静音状态，
+  所以即使刚才按了静音也能听见回答。
+- **纯文本**（`enable_listening=false` / 没有麦克风）：直接 `input()` 读一行。
+
+`update_plan` 不念给用户听，只把步骤记到 `TurnStats.extra["plan"]`（控制台/日志可见），
+模型想怎么规划都行，不会因为「计划」多占一轮回答。
 
 `api_tools` 里写预设名即可：
 
@@ -1810,18 +1826,22 @@ max_tool_chars = 6000     # 单个工具结果喂回模型的上限
 ```
 
 - `web` → `web_search` + `web_fetch`
-- `files` → `read_file` + `list_dir`
-- `write` / `shell` → 需要先在 `[agent]` 里显式开启
+- `files` → `read_file` + `list_dir` + `glob` + `grep`
+- `write` → `write_file` + `edit_file`（需要先在 `[agent]` 里显式开启）
+- `shell` → `run_command`（需要先在 `[agent]` 里显式开启）
 - `harness` → 全部（当前不可用的会自动跳过并告警）
 
 | 设计点 | 原因 |
 | --- | --- |
 | **默认隐藏**（`hidden = true`） | 本地 4B 看不到这些工具，不会误调；只有 API 角色点名才露出 |
 | **多轮工具循环** | 搜到结果后模型可以继续 `web_fetch` 读正文，或直接回答；不再把搜索摘要当最终答复 |
+| **运行时独立** | 循环 / `ask_user` / `update_plan` 都在 [`voice_loop/harness.py`](voice_loop/harness.py)，流水线只提供「念出来」「问用户」两个回调，方便单测 |
 | **URL 只给模型看** | 工具结果里有 URL（模型可读），最终回答由模型组织，不会念网址 |
 | **文件边界** | 所有路径都限制在 `[agent] workspace` 里；`..` / 越界绝对路径会被拒 |
 | **隐私路径** | 即使 workspace 指到项目根，`sessions/`、`data/memory/`、`data/knowledge/`、`data/vision/`、`data/backup/`、`config.local.toml` 也永远不给模型看/写 |
-| **写/命令默认关** | `write_file` / `run_command` 只有显式开启才出现在工具列表里；命令等于把本机 shell 交给模型，风险自负 |
+| **写/命令默认关** | `write_file` / `edit_file` / `run_command` 只有显式开启才出现在工具列表里；命令等于把本机 shell 交给模型，风险自负 |
+| **会问也会等** | `ask_user` 会把问题念出来并真的等回答（语音或键盘），答案作为工具结果喂回模型；用户打断/取消就结束这一轮 |
+| **计划不占回答** | `update_plan` 只记录步骤，不念出来也不额外花一轮；最后一轮模型仍要给出正常的一句话回答 |
 | **计费** | Search / Fetch 各 $0.75 / 1000 次成功请求；`count` 不影响单价；空结果/失败/超时不计费 |
 | **隐私** | 查询内容会发给 DeepSeek；本地角色完全不会触发联网工具 |
 

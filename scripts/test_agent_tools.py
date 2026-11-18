@@ -173,9 +173,10 @@ def test_files(tmp: Path) -> None:
     s.agent.allow_shell = False
     srv = ag.build_server(settings=s)
     names = {t.name for t in srv.tools()}
-    check("默认有读/列/联网", {"read_file", "list_dir", "web_search", "web_fetch"} <= names,
+    check("默认有读/列/找/搜/联网",
+          {"read_file", "list_dir", "glob", "grep", "web_search", "web_fetch"} <= names,
           detail=str(sorted(names)))
-    check("写文件默认不出现", "write_file" in names, False)
+    check("写/改文件默认不出现", {"write_file", "edit_file"} <= names, False)
     check("执行命令默认不出现", "run_command" in names, False)
 
     text, err = call(srv, "read_file", {"path": "a.txt", "start_line": 2, "max_lines": 1})
@@ -183,6 +184,11 @@ def test_files(tmp: Path) -> None:
     check("带行号与范围", "2  第二行" in text and "lines: 2-2 of 3" in text, detail=text)
     text, err = call(srv, "list_dir", {"path": "."})
     check("列目录有文件和子目录", "a.txt" in text and "sub/" in text, detail=text)
+    text, err = call(srv, "glob", {"pattern": "**/*.txt", "path": "."})
+    check("glob 找到两个 txt", err, False)
+    check("glob 结果", {"a.txt", "sub/b.txt"} <= set(text.splitlines()), detail=text)
+    text, err = call(srv, "grep", {"pattern": "第二行", "path": "."})
+    check("grep 命中带行号", "a.txt:2:" in text and "第二行" in text, detail=text)
     text, err = call(srv, "read_file", {"path": "../outside.txt"})
     check("★越界读取被拒★", err, True)
     check("越界提示", "工作区之外" in text, detail=text)
@@ -201,10 +207,14 @@ def test_files(tmp: Path) -> None:
     srv2 = ag.build_server(settings=s)
     names = {t.name for t in srv2.tools()}
     check("开启后有写文件", "write_file" in names, detail=str(sorted(names)))
+    check("开启后有改文件", "edit_file" in names)
     check("开启后有执行命令", "run_command" in names)
     text, err = call(srv2, "write_file", {"path": "new.txt", "content": "你好"})
     check("写文件成功", err, False)
     check("文件真的写了", (sandbox / "new.txt").read_text(encoding="utf-8"), "你好")
+    text, err = call(srv2, "edit_file", {"path": "a.txt", "old": "第二行", "new": "第二行改"})
+    check("改文件成功", err, False)
+    check("改文件生效", "第二行改" in (sandbox / "a.txt").read_text(encoding="utf-8"), True)
     text, err = call(srv2, "write_file", {"path": "../escape.txt", "content": "x"})
     check("★越界写入被拒★", err, True)
 
@@ -234,10 +244,12 @@ def test_hidden_and_preset() -> None:
     finally:
         host.close()
     check("web 预设", expand(["web"]), {"web_search", "web_fetch"})
-    check("files 预设", expand(["files"]), {"read_file", "list_dir"})
+    check("files 预设", expand(["files"]),
+          {"read_file", "list_dir", "glob", "grep"})
+    check("write 预设", expand(["write"]), {"write_file", "edit_file"})
     check("harness 预设", expand(["harness"]),
-          {"web_search", "web_fetch", "read_file", "list_dir",
-           "write_file", "run_command"})
+          {"web_search", "web_fetch", "read_file", "list_dir", "glob", "grep",
+           "write_file", "edit_file", "run_command"})
 
 
 class ScriptedLLM:
@@ -362,6 +374,57 @@ def test_pipeline_agent(tmp: Path) -> None:
         check("结果内容真的在里面", "https://example.com/news" in tool_msgs[0]["content"], True)
         check("历史只存最终问答", fake.history, [("最近 DeepSeek 有什么新闻？",
                                                    "根据搜索结果，DeepSeek 最近发布了新模型。")])
+
+        # ask_user：模型先问用户，拿到回答后再继续
+        fake3 = ScriptedLLM([
+            [{"tool_calls": [{
+                "id": "q1", "type": "function",
+                "function": {"name": "ask_user",
+                             "arguments": "{\"question\":\"用哪个音色？\","
+                                          "\"options\":[\"stella\",\"tide\"]}"},
+            }]}],
+            [{"delta": "好，用 stella。"}],
+        ])
+        loop.llm = fake3
+        asked: list[tuple[str, list[str]]] = []
+        real_ask = loop._ask_user  # noqa: SLF001
+
+        def fake_ask(question, options):
+            asked.append((question, list(options)))
+            return "stella"
+
+        loop._ask_user = fake_ask   # noqa: SLF001
+        st = loop.respond("帮我选个音色")
+        check("ask_user 被调用", asked, [("用哪个音色？", ["stella", "tide"])])
+        check("ask_user 后继续回答", st.answer, "好，用 stella。")
+        tool_msg = [m for m in fake3.calls[1] if m.get("role") == "tool"][0]
+        check("用户回答喂回模型", "用户回答：stella" in tool_msg["content"],
+              detail=tool_msg["content"])
+
+        # update_plan
+        fake4 = ScriptedLLM([
+            [{"tool_calls": [{
+                "id": "p1", "type": "function",
+                "function": {"name": "update_plan",
+                             "arguments": "{\"steps\":[\"查资料\",\"改文件\"]}"},
+            }]}],
+            [{"delta": "按计划做完了。"}],
+        ])
+        loop.llm = fake4
+        st = loop.respond("分步做一下")
+        check("计划记进 stats", st.extra.get("plan"), ["查资料", "改文件"])
+        check("计划后继续回答", st.answer, "按计划做完了。")
+
+        # 纯文本模式下 ask_user 真的会读 input()
+        loop._ask_user = real_ask   # noqa: SLF001
+        import builtins
+        old_input = builtins.input
+        builtins.input = lambda *_a, **_k: "蓝色"   # type: ignore[assignment]
+        try:
+            answer = loop._ask_user("用哪个颜色？", ["蓝", "红"])  # noqa: SLF001
+        finally:
+            builtins.input = old_input                   # type: ignore[assignment]
+        check("文本模式 ask_user 读到回答", answer, "蓝色")
 
         # 到轮数上限 → 最后一次不给工具，逼它收口
         fake2 = ScriptedLLM([

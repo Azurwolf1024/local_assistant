@@ -338,6 +338,85 @@ def make_list_dir(settings: Settings, log: logging.Logger):
     return list_dir
 
 
+def make_glob(settings: Settings, log: logging.Logger):
+    def glob(args: dict) -> dict:
+        pattern = str((args or {}).get("pattern") or "*").strip() or "*"
+        try:
+            base = _safe(settings, (args or {}).get("path"))
+        except ValueError as exc:
+            return {"text": str(exc), "is_error": True}
+        if not base.is_dir():
+            return {"text": f"不是目录：{base.name}", "is_error": True}
+        root = workspace_of(settings)
+        limit = max(10, int(getattr(settings.agent, "max_list_entries", 200) or 200))
+        found: list[str] = []
+        try:
+            for p in base.rglob(pattern):
+                if not p.is_file():
+                    continue
+                rel = p.relative_to(root).as_posix()
+                if _denied(rel):
+                    continue
+                found.append(rel)
+                if len(found) >= limit:
+                    break
+        except OSError as exc:
+            return {"text": f"找不了：{exc}", "is_error": True}
+        found.sort()
+        log.info(f"[mcp:agent.glob] {pattern} -> {len(found)} 个文件")
+        return {"text": "\n".join(found) if found else f"没有匹配 {pattern} 的文件。",
+                "is_error": False}
+
+    return glob
+
+
+def make_grep(settings: Settings, log: logging.Logger):
+    def grep(args: dict) -> dict:
+        pattern = str((args or {}).get("pattern") or "").strip()
+        if not pattern:
+            return {"text": "要搜什么？给我一个正则或普通文本。", "is_error": True}
+        try:
+            regex = re.compile(pattern)
+        except re.error as exc:
+            return {"text": f"正则写错了：{exc}", "is_error": True}
+        try:
+            base = _safe(settings, (args or {}).get("path"))
+        except ValueError as exc:
+            return {"text": str(exc), "is_error": True}
+        file_glob = str((args or {}).get("glob") or "*").strip() or "*"
+        try:
+            limit = max(1, min(500, int((args or {}).get("max_results") or 100)))
+        except (TypeError, ValueError):
+            limit = 100
+        root = workspace_of(settings)
+        files = [base] if base.is_file() else list(base.rglob(file_glob))
+        hits: list[str] = []
+        for p in files:
+            if not p.is_file():
+                continue
+            rel = p.relative_to(root).as_posix()
+            if _denied(rel):
+                continue
+            try:
+                if p.stat().st_size > 2_000_000:
+                    continue
+                text = _read_text(p)
+            except OSError:
+                continue
+            for lineno, line in enumerate(text.splitlines(), 1):
+                if regex.search(line):
+                    hits.append(f"{rel}:{lineno}: {line.strip()[:240]}")
+                    if len(hits) >= limit:
+                        break
+            if len(hits) >= limit:
+                break
+        log.info(f"[mcp:agent.grep] {pattern} -> {len(hits)} 处命中")
+        return {"text": "\n".join(hits) if hits else f"没有找到匹配 {pattern} 的内容。",
+                "is_error": False}
+
+    return grep
+
+
 def make_write_file(settings: Settings, log: logging.Logger):
     def write_file(args: dict) -> dict:
         if not bool(getattr(settings.agent, "allow_write", False)):
@@ -361,6 +440,45 @@ def make_write_file(settings: Settings, log: logging.Logger):
                 "is_error": False}
 
     return write_file
+
+
+def make_edit_file(settings: Settings, log: logging.Logger):
+    def edit_file(args: dict) -> dict:
+        if not bool(getattr(settings.agent, "allow_write", False)):
+            return {"text": "改文件没开：需要在 config.toml 里设 [agent] allow_write = true。",
+                    "is_error": True}
+        try:
+            path = _safe(settings, (args or {}).get("path"))
+        except ValueError as exc:
+            return {"text": str(exc), "is_error": True}
+        if not path.is_file():
+            return {"text": f"文件不存在：{path.name}", "is_error": True}
+        old = str((args or {}).get("old") or "")
+        new = str((args or {}).get("new") or "")
+        if not old:
+            return {"text": "old 不能为空：给我要替换的原文。", "is_error": True}
+        try:
+            text = _read_text(path)
+        except OSError as exc:
+            return {"text": f"读不了：{exc}", "is_error": True}
+        count = text.count(old)
+        if count == 0:
+            return {"text": "没找到要替换的原文（old）。", "is_error": True}
+        replace_all = bool((args or {}).get("replace_all", False))
+        if count > 1 and not replace_all:
+            return {"text": f"原文出现了 {count} 次；请多给一点上下文，或设 replace_all=true。",
+                    "is_error": True}
+        updated = text.replace(old, new) if replace_all else text.replace(old, new, 1)
+        try:
+            path.write_text(updated, encoding="utf-8")
+        except OSError as exc:
+            return {"text": f"写不了：{exc}", "is_error": True}
+        rel = path.relative_to(workspace_of(settings)).as_posix()
+        n = count if replace_all else 1
+        log.info(f"[mcp:agent.edit_file] {rel} 替换 {n} 处")
+        return {"text": f"已在 {rel} 替换 {n} 处。", "is_error": False}
+
+    return edit_file
 
 
 def make_run_command(settings: Settings, log: logging.Logger):
@@ -472,6 +590,37 @@ def build_server(
         },
         make_list_dir(settings, log),
     )
+    add(
+        "glob",
+        "按文件名/通配符在工作区里找文件，例如 **/*.py、data/*.json。",
+        {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string",
+                            "description": "通配符（默认 *）"},
+                "path": {"type": "string",
+                         "description": "从哪个目录开始（默认工作区根）"},
+            },
+        },
+        make_glob(settings, log),
+    )
+    add(
+        "grep",
+        "在工作区文本文件里按正则搜索，返回 文件:行号: 内容。",
+        {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "正则或普通文本"},
+                "path": {"type": "string", "description": "目录或文件（默认工作区根）"},
+                "glob": {"type": "string",
+                         "description": "只搜匹配的文件名（默认 *）"},
+                "max_results": {"type": "integer", "minimum": 1,
+                                "description": "最多返回多少处（默认 100）"},
+            },
+            "required": ["pattern"],
+        },
+        make_grep(settings, log),
+    )
     if bool(getattr(agent_cfg, "allow_write", False)):
         add(
             "write_file",
@@ -486,6 +635,22 @@ def build_server(
                 "required": ["path", "content"],
             },
             make_write_file(settings, log),
+        )
+        add(
+            "edit_file",
+            "按原文替换工作区文件里的一段内容（比整份重写安全）。",
+            {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "工作区内的相对路径"},
+                    "old": {"type": "string", "description": "要被替换的原文"},
+                    "new": {"type": "string", "description": "替换成什么"},
+                    "replace_all": {"type": "boolean",
+                                    "description": "true = 替换所有匹配"},
+                },
+                "required": ["path", "old", "new"],
+            },
+            make_edit_file(settings, log),
         )
     if bool(getattr(agent_cfg, "allow_shell", False)):
         add(

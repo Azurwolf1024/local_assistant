@@ -318,7 +318,9 @@ class VoiceLoop:
         self._speech_begin_at = 0.0
         self._muted = threading.Event()      # 播放期间忽略麦克风，避免自我唤醒
         self._needs_flush = False            # 播放过之后，下次监听前要清一次回声
-        self._speak_lock = threading.Lock()  # 保证同一时刻只有一处发声
+        # ★可重入★：harness agent 在持有这把锁的同一线程里还会调用 speak_text
+        # （ask_user 要先念问题再听回答），普通 Lock 会当场死锁。
+        self._speak_lock = threading.RLock()  # 保证同一时刻只有一处发声
         self._in_reply = False
         self._barge_audio: np.ndarray | None = None   # 被语音打断时收到的那句话
         self._watcher: threading.Thread | None = None
@@ -1481,18 +1483,17 @@ class VoiceLoop:
     ) -> None:
         """harness agent：模型→工具→模型…直到它给出最终回答。
 
-        ★和本地路径的区别★：本地 4B 只跑一轮（选中工具 → 工具的话直接念），
-        因为小模型多轮容易跑偏；API 模型则按成熟 harness agent 的做法，
-        把工具结果喂回模型，让它自己决定继续搜/读/执行，还是收口回答。
+        循环本身在 :class:`voice_loop.harness.HarnessAgent` 里；
+        这里只负责搭人设/记忆/时间提示，以及把最终回答念出来。
         """
+        from .harness import HarnessAgent  # noqa: PLC0415
         from .persona import now_block  # noqa: PLC0415
 
         tts_cfg = self.settings.tts
         t0 = time.perf_counter()
         first_audio: float | None = None
+        final_text = ""
         self._interrupt.clear()
-        agent_cfg = getattr(self.settings, "agent", None)
-        max_rounds = max(1, int(getattr(agent_cfg, "max_rounds", 6) or 6))
 
         runtime = now_block()
         if tools:
@@ -1514,12 +1515,6 @@ class VoiceLoop:
                 if style_hint:
                     hint = [{"role": "system", "content": style_hint}] + hint
 
-        messages = self.llm.build_messages(prompt, extra_messages=hint)
-        all_calls: list[dict] = []
-        final_text = ""
-        rounds = 0
-        ok_all = True
-
         def speak(sentence: str) -> None:
             nonlocal first_audio
             if not self.tts_enabled:
@@ -1527,109 +1522,42 @@ class VoiceLoop:
             if self._speak_chunk(sentence) and first_audio is None:
                 first_audio = time.perf_counter() - t0
 
-        # 和本地路径一样：一轮发言期间独占播放，避免提醒插进来把两段话搅在一起
         self._speak_lock.acquire()
         try:
-            for _round in range(max_rounds):
-                if self._interrupt.is_set():
-                    break
-                rounds += 1
-                text_parts: list[str] = []
-                calls: list[dict] = []
-                for ev in self.llm.chat_events(
-                    messages=messages, tools=tools, model=model, num_ctx=num_ctx
-                ):
-                    if self._interrupt.is_set():
-                        break
-                    if "tool_calls" in ev:
-                        calls.extend(ev["tool_calls"])
-                        continue
-                    piece = ev.get("delta", "")
-                    if stripper is not None and piece:
-                        piece = stripper.feed(piece)
-                        if stripper.style:
-                            self.set_style(stripper.style, reason="LLM 标签")
-                            stripper.style = ""
-                    if piece:
-                        if stats.llm_first_token == 0.0:
-                            stats.llm_first_token = time.perf_counter() - t0
-                        text_parts.append(piece)
-                text = "".join(text_parts).strip()
-                if self._interrupt.is_set():
-                    break
-                if not calls:
-                    if stripper is not None:
-                        tail = stripper.finish()
-                        if tail:
-                            text = (text + tail).strip()
-                    final_text = text
-                    break
+            agent = HarnessAgent(
+                self.llm,
+                self.settings,
+                self.log,
+                tool_specs=tools,
+                call_tool=self._call_tool_for_model,
+                ask_user=self._ask_user,
+                should_stop=lambda: self._interrupt.is_set(),
+            )
+            result = agent.run(prompt, extra_messages=hint, model=model, num_ctx=num_ctx)
+            final_text = result.text
 
-                # ---- 执行这一轮工具，把结果喂回模型 ----
-                normalized: list[dict] = []
-                for idx, call in enumerate(calls):
-                    fn = call.get("function") or call
-                    name = str(fn.get("name") or "")
-                    raw_args = fn.get("arguments")
-                    if isinstance(raw_args, str):
-                        try:
-                            args_obj = json.loads(raw_args) if raw_args.strip() else {}
-                        except json.JSONDecodeError:
-                            args_obj = {}
-                    elif isinstance(raw_args, dict):
-                        args_obj = raw_args
-                    else:
-                        args_obj = {}
-                    if not isinstance(args_obj, dict):
-                        args_obj = {}
-                    call_id = str(call.get("id") or f"call_{rounds}_{idx}")
-                    normalized.append({
-                        "id": call_id,
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "arguments": json.dumps(args_obj, ensure_ascii=False),
-                        },
-                        "_args": args_obj,
-                    })
-                messages.append({
-                    "role": "assistant",
-                    "content": text,
-                    "tool_calls": [
-                        {"id": c["id"], "type": "function", "function": c["function"]}
-                        for c in normalized
-                    ],
-                })
-                for call in normalized:
-                    ok, result = self._call_tool_for_model(
-                        call["function"]["name"], call["_args"])
-                    ok_all = ok_all and ok
-                    all_calls.append(call)
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": call["id"],
-                        "content": result,
-                    })
-                stats.extra["tool"] = describe_calls(all_calls)
-                stats.extra["tool_ok"] = ok_all
-                stats.extra["tool_rounds"] = rounds
+            if stripper is not None and final_text:
+                cleaned = stripper.feed(final_text) + stripper.finish()
+                if stripper.style:
+                    self.set_style(stripper.style, reason="LLM 标签")
+                final_text = cleaned.strip()
 
-            else:
-                # 轮数到顶：再问一次，不给工具，逼它用已有资料收口
-                text_parts = []
-                for ev in self.llm.chat_events(
-                    messages=messages, tools=None, model=model, num_ctx=num_ctx
-                ):
-                    if self._interrupt.is_set():
-                        break
-                    if "delta" in ev:
-                        text_parts.append(ev["delta"])
-                final_text = "".join(text_parts).strip()
-
-            if not final_text and not self._interrupt.is_set():
+            if not final_text and not result.interrupted:
                 final_text = "……我没想好说什么。"
 
-            if final_text and not self._interrupt.is_set():
+            stats.llm_first_token = result.first_token
+            stats.extra["agent"] = True
+            stats.extra["tool_rounds"] = result.rounds
+            stats.extra["model_calls"] = result.model_calls
+            if result.calls:
+                stats.extra["tool"] = describe_calls(result.calls)
+                stats.extra["tool_ok"] = result.ok
+            if result.plan:
+                stats.extra["plan"] = result.plan
+            if result.interrupted:
+                final_text = ""
+
+            if final_text:
                 self._speech_begin()
                 if on_delta is not None:
                     on_delta(final_text)
@@ -1665,7 +1593,6 @@ class VoiceLoop:
             self.speaker.join(timeout=30.0)
 
         stats.answer = final_text
-        stats.extra["agent"] = True
         stats.extra["tool_seconds"] = round(time.perf_counter() - t0, 3)
         self._note_spoken(final_text)
         self._note_dialog(commit_text or prompt, final_text)
@@ -1674,6 +1601,40 @@ class VoiceLoop:
         stats.total_seconds = time.perf_counter() - t0
         self.llm.commit(commit_text or prompt, final_text)
         self._write_session(stats)
+
+    def _ask_user(self, question: str, options: list[str]) -> str:
+        """harness 的 ask_user：把问题念/打出来，然后等用户回答。"""
+        question = str(question or "").strip() or "你想怎么做？"
+        options = [str(o).strip() for o in (options or []) if str(o).strip()][:6]
+        spoken = question
+        if options:
+            spoken += " 可选：" + "；".join(
+                f"{i}. {o}" for i, o in enumerate(options, 1))
+        print(f"\n[AI 提问] {spoken}\n", flush=True)
+
+        if self.mic is None or self.asr is None:
+            try:
+                answer = input("你的回答：").strip()
+            except (EOFError, KeyboardInterrupt):
+                self._interrupt.set()
+                return "（用户取消了）"
+            return answer or "（用户没有回答）"
+
+        if self._interrupt.is_set():
+            return "（用户取消了）"
+        try:
+            # _llm_turn 整轮都按着 _muted；提问要听人说话，先放开
+            self._muted.clear()
+            self.speak_text(spoken, fresh=True)
+            if self._interrupt.is_set():
+                return "（用户取消了）"
+            audio = self.listen_once(quick=False)
+            if audio is None:
+                return "（用户没有回答）"
+            text, _result, _seconds = self._transcribe(audio)
+            return (text or "").strip() or "（没有听清）"
+        finally:
+            self._muted.set()
 
     def _tool_specs(self) -> list[dict] | None:
         """这一轮要不要给模型工具（[llm] router = tools / chat）。

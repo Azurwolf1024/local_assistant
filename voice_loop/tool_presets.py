@@ -36,12 +36,12 @@ PRESETS: dict[str, dict] = {
         "tools": ["web_search", "web_fetch"],
     },
     "files": {
-        "title": "工作区文件（读 / 列目录）",
-        "tools": ["read_file", "list_dir"],
+        "title": "工作区文件（读 / 列目录 / 找文件 / 搜索）",
+        "tools": ["read_file", "list_dir", "glob", "grep"],
     },
     "write": {
-        "title": "写工作区文件（需要 [agent] allow_write = true）",
-        "tools": ["write_file"],
+        "title": "写/改工作区文件（需要 [agent] allow_write = true）",
+        "tools": ["write_file", "edit_file"],
     },
     "shell": {
         "title": "执行命令（需要 [agent] allow_shell = true；高风险）",
@@ -50,7 +50,7 @@ PRESETS: dict[str, dict] = {
     "harness": {
         "title": "完整 harness 工具集（不可用的会自动跳过）",
         "tools": ["web_search", "web_fetch", "read_file", "list_dir",
-                  "write_file", "run_command"],
+                  "glob", "grep", "write_file", "edit_file", "run_command"],
     },
     # ★下一步讨论好的额外工具加在这里★，例如：
     #   "web": {"title": "联网", "tools": ["web_search", "web_fetch"]},
