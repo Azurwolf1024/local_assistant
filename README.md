@@ -121,8 +121,9 @@ flowchart LR
 再加 **2 个记忆工具**（第 15 节）：`mcp__memory__recall`、`mcp__memory__remember`。
 
 > 可选：某个角色可以在人格文件里改用**云端 API**（`"engine": "api"`，见第 14 节）。
-> 默认工具还是这 10 个；API 角色可以在 `api_tools` 里按预设多开
-> （`web` = 联网搜索 / 网页读取，`memory` / `skills` = 现有能力；见 `voice_loop/tool_presets.py`）。
+> 默认工具还是这 10 个；API 角色在 `api_tools` 里按预设多开 harness 工具
+> （`web` = 联网搜索/读取，`files` = 工作区读/列目录，`harness` = 全部；
+> 见 `voice_loop/tool_presets.py`）。
 
 > ★合并前是 11 个★：`add_schedule`/`add_alarm` 是一回事，`change_schedule`/`cancel_alarm`
 > 是一回事，`list_schedule`/`list_alarms` 也是一回事。现在**一条事件只有一个入口**。
@@ -208,7 +209,7 @@ flowchart LR
 │  │  ├─ serve.py              #   python -m voice_loop.mcp.serve <服务器>
 │  │  ├─ servers/skills.py     #   技能服务器（见第 13 节）
 │  │  ├─ servers/memory.py     #   ★记忆服务器★：recall / remember / memory_stats
-│  │  └─ servers/web.py        #   ★联网服务器★：DeepSeek Search / Fetch（默认 hidden）
+│  │  └─ servers/agent.py      #   ★harness agent★：联网 / 文件 / 可选命令（默认 hidden）
 │  ├─ scheduler.py             # 后台提醒调度器
 │  ├─ system_ops.py            # 系统操作：关/开显示器（只关屏，不休眠）
 │  ├─ bargein.py               # 语音自动打断（实验性、默认关）：分清「自己的回声」和「你在插话」
@@ -281,7 +282,7 @@ flowchart LR
 │  ├─ test_mcp.py              # ★ MCP：协议 / 真管道 stdio / 白名单 / 路由 / 接进 pipeline
 │  ├─ test_api_llm.py          # ★ 可选 API：配置 / 人格字段 / OpenAI 兼容流 / 本地-API 切换（不联网）
 │  ├─ test_api_tts.py          # ★ 官方 TTS：PCM/WAV 流 / 失败回 Piper / 按角色切后端（不联网）
-│  ├─ test_web_tools.py        # ★ 联网工具：Search/Fetch / 默认隐藏 / 只有 API 角色看得到（不联网）
+│  ├─ test_agent_tools.py      # ★ harness agent：多轮工具循环 / 文件边界 / 预设 / 默认隐藏（不联网）
 │  ├─ test_persona.py          # ★ 角色：结构化人设 / 多角色唤醒归属 / 切换 / 热重载
 │  ├─ test_persona_guard.py    # ★ 兜底：第一句出戏（拒绝/议论/复述）→ 换人设重答
 │  ├─ lint_persona.py          # 人格文件体检（不是单元测试，跑的是你真实的 data/personas）
@@ -724,7 +725,7 @@ python scripts/test_tools.py           # 工具层（模型选工具、确定性
 python scripts/test_route.py           # 路由顺序：模型先选工具 / 技能兜底 / 参数换回原话
 python scripts/test_api_llm.py         # 可选 API：角色切本地/API / 降级 / 额外工具（不联网）
 python scripts/test_api_tts.py         # 官方 TTS：PCM/WAV / 失败回 Piper / 按角色切后端（不联网）
-python scripts/test_web_tools.py       # 联网工具：Search/Fetch / 默认隐藏 / 只有 API 角色看得到（不联网）
+python scripts/test_agent_tools.py     # harness agent：多轮工具循环 / 文件边界 / 预设 / 默认隐藏（不联网）
 python scripts/test_vision.py          # 看图：找文件/确认流程/编码/路由（不用视觉模型）
 python scripts/eval_router.py --builtin  # 评估「模型选工具」准不准（29 句带预期，算选对率/误报/漏调）
 python scripts/test_skills_route.py    # 技能路由 + 关屏幕 + 课表 + 提醒文案 + 重启不丢数据
@@ -1495,7 +1496,7 @@ pipeline（会话编排）
 | `mcp/host.py` | 聚合工具清单、白名单、路由、服务器崩了自动重启 |
 | `mcp/servers/skills.py` | 第一个服务器：把现成的 `ToolRegistry`（事件/提醒/备忘）挂到协议后面 |
 | `mcp/servers/memory.py` | ★ 记忆服务器（第 15 节）：`recall` / `remember` / `memory_stats`，默认只露前两个 |
-| `mcp/servers/web.py` | ★ 联网服务器：DeepSeek Search / Fetch，默认 `hidden`，只给 API 角色点名开 |
+| `mcp/servers/agent.py` | ★ harness agent：`web_search` / `web_fetch` / `read_file` / `list_dir`（+ 可选写/命令），默认 `hidden` |
 
 第一条命令：
 
@@ -1774,39 +1775,58 @@ tts_block_seconds = 0.2    # 边收边播：收够 0.2 秒就先交给扬声器
 | 计费 | 每 10000 字符 $0.45（限时 $0.225）；中文一个字按 2 字符算 |
 | 控制台 | 角色卡第 ⑤ 组「TTS 后端 / 官方 TTS 音色」 |
 
-### 联网搜索：API 角色的额外工具（可选）
+### API 角色的 harness agent（多轮工具 + 联网 / 文件 / 命令）
 
-「蓝色大肥鱼」还额外开了 DeepSeek 官方的 **Search / Fetch**：问新闻、实时信息、
-或者你不确定的知识时，它会先搜再答。
+本地 4B 仍是「选一个工具 → 直接念工具的话」；**API 角色则按成熟 harness agent 的做法**：
+模型 → 工具 → 模型，最多 `[agent] max_rounds` 轮，工具结果喂回模型，
+最后由模型自己收口成一句简短的中文回答（而不是把工具原文直接念出来）。
 
 ```toml
-[api]
-web_enabled = true
-search_count = 3          # 默认搜几条（1~50，语音场景 3 条够念）
-search_timeout = 60
-fetch_max_chars = 1200    # 网页正文最多念多少字
+[agent]
+enabled = true
+max_rounds = 6
+workspace = "."           # 文件/命令工具的根目录
+allow_write = false       # write_file 默认关
+allow_shell = false       # run_command 默认关（★高风险★）
+max_tool_chars = 6000     # 单个工具结果喂回模型的上限
 ```
+
+工具清单（`namespace = false`，名字就是 harness 风格）：
+
+| 工具 | 来源 | 什么时候有 |
+| --- | --- | --- |
+| `web_search` | DeepSeek `POST /v1/tools/search` | `api_tools` 含 `web` |
+| `web_fetch` | DeepSeek `POST /v1/tools/fetch` | `api_tools` 含 `web` |
+| `read_file` | 工作区文本文件（带行号） | `api_tools` 含 `files` |
+| `list_dir` | 工作区目录 | `api_tools` 含 `files` |
+| `write_file` | 写工作区文件 | `[agent] allow_write = true` 且点名 |
+| `run_command` | 工作区 shell | `[agent] allow_shell = true` 且点名 |
+
+`api_tools` 里写预设名即可：
 
 ```jsonc
 // data/personas/bluefish.json
-{ "api_tools": ["web"] }
+{ "api_tools": ["web", "files"] }
 ```
 
-```
-mcp__web__search   ← POST https://api.deepseek.com/v1/tools/search
-mcp__web__fetch    ← POST https://api.deepseek.com/v1/tools/fetch
-```
+- `web` → `web_search` + `web_fetch`
+- `files` → `read_file` + `list_dir`
+- `write` / `shell` → 需要先在 `[agent]` 里显式开启
+- `harness` → 全部（当前不可用的会自动跳过并告警）
 
 | 设计点 | 原因 |
 | --- | --- |
-| **默认隐藏**（`hidden = true`） | 本地 4B 看不到这两个工具，不会误调；只有 `api_tools` 里点名 `web` 的 API 角色才看得到 |
-| 走原始 Search / Fetch API | 官方的服务端 `deepseek_web_search` **不能**和普通 function tools 同时声明（会 400），而这里一轮还要用日程/备忘工具 |
-| 搜索结果是「能直接念」的中文摘要 | 当前流水线工具执行完就直接播报，不再多跑一轮模型；所以只取标题/来源/摘要，**不念 URL**（URL 进日志） |
-| 按成功请求计费 | Search / Fetch 各 $0.75 / 1000 次成功请求；`count` 不影响单价；空结果、失败、超时不计费 |
-| 隐私 | 查询内容会发给 DeepSeek；本地角色完全不会触发联网工具 |
+| **默认隐藏**（`hidden = true`） | 本地 4B 看不到这些工具，不会误调；只有 API 角色点名才露出 |
+| **多轮工具循环** | 搜到结果后模型可以继续 `web_fetch` 读正文，或直接回答；不再把搜索摘要当最终答复 |
+| **URL 只给模型看** | 工具结果里有 URL（模型可读），最终回答由模型组织，不会念网址 |
+| **文件边界** | 所有路径都限制在 `[agent] workspace` 里；`..` / 越界绝对路径会被拒 |
+| **隐私路径** | 即使 workspace 指到项目根，`sessions/`、`data/memory/`、`data/knowledge/`、`data/vision/`、`data/backup/`、`config.local.toml` 也永远不给模型看/写 |
+| **写/命令默认关** | `write_file` / `run_command` 只有显式开启才出现在工具列表里；命令等于把本机 shell 交给模型，风险自负 |
+| **计费** | Search / Fetch 各 $0.75 / 1000 次成功请求；`count` 不影响单价；空结果/失败/超时不计费 |
+| **隐私** | 查询内容会发给 DeepSeek；本地角色完全不会触发联网工具 |
 
-控制台不用额外配置：角色卡第 ③ 组「额外工具」里写 `web` 即可（一行一个，
-也可以写预设 `memory` / `skills` 或具体工具名）。
+控制台不用额外配置：角色卡第 ③ 组「额外工具」里写 `web` / `files` 即可
+（一行一个，也可以写具体工具名）。
 
 
 ### 身份卡怎么写才「不出戏」（★4B 小模型的硬限制★）

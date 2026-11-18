@@ -161,6 +161,26 @@ class ApiConfig:
 
 
 @dataclass
+class AgentConfig:
+    """API 角色的「harness agent」：多轮工具循环 + 文件/命令工具的安全边界。
+
+    本地 4B 仍走单轮「选一个工具就执行」的老路；只有 API 引擎才启用这一层，
+    因为成熟 harness agent 的做法是：模型自己决定搜什么、读哪一页、看哪个文件，
+    工具结果喂回模型，直到它给出最终回答（而不是把工具原文直接念出来）。
+    """
+
+    enabled: bool = True
+    max_rounds: int = 6                  # 最多几轮「模型→工具→模型」；到顶会强制收口
+    workspace: str = "."                 # 文件/命令工具的根目录（相对项目根）
+    allow_write: bool = False            # 允许 write_file（默认只读；开了才建/改文件）
+    allow_shell: bool = False            # 允许 run_command（★高风险，默认关★）
+    max_file_chars: int = 6000           # read_file 最多返回多少字
+    max_list_entries: int = 200          # list_dir 最多列多少项
+    max_tool_chars: int = 6000           # 单个工具结果喂回模型的上限
+    shell_timeout: float = 30.0          # run_command 超时（秒）
+
+
+@dataclass
 class VisionConfig:
     """看图：摄像头 / 屏幕截图 / 剪贴板 / 指定文件。"""
 
@@ -477,6 +497,7 @@ class Settings:
     asr: AsrConfig = field(default_factory=AsrConfig)
     llm: LlmConfig = field(default_factory=LlmConfig)
     api: ApiConfig = field(default_factory=ApiConfig)
+    agent: AgentConfig = field(default_factory=AgentConfig)
     tts: TtsConfig = field(default_factory=TtsConfig)
     chat: ChatConfig = field(default_factory=ChatConfig)
     persona: PersonaConfig = field(default_factory=PersonaConfig)
@@ -570,6 +591,7 @@ def load_settings(path: str | Path | None = None) -> Settings:
         asr=_build(AsrConfig, raw.get("asr", {}), "asr"),
         llm=_build(LlmConfig, raw.get("llm", {}), "llm"),
         api=_build(ApiConfig, raw.get("api", {}), "api"),
+        agent=_build(AgentConfig, raw.get("agent", {}), "agent"),
         wake=_build(WakeConfig, raw.get("wake", {}), "wake"),
         skills=_build(SkillsConfig, raw.get("skills", {}), "skills"),
         subtitle=_build(SubtitleConfig, raw.get("subtitle", {}), "subtitle"),

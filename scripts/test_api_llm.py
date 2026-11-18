@@ -310,7 +310,8 @@ def test_shipped_characters() -> None:
     check("它是 API 角色", fish.engine, "api")
     check("模型是 deepseek-chat", fish.api_model, "deepseek-chat")
     check("TTS 也走官方 API", (fish.backend, fish.tts_voice), ("api", "stella"))
-    check("额外开放了联网工具", "web" in fish.api_tools, detail=str(fish.api_tools))
+    check("额外开放了 harness 工具", {"web", "files"} <= set(fish.api_tools),
+          detail=str(fish.api_tools))
     check("退路是出厂 Piper（不碰克隆素材）",
           (fish.voice, fish.voice_ref, fish.voice_model),
           ("zh_CN-huayan-medium", "", ""))

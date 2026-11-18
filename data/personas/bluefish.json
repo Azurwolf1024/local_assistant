@@ -65,12 +65,13 @@
   "voice_ref_text": "",
   "voice_model": "",
   "api_tools": [
-    "web"
+    "web",
+    "files"
   ],
   "temperature": 0.8,
   "default": false,
   "enabled": true,
   "memory_all": false,
   "knowledge_all": false,
-  "notes": "★原生 API 角色（2026-11-18 加）★：engine=api，默认模型 deepseek-chat（DeepSeek）；backend=api 走 DeepSeek 官方 TTS（音色 stella），失败自动退回本地 Piper（voice 那一栏就是退路）。api_tools=[\"web\"] 额外开放 DeepSeek 官方联网搜索/网页读取（mcp__web__search / fetch）；本地角色看不到这两个工具。没有 API key 时流水线会自动退回本地模型，不会把嘴弄哑。"
+  "notes": "★原生 API 角色（2026-11-18 加）★：engine=api，默认模型 deepseek-chat（DeepSeek）；backend=api 走 DeepSeek 官方 TTS（音色 stella），失败自动退回本地 Piper（voice 那一栏就是退路）。api_tools=[\"web\",\"files\"] 额外开放 harness 工具：web_search / web_fetch / read_file / list_dir（写文件和执行命令要 [agent] 里显式开启）；本地角色看不到这些工具。没有 API key 时流水线会自动退回本地模型，不会把嘴弄哑。"
 }

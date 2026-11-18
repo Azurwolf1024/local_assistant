@@ -148,9 +148,23 @@ tts_block_seconds = 0.2           # 边收边播：收够多少秒就交给扬�
 web_enabled = true
 search_url = ""                   # 留空 = 由 base_url 推出（默认 .../v1/tools/search）
 fetch_url = ""                    # 留空 = 由 base_url 推出（默认 .../v1/tools/fetch）
-search_count = 3                  # 默认搜几条（1~50；语音场景 3 条够念）
+search_count = 3                  # 模型没指定 count 时默认搜几条（1~50）
 search_timeout = 60
-fetch_max_chars = 1200            # 网页正文最多念多少字
+fetch_max_chars = 6000            # 网页正文最多给模型多少字（最终回答由模型压缩）
+
+# ── API 角色的 harness agent（多轮工具循环 + 文件/命令工具）─────────────────
+# 本地 4B 仍走「选一个工具就执行」的老路；这里只影响 API 引擎的角色。
+# 工具结果会喂回模型，由模型自己决定继续搜/读/执行，还是给出最终回答。
+[agent]
+enabled = true
+max_rounds = 6                    # 最多几轮「模型→工具→模型」；到顶会强制收口
+workspace = "."                   # 文件/命令工具的根目录（相对项目根）
+allow_write = false               # write_file 默认关；开了也只能写 workspace 里面
+allow_shell = false               # run_command 默认关；★开了等于把本机 shell 交给模型★
+max_file_chars = 6000             # read_file 最多返回多少字
+max_list_entries = 200            # list_dir 最多列多少项
+max_tool_chars = 6000             # 单个工具结果喂回模型的上限
+shell_timeout = 30
 
 # ── 角色设定（名字 / 背景 / 对「我」的称呼 / 示例台词…）──────────────────
 # 人设现在是**结构化文件**，不再是上面那段长字符串：
@@ -497,16 +511,17 @@ module = "voice_loop.mcp.servers.memory"
 tools = ["recall", "remember"]   # 白名单：想全开就删掉这一行
 timeout = 10
 
-# ★联网（DeepSeek 官方 Search / Fetch）★：默认 hidden，不露给任何角色。
-# API 角色在人格文件里写 "api_tools": ["web"] 才会看到这两个工具；
-# 本地 4B 看不到，也就不会误调。工具名是 mcp__web__search / mcp__web__fetch。
+# ★harness agent 工具（DeepSeek 官方 Search / Fetch + 工作区文件 + 可选命令）★
+# 默认 hidden，不露给任何角色。API 角色在人格文件里写 "api_tools": ["web", "files"]
+# 才会看到；本地 4B 看不到，也就不会误调。
+# 工具名直接用 harness 风格：web_search / web_fetch / read_file / list_dir（+ 可选 write_file / run_command）
 [[mcp.servers]]
-name = "web"
+name = "agent"
 transport = "inproc"
-module = "voice_loop.mcp.servers.web"
+module = "voice_loop.mcp.servers.agent"
 hidden = true
-namespace = true
-timeout = 60
+namespace = false
+timeout = 120
 
 # 想更隔离就把它挪到子进程（每次调用多几毫秒，但服务器崩了不影响助手）：
 # [[mcp.servers]]

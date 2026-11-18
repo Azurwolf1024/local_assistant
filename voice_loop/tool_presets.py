@@ -33,10 +33,27 @@ PRESETS: dict[str, dict] = {
     },
     "web": {
         "title": "联网搜索 / 网页读取（DeepSeek Search / Fetch）",
-        "tools": ["mcp__web__search", "mcp__web__fetch"],
+        "tools": ["web_search", "web_fetch"],
+    },
+    "files": {
+        "title": "工作区文件（读 / 列目录）",
+        "tools": ["read_file", "list_dir"],
+    },
+    "write": {
+        "title": "写工作区文件（需要 [agent] allow_write = true）",
+        "tools": ["write_file"],
+    },
+    "shell": {
+        "title": "执行命令（需要 [agent] allow_shell = true；高风险）",
+        "tools": ["run_command"],
+    },
+    "harness": {
+        "title": "完整 harness 工具集（不可用的会自动跳过）",
+        "tools": ["web_search", "web_fetch", "read_file", "list_dir",
+                  "write_file", "run_command"],
     },
     # ★下一步讨论好的额外工具加在这里★，例如：
-    #   "web": {"title": "联网", "tools": ["mcp__web__search", "mcp__web__fetch"]},
+    #   "web": {"title": "联网", "tools": ["web_search", "web_fetch"]},
 }
 
 

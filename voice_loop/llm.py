@@ -716,6 +716,23 @@ class ChatClient:
         if self._api is not None:
             self._api.reset()
 
+    def build_messages(
+        self,
+        user_text: str,
+        images: list[str] | None = None,
+        extra_messages: list[dict] | None = None,
+        prefix_messages: list[dict] | None = None,
+        system_override: str | None = None,
+    ) -> list[dict]:
+        """按当前后端构造一份完整的 messages（harness agent 多轮要用）。"""
+        client = self._api if (self._engine == "api" and self._api) else self.local
+        msgs = [dict(m) for m in client._build_messages(user_text, images, system_override)]
+        if extra_messages:
+            msgs[-1:-1] = [dict(m) for m in extra_messages]
+        if prefix_messages:
+            msgs = [dict(m) for m in prefix_messages] + msgs
+        return msgs
+
     def chat_events(
         self,
         user_text: str = "",
