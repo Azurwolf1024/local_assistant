@@ -24,7 +24,7 @@ import json
 import re
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from ..manifest import parse_manifest
 from ..persona import Character
@@ -164,6 +164,20 @@ KNOWN_KEYS = {f["key"] for group in SPEC for f in group["fields"]}
 KNOWN_KEYS_LIST = [f["key"] for group in SPEC for f in group["fields"]]
 # 这几个字段允许写在人格文件里，但表单不暴露（索引/工具在管）
 QUIET_KEYS = {"enabled", "default", "voice_dir", "knowledge_all", "knowledge_title", "world"}
+# ★一改就换嗓子 / 换脑子★：被清空时必须明确告警，否则「只改了介绍」就会变成「声音变了」
+SENSITIVE_KEYS = {
+    "backend": "TTS 后端；清掉就跟 config.toml 的 [tts] backend",
+    "tts_voice": "官方 TTS 音色；清掉就跟 [api] tts_voice",
+    "voice": "piper 声线；清掉就跟全局声线",
+    "voice_ref": "克隆参考音频；清掉就没有她的克隆声线了",
+    "voice_ref_text": "参考音频的逐字文本；清掉克隆会声不对词",
+    "voice_refs": "分风格的多条参考",
+    "voice_model": "专属模型目录；清掉就用通用模型",
+    "engine": "AI 引擎；清掉就回到本地模型",
+    "api_model": "API 模型名；清掉就跟 [api] model",
+    "api_base": "API 地址；清掉就跟 [api] base_url",
+    "api_tools": "额外工具；清掉 harness 工具就只剩默认那几个",
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -178,13 +192,29 @@ def groups() -> list[dict]:
     return out
 
 
+def _defaults() -> dict:
+    """解析器的缺省值：布尔栏要拿它当默认（`knowledge_shared` 缺省是「开」）。"""
+    return _normalized({})
+
+
 def _blank() -> dict:
-    """空表：list → 空数组，bool → False，其余空串（JSON 里空值统一成一种写法）。"""
+    """空表：list → 空数组，bool → ★解析器的缺省值★，其余空串（JSON 里空值统一成一种写法）。
+
+    布尔栏为什么不用 False：`Character.from_dict` 的缺省是有方向的 ——
+    「也看共享知识库」缺省是开、「能查所有人的记忆」缺省是关。表单里一律 False 的话，
+    新建一张卡就会把「共享知识库」关掉（用户根本没碰那一栏）。
+    """
+    defaults = _defaults()
     out: dict[str, Any] = {}
     for group in SPEC:
         for f in group["fields"]:
-            out[f["key"]] = False if f["kind"] == "bool" else (
-                [] if f["kind"] in ("list", "json") else "")
+            key, kind = f["key"], f["kind"]
+            if kind == "bool":
+                out[key] = bool(defaults.get(key, False))
+            elif kind in ("list", "json"):
+                out[key] = []
+            else:
+                out[key] = ""
     return out
 
 
@@ -204,6 +234,10 @@ def example(char: Any = None) -> dict:
     for key in out:
         if key in data:
             out[key] = data[key]
+        elif isinstance(out[key], bool) and hasattr(char, key):
+            # `to_dict()` 会把 False 一起滤掉 —— 布尔栏得按真值填，
+            # 否则「已经关掉的知识库共享」会显示成开着的
+            out[key] = bool(getattr(char, key))
     return out
 
 
@@ -313,7 +347,9 @@ def parse(raw: dict) -> tuple[dict, list[str], list[str]]:
                     problems.append(f"{f['label']}：{err}")
                 fields[key] = got
             elif kind == "bool":
-                fields[key] = bool(value)
+                # 表单**没提这一栏** → 用解析器的缺省值（不是 False）：
+                # 否则「新建时不碰这一栏」会被写成 knowledge_shared=false
+                fields[key] = bool(value) if key in raw else bool(_defaults().get(key, False))
             elif kind == "number":
                 text = str(value or "").strip()
                 try:
@@ -395,7 +431,33 @@ def _normalized(raw: dict) -> dict:
     return preview(None, raw)
 
 
-def merge_into(raw: dict, form: dict) -> tuple[dict, list[str], list[str]]:
+def _form_values(settings: Any, fields: dict, raw: dict | None = None) -> dict:
+    """交给 :func:`merge_into` 的表单值：``preview()`` 的结果 + ★明确给出来的假值★。
+
+    `preview()` 走的是 `Character.to_dict()`，它把 `False` / `0.0` 也当「空」滤掉。
+    对合并来说这是个陷阱：`knowledge_shared: false`（全隔离）被滤掉 = 下次保存时
+    「表单里没有这一栏」= 从文件里删掉 = 她又开始看共享知识库了
+    （「只改了个介绍，怎么权限也变了」）。所以布尔值要按两件事补回来：
+    文件里本来就写着它，或者它跟解析器的缺省值不同（那才是用户的意思）。
+    """
+    data = preview(settings, fields)
+    defaults = _normalized({})
+    for key, value in fields.items():
+        if key in data or key not in KNOWN_KEYS or not isinstance(value, bool):
+            continue
+        if raw is None:
+            # 新建：缺省是 True 的栏被关掉了，那一定是用户的意思（否则不会写它）
+            if value != bool(defaults.get(key)):
+                data[key] = value
+        elif key in raw:
+            # 改已有角色：文件里本来就写着它 → 原样留着（跟「没这一栏」区分开，
+            # 不然会报出一片假的「改了 knowledge_shared」）
+            data[key] = value
+    return data
+
+
+def merge_into(raw: dict, form: dict, *, sent: Iterable[str] | None = None
+               ) -> tuple[dict, list[str], list[str]]:
     """把表单结果合进一张**已存在**的资料卡：★只动表单管得着的键★。
 
     返回 ``(合并后的 JSON, 改动的键, 被清掉的键)``。
@@ -405,16 +467,31 @@ def merge_into(raw: dict, form: dict) -> tuple[dict, list[str], list[str]]:
     只会被静默丢掉**。直接覆盖的后果就是「我就改了个称呼，怎么喊不醒了」。
     所以：表单里有值的按键写进去；表单里**清空**了的键真的删掉（那是用户的意图）。
 
+    ★``sent``：客户端这次真正提交了哪几栏★。只对这几栏判断「写 / 清」；
+    其余栏原样保留。为什么需要它：表单规范是**后端进程**给的 ——
+    控制台进程还是旧的（少一个字段 / 少一个下拉选项），而人格文件是新的，
+    那么「这一栏根本没送到」就会被当成「用户清空了」，
+    一声不响地把她从官方 TTS 打回全局克隆声线（真实事故，见 ENGINEERING_LOG）。
+    所以宁可留着（下一版表单还能改），也不要凭空删。
+
     ★只写真的变了的★：跟归一化后的当前值一样就不写（见 :func:`_normalized`），
     否则报告里会刷出一大片假的「改了 user_title」。
     """
     merged = dict(raw)
     base = _normalized(raw)
+    allowed = None if sent is None else {str(k) for k in sent}
     changed: list[str] = []
     removed: list[str] = []
     for key in KNOWN_KEYS_LIST:
+        if allowed is not None and key not in allowed:
+            continue                     # 客户端没提这一栏 → 不是「清空」，原样保留
         if key in form:
-            if base.get(key) != form[key]:
+            cur = base.get(key)
+            if isinstance(form[key], bool) and key in merged:
+                # ★布尔值要按文件里的原值比★：`to_dict()` 把 False 滤掉了，
+                # 归一化后拿不到它 —— 否则每次保存都会报一次假的「改了 knowledge_shared」
+                cur = bool(merged[key])
+            if cur != form[key]:
                 changed.append(key)
                 merged[key] = form[key]
         elif key in merged:
@@ -456,14 +533,15 @@ def create(settings: Any, fields: dict, *, overwrite: bool = False,
         entries.append(add_row)
     new_index = {**raw_index, "characters": entries}
 
-    data = preview(settings, fields)
+    data = _form_values(settings, fields)
     changed: list[str] = []
     removed: list[str] = []
     overwriting = char_id in ids and overwrite
     if overwriting and target.is_file():
         try:
+            old = json.loads(target.read_text(encoding="utf-8"))
             data, changed, removed = merge_into(
-                json.loads(target.read_text(encoding="utf-8")), data)
+                old, _form_values(settings, fields, old))
         except (OSError, ValueError):          # 旧文件坏了：那就只能按表单写
             pass
     report = {
@@ -483,7 +561,8 @@ def create(settings: Any, fields: dict, *, overwrite: bool = False,
     return report
 
 
-def update(settings: Any, fields: dict, *, dry_run: bool = True) -> dict:
+def update(settings: Any, fields: dict, *, dry_run: bool = True,
+           sent: Iterable[str] | None = None) -> dict:
     """★改一个已经存在的角色★：以表单为准，但保住表单管不着的键。
 
     跟 :func:`create` 的区别（也是为什么上一个「覆盖」不够用）：
@@ -491,6 +570,9 @@ def update(settings: Any, fields: dict, *, dry_run: bool = True) -> dict:
     - **不会建文件**：索引里没有这个 id 就报错（编辑不会偷偷造一个角色）；
     - **不会丢字段**：`enabled` / `default` / `voice_dir` / `world` 与不认识的键原样保留；
     - **不会动索引**：索引里那一行本来就在，重写它反而多一次风险。
+
+    ``sent``：客户端这次**真正提交了**哪几栏（见 :func:`merge_into`）。表单规范是
+    后端进程给的，进程比人格文件旧的时候，「没送到」不等于「用户清空了」。
     """
     fields, problems, warnings = parse(fields)
     if problems:
@@ -505,7 +587,15 @@ def update(settings: Any, fields: dict, *, dry_run: bool = True) -> dict:
         raw = json.loads(target.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise ValueError(f"{rel(settings, target)} 读不动（{exc}）——先修好它再编辑") from exc
-    data, changed, removed = merge_into(raw, preview(settings, fields))
+    data, changed, removed = merge_into(
+        raw, _form_values(settings, fields, raw), sent=sent)
+    # ★换嗓子的栏被清空要说出来★：事故现场是「只改了身份卡上的介绍」，
+    # 报告里只有一行「清掉了 backend」，谁也没注意她已经从官方 TTS 换成全局克隆声线了。
+    for key in removed:
+        if key in SENSITIVE_KEYS:
+            warnings.append(
+                f"★{key} 被清空了★（{SENSITIVE_KEYS[key]}）—— 这等于换嗓子/换脑子，"
+                "不是「只改了介绍」；不想这样就把它填回去再保存")
     report = {
         "id": char_id, "name": fields.get("name"), "updated": True,
         "file": str(target), "file_rel": rel(settings, target),

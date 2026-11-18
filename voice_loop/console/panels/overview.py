@@ -47,6 +47,10 @@ def register(app, ctx) -> None:
                     "voice": c.voice or "",
                     "voice_ref": c.voice_ref or "",
                     "voice_model": c.voice_model or "",
+                    # ★她实际用哪个嗓子★：卡片上只说 piper 声线会骗人 ——
+                    # backend=api 时真正出声的是官方 TTS 的音色（tts_voice）
+                    "backend": c.backend or "",
+                    "tts_voice": getattr(c, "tts_voice", "") or "",
                     "engine": c.engine or getattr(settings.api, "engine", "local"),
                 }
                 for c in registry.all()

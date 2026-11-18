@@ -243,9 +243,10 @@ def register(app, ctx) -> None:
         新建怕重名，修改怕**把文件里别的键弄丢**，所以各自一条路、各自一套校验。
         """
         body = payload or {}
+        sent = (body.get("fields") or {}).keys()
         try:
             report = card.update(ctx.settings, body.get("fields") or {},
-                                 dry_run=not bool(body.get("apply")))
+                                 dry_run=not bool(body.get("apply")), sent=sent)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         report["ok"] = True

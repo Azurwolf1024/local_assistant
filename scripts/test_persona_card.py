@@ -287,6 +287,19 @@ def test_endpoints(tmp: Path) -> None:
           (lambda r: (r.status_code, "创建" in r.json()["detail"]))(
               client.post("/api/persona/update", json={"fields": {**GOOD, "id": "nobody"}, "apply": True})),
           (400, True))
+    # ★旧前端少送一栏★（控制台进程比人格文件旧）：这一栏不能被当成「用户清空了」
+    keep = tmp / "personas" / "shining.json"
+    raw = json.loads(keep.read_text(encoding="utf-8"))
+    raw.update({"backend": "api", "tts_voice": "stella"})
+    keep.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+    part = {k: v for k, v in card.fields_of(
+        CharacterRegistry(tmp / "characters.json").get("shining")).items() if k != "tts_voice"}
+    part["title"] = "改个介绍"
+    upd2 = client.post("/api/persona/update", json={"fields": part, "apply": True})
+    saved = json.loads(keep.read_text(encoding="utf-8"))
+    check("★少送一栏的旧前端也不会把她的嗓子改掉★",
+          (upd2.status_code, saved.get("backend"), saved.get("tts_voice")),
+          (200, "api", "stella"))
     check("导出不存在的角色 → 404", client.get("/api/persona/export", params={"cid": "无"}).status_code, 404)
     over = client.post("/api/persona/import", json={"filename": "x.json", "data": _b64("x" * 10)})
     check("不是 JSON 的文件给 200 + problems", len(over.json()["problems"]), 1)
@@ -344,6 +357,50 @@ def test_update(tmp: Path) -> None:
         check("★编辑不会偷偷建角色（并指路去「创建」）★", "创建" in str(exc), True)
     check("坏输入（id 非法）什么都不写",
           _raises(lambda: card.update(settings, {**GOOD, "id": "../x"})), True)
+
+    # ★事故回归（2026-11-18）★：控制台进程比人格文件旧 → 表单里没有这一栏 /
+    #   下拉里没有这个值 → 以前会把「没送到」当成「用户清空了」，
+    #   于是一张身份卡改完，她悄悄从官方 TTS 掉回全局克隆声线。
+    blue = tmp / "personas" / "shining.json"
+    raw = json.loads(blue.read_text(encoding="utf-8"))
+    raw.update({"backend": "api", "tts_voice": "stella"})
+    blue.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+    form = card.fields_of(CharacterRegistry(tmp / "characters.json").get("shining"))
+    form.pop("tts_voice")                       # 旧控制台：这一栏压根不认识
+    rep = card.update(settings, form, dry_run=False, sent=set(form))
+    saved = json.loads(blue.read_text(encoding="utf-8"))
+    check("★表单没送到的那一栏原样保住（不当成「清空」）★", saved.get("tts_voice"), "stella")
+    check("保住的栏不算改动", "tts_voice" in rep["changed"], False)
+    form2 = dict(card.fields_of(CharacterRegistry(tmp / "characters.json").get("shining")))
+    form2["backend"] = ""                       # 明确清空 = 跟全局
+    rep2 = card.update(settings, form2, dry_run=False, sent=set(form2))
+    check("明确清空 backend 才真的删掉", "backend" in json.loads(
+        blue.read_text(encoding="utf-8")), False)
+    check("★清掉声线类的栏会告警★（不再一声不响地换嗓子）",
+          any("backend" in w and "清空" in w for w in rep2["warnings"]), True)
+
+    # ★同一类坑：明确关掉的布尔值也不能被当成「空」★
+    #   `to_dict()` 会把 False 一起滤掉，以前保存一次就把 knowledge_shared=false 删了，
+    #   等于把「只看自己的知识库」悄悄改回「也看共享的」。
+    raw = json.loads(blue.read_text(encoding="utf-8"))
+    raw["knowledge_shared"] = False
+    blue.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+    form3 = dict(card.fields_of(CharacterRegistry(tmp / "characters.json").get("shining")))
+    form3["notes"] = "顺手改个备注"
+    card.update(settings, form3, dry_run=False, sent=set(form3))
+    check("★明确关掉的 knowledge_shared 不会被保存删掉★",
+          json.loads(blue.read_text(encoding="utf-8")).get("knowledge_shared"), False)
+    check("关掉共享知识库真的读得回来（不是默认值）",
+          CharacterRegistry(tmp / "characters.json").get("shining").knowledge_shared, False)
+
+    fresh = {**card.example(), "id": "noshare", "name": "不共享", "wake_words": ["不共享"]}
+    card.create(settings, fresh, dry_run=False)
+    npath = tmp / "personas" / "noshare.json"
+    check("新建时没碰「共享」那一栏 → 不会变成「不共享」",
+          json.loads(npath.read_text(encoding="utf-8")).get("knowledge_shared", True), True)
+    card.create(settings, {**fresh, "knowledge_shared": False}, overwrite=True, dry_run=False)
+    check("★明确关掉共享 → 真的写进文件★",
+          json.loads(npath.read_text(encoding="utf-8")).get("knowledge_shared"), False)
 
 
 def test_gate(tmp: Path) -> None:

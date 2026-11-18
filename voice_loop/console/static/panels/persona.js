@@ -28,6 +28,9 @@
       const modeNote = h("p", { class: "muted", text: "" });
       const formBox = h("div", {});
       const status = h("p", { class: "muted", text: "" });
+      // ★表单认不出的值★：控制台进程比人格文件旧时才有 —— 必须常驻看得见，
+      // 不能塞进 status（它随时被别的话覆盖掉），否则「嗓子被悄悄换掉」还会再发生一次
+      const skewNote = h("p", { style: "color:var(--warn,#b80);margin:2px 0", text: "" });
       const problemsBox = h("div", {});
       const jsonBox = h("pre", { class: "mono", style: "font-size:11px;max-height:320px;overflow:auto" });
       const filePick = h("input", { type: "file", accept: ".json,.txt,application/json,text/plain" });
@@ -79,6 +82,7 @@
       }
 
       function fill(values) {
+        const odd = [];      // 表单不认识的值（多半是控制台进程比人格文件旧）
         Object.entries(inputs).forEach(([key, got]) => {
           const v = values[key];
           if (v === undefined || v === null) return;
@@ -87,8 +91,20 @@
           else if (got.kind === "json") got.el.value = (Array.isArray(v) && !v.length)
             || (v && typeof v === "object" && !Object.keys(v).length) ? "" : JSON.stringify(v, null, 1);
           else if (got.kind === "number") got.el.value = v === 0 ? "" : String(v);
-          else got.el.value = String(v);
+          else if (got.kind === "select") {
+            const miss = UI.keepSelect(got.el, v);
+            if (miss) odd.push(key + "=" + miss);
+          } else got.el.value = String(v);
         });
+        if (odd.length) {
+          // ★必须说出来★：这几栏要是存回去就会变成「清空」——她的嗓子就是这么没的
+          skewNote.textContent = "★表单比人格文件旧★：" + odd.join("、")
+            + " 不在下拉选项里（已原样保留，存回去也不会丢）。重启控制台"
+            + "（Ctrl+C 再 python main.py ui）后表单才会认得这个值。";
+        } else {
+          skewNote.textContent = "";
+        }
+        return odd;
       }
 
       function collect() {
@@ -152,6 +168,8 @@
           const rm = (got.removed || []).length ? "；清掉了 " + got.removed.join("、") : "";
           status.textContent = "已保存 " + got.file_rel + "：" + ch + rm
             + (got.backup ? "，旧文件备份在 " + got.backup.split(/[\\/]/).pop() : "");
+          // ★清掉声线/引擎类的栏会真的换嗓子★：服务端的告警就摆在这儿，别让它在几秒后消失
+          if ((got.warnings || []).length) showProblems([], got.warnings);
           ctx.toast("已保存：" + got.name, "ok");
         } else {
           if (r.exists) {
@@ -598,6 +616,7 @@
         h("p", { class: "muted", text: "导入认两种：① .json —— 一张资料卡（本面板导出的就是，也认数组/索引，取第一个）；② .txt —— 素材清单（名字一行 + 正文一行），只填「示例台词」这一栏。" }),
         meta,
         formBox,
+        skewNote,
         problemsBox,
         status,
         jsonBox,

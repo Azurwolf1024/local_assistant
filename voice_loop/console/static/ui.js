@@ -86,6 +86,19 @@ window.UI = (function () {
     return out;
   }
 
+  /** select 的兜底：值不在选项里时补一条，别让它被浏览器悄悄改成第一项（= 空）
+      谁会撞上：人格文件里写了新值，而这个控制台进程（它给的表单规范）还是旧的。
+      浏览器遇到「值不在选项里」不会报错，只会把 select 退回到第一项 ——
+      存回去就成了「用户把这一栏清空了」，于是她一声不响地换了嗓子。 */
+  function keepSelect(el, v) {
+    const want = String(v);
+    el.value = want;                       // 正常情况：选项里有这个值，一步就到位
+    if (el.value === want) return "";
+    el.appendChild(h("option", { value: want, text: want + "（当前值，本版表单不认识）" }));
+    el.value = want;
+    return want;
+  }
+
   /** 键盘：输入框里按回车就提交（表单里第一个按钮） */
   function onSubmit(form, fn) {
     form.addEventListener("submit", (e) => { e.preventDefault(); fn(); });
@@ -108,5 +121,5 @@ window.UI = (function () {
     return n.toFixed(n < 10 ? 2 : 1) + " s";
   }
 
-  return { h, card, table, field, collect, onSubmit, line, tags, secs };
+  return { h, card, table, field, collect, keepSelect, onSubmit, line, tags, secs };
 })();

@@ -102,7 +102,12 @@
                   h("p", { class: "muted", text: c.title || "" }),
                   h("p", { class: "muted", text: "唤醒词：" + ((c.wake_words || []).join("、") || "—") }),
                   h("p", { class: "muted", text: "引擎：" + (c.engine === "api" ? "云端 API" : "本地 Ollama") }),
-                  h("p", { class: "muted mono", text: c.voice_ref || c.voice || "（用全局声线）" }),
+                  // ★说清楚她到底用哪个嗓子★：backend=api 时出声的是官方 TTS 音色，
+                  // 卡片上只写 piper 声线（那是退路）会让人以为声音被换了
+                  h("p", { class: "muted mono", text: c.backend === "api"
+                    ? "TTS：DeepSeek 官方 · " + (c.tts_voice || "跟 [api] tts_voice")
+                    : "TTS：" + (c.backend || "跟全局") + " · "
+                      + (c.voice_ref || c.voice || "跟全局声线") }),
                 ]),
           ])))));
 
