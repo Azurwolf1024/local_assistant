@@ -42,6 +42,10 @@ class MCPHost:
         self._clients: dict[str, MCPClient] = {}
         self._routes: dict[str, tuple[str, str]] = {}   # 模型看到的名字 -> (服务器, 服务器内的名字)
         self._specs: list[ToolSpec] = []
+        # ★白名单之外的工具也留一份★：API 角色可以按 `api_tools` 点名多开几个，
+        # 本地角色照旧只看白名单（见 host.specs(include=...)）。
+        self._all_routes: dict[str, tuple[str, str]] = {}
+        self._all_specs: dict[str, ToolSpec] = {}
         self._stats: dict[str, dict] = {}
         self.calls = 0
         self.errors = 0
@@ -75,26 +79,35 @@ class MCPHost:
                 continue
             self._clients[spec.name] = client
             allow = {str(t) for t in (getattr(spec, "tools", None) or [])}
+            hidden_server = bool(getattr(spec, "hidden", False))
             prefix = "" if getattr(spec, "namespace", True) is False else f"mcp{SEP}{spec.name}{SEP}"
             kept = 0
             for tool in tools:
+                exposed = f"{prefix}{tool.name}"
+                spec_obj = ToolSpec(
+                    name=exposed, description=tool.description,
+                    input_schema=tool.input_schema,
+                )
+                self._all_routes[exposed] = (spec.name, tool.name)
+                self._all_specs[exposed] = spec_obj
+                if hidden_server:
+                    continue          # 默认不露出：等 api_tools / extra_tools 点名
                 if allow and tool.name not in allow:
                     continue
-                exposed = f"{prefix}{tool.name}"
                 self._routes[exposed] = (spec.name, tool.name)
-                self._specs.append(
-                    ToolSpec(name=exposed, description=tool.description, input_schema=tool.input_schema)
-                )
+                self._specs.append(spec_obj)
                 kept += 1
             self._stats[spec.name] = {
                 "tools": kept, "available": len(tools),
                 "transport": getattr(spec, "transport", "inproc"),
                 "allowlist": bool(allow),
+                "hidden": hidden_server,
             }
             hidden = len(tools) - kept
             self.log.info(
                 f"[mcp] {spec.name}：露出 {kept}/{len(tools)} 个工具"
-                + (f"（白名单挡掉 {hidden} 个）" if hidden else "")
+                + ("（hidden：等 API 角色点名）" if hidden_server
+                   else (f"（白名单挡掉 {hidden} 个）" if hidden else ""))
             )
 
     def close(self) -> None:
@@ -106,26 +119,49 @@ class MCPHost:
         self._clients.clear()
         self._routes.clear()
         self._specs.clear()
+        self._all_routes.clear()
+        self._all_specs.clear()
 
     # ------------------------------------------------------------- 给模型看
-    def specs(self) -> list[dict]:
-        """Ollama / OpenAI 形状的工具定义（只含白名单里的）。"""
-        self.start()
-        return [s.to_openai() for s in self._specs]
+    def specs(self, include=()) -> list[dict]:
+        """Ollama / OpenAI 形状的工具定义（白名单 + 点名多开的那些）。
 
-    def names(self) -> set[str]:
+        ``include`` 是 API 角色额外点名的工具（预设已展开成工具名）。
+        名字不在任何服务器里就跳过 —— 上层会按「点名了但没找到」打日志。
+        """
         self.start()
-        return set(self._routes)
+        out = [s.to_openai() for s in self._specs]
+        have = {s.name for s in self._specs}
+        for name in include or ():
+            name = str(name)
+            if name in have:
+                continue
+            extra = self._all_specs.get(name)
+            if extra is not None:
+                out.append(extra.to_openai())
+                have.add(name)
+        return out
+
+    def names(self, include=()) -> set[str]:
+        self.start()
+        out = set(self._routes)
+        out.update(str(n) for n in (include or ()) if str(n) in self._all_specs)
+        return out
+
+    def missing(self, include=()) -> list[str]:
+        """点名了、但没有任何服务器提供这些工具（给上层打警告用）。"""
+        self.start()
+        return [str(n) for n in (include or ()) if str(n) not in self._all_specs]
 
     def handleable(self, name: str) -> bool:
         self.start()
-        return str(name) in self._routes
+        return str(name) in self._routes or str(name) in self._all_routes
 
     # --------------------------------------------------------------- 调用
     def call(self, name: str, arguments: dict | None = None) -> tuple[bool, str]:
         """调一个工具，返回 ``(ok, 文本)``。名字必须是 :meth:`specs` 里露出的。"""
         self.start()
-        route = self._routes.get(str(name))
+        route = self._routes.get(str(name)) or self._all_routes.get(str(name))
         if route is None:
             self.errors += 1
             return False, f"没有这个工具：{name}"

@@ -2,22 +2,25 @@
 
 - ``piper``    ：低延迟固定音色（RTF ~0.04、首段 0.13s）
 - ``zipvoice`` ：零样本音色克隆（sherpa-onnx / CPU，RTF ~1.1~1.4），用参考音频把角色音色搬到中文上
+- ``api``      ：DeepSeek 官方 TTS（云端，24 kHz PCM；需要 [api] 里配好 key）
 
-两者接口一样，改 ``[tts] backend`` 就能切换。
-**无论选哪个都不会哑**：克隆模型没装全、或参考音频不可用时会自动退回 Piper 出声。
+三者接口一样，改 ``[tts] backend`` 就能切换。
+**无论选哪个都不会哑**：克隆模型没装全、参考音频不可用、API 没配好/调用失败时，
+都会自动退回 Piper 出声。
 """
 
 import sys
 
+from .api_tts import ApiTts, api_tts_ready, voice_of
 from .base import TtsEngine
 from .lazy import LazyTts
 from .piper_tts import PiperTts
 from .zipvoice_tts import ZipVoiceTts, missing_files
 
-__all__ = ["TtsEngine", "PiperTts", "ZipVoiceTts", "LazyTts", "create_tts", "resolve_backend",
-           "missing_files"]
+__all__ = ["TtsEngine", "PiperTts", "ZipVoiceTts", "ApiTts", "LazyTts", "create_tts",
+           "resolve_backend", "missing_files"]
 
-BACKENDS = ("piper", "zipvoice")
+BACKENDS = ("piper", "zipvoice", "api")
 ZIPVOICE_HINT = "python scripts/download_models.py --only zipvoice"
 
 
@@ -41,12 +44,20 @@ def resolve_backend(settings) -> tuple[type, str]:
                 flush=True,
             )
             backend = "piper"
+    if backend == "api":
+        ok, why = api_tts_ready(settings)
+        if not ok:
+            print(f"[tts] 官方 TTS 用不了（{why}），先用 Piper 出声。", file=sys.stderr,
+                  flush=True)
+            backend = "piper"
 
     if backend == "piper":
         return PiperTts, f"piper / {settings.tts.voice}"
     if backend == "zipvoice":
         ref = str(getattr(settings.tts, "clone_audio", "") or "").strip()
         return ZipVoiceTts, f"zipvoice / 参考 {ref or '（未设）'}"
+    if backend == "api":
+        return ApiTts, f"DeepSeek TTS / {voice_of(settings.api)}"
     raise ValueError(f"暂不支持 TTS 后端：{backend}（可选：{'、'.join(BACKENDS)}）")
 
 

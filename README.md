@@ -3,6 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 **SenseVoiceSmall / Whisper-large-v3-turbo → Ollama qwen3.5:4b → 凯尔希音色（ZipVoice 零样本克隆，可一行改回 Piper）**
+（可选：某个角色可以把「脑子」和「嗓子」都切到 DeepSeek API —— 见第 14 节。）
 
 完全跑在本机的「说话 → 识别 → 思考 → 说话」闭环，不联网、不上传任何数据。
 支持唤醒词常驻待命、闹钟与会议提醒、备忘、日程查询，并且边说边播（首音 1~2 秒）。
@@ -119,6 +120,10 @@ flowchart LR
 `list_memos` `add_memo`、`now`（报时）、`fix_last`（「我说是…」改刚记下那条）；
 再加 **2 个记忆工具**（第 15 节）：`mcp__memory__recall`、`mcp__memory__remember`。
 
+> 可选：某个角色可以在人格文件里改用**云端 API**（`"engine": "api"`，见第 14 节）。
+> 默认工具还是这 10 个；API 角色可以在 `api_tools` 里按预设多开
+> （`web` = 联网搜索 / 网页读取，`memory` / `skills` = 现有能力；见 `voice_loop/tool_presets.py`）。
+
 > ★合并前是 11 个★：`add_schedule`/`add_alarm` 是一回事，`change_schedule`/`cancel_alarm`
 > 是一回事，`list_schedule`/`list_alarms` 也是一回事。现在**一条事件只有一个入口**。
 > 工具内部还得防“说反了”：`change_event` 只在句子里真有「取消/删/改」类词时才动手，
@@ -202,7 +207,8 @@ flowchart LR
 │  │  ├─ host.py               #   聚合工具清单 + 白名单 + 路由 + 崩了重启
 │  │  ├─ serve.py              #   python -m voice_loop.mcp.serve <服务器>
 │  │  ├─ servers/skills.py     #   技能服务器（见第 13 节）
-│  │  └─ servers/memory.py     #   ★记忆服务器★：recall / remember / memory_stats
+│  │  ├─ servers/memory.py     #   ★记忆服务器★：recall / remember / memory_stats
+│  │  └─ servers/web.py        #   ★联网服务器★：DeepSeek Search / Fetch（默认 hidden）
 │  ├─ scheduler.py             # 后台提醒调度器
 │  ├─ system_ops.py            # 系统操作：关/开显示器（只关屏，不休眠）
 │  ├─ bargein.py               # 语音自动打断（实验性、默认关）：分清「自己的回声」和「你在插话」
@@ -273,6 +279,9 @@ flowchart LR
 │  ├─ test_tools.py            # 工具层自测（--live 走真模型）
 │  ├─ test_route.py            # ★ 路由顺序：模型先选工具 / 技能兜底 / 参数换回原话（不联网）
 │  ├─ test_mcp.py              # ★ MCP：协议 / 真管道 stdio / 白名单 / 路由 / 接进 pipeline
+│  ├─ test_api_llm.py          # ★ 可选 API：配置 / 人格字段 / OpenAI 兼容流 / 本地-API 切换（不联网）
+│  ├─ test_api_tts.py          # ★ 官方 TTS：PCM/WAV 流 / 失败回 Piper / 按角色切后端（不联网）
+│  ├─ test_web_tools.py        # ★ 联网工具：Search/Fetch / 默认隐藏 / 只有 API 角色看得到（不联网）
 │  ├─ test_persona.py          # ★ 角色：结构化人设 / 多角色唤醒归属 / 切换 / 热重载
 │  ├─ test_persona_guard.py    # ★ 兜底：第一句出戏（拒绝/议论/复述）→ 换人设重答
 │  ├─ lint_persona.py          # 人格文件体检（不是单元测试，跑的是你真实的 data/personas）
@@ -713,6 +722,9 @@ python scripts/test_offline.py         # 几秒钟，不加载模型，测分块
 python scripts/test_accel.py           # 加速设备选择（auto 绝不选 NPU / 回退顺序 / 报告编码）
 python scripts/test_tools.py           # 工具层（模型选工具、确定性代码干活），--live 会让真模型选一遍
 python scripts/test_route.py           # 路由顺序：模型先选工具 / 技能兜底 / 参数换回原话
+python scripts/test_api_llm.py         # 可选 API：角色切本地/API / 降级 / 额外工具（不联网）
+python scripts/test_api_tts.py         # 官方 TTS：PCM/WAV / 失败回 Piper / 按角色切后端（不联网）
+python scripts/test_web_tools.py       # 联网工具：Search/Fetch / 默认隐藏 / 只有 API 角色看得到（不联网）
 python scripts/test_vision.py          # 看图：找文件/确认流程/编码/路由（不用视觉模型）
 python scripts/eval_router.py --builtin  # 评估「模型选工具」准不准（29 句带预期，算选对率/误报/漏调）
 python scripts/test_skills_route.py    # 技能路由 + 关屏幕 + 课表 + 提醒文案 + 重启不丢数据
@@ -1483,6 +1495,7 @@ pipeline（会话编排）
 | `mcp/host.py` | 聚合工具清单、白名单、路由、服务器崩了自动重启 |
 | `mcp/servers/skills.py` | 第一个服务器：把现成的 `ToolRegistry`（事件/提醒/备忘）挂到协议后面 |
 | `mcp/servers/memory.py` | ★ 记忆服务器（第 15 节）：`recall` / `remember` / `memory_stats`，默认只露前两个 |
+| `mcp/servers/web.py` | ★ 联网服务器：DeepSeek Search / Fetch，默认 `hidden`，只给 API 角色点名开 |
 
 第一条命令：
 
@@ -1645,8 +1658,15 @@ python main.py memory --who amiya            # 她记得什么、知识库读到
                                     //   {"calm": "data/personas/<id>/a.wav",
                                     //    "催促": {"ref": "...b.wav", "text": "那句话"}}
                                     //   取不到那一档就退回 voice_ref；素材不会挑→ pick_voice_ref.py
-  "backend": "",                    // 可选：这个角色用哪个 TTS 后端（piper / zipvoice；
+  "backend": "",                    // 可选：这个角色用哪个 TTS 后端（piper / zipvoice / api；
                                     //   空 = 跟 config.toml 的 [tts] backend）
+  "tts_voice": "",                  // 可选：backend = api 时的官方音色（stella / tide）
+  // ↓↓↓ 可选：这个角色的「脑子」跑在哪（默认跟全局，全离线）↓↓↓
+  "engine": "",                     // "" = 跟 [api] engine；local = 本机 Ollama；api = 云端接口
+  "api_model": "",                  // 可选：API 模型名（空 = 跟 [api] model，如 deepseek-chat）
+  "api_base": "",                   // 可选：API 地址（空 = 跟 [api] base_url）
+  "api_key": "",                    // 可选：★别把真 key 写进要提交的文件★（留空 = 读环境变量）
+  "api_tools": [],                  // 可选：API 角色额外开放的工具（预设名或工具名）
   // ↓↓↓ 下面这几个是「它知道什么」（第 15 节）↓↓↓
   "knowledge": ["data/knowledge/x/设定.md"],  // 可选：专属知识库文件/目录
   "worlds": ["明日方舟"],           // 可选：★挂在哪个世界观上★（同一个 IP 的角色共享一套）
@@ -1660,6 +1680,134 @@ python main.py memory --who amiya            # 她记得什么、知识库读到
   "notes": "给自己看的备注，不进提示词"
 }
 ```
+
+### 每个角色的 AI 引擎：本地 / API（可选）
+
+默认仍然是**全离线**：`[llm]` 指向本机 Ollama。但有些角色想要云端模型的能力，
+所以在人格文件里给每个角色单独选「脑子」跑在哪 —— **喊谁就用谁的模型**：
+
+```jsonc
+// data/personas/bluefish.json（原生 API 角色「蓝色大肥鱼」）
+{
+  "id": "bluefish",
+  "name": "蓝色大肥鱼",
+  "engine": "api",              // ★这个角色走云端★
+  "api_model": "deepseek-chat", // 空 = 跟 [api] model
+  "api_tools": ["web"]          // 额外工具：web = 官方联网搜索/网页读取
+}
+```
+
+```toml
+[api]
+enabled = true
+engine = "local"                          # 角色卡上没选的角色用哪个
+base_url = "https://api.deepseek.com"     # 任何 OpenAI 兼容接口都行
+api_key_env = "DEEPSEEK_API_KEY"          # ★密钥放环境变量，别写进 git★
+api_key_file = ""                         # 或者：指向仓库外的一行 key
+model = "deepseek-chat"
+extra_tools = []                          # API 角色额外开放的工具（预设名或工具名）
+```
+
+```powershell
+$env:DEEPSEEK_API_KEY = "sk-..."          # PowerShell（当前窗口有效）
+python main.py text --character bluefish   # 用 API 角色聊一句
+```
+
+**密钥 / 个人路径放在 `config.local.toml`**（被 `.gitignore` 忽略，永远不会提交）：
+
+```toml
+# config.local.toml（本地才有；主 config.toml 里 api_key_file 保持空）
+[api]
+api_key_file = "D:/你的路径/assistant.txt"
+```
+
+优先级：`api_key` → `api_key_file` → `api_key_env`。主配置里这几项都是空的，
+所以仓库里不会出现你的本地路径或密钥；启动时会打印一行「已合并本地覆盖」。
+
+几条行为约定：
+
+| 情况 | 会发生什么 |
+| --- | --- |
+| 角色卡写 `"engine": "api"`，key/地址没配好 | **自动退回本地**并在日志里说清楚 —— 喊醒了却一个字说不出，比退回本地糟 |
+| 本地角色 | 完全不碰 `[api]`，还是全离线 |
+| 调用中途 API 断了 | 这一轮如果还没往外念字，就**改用本地模型重来**；已经念出去半句则如实报错 |
+| 记忆总结 / 看图 | **永远走本地**（不花云端 token，断网也不丢记忆） |
+| 改了角色卡上的引擎 | 服务会热加载人格文件，几秒内生效；不用重启 |
+| 控制台「角色」页 | 第 ③ 组「AI 引擎」就是这几栏，填完点保存即可 |
+
+**额外工具**：本地 4B 能稳定驾驭的工具就那十个，所以默认所有角色一样。
+API 角色可以在 `api_tools`（或 `[api] extra_tools`）里按 **预设名** 或 **具体工具名**
+点名多开。现在有的预设是 `memory`（recall / remember）和 `skills`（八个生活技能）；
+也可以直接点名一个被白名单挡住的工具，例如
+`"api_tools": ["mcp__memory__memory_stats"]`。预设表在
+[`voice_loop/tool_presets.py`](voice_loop/tool_presets.py)：加一个预设 = 加一行，
+流水线不用改；名字找不到只打警告，不会让这一轮失败。
+（具体还要加哪些工具，等下一步讨论。）
+
+### 官方 TTS：让 API 角色用云端嗓子（可选）
+
+「蓝色大肥鱼」不只是脑子走 DeepSeek，**嗓子也可以**。官方接口是
+`POST https://api.deepseek.com/v1/tools/tts`，返回 24 kHz / 16-bit / 单声道 PCM：
+
+```toml
+[api]
+tts_enabled = true
+tts_voice = "stella"       # stella（女，默认）/ tide（男）；角色卡可以覆盖
+tts_format = "pcm"         # 直接可播的裸 PCM（也支持 wav）
+tts_block_seconds = 0.2    # 边收边播：收够 0.2 秒就先交给扬声器
+```
+
+```jsonc
+// data/personas/bluefish.json
+{
+  "backend": "api",                 // ★声音也走官方 TTS★
+  "tts_voice": "stella",            // 空 = 跟 [api] tts_voice
+  "voice": "zh_CN-huayan-medium"    // ★退路★：API 不可用时自动用这个 Piper 声线
+}
+```
+
+| 情况 | 会发生什么 |
+| --- | --- |
+| `[api]` 没配 key / `tts_enabled=false` | 这个角色自动用 Piper 出声（角色卡上的 `voice` 那一栏） |
+| API 400 / 429 / 503 / 超时 | 还没出声 → 这一段改用 Piper；已经播了半句 → 保留已播部分，不重复 |
+| 音色 | 官方只有 `stella` / `tide`，**没有克隆、没有语速参数** |
+| 计费 | 每 10000 字符 $0.45（限时 $0.225）；中文一个字按 2 字符算 |
+| 控制台 | 角色卡第 ⑤ 组「TTS 后端 / 官方 TTS 音色」 |
+
+### 联网搜索：API 角色的额外工具（可选）
+
+「蓝色大肥鱼」还额外开了 DeepSeek 官方的 **Search / Fetch**：问新闻、实时信息、
+或者你不确定的知识时，它会先搜再答。
+
+```toml
+[api]
+web_enabled = true
+search_count = 3          # 默认搜几条（1~50，语音场景 3 条够念）
+search_timeout = 60
+fetch_max_chars = 1200    # 网页正文最多念多少字
+```
+
+```jsonc
+// data/personas/bluefish.json
+{ "api_tools": ["web"] }
+```
+
+```
+mcp__web__search   ← POST https://api.deepseek.com/v1/tools/search
+mcp__web__fetch    ← POST https://api.deepseek.com/v1/tools/fetch
+```
+
+| 设计点 | 原因 |
+| --- | --- |
+| **默认隐藏**（`hidden = true`） | 本地 4B 看不到这两个工具，不会误调；只有 `api_tools` 里点名 `web` 的 API 角色才看得到 |
+| 走原始 Search / Fetch API | 官方的服务端 `deepseek_web_search` **不能**和普通 function tools 同时声明（会 400），而这里一轮还要用日程/备忘工具 |
+| 搜索结果是「能直接念」的中文摘要 | 当前流水线工具执行完就直接播报，不再多跑一轮模型；所以只取标题/来源/摘要，**不念 URL**（URL 进日志） |
+| 按成功请求计费 | Search / Fetch 各 $0.75 / 1000 次成功请求；`count` 不影响单价；空结果、失败、超时不计费 |
+| 隐私 | 查询内容会发给 DeepSeek；本地角色完全不会触发联网工具 |
+
+控制台不用额外配置：角色卡第 ③ 组「额外工具」里写 `web` 即可（一行一个，
+也可以写预设 `memory` / `skills` 或具体工具名）。
+
 
 ### 身份卡怎么写才「不出戏」（★4B 小模型的硬限制★）
 

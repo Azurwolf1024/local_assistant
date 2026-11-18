@@ -410,6 +410,12 @@
         const node = card(c.name + (c.is_default ? " ·默认" : "") + (isEditing ? " ·★正在编辑★" : ""), [
           h("p", { class: "mono wrap-path", text: "id " + c.id + (c.title ? " · " + c.title : "") }),
           h("p", { class: "muted", text: "唤醒词：" + ((c.wake_words || []).join("、") || "—") }),
+          h("p", { class: "muted", text: "引擎：" + (c.engine === "api"
+            ? "云端 API" + (c.api_model ? "（" + c.api_model + "）" : "")
+            : (c.engine === "local" ? "本地 Ollama" : "跟全局")) }),
+          h("p", { class: "muted", text: "TTS：" + (c.tts_backend === "api"
+            ? "DeepSeek 官方" + (c.tts_voice ? "（" + c.tts_voice + "）" : "")
+            : (c.tts_backend || "跟全局")) }),
           h("p", { class: "muted", text: "称呼你：「" + (c.user_title || "你") + "」"
             + (c.ack ? " · 应答语：" + c.ack : "") }),
           c.style && c.style.length ? h("p", { class: "muted", text: "风格：" + c.style.join(" / ") }) : null,

@@ -106,6 +106,52 @@ system_prompt = """
 不要输出 Markdown / 代码块 / 表情 / 括号里的动作描写。
 """
 
+# ── 可选：云端 OpenAI 兼容接口（API 角色用）──────────────────────────────────
+# 默认仍然是**全离线**：只有人格文件里写了 "engine": "api" 的角色才会走这里。
+# 典型用法：角色卡上选 API、模型填 deepseek-chat。密钥别写进主配置：
+#   1) 环境变量：$env:DEEPSEEK_API_KEY = "sk-..."（只对当前窗口有效）
+#   2) 仓库外的一行文本：在 **config.local.toml**（被 git 忽略）里写
+#      [api]
+#      api_key_file = "D:/你的路径/assistant.txt"
+# 主 config.toml 里 api_key_file 留空，仓库里就永远不会出现你的本地路径或密钥。
+# 改了角色卡不用重启服务：服务会热加载人格文件，几秒内生效。
+[api]
+enabled = true                    # false = 所有角色强制回本地（角色卡上的 api 选择被忽略）
+engine = "local"                  # 没在角色卡上选的角色用哪个：local | api
+base_url = "https://api.deepseek.com"
+api_key = ""                      # ★留空 = 依次看 api_key_file / 环境变量★；也可写 "env:变量名"
+api_key_file = ""                 # 存着 key 的本地文件（一行）；★个人路径写 config.local.toml★
+                                  #   config.local.toml 被 .gitignore 忽略，仓库里只留空值
+api_key_env = "DEEPSEEK_API_KEY"
+model = "deepseek-chat"
+temperature = 0.7
+top_p = 1.0
+max_tokens = 512
+history_turns = 6
+timeout = 60                      # 单次请求最长等多少秒
+extra_tools = []                  # ★API 角色额外开放的工具★：预设名或工具名，见 voice_loop/tool_presets.py
+                                  #   角色卡上的 api_tools 留空时才用这一份；本地角色不看它
+
+# ---- 可选：DeepSeek 官方 TTS（角色卡上 backend = "api" 时用）----
+# 官方文档：整段合成 POST /v1/tools/tts，返回 24 kHz / 16-bit / 单声道 PCM（或 wav）。
+# 没有克隆、也没有语速参数；音色只有 stella / tide。失败会自动退回 Piper。
+tts_enabled = true
+tts_url = ""                      # 留空 = 由 base_url 推出（默认就是 .../v1/tools/tts）
+tts_voice = "stella"              # 默认音色：stella（女）/ tide（男）；角色卡可覆盖
+tts_format = "pcm"                # pcm = 直接可播的裸 PCM；wav = 带文件头
+tts_timeout = 120                 # 单次合成最长等多少秒
+tts_block_seconds = 0.2           # 边收边播：收够多少秒就交给扬声器
+
+# ---- 可选：DeepSeek 联网搜索 / 网页读取（API 角色的额外工具）----
+# 官方文档：POST /v1/tools/search、POST /v1/tools/fetch，按“成功请求”计费。
+# 默认不露出：只有 api_tools 里点名 "web" 的角色才看得到这两个工具。
+web_enabled = true
+search_url = ""                   # 留空 = 由 base_url 推出（默认 .../v1/tools/search）
+fetch_url = ""                    # 留空 = 由 base_url 推出（默认 .../v1/tools/fetch）
+search_count = 3                  # 默认搜几条（1~50；语音场景 3 条够念）
+search_timeout = 60
+fetch_max_chars = 1200            # 网页正文最多念多少字
+
 # ── 角色设定（名字 / 背景 / 对「我」的称呼 / 示例台词…）──────────────────
 # 人设现在是**结构化文件**，不再是上面那段长字符串：
 #   data/characters.json   每个角色一段（幂等热加载，改完保存即生效）
@@ -450,6 +496,17 @@ transport = "inproc"
 module = "voice_loop.mcp.servers.memory"
 tools = ["recall", "remember"]   # 白名单：想全开就删掉这一行
 timeout = 10
+
+# ★联网（DeepSeek 官方 Search / Fetch）★：默认 hidden，不露给任何角色。
+# API 角色在人格文件里写 "api_tools": ["web"] 才会看到这两个工具；
+# 本地 4B 看不到，也就不会误调。工具名是 mcp__web__search / mcp__web__fetch。
+[[mcp.servers]]
+name = "web"
+transport = "inproc"
+module = "voice_loop.mcp.servers.web"
+hidden = true
+namespace = true
+timeout = 60
 
 # 想更隔离就把它挪到子进程（每次调用多几毫秒，但服务器崩了不影响助手）：
 # [[mcp.servers]]

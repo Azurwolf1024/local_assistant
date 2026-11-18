@@ -1,19 +1,65 @@
-"""Ollama 本机大模型客户端（流式输出，便于边生成边朗读）。"""
+"""大模型客户端。
+
+两个后端，同一套接口：
+
+- :class:`OllamaClient` —— 本机 Ollama（默认；全离线）
+- :class:`OpenAICompatClient` —— OpenAI 兼容的云端接口（DeepSeek 等）
+
+:class:`ChatClient` 是流水线真正拿到的那个门面：它按「当前角色」在两者之间切换，
+本地不可用时也不会把嘴弄哑（见 ``configure`` / ``chat_events`` 的说明）。
+"""
 
 from __future__ import annotations
 
+import dataclasses
 import json
+import logging
+import os
 import sys
 from collections.abc import Iterator
+from pathlib import Path
 
 import requests
 
 from .accel import llm_options
-from .settings import LlmConfig
+from .settings import ApiConfig, LlmConfig
 
 
-class OllamaError(RuntimeError):
+class LlmError(RuntimeError):
+    """两边共用的错误基类（流水线只需要认这一个）。"""
+
+
+class OllamaError(LlmError):
     pass
+
+
+class ApiError(LlmError):
+    pass
+
+
+def resolve_api_key(cfg: ApiConfig) -> str:
+    """密钥优先级：``api_key`` → ``api_key_file`` → 环境变量。
+
+    ⚠ 单独抽成函数：LLM 与 TTS 共用同一份密钥解析，
+      免得两边对 ``env:`` / 文件 / 环境变量的优先级各写一套。
+    """
+    raw = str(getattr(cfg, "api_key", "") or "").strip()
+    if raw.lower().startswith("env:"):
+        return os.environ.get(raw[4:].strip(), "").strip()
+    if raw:
+        return raw
+    path = str(getattr(cfg, "api_key_file", "") or "").strip()
+    if path:
+        try:
+            for line in Path(path).expanduser().read_text(
+                encoding="utf-8-sig", errors="ignore"
+            ).splitlines():
+                line = line.strip()
+                if line:
+                    return line
+        except OSError:
+            pass
+    return os.environ.get(str(getattr(cfg, "api_key_env", "") or "").strip(), "").strip()
 
 
 class OllamaClient:
@@ -292,3 +338,450 @@ class OllamaClient:
         answer = "".join(self.chat_stream(user_text)).strip()
         self.commit(user_text, answer)
         return answer
+
+
+# =========================================================================== #
+# 云端：OpenAI 兼容接口（DeepSeek / 通义 / 任何照着 OpenAI 协议做的服务）
+# =========================================================================== #
+class OpenAICompatClient:
+    """``/chat/completions`` 的流式客户端（SSE）。
+
+    只实现流水线用到的那一小块：``chat_events`` 吐出 ``{"delta": ...}`` 与
+    ``{"tool_calls": [...]}``，工具定义沿用 OpenAI / Ollama 同一套 JSON 形状。
+    """
+
+    def __init__(self, cfg: ApiConfig) -> None:
+        self.cfg = cfg
+        self._history: list[dict] = []
+        # 跟 OllamaClient 一样：运行时可换的人设与温度（None = 用配置里的）
+        self.system_prompt: str | None = None
+        self.temperature: float | None = None
+
+    # ------------------------------------------------------------------ 基础
+    @property
+    def base(self) -> str:
+        return (self.cfg.base_url or "https://api.deepseek.com").rstrip("/")
+
+    def endpoint(self) -> str:
+        base = self.base
+        return base if base.endswith("/chat/completions") else f"{base}/chat/completions"
+
+    def api_key(self) -> str:
+        """密钥（见 :func:`resolve_api_key` 的优先级）。"""
+        return resolve_api_key(self.cfg)
+
+    def ready(self) -> tuple[bool, str]:
+        """配置够不够打这一枪。返回 ``(可以, 原因)``。"""
+        if not bool(getattr(self.cfg, "enabled", True)):
+            return False, "[api] enabled = false"
+        if not self.api_key():
+            env = str(self.cfg.api_key_env or "DEEPSEEK_API_KEY")
+            path = str(getattr(self.cfg, "api_key_file", "") or "").strip()
+            hint = f"写 [api] api_key、放一个 api_key_file（现在是 {path or '没填'}）" \
+                if path else f"设置环境变量 {env}，或写 [api] api_key / api_key_file"
+            return False, f"没有 API key（{hint}）"
+        if not str(self.cfg.model or "").strip():
+            return False, "[api] model 是空的"
+        return True, ""
+
+    def _system_prompt(self) -> str:
+        if self.system_prompt is not None:
+            return self.system_prompt
+        return ""
+
+    def ensure_model(self) -> None:
+        ok, why = self.ready()
+        if not ok:
+            raise ApiError(why)
+
+    def warmup(self, model: str | None = None) -> float:
+        # 云端没有「加载进显存」这回事；能用的前提就是 key/地址配好了
+        self.ensure_model()
+        return 0.0
+
+    def release(self, model: str | None = None) -> bool:
+        return True
+
+    def is_loaded(self, model: str | None = None) -> bool | None:
+        return None
+
+    # ---------------------------------------------------------------- 对话
+    def reset(self) -> None:
+        self._history.clear()
+
+    def _build_messages(self, user_text: str, images: list[str] | None = None,
+                        system_override: str | None = None) -> list[dict]:
+        if images:
+            raise ApiError("这个接口不支持看图（看图会继续走本地的视觉模型）")
+        msgs: list[dict] = []
+        prompt = (self._system_prompt() if system_override is None
+                  else system_override).strip()
+        if prompt:
+            msgs.append({"role": "system", "content": prompt})
+        keep = max(0, int(self.cfg.history_turns)) * 2
+        if keep:
+            msgs.extend(self._history[-keep:])
+        msgs.append({"role": "user", "content": user_text})
+        return msgs
+
+    def chat_stream(
+        self,
+        user_text: str,
+        images: list[str] | None = None,
+        model: str | None = None,
+        num_ctx: int | None = None,
+        tools: list[dict] | None = None,
+        extra_messages: list[dict] | None = None,
+    ) -> Iterator[str]:
+        for ev in self.chat_events(
+            user_text, images=images, model=model, num_ctx=num_ctx, tools=tools,
+            extra_messages=extra_messages,
+        ):
+            if "delta" in ev:
+                yield ev["delta"]
+
+    def chat_events(
+        self,
+        user_text: str = "",
+        images: list[str] | None = None,
+        model: str | None = None,
+        num_ctx: int | None = None,
+        tools: list[dict] | None = None,
+        extra_messages: list[dict] | None = None,
+        messages: list[dict] | None = None,
+        prefix_messages: list[dict] | None = None,
+        system_override: str | None = None,
+    ) -> Iterator[dict]:
+        """流式事件：``{"delta": 文字}`` / ``{"tool_calls": [...]}``。
+
+        工具调用在 OpenAI 协议里是**分片**到的（先 name，再一段段 arguments），
+        所以先把它们攒齐，流结束时一次性交出去 —— 形状和 Ollama 那份保持一致。
+        """
+        if messages is not None:
+            msgs = [dict(m) for m in messages]
+        else:
+            msgs = self._build_messages(user_text, images, system_override)
+            if extra_messages:
+                msgs[-1:-1] = [dict(m) for m in extra_messages]
+        if prefix_messages:
+            msgs = [dict(m) for m in prefix_messages] + msgs
+
+        payload: dict = {
+            "model": (model or self.cfg.model),
+            "messages": msgs,
+            "stream": True,
+            "temperature": (self.temperature if self.temperature is not None
+                            else self.cfg.temperature),
+            "top_p": self.cfg.top_p,
+            "max_tokens": int(self.cfg.max_tokens),
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+
+        ok, why = self.ready()
+        if not ok:
+            raise ApiError(why)
+
+        calls: dict[int, dict] = {}
+        headers = {
+            "Authorization": f"Bearer {self.api_key()}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
+        try:
+            with requests.post(
+                self.endpoint(), json=payload, headers=headers, stream=True,
+                timeout=(10, float(self.cfg.timeout)),
+            ) as resp:
+                if resp.status_code >= 400:
+                    body = resp.text[:400]
+                    raise ApiError(f"API {resp.status_code}：{body}")
+                for raw in resp.iter_lines(decode_unicode=False):
+                    if not raw:
+                        continue
+                    line = raw.decode("utf-8", "replace").strip()
+                    if line.startswith("data:"):
+                        line = line[5:].strip()
+                    if not line or line == "[DONE]":
+                        if line == "[DONE]":
+                            break
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if chunk.get("error"):
+                        raise ApiError(str(chunk["error"]))
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta") or {}
+                    for tc in delta.get("tool_calls") or []:
+                        idx = int(tc.get("index", 0) or 0)
+                        slot = calls.setdefault(
+                            idx,
+                            {"id": "", "type": "function",
+                             "function": {"name": "", "arguments": ""}},
+                        )
+                        if tc.get("id"):
+                            slot["id"] = str(tc["id"])
+                        fn = tc.get("function") or {}
+                        if fn.get("name"):
+                            slot["function"]["name"] = str(fn["name"])
+                        if fn.get("arguments"):
+                            slot["function"]["arguments"] += str(fn["arguments"])
+                    piece = delta.get("content")
+                    if piece:
+                        yield {"delta": piece}
+                    if choices[0].get("finish_reason") in ("stop", "tool_calls"):
+                        break
+        except ApiError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise ApiError(f"调用 API 失败（{self.base}）：{exc}") from exc
+
+        if calls:
+            yield {"tool_calls": [calls[i] for i in sorted(calls)]}
+
+    def chat_tools(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        model: str | None = None,
+        num_ctx: int | None = None,
+    ) -> tuple[str, list[dict]]:
+        content: list[str] = []
+        calls: list[dict] = []
+        for ev in self.chat_events(model=model, num_ctx=num_ctx, tools=tools,
+                                   messages=messages):
+            if "delta" in ev:
+                content.append(ev["delta"])
+            elif "tool_calls" in ev:
+                calls.extend(ev["tool_calls"])
+        return "".join(content).strip(), calls
+
+    def commit(self, user_text: str, answer: str) -> None:
+        self._history.append({"role": "user", "content": user_text})
+        self._history.append({"role": "assistant", "content": answer or ""})
+
+    def chat(self, user_text: str) -> str:
+        answer = "".join(self.chat_stream(user_text)).strip()
+        self.commit(user_text, answer)
+        return answer
+
+
+# =========================================================================== #
+# 门面：按角色在「本地 / API」之间切换（流水线只认这一层）
+# =========================================================================== #
+class ChatClient:
+    """统一门面，接口与 :class:`OllamaClient` 完全一样。
+
+    为什么要有这一层：``pipeline`` 已经把 ``self.llm`` 用得到处都是
+    （人设、温度、历史、预热、释放、看图），如果让各处自己判断走哪边，
+    迟早会漏一处。这里把「谁是当前后端」收成一处，其余代码不需要知道。
+    """
+
+    def __init__(
+        self,
+        local_cfg: LlmConfig,
+        api_cfg: ApiConfig | None = None,
+        logger: logging.Logger | None = None,
+    ) -> None:
+        self.local = OllamaClient(local_cfg)
+        self.api_cfg = api_cfg or ApiConfig()
+        self.log = logger or logging.getLogger("voice_loop")
+        self._api: OpenAICompatClient | None = None
+        self._engine = "local"
+        self._last_used = "local"
+        self._prompt_value: str | None = None
+        self._temperature = None
+
+    # ---------------------------------------------------------------- 身份
+    @property
+    def engine(self) -> str:
+        return self._engine
+
+    @property
+    def system_prompt(self) -> str | None:
+        return self._prompt_value
+
+    @system_prompt.setter
+    def system_prompt(self, value: str | None) -> None:
+        self._prompt_value = value
+        self.local.system_prompt = value
+        if self._api is not None:
+            self._api.system_prompt = value
+
+    @property
+    def temperature(self) -> float | None:
+        return self._temperature
+
+    @temperature.setter
+    def temperature(self, value: float | None) -> None:
+        self._temperature = value
+        self.local.temperature = value
+        if self._api is not None:
+            self._api.temperature = value
+
+    def _system_prompt(self) -> str:
+        client = self._api if (self._engine == "api" and self._api) else self.local
+        return client._system_prompt()
+
+    @property
+    def _history(self) -> list[dict]:
+        """当前后端的历史（自测/调试会直接看它，跟 OllamaClient 同名）。"""
+        client = self._api if (self._engine == "api" and self._api) else self.local
+        return client._history
+
+    def configure(
+        self,
+        engine: str | None,
+        *,
+        model: str = "",
+        base_url: str = "",
+        api_key: str = "",
+    ) -> str:
+        """把当前引擎切成 ``local`` 或 ``api``；返回**最终生效**的那个。
+
+        角色卡上写 ``api`` 但 key / 地址没配好时，这里会**退回本地**并打一条警告 ——
+        喊醒一个角色却一个字都说不出来，比退回本地糟得多。
+        """
+        want = str(engine or self.api_cfg.engine or "local").strip().lower()
+        if want not in ("local", "api"):
+            self.log.warning(f"[AI 引擎] 不认识 {want!r}，按本地处理")
+            want = "local"
+        if want == "api":
+            if not bool(getattr(self.api_cfg, "enabled", True)):
+                self.log.warning("[API] [api] enabled = false，这个角色改用本地模型")
+                want = "local"
+            else:
+                overrides: dict = {}
+                if model:
+                    overrides["model"] = model
+                if base_url:
+                    overrides["base_url"] = base_url
+                if api_key:
+                    overrides["api_key"] = api_key
+                cfg = dataclasses.replace(self.api_cfg, **overrides)
+                client = self._api
+                if client is None or client.cfg != cfg:
+                    client = OpenAICompatClient(cfg)
+                ok, why = client.ready()
+                if not ok:
+                    self.log.warning(f"[API] {why} —— 这个角色改用本地模型")
+                    want = "local"
+                else:
+                    client.system_prompt = self._prompt_value
+                    client.temperature = self._temperature
+                    self._api = client
+        if want != self._engine:
+            self.reset()               # 换了脑子就不继承上一段对话（跟切角色同理）
+            self.log.info(f"[AI 引擎] {'本地 Ollama' if want == 'local' else '云端 API'}"
+                          + (f"（{self._api.cfg.model}）" if want == "api" and self._api else ""))
+        self._engine = want
+        self._last_used = want
+        return want
+
+    # ---------------------------------------------------------------- 生命周期
+    def ensure_model(self) -> None:
+        if self._engine == "api" and self._api is not None:
+            self._api.ensure_model()
+        else:
+            self.local.ensure_model()
+
+    def warmup(self, model: str | None = None) -> float:
+        if self._engine == "api" and self._api is not None:
+            return self._api.warmup(model)
+        return self.local.warmup(model)
+
+    def release(self, model: str | None = None) -> bool:
+        # 就算当前角色用 API，本地模型仍要给看图/记忆总结用，所以照样释放
+        return self.local.release(model)
+
+    def is_loaded(self, model: str | None = None) -> bool | None:
+        if self._engine == "api":
+            return None
+        return self.local.is_loaded(model)
+
+    def list_models(self) -> list[str]:
+        return self.local.list_models()
+
+    def resolve_model(self, want: str) -> str:
+        return self.local.resolve_model(want)
+
+    # ---------------------------------------------------------------- 对话
+    def reset(self) -> None:
+        self.local.reset()
+        if self._api is not None:
+            self._api.reset()
+
+    def chat_events(
+        self,
+        user_text: str = "",
+        images: list[str] | None = None,
+        model: str | None = None,
+        num_ctx: int | None = None,
+        tools: list[dict] | None = None,
+        extra_messages: list[dict] | None = None,
+        messages: list[dict] | None = None,
+        prefix_messages: list[dict] | None = None,
+        system_override: str | None = None,
+    ) -> Iterator[dict]:
+        if self._engine == "api" and self._api is not None and not images:
+            yielded = False
+            try:
+                for ev in self._api.chat_events(
+                    user_text, images=images, model=model, num_ctx=num_ctx,
+                    tools=tools, extra_messages=extra_messages, messages=messages,
+                    prefix_messages=prefix_messages, system_override=system_override,
+                ):
+                    yielded = True
+                    yield ev
+                self._last_used = "api"
+                return
+            except LlmError as exc:
+                if yielded:
+                    # 已经念出去半句了，再切本地会重复；这一轮只能如实报错
+                    raise
+                self.log.warning(f"[API] 没通，这一轮改用本地模型：{exc}")
+                self._api.reset()       # 云端那份历史接不上这一轮，清掉免得错位
+                self._engine = "local"
+        for ev in self.local.chat_events(
+            user_text, images=images, model=model, num_ctx=num_ctx, tools=tools,
+            extra_messages=extra_messages, messages=messages,
+            prefix_messages=prefix_messages, system_override=system_override,
+        ):
+            yield ev
+        self._last_used = "local"
+
+    def chat_stream(
+        self,
+        user_text: str,
+        images: list[str] | None = None,
+        model: str | None = None,
+        num_ctx: int | None = None,
+        tools: list[dict] | None = None,
+        extra_messages: list[dict] | None = None,
+    ) -> Iterator[str]:
+        for ev in self.chat_events(
+            user_text, images=images, model=model, num_ctx=num_ctx, tools=tools,
+            extra_messages=extra_messages,
+        ):
+            if "delta" in ev:
+                yield ev["delta"]
+
+    def commit(self, user_text: str, answer: str) -> None:
+        if self._last_used == "api" and self._api is not None:
+            self._api.commit(user_text, answer)
+        else:
+            self.local.commit(user_text, answer)
+
+    def chat(self, user_text: str) -> str:
+        answer = "".join(self.chat_stream(user_text)).strip()
+        self.commit(user_text, answer)
+        return answer
+
+    def local_chat(self, user_text: str) -> str:
+        """永远走本机的那一条（记忆总结、看图这类不该花云端 token 的活）。"""
+        return self.local.chat(user_text)

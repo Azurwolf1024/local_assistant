@@ -371,6 +371,22 @@ class Character:
     # 模型于是会往游戏设定上扯）。
     work: str = ""
 
+    # ★可选：这个角色的「脑子」跑在哪★（见 README 第 14 节「每个角色的 AI 引擎」）
+    #   ""    = 跟 config.toml 的 [api] engine（默认 local）
+    #   local = 本机 Ollama
+    #   api   = OpenAI 兼容的云端接口（DeepSeek 等）
+    # 放在最后：dataclass 的字段顺序会被位置构造依赖。
+    engine: str = ""
+    api_model: str = ""                   # 空 = 跟 [api] model
+    api_base: str = ""                    # 空 = 跟 [api] base_url
+    api_key: str = ""                     # 空 = 跟 [api] 的密钥设置（api_key_file / 环境变量）
+    # ★API 角色额外开放的工具★：预设名（见 voice_loop/tool_presets.py）或具体工具名。
+    # 只在 engine = api 时生效；留空 = 跟 [api] extra_tools。
+    api_tools: list[str] = field(default_factory=list)
+    # ★后端 = "api" 时用哪个官方 TTS 音色★（stella / tide）；空 = 跟 [api] tts_voice。
+    # 跟 `voice`（Piper 声线）分开存：切回本地时 Piper 声线还得是原来那个。
+    tts_voice: str = ""
+
     # ------------------------------------------------------------------ 基础
     @property
     def label(self) -> str:
@@ -443,6 +459,13 @@ class Character:
             default=bool(raw.get("default")),
             enabled=bool(raw.get("enabled", True)),
             notes=str(raw.get("notes") or "").strip(),
+            # ★同样必须显式搬一次★（白名单式构造，漏了就是静默忽略）
+            engine=str(raw.get("engine") or "").strip().lower(),
+            api_model=str(raw.get("api_model") or "").strip(),
+            api_base=str(raw.get("api_base") or "").strip(),
+            api_key=str(raw.get("api_key") or "").strip(),
+            api_tools=[str(t).strip() for t in _list("api_tools") if str(t).strip()],
+            tts_voice=str(raw.get("tts_voice") or "").strip().lower(),
         )
 
 
@@ -926,7 +949,14 @@ class CharacterRegistry:
         return before != self._signature()
 
     def _signature(self) -> list[tuple]:
-        return [(c.id, c.name, tuple(c.wake_words), c.ack) for c in self.characters]
+        # ★引擎相关字段也要算进签名★：只改角色卡上的「本地 / API」时，
+        # `maybe_reload` 才会真的重装人设（否则改了引擎要重启服务才生效）。
+        return [
+            (c.id, c.name, tuple(c.wake_words), c.ack, c.engine, c.api_model,
+             c.api_base, c.api_key, tuple(c.api_tools), c.backend, c.voice,
+             c.tts_voice)
+            for c in self.characters
+        ]
 
     # ------------------------------------------------------------------ 查询
     def all(self, only_enabled: bool = False) -> list[Character]:

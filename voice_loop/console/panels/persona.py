@@ -71,6 +71,8 @@ def register(app, ctx) -> None:
     @app.get("/api/persona/spec")
     def api_spec(cid: str = ""):
         """表单规范 + 一份样板 + 现有 id（前端据此画表单、挡重名）。"""
+        from ... import tool_presets  # noqa: PLC0415
+
         registry = ctx.characters()
         example_char = find(cid) if cid else None
         if example_char is None:
@@ -81,6 +83,7 @@ def register(app, ctx) -> None:
             "ids": card.existing_ids(ctx.settings),
             "personas_dir": card.rel(ctx.settings, card.persona_path(ctx.settings, "x").parent),
             "index": card.rel(ctx.settings, card.index_path(ctx.settings)),
+            "tool_presets": tool_presets.describe(),
         }
 
     @app.post("/api/persona/preview")

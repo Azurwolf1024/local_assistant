@@ -47,6 +47,7 @@ def register(app, ctx) -> None:
                     "voice": c.voice or "",
                     "voice_ref": c.voice_ref or "",
                     "voice_model": c.voice_model or "",
+                    "engine": c.engine or getattr(settings.api, "engine", "local"),
                 }
                 for c in registry.all()
             ]
@@ -80,6 +81,14 @@ def register(app, ctx) -> None:
                 "router": getattr(settings.llm, "router", ""),
                 "route": getattr(settings.llm, "route", ""),
                 "temperature": settings.llm.temperature,
+            },
+            "api": {
+                "enabled": bool(getattr(settings.api, "enabled", True)),
+                "engine": getattr(settings.api, "engine", "local"),
+                "model": settings.api.model,
+                "base_url": settings.api.base_url,
+                "key_env": settings.api.api_key_env,
+                "has_key": bool(settings.api.api_key),
             },
             "persona": {
                 "default": settings.persona.default,

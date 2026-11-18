@@ -57,6 +57,15 @@ TOOL_HINT = (
     "7. 要调工具就**直接用工具接口**，不要用文字写出 {'name': ..., 'arguments': ...} 这种 JSON。"
 )
 
+WEB_TOOL_HINT = (
+    "你还可以联网（这两个工具只在 API 角色上出现）。规则：\n"
+    "1. 用户问新闻、实时信息、你不确定或可能过时的知识时，先调用 mcp__web__search；"
+    "query 用简洁的检索词，question 可以放用户原话。\n"
+    "2. 需要看某个网页正文时调用 mcp__web__fetch（url 必须是完整网址）。\n"
+    "3. 搜索/读取返回的文字就是最终答复：照实念，不要编，也不要念网址。\n"
+    "4. 日程、备忘、提醒仍然用本地工具；不要拿联网工具去查日程。"
+)
+
 # 模型（尤其是小模型）偶尔不调工具，而是把调用**写成一段 JSON 文字**。
 # 这段文字绝对不能念给用户听，得拦下来，能抢回就抢回来当工具调用。
 _TOOL_TEXT_HINT = re.compile(r'"(?:arguments|function)"\s*:')
@@ -589,6 +598,7 @@ __all__ = [
     "ToolRegistry",
     "ToolResult",
     "TOOL_HINT",
+    "WEB_TOOL_HINT",
     "SUSPICIOUS_START",
     "describe_calls",
     "looks_like_tool_text",

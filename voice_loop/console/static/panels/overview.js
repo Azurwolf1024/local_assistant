@@ -101,6 +101,7 @@
               : h("div", {}, [
                   h("p", { class: "muted", text: c.title || "" }),
                   h("p", { class: "muted", text: "唤醒词：" + ((c.wake_words || []).join("、") || "—") }),
+                  h("p", { class: "muted", text: "引擎：" + (c.engine === "api" ? "云端 API" : "本地 Ollama") }),
                   h("p", { class: "muted mono", text: c.voice_ref || c.voice || "（用全局声线）" }),
                 ]),
           ])))));
@@ -112,6 +113,9 @@
             { k: "Whisper", v: data.asr.whisper },
             { k: "LLM", v: data.llm.model + " @ " + data.llm.host },
             { k: "LLM 路由", v: (data.llm.router || data.llm.route || "—") + " · temperature " + data.llm.temperature },
+            { k: "API 引擎", v: (data.api.enabled ? (data.api.engine === "api" ? "全局默认 API" : "全局默认本地") : "已关闭")
+                + " · " + data.api.model + " @ " + data.api.base_url
+                + (data.api.has_key ? " · 配置里有 key" : " · key 走环境变量 " + data.api.key_env) },
             { k: "TTS 后端", v: data.tts.backend + "（" + (data.tts.clone_dir || data.tts.model) + "）" },
             { k: "输出高频压制", v: "≥" + Math.round(data.tts.out_tilt[0] / 1000) + " kHz：" + data.tts.out_tilt[1] + " dB" },
             { k: "音区守卫", v: data.tts.pitch_guard[0] + " 半音 · 最多 " + data.tts.pitch_guard[1] + " 遍" },

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import sys
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -104,6 +105,59 @@ class LlmConfig:
     #   on   = 显式打开（已确认模型支持时）
     #   auto = 完全不发这个字段，交给 Ollama / 模型自己的默认
     think: str = "off"
+
+
+@dataclass
+class ApiConfig:
+    """可选：云端 OpenAI 兼容接口（默认给 DeepSeek 用）。
+
+    本项目的默认形态仍然是**全离线**（[llm] 指向 Ollama）。这一段只是让「某个角色」
+    可以改用云端模型 —— 在人格文件里写 ``"engine": "api"`` 就只影响那一个角色，
+    其余角色照旧跑本地（见 README 第 14 节「每个角色的 AI 引擎」）。
+
+    ★为什么把「用哪个引擎」放在角色上而不是全局★：本地 4B 撑得住日常闲聊和工具调用，
+    但有些角色（比如原创的 API 角色「蓝色大肥鱼」）就是想要云端模型的能力。
+    放到角色上，喊谁就用谁的模型，不用改一次配置重启一次。
+
+    ★密钥★：``api_key`` 留空时依次看 ``api_key_file``（仓库外的一行文本）和
+    环境变量 ``api_key_env``（默认 DEEPSEEK_API_KEY）。也支持 ``api_key = "env:变量名"``。
+    **不要把真 key 写进要提交的文件。**
+    """
+
+    enabled: bool = True                 # false = 所有角色强制回本地（角色卡上的 api 选择被忽略）
+    engine: str = "local"                # 没在角色卡上选的角色用哪个：local | api
+    base_url: str = "https://api.deepseek.com"
+    api_key: str = ""                    # 留空 = 依次看 api_key_file / 环境变量；也可写 "env:VAR"
+    api_key_file: str = ""               # 存着 key 的本地文件（一行；★放在仓库外最省事★）
+    api_key_env: str = "DEEPSEEK_API_KEY"
+    model: str = "deepseek-chat"
+    temperature: float = 0.7
+    top_p: float = 1.0
+    max_tokens: int = 512
+    history_turns: int = 6               # 带几轮历史（user+assistant 各算一条）
+    timeout: float = 60.0                # 单次请求最长等多久（秒）
+    # ★API 角色额外开放的工具★（预设名或具体工具名，见 voice_loop/tool_presets.py）。
+    # 角色卡上的 api_tools 留空时用这一份；本地角色不看它。
+    extra_tools: list[str] = field(default_factory=list)
+
+    # ---- 可选：DeepSeek 官方 TTS（人格文件里 backend = "api" 时用）----
+    # 官方文档：POST /v1/tools/tts，返回 wav 或 24 kHz 16-bit 单声道 PCM。
+    # ★这里只是默认值★：角色卡上的 tts_voice 可以按角色覆盖。
+    tts_enabled: bool = True
+    tts_url: str = ""                    # 留空 = 由 base_url 推出来（.../v1/tools/tts）
+    tts_voice: str = "stella"            # 官方音色：stella（女，默认）/ tide（男）
+    tts_format: str = "pcm"              # pcm = 24 kHz 16-bit mono（可直接播）；wav = 带文件头
+    tts_timeout: float = 120.0           # 单次合成最长等多久（秒）
+    tts_block_seconds: float = 0.2       # 边收边播的块大小（秒）
+
+    # ---- 可选：DeepSeek 联网搜索 / 网页读取（API 角色额外工具）----
+    # 官方文档：POST /v1/tools/search、POST /v1/tools/fetch，按成功请求计费。
+    web_enabled: bool = True
+    search_url: str = ""                 # 留空 = 由 base_url 推出（.../v1/tools/search）
+    fetch_url: str = ""                  # 留空 = 由 base_url 推出（.../v1/tools/fetch）
+    search_count: int = 3                # 默认取几条（1~50）
+    search_timeout: float = 60.0
+    fetch_max_chars: int = 1200          # 网页正文最多念多少字（语音场景别太长）
 
 
 @dataclass
@@ -283,6 +337,7 @@ class McpServerConfig:
     cwd: str = ""                    # stdio：工作目录
     env: dict[str, str] = field(default_factory=dict)  # stdio：额外的环境变量
     tools: list[str] = field(default_factory=list)     # ★白名单★，空 = 全部（不推荐）
+    hidden: bool = False             # true = 注册但默认不露出；只给 API 角色的 api_tools 点名开
     namespace: bool = True           # 工具名要不要加 mcp__<服务器>__ 前缀
     timeout: float = 15.0            # 单次调用超时（秒）
 
@@ -421,6 +476,7 @@ class Settings:
     vad: VadConfig = field(default_factory=VadConfig)
     asr: AsrConfig = field(default_factory=AsrConfig)
     llm: LlmConfig = field(default_factory=LlmConfig)
+    api: ApiConfig = field(default_factory=ApiConfig)
     tts: TtsConfig = field(default_factory=TtsConfig)
     chat: ChatConfig = field(default_factory=ChatConfig)
     persona: PersonaConfig = field(default_factory=PersonaConfig)
@@ -456,7 +512,8 @@ def _build(cls: type, data: dict[str, Any], section: str) -> Any:
     valid = {f.name for f in dataclasses.fields(cls)}
     unknown = set(data) - valid
     if unknown:
-        print(f"[config] 警告：[{section}] 中存在未知配置项 {sorted(unknown)}，已忽略")
+        print(f"[config] 警告：[{section}] 中存在未知配置项 {sorted(unknown)}，已忽略",
+              file=sys.stderr)
     kwargs = {k: v for k, v in data.items() if k in valid}
     return cls(**kwargs)
 
@@ -473,6 +530,18 @@ def _build_mcp(data: dict[str, Any]) -> McpConfig:
     return cfg
 
 
+def _deep_merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
+    """把 ``over`` 深合并进 ``base``（只用于 config.local.toml）。"""
+    out = dict(base)
+    for key, value in over.items():
+        current = out.get(key)
+        if isinstance(current, dict) and isinstance(value, dict):
+            out[key] = _deep_merge(current, value)
+        else:
+            out[key] = value
+    return out
+
+
 def load_settings(path: str | Path | None = None) -> Settings:
     cfg_path = Path(path) if path else (PROJECT_ROOT / "config.toml")
     if not cfg_path.exists():
@@ -480,12 +549,27 @@ def load_settings(path: str | Path | None = None) -> Settings:
     with open(cfg_path, "rb") as f:
         raw = tomllib.load(f)
 
+    # ★个人信息 / 密钥放这里，不进 git★：<config>.local.toml 深合并到主配置。
+    #   例如 config.local.toml 里写 [api] api_key_file = "D:/xxx/key.txt"。
+    #   主配置只留空值，仓库里就永远不会出现你的本地路径或密钥。
+    local_path = cfg_path.with_name(f"{cfg_path.stem}.local{cfg_path.suffix}")
+    if local_path.exists():
+        try:
+            with open(local_path, "rb") as f:
+                local_raw = tomllib.load(f)
+            raw = _deep_merge(raw, local_raw)
+            print(f"[config] 已合并本地覆盖：{local_path.name}", file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001 - 本地覆盖坏了也不能让助手起不来
+            print(f"[config] 警告：{local_path.name} 读不了，已忽略（{exc}）",
+                  file=sys.stderr)
+
     return Settings(
         app=_build(AppConfig, raw.get("app", {}), "app"),
         audio=_build(AudioConfig, raw.get("audio", {}), "audio"),
         vad=_build(VadConfig, raw.get("vad", {}), "vad"),
         asr=_build(AsrConfig, raw.get("asr", {}), "asr"),
         llm=_build(LlmConfig, raw.get("llm", {}), "llm"),
+        api=_build(ApiConfig, raw.get("api", {}), "api"),
         wake=_build(WakeConfig, raw.get("wake", {}), "wake"),
         skills=_build(SkillsConfig, raw.get("skills", {}), "skills"),
         subtitle=_build(SubtitleConfig, raw.get("subtitle", {}), "subtitle"),

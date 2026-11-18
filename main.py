@@ -782,6 +782,21 @@ def cmd_persona(settings: Settings, args: argparse.Namespace) -> int:
         print(f"  唤醒词      : {'、'.join(char.wake_words) or '（没写，只能在会话里用）'}")
         print(f"  应答语      : {char.ack or '（不出声）'}")
         print(f"  声线/温度   : {char.voice or '（用全局）'} / {char.temperature or '（用全局）'}")
+        tts_backend = char.backend or f"（跟全局 [tts] backend = {settings.tts.backend}）"
+        print(f"  TTS 后端    : {tts_backend}")
+        if char.backend == "api":
+            print(f"      官方音色: {char.tts_voice or settings.api.tts_voice}")
+        engine = char.engine or f"（跟全局 [api] engine = {settings.api.engine}）"
+        print(f"  AI 引擎     : {engine}")
+        if char.engine == "api" or char.api_model or char.api_base:
+            print(f"      API     : {char.api_model or settings.api.model}"
+                  f" @ {char.api_base or settings.api.base_url}")
+            key = char.api_key or ""
+            shown = "（跟全局/环境变量）" if not key else (
+                "env:" + key[4:].strip() if key.lower().startswith("env:") else "（已填，略）")
+            print(f"      密钥    : {shown}")
+        if char.api_tools:
+            print(f"      额外工具: {'、'.join(char.api_tools)}")
         print(f"  默认角色    : {'是' if char.default else '否'}   启用：{'是' if char.enabled else '否'}")
         print(f"  背景        : {char.background or '（空）'}")
         print(f"  别名        : {sum(len(v) for v in char.aliases.values())} 条")

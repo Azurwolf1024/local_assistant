@@ -25,7 +25,7 @@ from .asr import AsrResult, AsrRouter
 from .audio import BaseSegmenter, MicReader, MicRecorder, Speaker, make_segmenter, save_wav
 from .bargein import BargeInDetector
 from .control import ControlChannel, reap as reap_control, serve_once as serve_control_once
-from .llm import OllamaClient, OllamaError
+from .llm import ChatClient, LlmError
 from .mcp import MCPHost
 from .names import NameCorrector
 from .persona import (Character, CharacterRegistry, TRUTH_HINT, knowledge_spec_for,
@@ -39,6 +39,7 @@ from .toast import VisualNotifier
 from .tools import (
     SUSPICIOUS_START,
     TOOL_HINT,
+    WEB_TOOL_HINT,
     ToolRegistry,
     describe_calls,
     looks_like_tool_text,
@@ -139,7 +140,9 @@ class VoiceLoop:
             else None
         )
         self.speaker = Speaker(settings)
-        self.llm = OllamaClient(settings.llm)
+        self.llm = ChatClient(
+            settings.llm, getattr(settings, "api", None), self.log
+        )
         self.tts = create_tts(settings, self.log, lazy=self.lazy)
         # ★合成回听★：有 ASR 就把「说的是不是这句」的校验器接上去（见 textcheck.py）
         self._wire_text_guard()
@@ -151,6 +154,10 @@ class VoiceLoop:
         self._base_clone_dir = str(getattr(settings.tts, "clone_dir", "") or "")
         self._base_clone_audio = str(getattr(settings.tts, "clone_audio", "") or "")
         self._base_clone_text = str(getattr(settings.tts, "clone_text", "") or "")
+        # ★API TTS 的全局音色★：角色卡没写 tts_voice 时回到它（stella/tide）
+        self._base_api_tts_voice = str(
+            getattr(getattr(settings, "api", None), "tts_voice", "") or "stella"
+        )
         # 技能与提醒
         self.skills: Skills | None = Skills(settings, self.log) if enable_skills else None
         # 工具层（旧的进程内注册表）：MCP 宿主没就绪时当兼底，也还是不少单测的入口
@@ -841,6 +848,7 @@ class VoiceLoop:
         if char is None:
             self.llm.system_prompt = None
             self.llm.temperature = None
+            self._apply_engine(None)
             return
         extra = str(getattr(self.settings.persona, "extra_prompt", "") or "")
         self.llm.system_prompt = render_system_prompt(
@@ -849,12 +857,33 @@ class VoiceLoop:
             style=str(getattr(self.settings.persona, "prompt_style", "") or ""),
         )
         self.llm.temperature = float(char.temperature) if char.temperature else None
+        self._apply_engine(char)
         # 唤醒应答语跟着角色走（wakewords.json 里的 ack 只在没有角色时生效）
         if char.ack:
             self.wake.settings.ack = char.ack
         self._apply_voice(char, reason)
         self._seed_memory_identity(char)
         self.log.info(f"[角色] 生效：{char.label}（{reason or '设定'}）")
+
+    def _apply_engine(self, char: Character | None) -> None:
+        """按角色切「本地 / API」；配置不全时门面会自己退回本地并打警告。"""
+        configure = getattr(self.llm, "configure", None)
+        if not callable(configure):
+            return                      # 测试里的假客户端没有这一层
+        try:
+            got = configure(
+                char.engine if char is not None else "",
+                model=char.api_model if char is not None else "",
+                base_url=char.api_base if char is not None else "",
+                api_key=char.api_key if char is not None else "",
+            )
+        except Exception as exc:  # noqa: BLE001 - 引擎切不过去也不能把人设带崩
+            self.log.warning(f"[AI 引擎] 切换失败（继续用当前的）：{exc}")
+            return
+        self.log.info(
+            f"[AI 引擎] {char.label if char else '（无角色）'} → "
+            f"{'云端 API' if got == 'api' else '本地 Ollama'}"
+        )
 
     def _seed_memory_identity(self, char: Character) -> None:
         """把角色的名字/身份/称呼写成 L3 的 **pinned** 事实（深层记忆的起点）。
@@ -873,7 +902,12 @@ class VoiceLoop:
     def _tts_label(self) -> str:
         """启动横幅用的一行说明（不加载模型，纯看配置）。"""
         cfg = self.settings.tts
-        if (cfg.backend or "piper").strip().lower() == "zipvoice":
+        backend = (cfg.backend or "piper").strip().lower()
+        if backend == "api":
+            api = getattr(self.settings, "api", None)
+            voice = str(getattr(api, "tts_voice", "") or "stella")
+            return f"DeepSeek TTS / {voice}（云端，失败自动回 Piper）"
+        if backend == "zipvoice":
             ref = str(getattr(cfg, "clone_audio", "") or "").strip()
             name = ref.replace("\\", "/").rsplit("/", 1)[-1] if ref else "未设参考音频"
             model = str(getattr(cfg, "clone_dir", "") or "").replace("\\", "/").rstrip("/")
@@ -900,6 +934,15 @@ class VoiceLoop:
         # 空 = 跟 config.toml 的 [tts] backend（也就是原来的行为）。
         want_backend = (getattr(char, "backend", "") or "").strip().lower() or self._base_backend
         cur_backend = (str(getattr(self.settings.tts, "backend", "") or "piper")).strip().lower()
+        if want_backend == "api":
+            from .tts.api_tts import api_tts_ready  # noqa: PLC0415
+
+            ok, why = api_tts_ready(self.settings)
+            if not ok:
+                # ★API TTS 没配好不能把嘴弄哑★：退回 Piper（用这个角色自己的 piper 声线）
+                self.log.warning(f"角色 {char.name} 想用官方 TTS，但用不了（{why}），改用 Piper")
+                print(f"[角色] 官方 TTS 用不了（{why}），{char.name} 先用 Piper 出声", flush=True)
+                want_backend = "piper"
         if want_backend not in TTS_BACKENDS:
             # ★写错后端名不能把嘴弄哑★：忽略它、继续用当前的（跟「声线没装就沿用旧的」一个道理）
             self.log.warning(f"角色 {char.name} 的 backend={want_backend!r} 不认识，忽略")
@@ -914,6 +957,10 @@ class VoiceLoop:
                 unload_old()
             self.log.info(f"[角色] 后端：{cur_backend} → {want_backend}（{char.name} 指定）")
             print(f"[角色] TTS 后端切到 {want_backend}（{char.name} 指定的）", flush=True)
+        if want_backend == "api":
+            self._apply_api_voice(char, reason)
+            self._apply_piper_fallback_voice(char)
+            return
         if want_backend == "zipvoice":
             self._apply_reference(char, reason)
             return
@@ -938,6 +985,52 @@ class VoiceLoop:
         if callable(unload):
             unload()
         self.log.info(f"[角色] 声线：{current} → {want}（{reason or '切换'}）")
+
+    def _apply_api_voice(self, char: Character, reason: str = "") -> None:
+        """API TTS 没有「音色克隆」，只有官方给的两个 voice_id（stella / tide）。
+
+        角色卡上的 ``tts_voice`` 优先；没写就回到全局 ``[api] tts_voice``。
+        换音色要 ``unload()``（引擎读的是 settings 里的值，重建时才会用新的）。
+        """
+        from .tts.api_tts import API_TTS_VOICES  # noqa: PLC0415
+
+        api_cfg = getattr(self.settings, "api", None)
+        if api_cfg is None:
+            return
+        want = (getattr(char, "tts_voice", "") or "").strip().lower() or self._base_api_tts_voice
+        if want not in API_TTS_VOICES:
+            self.log.warning(f"角色 {char.name} 的 tts_voice={want!r} 不支持，改用 "
+                             f"{self._base_api_tts_voice}")
+            print(f"[角色] {want!r} 不是官方音色（可选：{'、'.join(API_TTS_VOICES)}），"
+                  f"改用 {self._base_api_tts_voice}", flush=True)
+            want = self._base_api_tts_voice
+        current = str(getattr(api_cfg, "tts_voice", "") or "")
+        if want == current:
+            return
+        api_cfg.tts_voice = want
+        unload = getattr(self.tts, "unload", None)
+        if callable(unload):
+            unload()
+        self.log.info(f"[角色] API TTS 音色：{current or '（默认）'} → {want}"
+                      f"（{reason or '切换'}）")
+
+    def _apply_piper_fallback_voice(self, char: Character) -> None:
+        """API TTS 失败时会退回 Piper；先把「退路声线」摆好（不卸载当前引擎）。
+
+        不这么做的话，角色卡里 `voice` 那一栏对 API 角色就是摆设 ——
+        全局 `[tts] voice` 恰好一样时看不出来，换一个角色就会用错嗓子。
+        """
+        want = (getattr(char, "voice", "") or "").strip() or self._base_voice
+        tts_cfg = self.settings.tts
+        if not want or want == str(getattr(tts_cfg, "voice", "") or ""):
+            return
+        model = self.settings.resolve(f"models/tts/piper/{want}.onnx")
+        if not model.exists():
+            self.log.warning(f"角色 {char.name} 的退路声线 {want} 没装，失败时用当前 Piper")
+            return
+        tts_cfg.voice = want
+        tts_cfg.model = f"models/tts/piper/{want}.onnx"
+        tts_cfg.config = f"models/tts/piper/{want}.onnx.json"
 
     @property
     def style(self) -> str:
@@ -1332,25 +1425,47 @@ class VoiceLoop:
         self._muted.clear()
         return stats
 
+    def _api_extra_tools(self) -> set[str]:
+        """API 角色额外点名的工具（预设名已展开）。本地角色永远为空。"""
+        if str(getattr(self.llm, "engine", "local")) != "api":
+            return set()
+        from . import tool_presets  # noqa: PLC0415
+
+        char = self.character
+        entries = list(char.api_tools or []) if char is not None else []
+        if not entries:
+            api_cfg = getattr(self.settings, "api", None)
+            entries = list(getattr(api_cfg, "extra_tools", []) or [])
+        return tool_presets.expand(entries)
+
     def _tool_specs(self) -> list[dict] | None:
         """这一轮要不要给模型工具（[llm] router = tools / chat）。
 
         优先用 MCP 宿主（它可能聚合了好几个服务器）；宿主里一个工具都没有
         （比如 [mcp] enabled = false）就退回旧的进程内注册表，
         免得助手突然变成不会查日程、不会记事的。——前者是常态，后者是兼底。
+
+        ★API 角色可以多开工具★：人格文件 / ``[api] extra_tools`` 里点名的
+        预设会在这里并进来（见 voice_loop/tool_presets.py）。
         """
         if self.tools is None:
             return None
         if str(self.settings.llm.router or "tools").lower() != "tools":
             return None
-        if self.mcp is not None and self.mcp.names():
-            return self.mcp.specs()
+        extra = self._api_extra_tools()
+        if self.mcp is not None and (self.mcp.names() or extra):
+            if extra:
+                missing = self.mcp.missing(extra)
+                if missing:
+                    self.log.warning(f"[工具] 这些额外工具没有服务器提供：{missing}")
+            return self.mcp.specs(include=extra)
         return self.tools.specs()
 
     def _tool_names(self) -> set[str] | None:
         """模型当前能看到的所有工具名（把「写成文字的工具调用」抢回来时要用）。"""
-        if self.mcp is not None and self.mcp.names():
-            return self.mcp.names()
+        extra = self._api_extra_tools()
+        if self.mcp is not None and (self.mcp.names() or extra):
+            return self.mcp.names(include=extra)
         return self.tools.names() if self.tools else None
 
     def _call_tool(self, call: dict) -> tuple[bool, str]:
@@ -1433,7 +1548,7 @@ class VoiceLoop:
         if images:
             try:
                 model = self.llm.resolve_model(str(self.settings.vision.model))
-            except OllamaError as exc:
+            except LlmError as exc:
                 hint = f"看图要视觉模型，本机还没有 {self.settings.vision.model}。先在终端跑 ollama pull {self.settings.vision.model}。"
                 self.log.warning(f"[看图] {exc}")
                 print(f"\n[看图] {exc}\n", flush=True)
@@ -1463,7 +1578,7 @@ class VoiceLoop:
                 num_ctx=data.get("num_ctx"),
                 commit_text=user_text,
             )
-        except OllamaError as exc:
+        except LlmError as exc:
             hint = "看图这一步失败了，具体原因我打在终端里了。"
             self.log.warning(f"[看图] {exc}")
             print(f"\n[看图] {exc}\n", flush=True)
@@ -1572,7 +1687,12 @@ class VoiceLoop:
 
         runtime = now_block()
         if tools:
-            runtime = f"{runtime}\n{TOOL_HINT}\n{TRUTH_HINT}"
+            has_web = any(
+                str((t.get("function") or {}).get("name") or "").startswith("mcp__web__")
+                for t in tools
+            )
+            web_hint = f"{WEB_TOOL_HINT}\n" if has_web else ""
+            runtime = f"{runtime}\n{web_hint}{TOOL_HINT}\n{TRUTH_HINT}"
         else:
             runtime = f"{runtime}\n{TRUTH_HINT}"
         hint = [{"role": "system", "content": runtime}]        # ★记忆摘要在 TOOL_HINT 之前★：工具提示必须紧贴用户那一句（实测过），
@@ -2051,7 +2171,7 @@ class VoiceLoop:
                 f" / 总耗时 {stats.total_seconds:.2f}s]"
             )
         if stats.answer == "" and not stats.interrupted:
-            print("      （没有返回内容，请检查 Ollama 服务）")
+            print("      （没有返回内容，请检查 Ollama 服务或角色的 API 配置）")
         return False
 
     # ---------------------------------------------------------------- 普通对话
@@ -2427,7 +2547,9 @@ class VoiceLoop:
             raise RuntimeError("本次归档的总结次数已用完")
         self._memory_summaries += 1
         try:
-            return self.llm.chat(prompt)
+            # ★永远走本地★：记忆总结/归档不该花云端 token，也不该因为断网就丢掉记忆
+            local_chat = getattr(self.llm, "local_chat", None)
+            return local_chat(prompt) if callable(local_chat) else self.llm.chat(prompt)
         finally:
             self.llm.reset()
 

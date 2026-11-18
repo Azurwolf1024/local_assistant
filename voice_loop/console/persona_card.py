@@ -28,6 +28,7 @@ from typing import Any
 
 from ..manifest import parse_manifest
 from ..persona import Character
+from .. import tool_presets
 
 # id 直接当文件名用，所以只允许安全字符（小写字母/数字/下划线/短横）
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
@@ -71,7 +72,32 @@ SPEC: list[dict] = [
         ],
     },
     {
-        "title": "③ 说话风格（直接进提示词）",
+        "title": "③ AI 引擎（本地 / API，可留空）",
+        "note": "留空 = 跟 config.toml 的 [api]。★API 只影响这一个角色★："
+                "别的角色照旧跑本地。密钥建议放环境变量，不要写进要提交的文件。",
+        "fields": [
+            {"key": "engine", "label": "跑在哪", "kind": "select",
+             "options": ["", "local", "api"],
+             "hint": "空 = 跟 [api] engine；local = 本机 Ollama；"
+                     "api = OpenAI 兼容接口（例如 DeepSeek）"},
+            {"key": "api_model", "label": "API 模型名", "kind": "text",
+             "placeholder": "deepseek-chat",
+             "hint": "空 = 跟 [api] model"},
+            {"key": "api_base", "label": "API 地址", "kind": "text",
+             "placeholder": "https://api.deepseek.com",
+             "hint": "空 = 跟 [api] base_url；写到 .../chat/completions 也行"},
+            {"key": "api_key", "label": "API Key", "kind": "text",
+             "placeholder": "留空 = 读环境变量",
+             "hint": "★不要把真 key 写进要提交的人格文件★：留空时跟 [api] 的配置"
+                     "（api_key_file 指向的仓库外文件，或 api_key_env 指定的环境变量）；"
+                     "也可以写 env:变量名"},
+            {"key": "api_tools", "label": "额外工具", "kind": "list",
+             "hint": "一行一个预设名或工具名（见 voice_loop/tool_presets.py）；"
+                     "只在 engine=api 时生效，留空 = 跟 [api] extra_tools"},
+        ],
+    },
+    {
+        "title": "④ 说话风格（直接进提示词）",
         "note": "这几栏就是「人设」本体：写得越具体越像她。示例台词会被她学语气，别写成问答对。",
         "fields": [
             {"key": "style", "label": "风格", "kind": "list", "hint": "一行一条，如「语速快、句子短」"},
@@ -87,13 +113,18 @@ SPEC: list[dict] = [
         ],
     },
     {
-        "title": "④ 声线（可全部留空 = 用全局）",
+        "title": "⑤ 声线（可全部留空 = 用全局）",
         "note": "不填就用 config.toml 的 [tts]。克隆类字段的细节见 README 第 14 节；"
                 "素材不会挑就用 python scripts/pick_voice_ref.py --who <id>。",
         "fields": [
             {"key": "backend", "label": "TTS 后端", "kind": "select",
-             "options": ["", "piper", "zipvoice"],
-             "hint": "空 = 跟着全局；原创角色建议 piper（不碰任何克隆素材）"},
+             "options": ["", "piper", "zipvoice", "api"],
+             "hint": "空 = 跟着全局；原创角色建议 piper（不碰任何克隆素材）；"
+                     "api = DeepSeek 官方 TTS（需要 [api] 里配好 key；失败自动回 Piper）"},
+            {"key": "tts_voice", "label": "官方 TTS 音色", "kind": "select",
+             "options": ["", "stella", "tide"],
+             "hint": "只在 backend = api 时生效：stella（女，默认）/ tide（男）；"
+                     "空 = 跟 [api] tts_voice"},
             {"key": "voice", "label": "piper 声线名", "kind": "text",
              "placeholder": "zh_CN-huayan-medium", "hint": "用的是 models/tts/piper/ 里的 onnx"},
             {"key": "voice_ref", "label": "克隆参考音频", "kind": "text",
@@ -110,7 +141,7 @@ SPEC: list[dict] = [
         ],
     },
     {
-        "title": "⑤ 它知道什么（第 15 节，可全留空）",
+        "title": "⑥ 它知道什么（第 15 节，可全留空）",
         "note": "留空 = 只看共享知识库；世界观组让同一个 IP 的角色共享一套设定。",
         "fields": [
             {"key": "worlds", "label": "挂在哪个世界观上", "kind": "list",
@@ -138,7 +169,13 @@ QUIET_KEYS = {"enabled", "default", "voice_dir", "knowledge_all", "knowledge_tit
 # --------------------------------------------------------------------------- #
 def groups() -> list[dict]:
     """给前端的表单规范（深拷一份，免得调用方改到 SPEC）。"""
-    return json.loads(json.dumps(SPEC, ensure_ascii=False))
+    out = json.loads(json.dumps(SPEC, ensure_ascii=False))
+    names = "、".join(p["name"] for p in tool_presets.describe())
+    if names:
+        for group in out:
+            if any(f.get("key") == "api_tools" for f in group.get("fields", [])):
+                group["note"] = f"{group.get('note', '')} 现在可用的预设：{names}。"
+    return out
 
 
 def _blank() -> dict:

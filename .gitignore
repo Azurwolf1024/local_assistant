@@ -92,3 +92,7 @@ data/memory/
 # （想公开某一本，就 `git add -f data/knowledge/xxx.md` 显式加。）
 data/knowledge/*
 !data/knowledge/_README.md
+
+# ★本地私有覆盖：密钥路径、个人设备名、自己的 API 地址都写这里★
+#   主 config.toml 只留空值；这个文件被 git 忽略，永远不会被提交。
+config.local.toml
