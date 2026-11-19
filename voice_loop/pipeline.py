@@ -115,10 +115,14 @@ class VoiceLoop:
         enable_skills: bool = True,
         enable_listening: bool = True,
         lazy_whisper: bool = False,
+        auto_sync: bool = False,
     ) -> None:
         import logging
 
         self.settings = settings
+        # ★退出时要不要同步记忆到云端★：只由 main 的「真的在聊天」那两个入口打开
+        # （见 build_loop 的说明）。默认关，自测就算 close() 也不会碰网络。
+        self.auto_sync = bool(auto_sync)
         self.log = logger or logging.getLogger("voice_loop")
         self.cfg = settings
 
@@ -2775,6 +2779,16 @@ class VoiceLoop:
                 gone = mem.prune_raw_sessions(self.settings.sessions_dir, dry_run=False)
                 if gone:
                     self.log.info(f"[记忆] 滑动窗口清掉 {len(gone)} 个原始对话")
+            # ★最后一步才同步云端★：先归档、巩固、清窗口，推上去的才是整理后的记忆。
+            #   失败只记一行日志 —— 断网不该影响「退出」这件事。
+            if self.auto_sync and getattr(cfg, "sync_on_close", False):
+                from .memory.sync import sync_memory  # noqa: PLC0415
+
+                got = sync_memory(self.settings, logger=self.log)
+                if got.ok:
+                    self.log.info(f"[记忆] 云端同步：{got.summary()}")
+                else:
+                    self.log.warning(f"[记忆] 云端同步没成（不影响退出）：{got.error}")
         except Exception as exc:  # noqa: BLE001
             self.log.warning(f"[记忆] 收尾失败（不影响退出）：{exc}")
 

@@ -200,6 +200,7 @@ flowchart LR
 │  │  ├─ extract.py            #   对话 → 事件 / 事实（规则为主，可用本地模型总结）
 │  │  ├─ retrieve.py           #   打分与时间检索（parse_when 认中文时间）
 │  │  ├─ knowledge.py          #   知识库：共享 / 世界观组 / 专属三层 + 可插拔 provider
+│  │  ├─ sync.py               #   ★云端同步★：镜像到私有 git 仓库 / 合并回来（见第 15 节）
 │  │  └─ schedule.py           #   日程只读接口（共享那一半）｜ __init__.py = Memory / MemoryHub
 │  ├─ tools.py                 # 工具层：技能包成模型能调的工具（现在是 MCP 的一个服务器）
 │  ├─ mcp/                     # ★ 自己搭的 MCP 架构（协议 / 服务器 / 客户端 / 宿主）
@@ -246,6 +247,7 @@ flowchart LR
 │  ├─ preflight_heavy.py       # ★ 跑重活（全套自测/评测）前的起飞检查：训练在跑+内存紧张就拦下
 │  ├─ test_memory.py           # ★ 记忆：分级 / 自清洁规则 / 双路检索 / 角色隔离（90 条断言，纯离线）
 │  ├─ test_memory_mcp.py       # ★ 记忆：知识库三层隔离 / 世界观组 / 全知不代入 / MCP 工具
+│  ├─ test_memory_sync.py      # ★ 记忆云端同步：结构 / 镜像 / 合并 / 公开仓库闸门（本地 bare 仓库，不联网）
 │  ├─ test_offline.py          # 离线自测（分块/时间/技能/唤醒/生命周期，含 09-19 那次误解析误删的回归）
 │  ├─ tts_clone_probe.py       # ★ 音色克隆试听/测速（生成 wav 供耳朵判断，可与 Piper 对比）
 │  ├─ test_tts_clone.py        # ★ 克隆后端测试（--full 会真的加载模型跑一句）
@@ -1380,7 +1382,7 @@ Piper 的 `zh_CN-huayan-medium` 是官方唯一的中文女声。调 `noise_w_sc
 | 位置 | 是什么 | 生命周期 |
 | --- | --- | --- |
 | `sessions/session-*.jsonl` | 每次对话的原始记录（L1） | 归档进记忆库后，**超过 30 天自动清**（`[memory] keep_session_days`） |
-| `data/memory/<角色>/` | 记忆（L2 情节 / L3 事实） | 只在本地；删掉就等于失忆 |
+| `data/memory/<角色>/` | 记忆（L2 情节 / L3 事实） | 只在本地；删掉就等于失忆（想备份就 `python main.py memsync` 推到你的私有仓库，见第 15 节） |
 | `data/vision/` | 截屏 / 摄像头拍到的画面 | 想清就整个删掉，不影响运行 |
 | `data/knowledge/` | 你给它的世界观/资料 | 随你放 |
 
@@ -2335,10 +2337,47 @@ python main.py memory --remember "记住：周五三点见导师"
 python main.py memory --consolidate        # 手动跑一遍自清洁（合并/衰减/提升）
 python main.py memory --prune --apply      # 真删已入库的旧原始对话
 python main.py memory --who baize --forget <id>
+python main.py memsync                     # ★云端同步★：导出 → 提交 → 推送（见下）
 ```
 
 时间词支持「昨天 / 今天 / 前天 / 上周 / 上周三 / 最近 7 天 / 上个月 / 去年 / 2026-09-20」；
 **认不出来它就不按时间筛（不猜）** —— 猜错时间比不筛更坏。
+
+### 云端同步：记忆存到一个**私有**仓库
+
+本地 `data/memory/` 是隐私、被 `.gitignore` 挡着；又要能跨机器用，所以给它单独一个
+**你自己确认过是 Private** 的仓库（默认指向 `[memory] sync_remote`）：
+
+```toml
+[memory]
+sync_on_close = true          # 退出/归档后顺手推一次（失败只记日志，绝不影响退出）
+sync_dir = "memory_cloud"     # 仓库的本地克隆（不进主仓库 git）
+sync_remote = "https://github.com/<你>/assistant_memories.git"
+```
+
+```powershell
+python main.py memsync            # 导出 → 提交 → 推送
+python main.py memsync --status   # 有没有没推的 / 远端有没有新的 / 各角色多少条
+python main.py memsync --pull     # 换机器：把云端的记忆合并回来（不覆盖本地独有的）
+python main.py memsync --dry-run  # 只导出到克隆里看一眼，不提交不推
+```
+
+仓库里的结构与本地设计一一对应（第 15 节的四级记忆）：
+
+```
+memory/<角色>/episodes.jsonl   L2 情景      memory/<角色>/knowledge/   L4 这个角色自己的资料
+memory/<角色>/facts.json       L3 事实      manifest.json              上次同步的清单
+memory/<角色>/sessions.json    L1 索引
+```
+
+| 设计点 | 为什么 |
+| --- | --- |
+| **L1 原始对话不上云** | 它是「滑窗会清掉」的工作记忆，云端留一份没用（下次归档会重算），而且整段对话原文最隐私 |
+| **本地 → 云端是镜像** | 本地删了云端也删，这样「忘掉一条」不会被下一次 pull 又拉回来；删掉的旧值在 git 历史里还能捞 |
+| **云端 → 本地是合并** | 按 episode `id` / fact `key` 取新的那份（`updated_at` / `last_seen` 晚的赢），本地独有的照样留着 |
+| **推之前先问一次是不是 Public** | 匿名查 GitHub：认出来是公开仓库就**拒推**（记忆里全是个人信息），要硬推得 `--allow-public` |
+| **本地一个角色都没有时拒绝同步** | 「镜像」碰上指错目录 / 自测临时目录 = 把云端清空；宁可什么都不做并告诉你 `--pull` |
+| **git 一律不交互** | `GIT_TERMINAL_PROMPT=0`：凭据没缓存就当场失败，绝不在退出服务时弹窗把进程挂住 |
 
 ### 自清洁（什么时候自己动手）
 

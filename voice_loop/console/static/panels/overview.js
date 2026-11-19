@@ -74,6 +74,50 @@
           ]
         )));
 
+        // ★记忆上云★：放在概览，是因为「同步」是一次动作，不该每轮对话都去碰网络
+        const ms = data.memory_sync || {};
+        const syncBox = h("p", { class: "muted", text: "" });
+        const syncBtn = h("button", {
+          class: "btn small", text: "同步到云端",
+          onclick: async () => {
+            syncBtn.disabled = true;
+            syncBox.textContent = "正在导出 → 提交 → 推送…（第一次可能要几秒）";
+            const r = await ctx.api.safe(() => ctx.api.post("/api/overview/memory-sync", {}));
+            syncBtn.disabled = false;
+            if (!r) { syncBox.textContent = "请求失败（看日志页）"; return; }
+            syncBox.textContent = (r.ok ? "√ " : "× ") + (r.summary || r.error || "");
+            if (r.ok) ctx.toast("记忆已同步", "ok");
+            else ctx.toast("同步没成：" + (r.error || ""), "err");
+          },
+        });
+        const pullBtn = h("button", {
+          class: "btn small", text: "从云端合并回来",
+          onclick: async () => {
+            pullBtn.disabled = true;
+            syncBox.textContent = "正在拉取并合并…";
+            const r = await ctx.api.safe(() => ctx.api.post("/api/overview/memory-sync", { pull: true }));
+            pullBtn.disabled = false;
+            syncBox.textContent = r ? ((r.ok ? "√ " : "× ") + (r.summary || r.error || ""))
+              : "请求失败（看日志页）";
+          },
+        });
+        body.appendChild(card("记忆（同步到你的私有仓库）", [
+          table([{ key: "k", label: "项目", cls: "num" }, { key: "v", label: "值" }], [
+            { k: "同步开关", v: ms.enabled ? "退出时自动推一次（[memory] sync_on_close）" : "关（只手动同步）" },
+            { k: "仓库", v: ms.remote
+              ? h("span", { class: "mono", text: ms.remote })
+              : h("span", { class: "muted", text: "没配 [memory] sync_remote（只在本地克隆里留着）" }) },
+            { k: "上次同步", v: ms.updated_at
+              ? ms.updated_at + " · " + (ms.characters || 0) + " 个角色 · episodes "
+                + ((ms.counts || {}).episodes || 0) + " / facts " + ((ms.counts || {}).facts || 0)
+              : h("span", { class: "muted", text: "还没同步过" }) },
+          ]),
+          h("div", { class: "row" }, [syncBtn, pullBtn]),
+          syncBox,
+          h("p", { class: "muted", text: "只同步「每角色一份的记忆」（episodes / facts / sessions 索引 / knowledge），"
+            + "原始对话（L1，sessions/*.jsonl）不上云。推之前会确认仓库不是公开的。" }),
+        ]));
+
         const today = data.events.today || [];
         const next = data.events.due_next;
         body.appendChild(card("今天的提醒（库里共 " + data.events.total + " 条）", [

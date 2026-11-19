@@ -134,6 +134,7 @@ def build_loop(
     preload: bool = True,
     enable_listening: bool = True,
     lazy_whisper: bool = False,
+    auto_sync: bool = False,
 ):
     from voice_loop.pipeline import VoiceLoop
 
@@ -143,6 +144,9 @@ def build_loop(
         preload=preload,
         enable_listening=enable_listening,
         lazy_whisper=lazy_whisper,
+        # ★只有「真的在跟人聊」的入口才在退出时同步记忆★：底下的 run_* 一次性命令
+        # 也走 build_loop，让它们去推云端既没道理、又容易把自测的记忆推上去
+        auto_sync=auto_sync,
     )
 
 
@@ -168,7 +172,7 @@ def write_pid(settings: Settings, pid: int | None = None) -> Path:
 # --------------------------------------------------------------------------- #
 def cmd_chat(settings: Settings, args: argparse.Namespace) -> int:
     require_models(settings)
-    loop = build_loop(settings)
+    loop = build_loop(settings, auto_sync=True)
     try:
         loop.chat(args.mode)
     finally:
@@ -242,7 +246,7 @@ def cmd_listen(settings: Settings, args: argparse.Namespace) -> int:
 
     # 前台运行
     write_pid(settings)
-    loop = build_loop(settings, lazy_whisper=settings.wake.lazy_load)
+    loop = build_loop(settings, lazy_whisper=settings.wake.lazy_load, auto_sync=True)
     if getattr(args, "wake_file", None):
         loop.use_wake_file(args.wake_file)
     try:
@@ -1324,6 +1328,50 @@ def cmd_memory(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_memsync(settings: Settings, args: argparse.Namespace) -> int:
+    """`python main.py memsync`：记忆 ↔ 私有 git 仓库。
+
+    ★为什么单独一条命令★：同步是「一次动作」，不是记忆的一部分 ——
+    放进 `memory` 会让「我只是想查一条记忆」也带上网络和 git 的风险。
+    """
+    from voice_loop.memory.sync import MemorySync
+
+    cfg = getattr(settings, "memory", None)
+    if not getattr(cfg, "enabled", True):
+        print("记忆功能关着（config.toml 的 [memory] enabled = false）—— 没有记忆可同步。")
+        return 1
+    sync = MemorySync(settings, remote=args.remote, branch=args.branch,
+                      clone_dir=args.dir or None)
+    print("=" * 66)
+    print(" 记忆云端同步")
+    print("=" * 66)
+    print(f"  本地记忆：{sync.local_root}")
+    print(f"  仓库克隆：{sync.clone_dir}")
+    if args.status:
+        report = sync.status()
+    elif args.pull:
+        report = sync.pull(dry_run=args.dry_run)
+    else:
+        report = sync.sync(message=args.message, allow_public=args.allow_public,
+                           dry_run=args.dry_run)
+
+    for cid, got in sorted(report.characters.items()):
+        counts = "、".join(f"{k} {v}" for k, v in got.items()
+                           if k in ("episodes", "facts", "sessions") and v)
+        print(f"  · {cid:<12}{counts or '（空）'}")
+    for line in report.notes:
+        print(f"  提示：{line}")
+    for line in report.warnings:
+        print(f"  注意：{line}")
+    print()
+    print(("√ " if report.ok else "× ") + report.summary())
+    if not report.ok:
+        return 1
+    if report.action == "status":
+        return 0
+    return 0
+
+
 def _model_groups() -> tuple[str, ...]:
     """模型组名从 `download_models.py` 里读（★两边不会跑偏★）。"""
     return setup_flow.model_groups_known()
@@ -1626,6 +1674,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--prune", action="store_true", help="滑动窗口：列出可清理的原始对话")
     p.add_argument("--apply", action="store_true", help="配合 --prune：真的删")
     p.set_defaults(func=cmd_memory)
+
+    p = sub.add_parser("memsync",
+                       help="记忆云端同步（私有 git 仓库）：导出→提交→推送 / 合并回来 / 看状态")
+    p.add_argument("--pull", action="store_true",
+                   help="把云端的记忆合并回本地（按 id/key 取新，本地独有的保留）")
+    p.add_argument("--status", action="store_true", help="只看状态：有没有没推的、远端有几个新的")
+    p.add_argument("--dry-run", action="store_true", help="只做导出/合并的试运行，不提交不推送")
+    p.add_argument("--dir", default="", help="本地克隆目录（默认 [memory] sync_dir = memory_cloud）")
+    p.add_argument("--remote", default="", help="仓库地址（首次可以在这里给，之后记在克隆里）")
+    p.add_argument("--branch", default="", help="分支（默认 [memory] sync_branch = main）")
+    p.add_argument("--allow-public", action="store_true",
+                   help="★不建议★：允许往公开仓库推记忆（默认拦下）")
+    p.add_argument("--message", default="", help="自定义提交信息")
+    p.set_defaults(func=cmd_memsync)
 
     return ap
 

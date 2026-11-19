@@ -88,6 +88,10 @@ data/vision/
 #   删掉本地文件就等于失忆，但删错了也回不来，所以宁可它不在版本库里。
 data/memory/
 
+# ★记忆的云端克隆★（`python main.py memsync`）：它自己是一个**私有** git 仓库，
+#   里面是同一份隐私数据，所以同样不进主仓库。
+memory_cloud/
+
 # 你放进去的知识库资料：说明文件（下划线开头）只留模板，别的都当私人资料挡在外面。
 # （想公开某一本，就 `git add -f data/knowledge/xxx.md` 显式加。）
 data/knowledge/*

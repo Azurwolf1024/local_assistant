@@ -472,6 +472,13 @@ class MemoryConfig:
     knowledge_paths: list[str] = field(default_factory=list)   # 知识库文件/目录（空 = data/knowledge）
     world_title: str = "世界观"           # 写在配置里的那段背景的标题
     world: str = ""                       # 直接写在配置里的世界观背景
+    # ---- 云端同步（见 voice_loop/memory/sync.py）----
+    # ★默认关★：把记忆推到网上是「你点头才做」的事，不能悄悄发生。
+    sync_on_close: bool = False           # 退出/归档后顺手推一次（失败只记日志）
+    sync_dir: str = "memory_cloud"        # 云端仓库的本地克隆（跟着项目走，不进 git）
+    sync_remote: str = ""                 # 仓库地址；空 = 这个克隆里已经有的 origin
+    sync_branch: str = "main"
+    sync_timeout: float = 120.0           # 单条 git 命令的超时（别把退出挂住）
 
 
 @dataclass
@@ -600,6 +607,9 @@ def load_settings(path: str | Path | None = None) -> Settings:
         tts=_build(TtsConfig, raw.get("tts", {}), "tts"),
         chat=_build(ChatConfig, raw.get("chat", {}), "chat"),
         persona=_build(PersonaConfig, raw.get("persona", {}), "persona"),
+        # ★这一行以前漏了★：`[memory]` 从来没被读过（一直用的是 MemoryConfig 的默认值，
+        # 而默认值刚好和 config.toml 里写的一样，所以「改配置没反应」一直没人发现）。
+        memory=_build(MemoryConfig, raw.get("memory", {}), "memory"),
         mcp=_build_mcp(raw.get("mcp", {})),
         path=cfg_path,
     )

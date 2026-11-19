@@ -1,13 +1,15 @@
 """面板：状态概览。
 
 一个页面回答「现在什么情况」：服务在不在跑、模型是什么、当前是谁、
-今天还剩哪些提醒、信箱通不通。这里**只读**（改数据的操作在各专门面板里），
-除了三个「一键」：试听一句、弹个提醒、重载角色文件。
+今天还剩哪些提醒、信箱通不通、记忆上次同步到什么时候。这里**只读**（改数据的操作在各专门面板里），
+除了四个「一键」：试听一句、弹个提醒、重载角色文件、把记忆同步到云端。
 """
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
+from pathlib import Path
 
 from ...service_ctl import status as service_status
 from ..registry import Panel
@@ -110,7 +112,31 @@ def register(app, ctx) -> None:
                 "log": str(status.log_file),
                 "console_dir": str(ctx.channel.root),
             },
+            "memory_sync": _memory_sync_state(settings),
         }
+
+    @app.post("/api/overview/memory-sync")
+    def api_memory_sync(payload: dict = Body(default={})):
+        """把记忆同步到私有仓库（见第 15 节 / voice_loop/memory/sync.py）。
+
+        ★为什么放在概览页★：同步是「一次动作」，跟记忆本身不是一回事；
+        放在概览就是让人想起来才点一下，而不是每轮对话都去碰网络。
+        """
+        from ...memory.sync import MemorySync  # noqa: PLC0415
+
+        settings = ctx.settings
+        body = payload or {}
+        sync = MemorySync(settings)
+        try:
+            if bool(body.get("pull")):
+                report = sync.pull(dry_run=bool(body.get("dry_run")))
+            elif bool(body.get("status")):
+                report = sync.status()
+            else:
+                report = sync.sync(dry_run=bool(body.get("dry_run")))
+        except Exception as exc:  # noqa: BLE001 - 控制台不能因为 git 挂了就 500
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "summary": ""}
+        return {**report.as_dict(), "summary": report.summary()}
 
     @app.post("/api/overview/audition")
     def api_audition(payload: dict = Body(default={})):
@@ -148,6 +174,35 @@ def _live_status(ctx) -> dict:
     前端加载时会顺手打一次 `/api/overview/ping`，结果缓存在 ctx.cache 里。
     """
     return dict(ctx.cache.get("last_ping") or {})
+
+
+def _memory_sync_state(settings) -> dict:
+    """记忆云端同步的「现在什么情况」：配没配、上次同步到什么时候、几个角色。
+
+    ★只读本地文件★：概览页不该为了显示一行字就去 fetch 远端（慢，还会因为断网变成红字）。
+    """
+    cfg = getattr(settings, "memory", None)
+    want = str(getattr(cfg, "sync_dir", "") or "memory_cloud")
+    root = Path(str(getattr(settings, "root", ".") or "."))
+    clone = Path(want) if Path(want).is_absolute() else root / want
+    manifest = clone / "manifest.json"
+    out = {
+        "enabled": bool(getattr(cfg, "sync_on_close", False)),
+        "remote": str(getattr(cfg, "sync_remote", "") or ""),
+        "dir": str(clone),
+        "cloned": (clone / ".git").is_dir(),
+        "updated_at": "",
+        "characters": 0,
+        "counts": {},
+    }
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return out
+    out["updated_at"] = str(data.get("updated_at") or "")
+    out["counts"] = dict(data.get("counts") or {})
+    out["characters"] = int(out["counts"].get("characters") or 0)
+    return out
 
 
 def _today_events(ctx) -> list[dict]:
