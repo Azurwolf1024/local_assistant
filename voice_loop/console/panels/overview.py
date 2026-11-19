@@ -114,7 +114,34 @@ def register(app, ctx) -> None:
                 "console_dir": str(ctx.channel.root),
             },
             "memory_sync": _memory_sync_state(settings),
+            "memory_dream": _dream_state(settings),
         }
+
+    @app.post("/api/overview/dream")
+    def api_dream(payload: dict = Body(default={})):
+        """手动做一次梦（等价于 `python main.py dream`）。
+
+        ★默认走规则版★：控制台这一个按钮不该悄悄花云端 token；
+        要 agent 版就等夜里的调度器，或者配置文件里指定 `[memory.dream] model`。
+        """
+        from ...memory import MemoryHub  # noqa: PLC0415
+        from ...memory.dream import Dreamer  # noqa: PLC0415
+
+        settings = ctx.settings
+        who = str((payload or {}).get("who") or "").strip() or _default_char(settings)
+        try:
+            hub = MemoryHub(settings)
+            report = Dreamer(settings, hub, who).run(
+                day=str((payload or {}).get("date") or ""),
+                dry_run=bool((payload or {}).get("dry_run")),
+                force=bool((payload or {}).get("force")),
+                source="rule",
+            )
+        except Exception as exc:  # noqa: BLE001 - 控制台不能因为做梦失败就 500
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "summary": ""}
+        return {"ok": report.ok, "summary": report.summary(),
+                "digest": report.digest, "skipped": report.skipped[:8],
+                "counts": hub.for_character(who).context.counts()}
 
     @app.post("/api/overview/memory-sync")
     def api_memory_sync(payload: dict = Body(default={})):
@@ -211,6 +238,67 @@ def _memory_sync_state(settings) -> dict:
     out["counts"] = dict(data.get("counts") or {})
     out["characters"] = int(out["counts"].get("characters") or 0)
     return out
+
+
+def _dream_state(settings) -> dict:
+    """L1 连续上下文 / 做梦的「现在什么情况」：几个角色、各有多少轮、缓存命中率。
+
+    ★只读本地文件★（`context/state.json`），不加载模型、不碰网络。
+    """
+    out = {"enabled": False, "characters": [], "cache": {}, "window": ""}
+    cfg = getattr(settings, "memory", None)
+    if not cfg or not getattr(cfg, "enabled", True):
+        return out
+    dcfg = getattr(cfg, "dream", None)
+    ctx_cfg = getattr(cfg, "context", None)
+    out["enabled"] = bool(getattr(dcfg, "enabled", False)) and \
+        bool(getattr(ctx_cfg, "enabled", True))
+    out["window"] = str(getattr(dcfg, "window", "") or "")
+    out["at_tokens"] = int(getattr(dcfg, "at_tokens", 0) or 0)
+    want = str(getattr(cfg, "dir", "") or "")
+    root = Path(str(getattr(settings, "root", ".") or "."))
+    base = Path(want) if Path(want).is_absolute() else root / (want or "data/memory")
+    total_prompt = total_hit = 0
+    try:
+        rooms = sorted(p for p in base.iterdir() if (p / "context").is_dir())
+    except OSError:
+        return out
+    for room in rooms:
+        try:
+            state = json.loads((room / "context" / "state.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        today = (state.get("cache") or {}).get(datetime.now().date().isoformat()) or {}
+        prompt = int(today.get("prompt") or 0)
+        hit = int(today.get("hit") or 0)
+        total_prompt += prompt
+        total_hit += hit
+        segs = len(list((room / "context" / "segments").glob("seg-*.jsonl")))
+        out["characters"].append({
+            "id": room.name,
+            "segments": segs,
+            "open_turns": int(state.get("turns") or 0),
+            "last_dream": str(state.get("last_dream_day") or ""),
+            "prompt": prompt,
+            "hit": hit,
+        })
+    out["cache"] = {"prompt": total_prompt, "hit": total_hit,
+                    "ratio": round(total_hit / total_prompt, 3) if total_prompt else 0.0}
+    return out
+
+
+def _default_char(settings) -> str:
+    """默认角色（跟助手的 default 一致：先看 [persona] default，再看索引的 default）。"""
+    who = str(getattr(getattr(settings, "persona", None), "default", "") or "").strip()
+    if who:
+        return who
+    try:
+        from ...persona import CharacterRegistry  # noqa: PLC0415
+
+        char = CharacterRegistry(settings.resolve(settings.persona.file)).default()
+        return char.id if char else "default"
+    except Exception:  # noqa: BLE001
+        return "default"
 
 
 def _today_events(ctx) -> list[dict]:

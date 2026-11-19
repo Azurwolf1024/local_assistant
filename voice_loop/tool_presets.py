@@ -22,7 +22,8 @@ from __future__ import annotations
 PRESETS: dict[str, dict] = {
     "memory": {
         "title": "跨角色记忆",
-        "tools": ["mcp__memory__recall", "mcp__memory__remember"],
+        "tools": ["mcp__memory__recall", "mcp__memory__remember",
+                  "mcp__memory__request_dream"],
     },
     "skills": {
         "title": "日程 / 备忘 / 提醒",

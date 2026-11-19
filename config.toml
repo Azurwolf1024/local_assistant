@@ -220,6 +220,40 @@ sync_remote = "https://github.com/Azurwolf1024/assistant_memories.git"
 sync_branch = "main"
 sync_timeout = 120            # 单条 git 命令超时（秒）；没凭据会立刻失败而不是弹窗
 
+# ── L1 连续上下文（★「命中缓存」的实现★，见 voice_loop/memory/context.py）──────
+# 一天里的对话接着上一天往下长，而不是每次开机另起一段。做法是「不可变段 + 追加尾」：
+# 段写满就封存、★封存后一个字节都不再改★，新内容只往后追加。
+# 云端的前缀缓存按前缀字节匹配（DeepSeek 命中部分约 1/10 价），所以白天每一轮都能命中。
+[memory.context]
+enabled = true
+segment_tokens = 1200         # 一段写满多少 token 就封存（太小：前缀碎；太大：miss 一次更贵）
+segment_turns = 30            # 或者多少轮就封存
+digest_days = 3               # 提示词里往前带几天的摘要（做梦产出）
+tail_tokens = 2000            # 「刚才聊的」原文最多占多少 token（按整轮砍，不切半句）
+local_tail_tokens = 800       # 本地模型那一档：窗口小、注意力弱，塞太多反而更糊涂
+
+# ── 做梦（夜里整理 + 压缩，见 voice_loop/memory/dream.py）─────────────────────
+# 白天只管聊天，判断「这条值不值得记」挪到离线做（Letta 的 sleep-time compute 思路）：
+#   rule  = 不调模型：封段 + 规则抽取 + 规则摘要（★本地角色只走这条★）
+#   agent = 云端角色：模型读完今天的对话，提交结构化提议，由确定性代码逐条校验后执行
+# 全部改动都留前镜像（context/dreams/<date>.json），`python main.py dream --undo <date>` 可整批回滚。
+[memory.dream]
+enabled = true
+window = "02:00-05:00"        # 每晚在这个窗口里挑一个时间做一次
+random = true                 # 窗口里随机挑（不是准点，免得每天同一秒醒）
+check_seconds = 30            # 调度器多久看一次条件
+idle_minutes = 20             # 空闲够久 + 攒够轮数 → 做一次小睡式的整理
+idle_min_turns = 8
+at_tokens = 3000              # 没做梦的新内容积到这么多 token → 立刻做**规则版**压缩
+min_turns = 4                 # 新内容少于这个数不值得做梦
+min_interval_minutes = 30     # 两次 agent 梦之间至少隔多久
+model = ""                    # 空 = 跟角色引擎；"api:deepseek-chat" = 整理用云端更强的模型
+max_rounds = 6                # agent 做梦最多几轮工具调用
+max_actions = 24              # 一次梦最多改多少条记忆
+allow_tool_call = true        # 允许角色在对话里主动调 request_dream（"你整理一下记忆"）
+keep_days = 60                # dreams/ 可撤销记录保留多少天
+sync_after = true             # 梦完顺手推云端
+
 # ── 语音合成 ─────────────────────────────────────────────────────────────────
 # backend：
 #   "zipvoice" = 用角色本人的音色读中文（零样本克隆，就是凯尔希的声线）——当前默认

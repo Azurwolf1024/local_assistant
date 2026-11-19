@@ -4953,3 +4953,162 @@ voice_model / tts_voice` **不再生效**（解析器只认 `"tts": {...}`）。
 | 真机合成 | `--online`：[12] piper 3.15 s、edge 3.43 s 都出了音频 | 通过 |
 | 控制台 | 重启后：声音后端下拉 = 注册表（带「可用/不可用（原因）」）、编辑大肥鱼保存 → 「内容没变」、概览页 `TTS：deepseek · stella` | 通过 |
 | 回归 | 25 个脚本（persona / persona_card / style / voice_model / precision / tts_clone / api_tts / api_llm / console / route / mcp / agent_tools / memory / offline …） | 全 EXIT=0（`test_bargein` 有一条已知 flaky：能量比阈值卡在边界，重跑即过，与本次改动无关） |
+
+---
+## 62. 记忆再进一步：日上下文连续 + 每晚「做梦」压缩（2026-11-20）
+
+### 62.1 为什么要动 L1
+
+到 §60 为止，L1（原始对话）是「**一次进程一个文件**」：早上喊一次、晚上喊一次就是两个
+互不知情的 `session-*.jsonl`，而模型每轮只看得到 700 字摘要 + 20 条事件/事实。
+于是三个问题一起出现：
+
+| 现象 | 根因 |
+| --- | --- |
+| 「我刚才说啥」答不上来 | 上下文按**进程**切，不按**人**连着 |
+| 长聊之后越答越飘 | 上下文没压缩，全靠检索挑几条，聊得越久越靠运气 |
+| 云端 token 花得快 | 每轮都把「今天所有历史」重新拼一遍 → 前缀一直变 → 缓存永远 miss |
+
+参考成熟实现的做法：Letta 的 sleep-time compute（把「判断」挪到离线做）、
+Zep/Graphiti 的双时间事实（旧值不删、标失效）、Mem0 的 ADD/UPDATE/DELETE/NOOP 四动作、
+Generative Agents 的 reflection（定期把经历归纳成更高的认识）。
+这四个里我们**只借了「判断离线化 + 旧值留痕 + 动作化 + 归纳」四件事**，
+刻意没借的是：向量库（本地不需要）、自动覆盖（本地 4B 判断不可靠）。
+
+### 62.2 L1 改成「不可变段 + 打开中的尾」
+
+```
+data/memory/<角色>/context/
+  segments/seg-000003.jsonl   已封存：★一个字节都不再改★
+  segments/seg-000004.jsonl   打开中：每轮只 append
+  digests/2026-11-19.json     做梦产出（summary / open_threads / decisions）
+  dreams/2026-11-19.json      这次梦改了什么 + 改之前的前镜像（--undo）
+  state.json                  seg / seq / turns / tokens / last_dream_seq / cache
+```
+
+两条硬规则：
+
+1. **封存只改段号，不动旧文件**。`seal()` 只把 `state.seg` +1，新内容进新文件。
+   这是「白天的提示词前缀不动」的**唯一**实现方式 —— 实测断言在
+   `test_memory_dream.py [1]`（封存后再 append，旧文件字节数不变）。
+2. **压缩不是删除**。封存的段还在磁盘上，`recall` 照样检索得到；
+   只是不再逐字进提示词，用 `digests/` 里那几行代替。
+
+提示词布局（`ContextLog.render`）：
+
+```
+事实（L3，一天只变一次） → 往日摘要（做梦追加） → 最近原文（只追加）
+```
+
+`_tail()` 按 token 预算**从尾往前整轮取**，绝不把一句话切一半（切一半最容易让模型
+接错半句）。本地模型单独一档预算（`local_tail_tokens = 800`）：4B 的窗口紧、注意力弱，
+塞 2000 token 原文的结果是「记得更少还更爱跑题」。
+
+### 62.3 做梦：一个离线 agent + 五道校验
+
+`Dreamer.run()` 两种跑法（`rule` / `agent`），**同一个出口**：
+
+```
+pending = context.new_turns()        # 上次做梦之后新长出来的
+  ├─ agent 版：HarnessAgent(read_turns / query_memory / done, plan_tool=False)
+  │            → 模型交 {digest, actions[]}
+  ├─ 失败/本地角色 → rule 版：episodes_from_session + 规则摘要
+  → 五道校验 → 执行 → write_digest → seal → mark_dreamed → consolidate → 前镜像
+```
+
+★`plan_tool=False`★：做梦只要一份结构化提议，给它 `update_plan` 只会让它把步骤写进
+计划里然后忘了交提议（第一次联调就是这么失败的）。
+
+五道校验（`_apply_actions`）：
+
+| 校验 | 为什么必须有 |
+| --- | --- |
+| `pinned` 不许 forget/supersede | 名字、称呼是身份，改了就是「换了个人」 |
+| `promote.evidence_seq` 必须是 **user** turn | ★防 poisoned consolidation★：工具/网页返回的内容不是对方说的，不能升成事实 |
+| `(key,value)` 已存在 → NOOP | 梦境每天跑，不判重就会一条事实记十遍 |
+| `max_actions` 上限 | 一次梦改几十条 = 没法复核 |
+| 前镜像是**动手之前**抓的 | 见 62.5 的坑 |
+
+`rule` 版还多一道去重：退出时 `ingest_session` 会从原始对话里抽一遍同样的东西，
+两条路都走到就重复记 —— 按「日期 + 标题」判重，先来的算数。
+
+### 62.4 五种触发（一个调度器，条件互相让路）
+
+| 触发 | 默认 | 落到哪 |
+| --- | --- | --- |
+| ① 模型主动 | `mcp__memory__request_dream` 写 `_dream_requests.jsonl` | 下一轮 `tick()` 读走（★只投请求不直接做★：stdio 下那是另一个进程，直接改记忆会跟主进程抢写） |
+| ② 长度阈值 | `at_tokens = 3000` | 只做 **rule**（毫秒级、不花 token） |
+| ③ 夜间窗口 | `window = "02:00-05:00"`，`random = true` | 每天在这个窗口里**随机**挑一分钟，落 `_dream_schedule.json`（`done` 标记保证一天一次） |
+| ④ 空闲 | `idle_minutes = 20` 且 `idle_min_turns = 8` | 白天也能小睡 |
+| ⑤ 手动 | `python main.py dream` | 备用扳机 |
+
+`DreamScheduler.request(reason, delay, who)` 是**预留给「随机时间唤醒」**的接口：
+以后要做「她自己挑个时间醒过来整理/找你」，调这个就行，不用再动调度逻辑。
+
+★退出时补一次 rule 版梦★（`_dream_on_close`）：夜里那个窗口你要是 23 点关机、
+第二天 9 点再开，就永远碰不到，上下文会一天天只增不减。补的这次**只走规则版**
+（不花 token、不做价值判断），真正的「该记什么」还是留给夜里的 agent 梦。
+
+### 62.5 开发中踩的四个坑
+
+1. **前镜像抓晚了**：最初 `_write_record()` 在 `_agent_pass()` **之后**抓
+   `episodes/facts` —— 存下来的是「改完的样子」，`--undo` 成了空转。
+   修法：`run()` 一开始就抓 `before`，一路传下去；顺带把 `last_seq_before` 也记真值
+   （以前写死 0，回滚会把 `last_dream_seq` 归零 → 整段历史重做一遍）。
+2. **`Episode` 没有 `note` 字段**：`insight` 动作一直静默失败
+   （`__init__() got an unexpected keyword argument 'note'` 被 `_apply_actions` 的
+   `except` 吞成一条 `skipped`）。教训：批量动作的 except 要留痕，但也**必须有人看**。
+3. **`Turn(index=...)` vs `Turn(turn=...)`**：`extract.Turn` 的字段叫 `turn`，
+   规则版一跑就 TypeError —— 这条路径此前**从来没有被真跑过**（`_rule_pass` 是这次新写的）。
+4. **同一轮写两遍**：`_write_session` 有好几条路径（正常/打断/兜底），重试时 stats 会被
+   写两次；而 uid 里带时间戳（秒级），两次的时间戳不同 → 去重失效。
+   修法：`_append_context` 里按 `(turn, user_text, answer)` 再拦一道。
+
+### 62.6 双时间事实（Zep 那一半）
+
+`Fact` 加 `invalid_at` / `superseded_by`；`apply_supersede()` 是唯一实现
+（`Memory.supersede_fact` 和 `dream._apply_actions` 都调它，只是**写盘时机不同**：
+前者自己写，后者在内存里攒、由 `_apply_actions` 收尾统一写）。
+
+`facts()` 默认只返回没失效的；`facts(include_invalid=True)` 能把旧值翻出来 ——
+所以「我以前喝什么」答得上来，「现在喝什么」不会被旧值干扰。
+`_upsert_facts` 遇到值变化也改走这条路（以前是**原地覆盖**，旧值只剩 note 里一句「原…」）。
+`pinned` 例外：名字/称呼直接改，不留旧值当「历史真相」。
+
+### 62.7 缓存记账（怎么知道真的省了）
+
+`OpenAICompatClient` 的请求体加了 `stream_options: {include_usage: true}`
+（★不要这个，DeepSeek 就不回 usage★），流里多一种事件 `{"usage": {...}}`；
+`pipeline._record_usage` 认两种字段名（`prompt_cache_hit_tokens` / `prompt_tokens_details.cached_tokens`），
+落到 `context/state.json` 的 `cache.<日期>`，控制台概览页显示今天的命中率。
+
+### 62.8 上云（追加 §60 的边界）
+
+`memory/<角色>/context/{segments,digests,state.json}` 也镜像过去：换机器后
+「今天聊到哪儿」接得上（段是追加文件，镜像过去字节不变，前缀缓存照样命中）。
+`--pull` 时：
+
+- **段按 `uid` 合并**（两台机器各自追加过同一段时，整段覆盖会丢行），按 `seq` 排序；
+- 摘要按日期取 `dream_at` 新的；
+- `state.json` 取 `last_dream_seq` 大的那一份，但★`seg` / `seq` 取大的★
+  （降了就会往一个已经写满的旧段里追加）。
+
+### 62.9 验证
+
+| 验的东西 | 怎么验 | 结果 |
+| --- | --- | --- |
+| 段封存后字节不变 | `scripts/test_memory_dream.py [1]` | 全过 |
+| uid 去重 / 序号递增 | 同上 [1] | 全过 |
+| 三段顺序与尾预算 | 同上 [2]（`事实 < 摘要 < 原文`、不切半句） | 全过 |
+| 规则版做梦 | 同上 [3]（摘要落盘、封段、`last_dream_seq` 前进、再跑一次拒绝） | 全过 |
+| 空上下文 | 同上 [4]（不写空摘要、不建空 dreams） | 全过 |
+| agent 版五道校验 | 同上 [5]（假 LLM 交提议：证据是助手说的 → 拦下；pinned → 拦下；重复 → NOOP；insight 落 L2） | 全过 |
+| `--undo` 整批回滚 | 同上 [6]（facts 退回、`last_dream_seq` 退回、digest 删除、前镜像自清） | 全过 |
+| 双时间 | 同上 [7]（`include_invalid` 翻出旧值、pinned 拒绝换新） | 全过 |
+| 五种触发 | 同上 [8]（`tick(now=...)` 注入时间：到量 / 窗口 / 空闲 / 请求文件 / 手动） | 全过 |
+| 缓存记账 | 同上 [9] | 全过 |
+| 上下文上云 + 按 uid 合并 | 同上 [10] | 全过 |
+| 流水线接线 | 同上 [11]（`_write_session` → 上下文；`_memory_context` 带三段；usage 记账；本地预算更小；同一轮不写两遍） | 全过 |
+| 真机 | `python main.py dream --dry-run` → `python main.py dream --date ...` 写了 digest + 封段 + episodes；再 `--undo` → episodes/facts/`last_dream_seq` 全退回原值 | 通过 |
+| 控制台 | `/api/overview` 带 `memory_dream`（各角色段数/上次整理/命中率）；`/api/overview/dream` 手动整理返回摘要 | 通过 |
+| 回归 | `test_memory` / `test_memory_mcp`（工具数改 4）/ `test_memory_sync` / `test_agent_tools` / `test_tts_registry` / `test_console` / `test_offline` / `test_persona` / `test_mcp` / `test_tools` / `test_route` / `test_store_lock` | 全 EXIT=0 |

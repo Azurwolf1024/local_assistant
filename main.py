@@ -1372,6 +1372,81 @@ def cmd_memsync(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_dream(settings: Settings, args: argparse.Namespace) -> int:
+    """`python main.py dream`：手动做一次梦 / 看结果 / 整批回滚。
+
+    ★命令行这条是「备用扳机」★：正常情况下调度器会自己在夜里/空闲/到量时做，
+    这条命令用来（a）立刻整理一次（b)看某天到底整理出了什么（--dry-run），
+    （c）发现整理得不对就 --undo 整批退回去。
+    """
+    from voice_loop.memory import MemoryHub
+    from voice_loop.memory.dream import Dreamer, undo as undo_dream
+    from voice_loop.memory.schedule import SharedSchedule
+
+    if not getattr(settings, "memory", None) or not settings.memory.enabled:
+        print("记忆功能关着（config.toml 的 [memory] enabled = false）—— 没有上下文可整理。")
+        return 1
+    hub = MemoryHub(settings, schedule=SharedSchedule(settings))
+    registry = None
+    try:
+        from voice_loop.persona import CharacterRegistry
+
+        registry = CharacterRegistry(settings.resolve(settings.persona.file))
+    except Exception:  # noqa: BLE001 - 角色文件坏了就用目录里现有的
+        registry = None
+    if args.all:
+        targets = hub.characters() or (["default"] if not args.who else [args.who])
+    elif args.who:
+        targets = [args.who]
+    else:
+        who = settings.persona.default
+        if not who and registry is not None:
+            char = registry.default()
+            who = char.id if char else "default"
+        targets = [who or "default"]
+
+    def _llm(_character: str):
+        want = str(getattr(getattr(settings.memory, "dream", None), "model", "") or "").strip()
+        if not want.startswith("api:"):
+            return None                    # 本地角色只走规则版（命令行不给它加 token）
+        from voice_loop.llm import ChatClient
+
+        client = ChatClient(settings.llm, getattr(settings, "api", None))
+        client.configure("api", model=want.split(":", 1)[1].strip())
+        return client
+
+    print("=" * 66)
+    print(" 做梦（整理上下文 → L2/L3，然后压缩）")
+    print("=" * 66)
+    code = 0
+    for who in targets:
+        if args.undo:
+            got = undo_dream(settings, hub, who, args.undo)
+            print(f"  · {who}：{'已回滚' if got.get('ok') else '回滚失败'} "
+                  f"{got.get('reason') or ''}")
+            code = 0 if got.get("ok") else 1
+            continue
+        dreamer = Dreamer(settings, hub, who, llm_factory=_llm)
+        counts = dreamer.context.counts()
+        print(f"  · {who}：上下文 {counts['turns']} 轮 / {counts['segments']} 段 / "
+              f"未整理 {counts['undreamed']} 轮")
+        report = dreamer.run(day=args.date, dry_run=args.dry_run, force=args.force,
+                             source="rule" if args.rule else "")
+        print("    " + report.summary())
+        digest = report.digest or {}
+        if digest.get("summary"):
+            print(f"    摘要：{digest['summary']}")
+        for line in digest.get("open_threads") or []:
+            print(f"    没聊完：{line}")
+        for line in report.skipped[:8]:
+            print(f"    跳过：{line}")
+        if args.dry_run:
+            print("    （--dry-run：以上都没有写进记忆）")
+        if not report.ok:
+            code = 1
+    return code
+
+
 def _model_groups() -> tuple[str, ...]:
     """模型组名从 `download_models.py` 里读（★两边不会跑偏★）。"""
     return setup_flow.model_groups_known()
@@ -1688,6 +1763,19 @@ def build_parser() -> argparse.ArgumentParser:
                    help="★不建议★：允许往公开仓库推记忆（默认拦下）")
     p.add_argument("--message", default="", help="自定义提交信息")
     p.set_defaults(func=cmd_memsync)
+
+    p = sub.add_parser("dream",
+                       help="做梦：把上下文整理进 L2/L3 并压缩（看 / 手动跑 / 回滚）")
+    p.add_argument("--date", default="", help="哪一天的上下文（默认今天，YYYY-MM-DD）")
+    p.add_argument("--dry-run", action="store_true",
+                   help="只算不改：把提议和摘要打出来，记忆一个字都不动")
+    p.add_argument("--undo", default="",
+                   help="回滚某一天那次梦（用 context/dreams/<date>.json 里存的前镜像）")
+    p.add_argument("--force", action="store_true", help="新内容不足 min_turns 也照做")
+    p.add_argument("--rule", action="store_true", help="强制走规则版（不调模型）")
+    p.add_argument("--who", default=None, help="哪个角色（默认用默认角色）")
+    p.add_argument("--all", action="store_true", help="所有角色都做一遍")
+    p.set_defaults(func=cmd_dream)
 
     return ap
 

@@ -21,8 +21,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +40,7 @@ INSTRUCTIONS = (
     "这是助手的长期记忆。recall 用来「想起来」——尤其是用户提到过去的事、"
     "或者问「上次/上周/以前」时，先查一下再回答，不要凭印象编。"
     "remember 用来「记住」——用户明确说「记住…」、或者提到值得长期记住的偏好/事实时调用。"
+    "request_dream 用来「请助手整理一遍记忆」——用户说「你整理一下」时调用，一天一两次就够。"
     "查不到就如实说记不起来，不要编造。"
     "★记忆默认按角色隔离★：只能查自己的；有 memory_all 权限的角色（如白泽）可以用 who=\"*\" "
     "查全部，但★回答时必须说清每一条是从谁的记忆里查到的★。"
@@ -293,6 +296,35 @@ def build_server(
             f"知识库：{stats['knowledge']}",
         ])
 
+    def request_dream(args: dict) -> dict:
+        """★模型主动要求整理记忆★：写一行请求，调度器下一轮就做。
+
+        ★为什么不在这里直接做★：整理要读几十轮对话、可能还要调模型，会卡住用户这一轮；
+        而且 stdio 模式下这个服务器是另一个进程，直接改记忆文件会跟主进程抢写。
+        所以只投一个「请求」，由主进程的调度器按同一套校验去做（见 memory/dream.py）。
+        """
+        cfg = getattr(settings, "memory", None)
+        dcfg = getattr(cfg, "dream", None)
+        if not getattr(dcfg, "allow_tool_call", True):
+            return {"text": "现在不允许主动整理记忆（[memory.dream] allow_tool_call = false）。",
+                    "is_error": True}
+        reason = str((args or {}).get("reason") or "").strip()[:120]
+        try:
+            from ...memory.dream import REQUEST_FILE  # noqa: PLC0415
+
+            root = Path(str(getattr(settings, "root", ".") or ".")) / \
+                str(getattr(cfg, "dir", "") or "data/memory")
+            root.mkdir(parents=True, exist_ok=True)
+            path = root / REQUEST_FILE
+            # ★只追加一行 JSON★：调度器读的时候整行解析，坏行跳过，不会互相踩
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"who": who_of(args), "reason": reason,
+                                    "at": time.time()}, ensure_ascii=False) + "\n")
+        except Exception as exc:  # noqa: BLE001
+            return {"text": f"没能把整理请求记下来：{exc}", "is_error": True}
+        return ("好，我一会儿就整理一下今天聊的东西（" + (reason or "你让我整理")
+                + "）。整理完你之前的话会被压成几句摘要，具体的事我照样记得。")
+
     server.add_tool(
         "recall",
         "检索长期记忆：过去发生的事（事件）、记住的事实、知识库资料。"
@@ -334,5 +366,19 @@ def build_server(
             "properties": {"who": {"type": "string", "description": "看哪个角色（默认当前角色）"}},
         },
         memory_stats,
+    )
+    server.add_tool(
+        "request_dream",
+        "请助手在后台整理一遍记忆（把今天聊的压成摘要、挑出该长期记住的）。"
+        "用户说「你整理一下记忆」「你今天记了些什么」、或者这轮聊了很多又快到结束时可以用；"
+        "★不用频繁调用★，一天一两次就够。整理在后台做，不影响这轮回答。",
+        {
+            "type": "object",
+            "properties": {
+                "reason": {"type": "string", "description": "为什么现在整理（一句话）"},
+                "who": {"type": "string", "description": "整理谁的记忆（默认当前角色）"},
+            },
+        },
+        request_dream,
     )
     return server

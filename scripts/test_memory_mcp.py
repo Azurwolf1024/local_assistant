@@ -248,8 +248,9 @@ def test_mcp_tools(tmp: Path) -> None:
                                     character=lambda: "baize")
 
     tools = {t.name for t in server.tools()}
-    check_text("三个工具都在（露哪几个由 config.toml 白名单决定）",
-               tools == {"recall", "remember", "memory_stats"}, str(sorted(tools)))
+    check_text("四个工具都在（露哪几个由 config.toml 白名单决定）",
+               tools == {"recall", "remember", "memory_stats", "request_dream"},
+               str(sorted(tools)))
 
     out = call(server, "remember", {"text": "记住：我周五下午三点跟导师见面"})
     check_text("remember 记到当前角色（baize）名下", "baize" in out, out)

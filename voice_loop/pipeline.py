@@ -16,7 +16,8 @@ import sys
 import threading
 import time
 from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace as _dc_replace
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -97,6 +98,14 @@ class DeferredAnswer:
     text: str = ""
     t0: float = 0.0
     first_token: float = 0.0
+
+
+def _turn_stamp(stats: TurnStats, *, first: bool) -> str:
+    """这一轮的墙上时间。用户那句按「助手说完倒推开头」，助手那句就是现在。"""
+    end = datetime.now()
+    if first:
+        end = end - timedelta(seconds=max(0.0, float(stats.total_seconds or 0.0)))
+    return end.isoformat(timespec="seconds")
 
 
 class VoiceLoop:
@@ -339,6 +348,18 @@ class VoiceLoop:
         # 于是第二天说「上次那张截图」也找得回来（文件还在就能再看一眼）。
         if self.skills is not None and getattr(self.skills, "vision", None) is not None:
             self.skills.last_image = self._last_seen_image
+        # ★做梦调度器★：夜里/空闲/到量/被点名时把上下文整理进 L2/L3 并压缩。
+        # 只在 listen/chat 这种「一直开着」的入口值得跑（一次性命令自己会做）。
+        self.dreamer = None
+        self._dream_scheduler = None
+        self._last_activity = time.time()
+        dcfg = getattr(getattr(settings, "memory", None), "dream", None)
+        if (self.memory_hub is not None and auto_sync
+                and getattr(dcfg, "enabled", False)):
+            try:
+                self._start_dream_scheduler(dcfg)
+            except Exception as exc:  # noqa: BLE001 - 调度器起不来不该影响说话
+                self.log.warning(f"[记忆] 做梦调度器没起来（不影响对话）：{exc}")
 
     # ======================================================================
     # 预热
@@ -1810,6 +1831,9 @@ class VoiceLoop:
                         if "tool_calls" in ev:
                             calls.extend(ev["tool_calls"])
                             continue
+                        if "usage" in ev:
+                            self._record_usage(ev["usage"])
+                            continue
                         if calls:
                             continue          # 已经在调工具了，后面的解释性文字不念
                         delta = ev["delta"]
@@ -2565,17 +2589,144 @@ class VoiceLoop:
     # 收尾
     # ======================================================================
     def _memory_context(self, text: str) -> str:
-        """这一轮要带上的记忆摘要（塞进提示词）。★不加载模型、失败也不影响回答★。"""
+        """这一轮要带上的记忆摘要（塞进提示词）。★不加载模型、失败也不影响回答★。
+
+        结构 = 事实（L3）→ 往日摘要（做梦产出）→ 今天/最近的原文（L1 尾）。
+        ★这个顺序就是缓存的前缀顺序★：前两块一天只变一次，所以白天的请求能一直
+        命中云端前缀缓存（见 memory/context.py）。
+        """
         hub = getattr(self, "memory_hub", None)
         cfg = getattr(self.settings, "memory", None)
         if hub is None or not getattr(cfg, "inject", True):
             return ""
         try:
+            max_chars = int(getattr(cfg, "inject_chars", 700) or 700)
             mem = hub.for_character(self.character.id if self.character else "default")
-            return mem.prompt_block(text, max_chars=int(getattr(cfg, "inject_chars", 700) or 700))
+            facts_text = mem.prompt_block(text, max_chars=max_chars)
+            ctx_cfg = getattr(cfg, "context", None)
+            if not getattr(ctx_cfg, "enabled", True):
+                return facts_text
+            budget = int(getattr(ctx_cfg, "tail_tokens", 2000) or 2000)
+            if str(getattr(getattr(self, "llm", None), "engine", "local")) != "api":
+                # ★本地模型给一档更小的预算★：4B 的窗口本来就紧，
+                # 塞 2000 token 原文的结果是「记得更少、还更爱跑题」。
+                budget = min(budget, int(getattr(ctx_cfg, "local_tail_tokens", 800) or 800))
+            return mem.context.render(
+                facts_text,
+                digest_days=int(getattr(ctx_cfg, "digest_days", 3) or 3),
+                tail_tokens=budget,
+            )
         except Exception as exc:  # noqa: BLE001
             self.log.warning(f"[记忆] 摘要生成失败（这一轮不带记忆）：{exc}")
             return ""
+
+    def _append_context(self, stats: TurnStats) -> None:
+        """把这一轮写进 L1 连续上下文（★跨天、跨进程都连续★）。
+
+        ★和 `_write_session` 的分工★：那边是「原始日志」（按进程一段，会被滑窗清掉），
+        这边是「模型真能看见的上下文」（按角色一份，段封存后永不改写）。
+        两边都写是有意的：日志给排查看，上下文给模型看。
+        """
+        hub = getattr(self, "memory_hub", None)
+        cfg = getattr(self.settings, "memory", None)
+        ctx_cfg = getattr(cfg, "context", None)
+        if hub is None or not getattr(ctx_cfg, "enabled", True):
+            return
+        # ★同一轮只记一次★：`_write_session` 有几条路径（正常/打断/技能兜底），
+        # 重试时 stats 可能被写两遍；uid 里带时间戳，时间戳会变，所以要额外按内容拦一次。
+        sig = (stats.turn, stats.user_text, stats.answer)
+        if sig == getattr(self, "_ctx_last_sig", None):
+            return
+        self._ctx_last_sig = sig
+        try:
+            mem = hub.for_character(self.character.id if self.character else "default")
+            session = self._session_file.name
+            rows = []
+            if stats.user_text.strip():
+                rows.append({"ts": _turn_stamp(stats, first=True), "role": "user",
+                             "text": stats.user_text, "session": session})
+            if stats.answer.strip():
+                rows.append({"ts": _turn_stamp(stats, first=False), "role": "assistant",
+                             "text": stats.answer, "session": session})
+            if rows:
+                mem.context.append(rows, session=session)
+        except Exception as exc:  # noqa: BLE001 - 记上下文失败不该影响这一轮
+            self.log.debug(f"[记忆] 上下文追加失败（忽略）：{exc}")
+
+    def _record_usage(self, usage: dict) -> None:
+        """把云端报的真实用量记下来（★缓存到底省了多少，只能靠这个数★）。
+
+        DeepSeek 的字段是 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`，
+        OpenAI 系是 `prompt_tokens_details.cached_tokens`，两个都认。
+        """
+        hub = getattr(self, "memory_hub", None)
+        if hub is None or not isinstance(usage, dict):
+            return
+        try:
+            prompt = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+            hit = int(usage.get("prompt_cache_hit_tokens") or 0)
+            if not hit:
+                details = usage.get("prompt_tokens_details") or {}
+                if isinstance(details, dict):
+                    hit = int(details.get("cached_tokens") or 0)
+            if prompt <= 0 and hit <= 0:
+                return
+            mem = hub.for_character(self.character.id if self.character else "default")
+            mem.context.record_usage(prompt_tokens=prompt, hit_tokens=hit)
+        except Exception as exc:  # noqa: BLE001
+            self.log.debug(f"[记忆] 缓存记账失败（忽略）：{exc}")
+
+    def _start_dream_scheduler(self, dcfg) -> None:
+        """起一个后台线程，按「到量 / 夜间随机 / 空闲 / 被点名」触发做梦。"""
+        from .memory.dream import DreamScheduler  # noqa: PLC0415
+
+        def _make(character: str):
+            from .memory.dream import Dreamer  # noqa: PLC0415
+
+            return Dreamer(self.settings, self.memory_hub, character, logger=self.log,
+                           llm_factory=self._dream_llm)
+
+        self.dreamer = _make
+        self._dream_scheduler = DreamScheduler(
+            self.settings, self.memory_hub, make_dreamer=_make,
+            character=lambda: self.character.id if self.character else "default",
+            activity=lambda: self._last_activity, logger=self.log,
+        )
+        self._dream_scheduler.start()
+        self.log.info(f"[梦] 调度器已启动：窗口 {getattr(dcfg, 'window', '')}，"
+                      f"到量 {getattr(dcfg, 'at_tokens', 0)} token，"
+                      f"空闲 {getattr(dcfg, 'idle_minutes', 0)} 分钟")
+
+    def _dream_llm(self, character: str):
+        """做梦用的模型：`[memory.dream] model` 指谁就用谁，空则跟角色走。
+
+        ★为什么允许单独指定★：整理记忆是**离线**的，没有延迟压力，
+        用比对话更强的模型更划算（白天那个可以为了快而用小模型）。
+        写法：``"api:deepseek-chat"`` = 云端某个模型；``"local:qwen3:4b"`` = 本地某个模型。
+        """
+        want = str(getattr(getattr(self.settings.memory, "dream", None), "model", "") or "").strip()
+        if not want:
+            return self.llm
+        engine, _, model = want.partition(":")
+        engine = engine.strip().lower()
+        if engine not in ("api", "local"):
+            self.log.warning(f"[梦] 看不懂 [memory.dream] model = {want!r}，改用角色引擎")
+            return self.llm
+        try:
+            client = ChatClient(self.settings.llm, getattr(self.settings, "api", None), self.log)
+            if not model.strip():
+                client.configure(engine)
+                return client
+            if engine == "api":
+                client.configure("api", model=model.strip())
+            else:
+                # 本地换模型：直接换 OllamaClient 的模型名，别碰引擎切换逻辑
+                client.local.cfg = _dc_replace(client.local.cfg, model=model.strip())
+                client.configure("local")
+            return client
+        except Exception as exc:  # noqa: BLE001 - 指错了就退回角色自己的引擎
+            self.log.warning(f"[梦] 指定模型 {want} 起不来（{exc}），改用角色引擎")
+            return self.llm
 
     def _character_knowledge(self, char_id: str) -> dict:
         """某个角色的知识库说明书（L4）—— ★不同 IP 的角色各看各的世界观★。
@@ -2635,6 +2786,7 @@ class VoiceLoop:
                 gone = mem.prune_raw_sessions(self.settings.sessions_dir, dry_run=False)
                 if gone:
                     self.log.info(f"[记忆] 滑动窗口清掉 {len(gone)} 个原始对话")
+            self._dream_on_close()
             # ★最后一步才同步云端★：先归档、巩固、清窗口，推上去的才是整理后的记忆。
             #   失败只记一行日志 —— 断网不该影响「退出」这件事。
             if self.auto_sync and getattr(cfg, "sync_on_close", False):
@@ -2648,15 +2800,54 @@ class VoiceLoop:
         except Exception as exc:  # noqa: BLE001
             self.log.warning(f"[记忆] 收尾失败（不影响退出）：{exc}")
 
+    def _dream_on_close(self) -> None:
+        """退出前补一次**规则版**梦：把今天的上下文封段 + 写摘要。
+
+        ★为什么要有★：夜里那次梦靠 `[memory.dream] window`（默认 02:00-05:00），
+        可你要是 23 点关机、第二天 9 点再开，那个窗口永远碰不到 —— 上下文就一天天
+        只增不减。所以退出时补一次：★只走规则版★（毫秒级、不花 token、不改事实判断），
+        真正的「该记什么」还是留给夜里那次 agent 梦。
+        """
+        hub = getattr(self, "memory_hub", None)
+        cfg = getattr(self.settings, "memory", None)
+        dcfg = getattr(cfg, "dream", None)
+        if hub is None or not getattr(dcfg, "enabled", False):
+            return
+        if not getattr(getattr(cfg, "context", None), "enabled", True):
+            return
+        try:
+            from .memory.dream import Dreamer  # noqa: PLC0415
+
+            dreamer = Dreamer(self.settings, hub,
+                              self.character.id if self.character else "default",
+                              logger=self.log, llm_factory=self._dream_llm)
+            got = dreamer.run(source="rule")
+            if got.ok:
+                self.log.info(f"[梦] 退出前整理：{got.summary()}")
+            else:
+                self.log.debug(f"[梦] 退出前没整理（{got.error}）")
+        except Exception as exc:  # noqa: BLE001 - 整理失败不该挡住退出
+            self.log.warning(f"[梦] 退出前整理失败（不影响退出）：{exc}")
+
     def _write_session(self, stats: TurnStats) -> None:
         try:
             with open(self._session_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(asdict(stats), ensure_ascii=False) + "\n")
         except Exception:  # noqa: BLE001
             pass
+        self._append_context(stats)
+        self._last_activity = time.time()
 
     def close(self) -> None:
         self._stop.set()
+        # ★先让调度器停下★：它可能正在做梦，梦里会读上下文文件；
+        # 让它和下面的收尾并发跑，容易出现「一边封段一边归档」的怪账。
+        if self._dream_scheduler is not None:
+            try:
+                self._dream_scheduler.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self._dream_scheduler = None
         # ★先归档记忆再拆别的东西★：记忆收尾只需要原始对话文件与配置，
         # 而 MCP/hotkey 的清理有可能报错（报错就不该把归档吞掉）。
         self._close_memory()

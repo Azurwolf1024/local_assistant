@@ -474,6 +474,9 @@ class OpenAICompatClient:
                             else self.cfg.temperature),
             "top_p": self.cfg.top_p,
             "max_tokens": int(self.cfg.max_tokens),
+            # ★要 usage 才会给缓存命中数★：deepseek 的 prompt_cache_hit_tokens 只有
+            # 在 stream_options 里开口要的时候才随流回来（默认不回）。
+            "stream_options": {"include_usage": True},
         }
         if tools:
             payload["tools"] = tools
@@ -513,6 +516,10 @@ class OpenAICompatClient:
                         continue
                     if chunk.get("error"):
                         raise ApiError(str(chunk["error"]))
+                    usage = chunk.get("usage")
+                    if isinstance(usage, dict) and usage:
+                        # 有的服务把 usage 塞在最后一个 choices 为空的 chunk 里
+                        yield {"usage": usage}
                     choices = chunk.get("choices") or []
                     if not choices:
                         continue

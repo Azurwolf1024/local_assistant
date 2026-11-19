@@ -101,6 +101,7 @@ class HarnessAgent:
         call_tool: Callable[[str, dict], tuple[bool, str]] | None = None,
         ask_user: Callable[[str, list[str]], str] | None = None,
         should_stop: Callable[[], bool] | None = None,
+        plan_tool: bool = True,
     ) -> None:
         self.llm = llm
         self.settings = settings
@@ -114,7 +115,10 @@ class HarnessAgent:
         self.tools = list(tool_specs or [])
         if ask_user is not None:
             self.tools.append(ASK_USER_SPEC)
-        self.tools.append(UPDATE_PLAN_SPEC)
+        # ★「做梦」不许规划★：它只要一份结构化的整理提议，多给一个 update_plan 只会
+        # 让它把步骤写进计划里然后忘了交提议（见 memory/dream.py）。
+        if plan_tool:
+            self.tools.append(UPDATE_PLAN_SPEC)
         self.plan: list[str] = []
 
     # ------------------------------------------------------------------ 工具
@@ -185,10 +189,12 @@ class HarnessAgent:
         extra_messages: list[dict] | None = None,
         model: str | None = None,
         num_ctx: int | None = None,
+        system_override: str | None = None,
     ) -> AgentResult:
         t0 = time.perf_counter()
         result = AgentResult()
-        messages = self.llm.build_messages(user_text, extra_messages=extra_messages)
+        messages = self.llm.build_messages(user_text, extra_messages=extra_messages,
+                                           system_override=system_override)
         result.messages = messages
         calls_all: list[dict] = []
         final_text = ""

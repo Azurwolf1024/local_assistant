@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Protocol
 
 from ..store import cross_process_lock
+from .context import ContextLog, est_tokens
 from .extract import Turn, episodes_from_session, facts_from_text, rule_summary, signals
 from .knowledge import KnowledgeBase, build_knowledge
 from .levels import (
@@ -100,9 +101,15 @@ class Memory:
         max_facts: int = MAX_FACTS,
         keep_session_days: float = KEEP_SESSION_DAYS,
         keep_session_files: int = KEEP_SESSION_FILES,
+        segment_tokens: int = 1200,
+        segment_turns: int = 30,
     ) -> None:
         self.paths = MemoryPaths(root, character)
         self.character = self.paths.character
+        # ★L1 的连续上下文★（见 context.py）：段化 + 追加，做梦时压缩
+        self.context = ContextLog(self.paths.root, self.character,
+                                  segment_tokens=segment_tokens,
+                                  segment_turns=segment_turns, logger=logger)
         self.knowledge = knowledge or KnowledgeBase()
         self.schedule = schedule or NullSchedule()
         self.llm_call = llm_call
@@ -116,11 +123,18 @@ class Memory:
     def episodes(self) -> list[Episode]:
         return [Episode.from_dict(raw) for raw in read_jsonl(self.paths.episodes)]
 
-    def facts(self, include_weak: bool = False) -> list[Fact]:
+    def facts(self, include_weak: bool = False,
+              include_invalid: bool = False) -> list[Fact]:
+        """当前的事实。
+
+        ``include_invalid=True`` 会连**已经失效**的旧事实一起返回（问「上个月呢」时用）——
+        默认只给现在仍然成立的（`invalid_at` 为空），否则同一件事会出现新旧两条、自相矛盾。
+        """
         rows = [Fact.from_dict(raw) for raw in read_json(self.paths.facts, [])]
+        if not include_invalid:
+            rows = [f for f in rows if not f.invalid_at]
         if include_weak:
             return rows
-        now = datetime.now()
         return [f for f in rows if f.pinned or f.confidence >= 0.15]
 
     def session_states(self) -> dict[str, dict]:
@@ -439,7 +453,8 @@ class Memory:
         with cross_process_lock(self.paths.facts):
             current = [Fact.from_dict(raw) for raw in read_json(self.paths.facts, [])]
             for fact in incoming:
-                hit = next((f for f in current if f.key == fact.key), None)
+                hit = next((f for f in current
+                            if f.key == fact.key and not f.invalid_at), None)
                 if hit is None:
                     current.append(fact)
                     continue
@@ -448,10 +463,32 @@ class Memory:
                 hit.last_seen = now_iso()
                 hit.sources = sorted(set(hit.sources) | set(fact.sources))[:10]
                 if fact.value != hit.value:
-                    # 值变了 = 改主意了：以新的为准（旧值留在 note 里可追）
-                    hit.note = f"（原 {hit.value}）{fact.note}"[:200]
-                    hit.value = fact.value
+                    if hit.pinned:
+                        # 身份类（名字/称呼）：直接改，不保留旧值当"历史真相"
+                        hit.note = f"（原 {hit.value}）{fact.note}"[:200]
+                        hit.value = fact.value
+                    else:
+                        # ★双时间★：旧值不删，标成失效 —— 「上个月呢」还答得出来
+                        hit.invalid_at = now_iso()
+                        hit.superseded_by = f"{fact.key}={fact.value}"
+                        fact.evidence = max(fact.evidence, 2)
+                        current.append(fact)
             write_json(self.paths.facts, [f.to_dict() for f in current])
+
+    def supersede_fact(self, key: str, value: str, *, note: str = "",
+                       confidence: float = 0.7) -> Fact | None:
+        """把一条事实「换成新的」：旧的标记失效、新的追加（Zep 的双时间做法）。
+
+        ★不是覆盖★：`facts()` 默认只看没失效的那条，但
+        `facts(include_invalid=True)` 仍然能翻出旧值 —— 问「我以前喝什么」答得上来。
+        """
+        with cross_process_lock(self.paths.facts):
+            current = [Fact.from_dict(raw) for raw in read_json(self.paths.facts, [])]
+            fresh = apply_supersede(current, key, value, note=note, confidence=confidence)
+            if fresh is None:
+                return None
+            write_json(self.paths.facts, [f.to_dict() for f in current])
+            return fresh
 
     def _rewrite_episodes(self, episodes: list[Episode]) -> None:
         rewrite_jsonl(self.paths.episodes, [e.to_dict() for e in episodes])
@@ -523,6 +560,10 @@ class MemoryHub:
                                       or KEEP_SESSION_FILES)
         self.enabled = bool(getattr(cfg, "enabled", True))
         self.inject = bool(getattr(cfg, "inject", True))
+        # L1 上下文的段大小（[memory.context]；留空就用 context.py 的默认值）
+        ctx_cfg = getattr(cfg, "context", None)
+        self.segment_tokens = int(getattr(ctx_cfg, "segment_tokens", 1200) or 1200)
+        self.segment_turns = int(getattr(ctx_cfg, "segment_turns", 30) or 30)
         # 共享知识库：目录里的**顶层文件** + 配置里 inline 的设定（每个角色都能看到）
         paths = list(getattr(cfg, "knowledge_paths", None) or [])
         if not paths:
@@ -627,6 +668,7 @@ class MemoryHub:
                 max_episodes=self.max_episodes, max_facts=self.max_facts,
                 keep_session_days=self.keep_session_days,
                 keep_session_files=self.keep_session_files,
+                segment_tokens=self.segment_tokens, segment_turns=self.segment_turns,
             )
         else:
             # 知识库热更新：人格文件改了 `knowledge` / 新丢了个专属知识文件，下一轮就生效
@@ -674,6 +716,26 @@ class MemoryHub:
         }
 
 
+def apply_supersede(facts: list[Fact], key: str, value: str, *, note: str = "",
+                    confidence: float = 0.7) -> Fact | None:
+    """在**内存里的**事实列表上做一次「换新」（旧的标失效、新的追加）。
+
+    抽出来是因为两个地方都要做这件事：`Memory.supersede_fact`（独立写盘）和
+    `dream._apply_actions`（一批动作最后统一写盘 —— 它在内存里攒改动）。
+    两处各写一遍的话，迟早有一处忘了标 `invalid_at`。
+    """
+    old = next((f for f in facts if f.key == key and not f.invalid_at), None)
+    if old is None or old.pinned:
+        return None                     # 身份类（名字/称呼）不走这条路
+    old.invalid_at = now_iso()
+    old.superseded_by = f"{key}={value}"
+    fresh = Fact(key=key, value=value, about=old.about, confidence=confidence,
+                 evidence=max(2, old.evidence + 1), first_seen=old.first_seen,
+                 sources=list(old.sources)[:10], note=note[:200], pinned=False)
+    facts.append(fresh)
+    return fresh
+
+
 def _read_turns(path: Path) -> list[Turn]:
     from .extract import read_session, Turn as TurnCls  # noqa: PLC0415
 
@@ -682,5 +744,5 @@ def _read_turns(path: Path) -> list[Turn]:
 
 __all__ = [
     "Chunk", "Episode", "Fact", "Hit", "KnowledgeBase", "Memory", "MemoryHub", "NullSchedule",
-    "Schedule", "build_knowledge", "rule_summary",
+    "Schedule", "apply_supersede", "build_knowledge", "rule_summary",
 ]

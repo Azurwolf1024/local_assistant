@@ -86,6 +86,11 @@ class Fact:
     last_seen: str = field(default_factory=now_iso)
     sources: list[str] = field(default_factory=list)
     note: str = ""
+    # ★双时间（借 Zep / Graphiti 的做法）★：一条事实「不再为真」时**不删除**，
+    # 只标记它从什么时候起失效、被哪条取代。这样「上个月我作息是什么样的」还答得出来，
+    # 而当前生效的永远是 `invalid_at` 为空的那条（见 Memory.facts）。
+    invalid_at: str = ""                        # 空 = 现在仍然成立
+    superseded_by: str = ""                     # 取代它的那条（"key=value"）
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

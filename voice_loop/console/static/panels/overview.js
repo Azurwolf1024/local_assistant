@@ -114,8 +114,42 @@
           ]),
           h("div", { class: "row" }, [syncBtn, pullBtn]),
           syncBox,
-          h("p", { class: "muted", text: "只同步「每角色一份的记忆」（episodes / facts / sessions 索引 / knowledge），"
+          h("p", { class: "muted", text: "只同步「每角色一份的记忆」（episodes / facts / sessions 索引 / knowledge / 上下文），"
             + "原始对话（L1，sessions/*.jsonl）不上云。推之前会确认仓库不是公开的。" }),
+        ]));
+
+        // ★日上下文 + 做梦★：今天的对话记得多连、缓存省了多少、上次整理是什么时候
+        const md = data.memory_dream || {};
+        const dreamBox = h("p", { class: "muted", text: "" });
+        const dreamBtn = h("button", {
+          class: "btn small", text: "现在整理一次（规则版）",
+          onclick: async () => {
+            dreamBtn.disabled = true;
+            dreamBox.textContent = "正在整理上下文 → 记忆…";
+            const r = await ctx.api.safe(() => ctx.api.post("/api/overview/dream", {}));
+            dreamBtn.disabled = false;
+            if (!r) { dreamBox.textContent = "请求失败（看日志页）"; return; }
+            dreamBox.textContent = (r.ok ? "√ " : "× ") + (r.summary || r.error || "");
+            if (r.ok) ctx.toast("整理完了", "ok");
+          },
+        });
+        const charRows = (md.characters || []).length
+          ? (md.characters || []).map((c) => ({
+            k: c.id,
+            v: c.segments + " 段 · 打开中 " + c.open_turns + " 轮"
+              + (c.last_dream ? " · 上次整理 " + c.last_dream : " · 还没整理过")
+              + (c.prompt ? " · 今天缓存命中 " + Math.round((c.hit / c.prompt) * 100) + "%" : ""),
+          }))
+          : [{ k: "（还没有）", v: h("span", { class: "muted", text: "聊几句就有了" }) }];
+        body.appendChild(card("上下文与整理（让每天的对话接着长）", [
+          table([{ key: "k", label: "角色", cls: "num" }, { key: "v", label: "上下文" }], charRows),
+          h("p", { class: "muted", text: md.enabled
+            ? "夜里 " + (md.window || "02:00-05:00") + " 随机整理一次，攒到 "
+              + (md.at_tokens || 0) + " token 也会自动压一次。段封存后不再改写，"
+              + "所以白天的提示词前缀是稳定的（云端缓存能命中）。"
+              : "做梦关着（[memory.dream] enabled = false）：上下文只追加、不压缩。" }),
+          h("div", { class: "row" }, [dreamBtn]),
+          dreamBox,
         ]));
 
         const today = data.events.today || [];

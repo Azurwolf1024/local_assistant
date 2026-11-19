@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import sys
 import tomllib
+import typing
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -470,6 +471,48 @@ class BargeInConfig:
 
 
 @dataclass
+class MemoryContextConfig:
+    """L1 的连续上下文（见 voice_loop/memory/context.py）。
+
+    ★「命中缓存」的落地方式★：段封存后永不改写、新内容只往后追加，
+    所以云端的前缀缓存在白天能一直命中；只有每晚追加摘要那一次会失效。
+    """
+
+    enabled: bool = True
+    segment_tokens: int = 1200      # 一段多大就封存（越小前缀越碎、越大 miss 越贵）
+    segment_turns: int = 30
+    digest_days: int = 3            # 提示词里往前带几天的摘要
+    tail_tokens: int = 2000         # 未压缩的尾最多占多少 token（按整句砍，不切半句）
+    # ★本地模型单独一档★：4B 的上下文窗口小、注意力也弱，塞 2000 token 的原文反而更糊涂
+    local_tail_tokens: int = 800
+
+
+@dataclass
+class MemoryDreamConfig:
+    """「做梦」：夜里把上下文整理进 L2/L3 并压缩（见 voice_loop/memory/dream.py）。
+
+    ★两种跑法★：云端角色走 agent（模型自己判断该记什么），本地角色只走规则版
+    （4B 做价值判断会往 L3 灌噪声）。agent 失败自动退回规则版。
+    """
+
+    enabled: bool = True
+    window: str = "02:00-05:00"     # 每晚在这个窗口里**随机**挑一个时间
+    random: bool = True
+    check_seconds: int = 30         # 调度器多久看一次条件
+    idle_minutes: float = 20        # 空闲多久可以做一次小睡
+    idle_min_turns: int = 8
+    at_tokens: int = 3000           # 上下文积到多少就强制压缩（只做规则版，很快）
+    min_turns: int = 4              # 新内容少于这个不值得做梦
+    min_interval_minutes: float = 30  # 两次 agent 梦之间至少隔多久
+    model: str = ""                 # 空 = 跟角色引擎；"api:deepseek-chat" = 显式用云端
+    max_rounds: int = 6
+    max_actions: int = 24           # 一次梦最多改多少条（防止一次性大改）
+    allow_tool_call: bool = True    # 允许模型主动调 request_dream
+    keep_days: int = 60             # dreams/ 保留多少天的可撤销记录
+    sync_after: bool = True         # 梦完就推云端
+
+
+@dataclass
 class MemoryConfig:
     """模型记忆：四级记忆 + 自清洁 + 知识库。见 docs/ENGINEERING_LOG.md 第 36 节。
 
@@ -505,6 +548,9 @@ class MemoryConfig:
     sync_remote: str = ""                 # 仓库地址；空 = 这个克隆里已经有的 origin
     sync_branch: str = "main"
     sync_timeout: float = 120.0           # 单条 git 命令的超时（别把退出挂住）
+    # ★L1 连续上下文 + 做梦★（见 memory/context.py / memory/dream.py）
+    context: MemoryContextConfig = field(default_factory=MemoryContextConfig)
+    dream: MemoryDreamConfig = field(default_factory=MemoryDreamConfig)
 
 
 @dataclass
@@ -562,13 +608,27 @@ class Settings:
 
 
 def _build(cls: type, data: dict[str, Any], section: str) -> Any:
-    """按 dataclass 字段类型填充，忽略 TOML 中的未知键。"""
+    """按 dataclass 字段类型填充，忽略 TOML 中的未知键。
+
+    ★嵌套的 dataclass 也认★（`[memory.context]` / `[memory.dream]` 这种）：
+    以前只做平铺拷贝，嵌套表会被当成一个 dict 原样塞进去，读到的是 dict 而不是配置对象
+    —— 于是 `getattr(cfg, "segment_tokens", 默认值)` 永远拿默认值，改配置像没生效。
+    """
     valid = {f.name for f in dataclasses.fields(cls)}
     unknown = set(data) - valid
     if unknown:
         print(f"[config] 警告：[{section}] 中存在未知配置项 {sorted(unknown)}，已忽略",
               file=sys.stderr)
-    kwargs = {k: v for k, v in data.items() if k in valid}
+    hints = typing.get_type_hints(cls) if typing else {}
+    kwargs: dict[str, Any] = {}
+    for key, value in data.items():
+        if key not in valid:
+            continue
+        hint = hints.get(key)
+        if isinstance(value, dict) and dataclasses.is_dataclass(hint):
+            kwargs[key] = _build(hint, value, f"{section}.{key}")
+        else:
+            kwargs[key] = value
     return cls(**kwargs)
 
 

@@ -55,6 +55,11 @@ DEFAULT_BRANCH = "main"
 DEFAULT_CLONE = "memory_cloud"
 REPO_MEMORY = "memory"                 # 仓库里的目录名：memory/<角色>/…
 LOCAL_FILES = ("episodes.jsonl", "facts.json", "sessions.json")
+# ★L1 连续上下文★：段/摘要/状态三个子目录（见 memory/context.py）
+CONTEXT_DIR = "context"
+SEGMENT_DIR = "segments"
+DIGEST_DIR = "digests"
+CONTEXT_STATE = "state.json"
 STATE_FILE = "manifest.json"
 README_FILE = "README.md"
 KNOWLEDGE_EXTS = (".md", ".txt", ".json")
@@ -438,7 +443,7 @@ class MemorySync:
         src = self.local_root / cid
         dst = self.clone_dir / REPO_MEMORY / cid
         dst.mkdir(parents=True, exist_ok=True)
-        counts = {"episodes": 0, "facts": 0, "sessions": 0}
+        counts = {"episodes": 0, "facts": 0, "sessions": 0, "context": 0}
         for name in LOCAL_FILES:
             source, target = src / name, dst / name
             if source.is_file():
@@ -451,6 +456,28 @@ class MemorySync:
                     counts["sessions"] = len(read_json(target, {}) or {})
             elif target.exists():
                 target.unlink()                  # 本地删了 → 云端也删（镜像；git 历史里还在）
+        # ★连续上下文也要上云★：换机器/换设备后「今天聊到哪儿」得接得上。
+        # 段文件是追加写的不可变文件，镜像过来一个字节都不会变（前缀缓存照样命中）。
+        ctx_src = src / CONTEXT_DIR
+        ctx_dst = dst / CONTEXT_DIR
+        if ctx_src.is_dir():
+            ctx_dst.mkdir(parents=True, exist_ok=True)
+            for sub in (SEGMENT_DIR, DIGEST_DIR):
+                room = ctx_dst / sub
+                keep = ctx_src / sub
+                if room.exists():
+                    shutil.rmtree(room)
+                if keep.is_dir():
+                    room.mkdir(parents=True, exist_ok=True)
+                    for item in sorted(keep.glob("*.json*")):
+                        if item.is_file():
+                            shutil.copyfile(item, room / item.name)
+                            counts["context"] += 1
+            state = ctx_src / CONTEXT_STATE
+            if state.is_file():
+                shutil.copyfile(state, ctx_dst / CONTEXT_STATE)
+        elif ctx_dst.exists():
+            shutil.rmtree(ctx_dst)
         keep = src / "knowledge"
         room = dst / "knowledge"
         if keep.is_dir():
@@ -694,6 +721,65 @@ class MemorySync:
                 if not dry_run:
                     self._backup(local_dir / "sessions.json")
                     write_json(local_dir / "sessions.json", merged)
+        got = self._merge_context(local_dir, cloud_dir, dry_run=dry_run)
+        out["context"] = got["files"]
+        if got["changed"]:
+            out["changed"].append("context")
+        return out
+
+    def _merge_context(self, local_dir: Path, cloud_dir: Path, *,
+                       dry_run: bool) -> dict:
+        """合并 L1 连续上下文（★按 uid 合并段，不是整段覆盖★）。
+
+        段文件虽然"封存后不改"，但两台机器各自追加过同一段时（同一个 seg 号、
+        不同的行），整段覆盖就会丢东西。所以：同一段的行按 `uid` 并起来、按 `seq` 排。
+        摘要按日期取 `dream_at` 新的；`state.json` 取 `last_dream_seq` 大的那份
+        （= 记的账更靠前，不会被旧机器拉回去重复做梦）。
+        """
+        src = cloud_dir / CONTEXT_DIR
+        dst = local_dir / CONTEXT_DIR
+        out = {"files": 0, "changed": False}
+        if not src.is_dir():
+            return out
+        for sub in (SEGMENT_DIR, DIGEST_DIR):
+            room = dst / sub
+            room.mkdir(parents=True, exist_ok=True)
+            for item in sorted((src / sub).glob("*.json*")):
+                if not item.is_file():
+                    continue
+                target = room / item.name
+                if sub == SEGMENT_DIR:
+                    known = {str(r.get("uid") or "") for r in read_jsonl(target)}
+                    fresh = [r for r in read_jsonl(item)
+                             if str(r.get("uid") or "") not in known]
+                    if fresh:
+                        out["changed"] = True
+                        if not dry_run:
+                            rows = read_jsonl(target) + fresh
+                            rows.sort(key=lambda r: int(r.get("seq") or 0))
+                            self._backup(target)
+                            rewrite_jsonl(target, rows)
+                else:
+                    got = read_json(item, {}) or {}
+                    have = read_json(target, {}) or {}
+                    if _newer(str(got.get("dream_at") or ""), str(have.get("dream_at") or "")):
+                        out["changed"] = True
+                        if not dry_run:
+                            write_json(target, got)
+                out["files"] += 1
+        cloud_state = read_json(src / CONTEXT_STATE, {}) or {}
+        local_state = read_json(dst / CONTEXT_STATE, {}) or {}
+        if cloud_state and int(cloud_state.get("last_dream_seq") or 0) > \
+                int(local_state.get("last_dream_seq") or 0):
+            merged = dict(cloud_state)
+            # ★本机的段号不能降★：降了就会往一个已经写满的旧段里追加
+            merged["seg"] = max(int(cloud_state.get("seg") or 1),
+                                int(local_state.get("seg") or 1))
+            merged["seq"] = max(int(cloud_state.get("seq") or 0),
+                                int(local_state.get("seq") or 0))
+            out["changed"] = True
+            if not dry_run:
+                write_json(dst / CONTEXT_STATE, merged)
         return out
 
     # ----------------------------------------------------------------- 状态
