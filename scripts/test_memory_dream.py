@@ -167,10 +167,13 @@ def test_rule_dream(tmp: Path) -> None:
 
     again = dreamer.run(day="2026-11-19", source="rule")
     check("没新内容时拒绝做梦", again.ok, False)
-    check("拒绝时一个字都没改", again.error.startswith("新内容只有"), True)
+    check("拒绝的理由说得清楚", "没有新内容" in again.error, True)
 
     forced = dreamer.run(day="2026-11-19", source="rule", force=True)
-    check("--force 能做空梦", forced.ok, True)
+    check("★--force 也不做空梦★（“今天聊了 0 轮”会污染摘要）", forced.ok, False)
+    check("空梦的原因说得清楚", "没有新内容" in forced.error, True)
+    digests = list(mem.context.digests_dir.glob("*.json"))
+    check("没有多出第二个摘要", len(digests), 1)
 
 
 def test_noop_without_context(tmp: Path) -> None:
@@ -426,6 +429,8 @@ def test_sync_context(tmp: Path) -> None:
     check("段文件镜到云端了", got["context"] > 0, True)
     check("state.json 也上去了",
           (repo / "memory" / "baize" / "context" / "state.json").is_file(), True)
+    check("★锁文件不上云★",
+          not list((repo / "memory" / "baize" / "context").rglob("*.lock")))
 
     # 云端多一段、本地没有 → 拉回来
     cloud_ctx = repo / "memory" / "baize" / "context"

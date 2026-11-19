@@ -311,9 +311,12 @@ def build_server(
         reason = str((args or {}).get("reason") or "").strip()[:120]
         try:
             from ...memory.dream import REQUEST_FILE  # noqa: PLC0415
+            from ...memory.sync import memory_root  # noqa: PLC0415
 
-            root = Path(str(getattr(settings, "root", ".") or ".")) / \
-                str(getattr(cfg, "dir", "") or "data/memory")
+            # ★路径必须跟 MemoryHub 用同一套解析★：`[memory] dir` 留空时要跟
+            # `[skills] data_dir` 走，不然「测试/多开把 data_dir 指到临时目录」会把
+            # 请求写进真实数据目录（实测踩过：自测的请求被真实服务捡走做了一次空梦）。
+            root = memory_root(settings)
             root.mkdir(parents=True, exist_ok=True)
             path = root / REQUEST_FILE
             # ★只追加一行 JSON★：调度器读的时候整行解析，坏行跳过，不会互相踩

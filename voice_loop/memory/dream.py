@@ -165,6 +165,12 @@ class Dreamer:
         report = DreamReport(date=today)
         pending = self.context.new_turns()
         min_turns = int(getattr(self.cfg, "min_turns", 4) or 4)
+        if not pending:
+            # ★空梦一律不做★（连 --force 也不做）：摘要「今天聊了 0 轮」会跟着
+            # digest_days 天每天进提示词，是纯噪声。`request_dream` 撞上空上下文、
+            # 或退出时刚好没什么新内容，都走这条。
+            report.ok, report.error = False, "上次整理之后没有新内容，不用做梦"
+            return report
         if not force and len(pending) < min_turns:
             report.ok, report.error = False, f"新内容只有 {len(pending)} 轮（< {min_turns}），不值得做梦"
             return report
@@ -601,10 +607,11 @@ class DreamScheduler:
         self._queue: list[DreamRequest] = []
         self._lock = threading.Lock()
         self._last_agent_at = 0.0
-        self._schedule_path = Path(str(getattr(settings, "root", ".") or ".")) / \
-            str(getattr(cfg, "dir", "") or "data/memory") / "_dream_schedule.json"
-        self._requests_path = Path(str(getattr(settings, "root", ".") or ".")) / \
-            str(getattr(cfg, "dir", "") or "data/memory") / REQUEST_FILE
+        from .sync import memory_root  # noqa: PLC0415 - 跟 MemoryHub 共用同一套解析
+
+        room = memory_root(settings)
+        self._schedule_path = room / "_dream_schedule.json"
+        self._requests_path = room / REQUEST_FILE
         self.last_report: DreamReport | None = None
 
     # ------------------------------------------------------------------ 接口

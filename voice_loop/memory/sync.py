@@ -470,6 +470,10 @@ class MemorySync:
                 if keep.is_dir():
                     room.mkdir(parents=True, exist_ok=True)
                     for item in sorted(keep.glob("*.json*")):
+                        # ★锁文件和临时文件不是记忆★：`.lock` 是本机跨进程锁，
+                        # `.tmp` 是写到一半的东西，上云只会让另一台机器读出脏数据。
+                        if item.suffix in (".lock", ".tmp") or item.name.endswith(".tmp"):
+                            continue
                         if item.is_file():
                             shutil.copyfile(item, room / item.name)
                             counts["context"] += 1
