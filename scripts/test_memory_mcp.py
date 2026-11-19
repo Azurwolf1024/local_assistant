@@ -287,6 +287,21 @@ def test_mcp_tools(tmp: Path) -> None:
                "没有这个工具" in call(server, "forget", {"key": "x"}),
                call(server, "forget", {"key": "x"}))
 
+    # ★request_dream★：只投一个请求，不在这里改记忆（stdio 下那是另一个进程）
+    out = call(server, "request_dream", {"reason": "用户让我整理"})
+    check_text("request_dream 会回一句「一会儿整理」", "整理" in out, out)
+    data_root = Path(getattr(settings.memory, "dir", "") or "data/memory")
+    if not data_root.is_absolute():
+        data_root = Path(settings.root) / data_root
+    req = data_root / "_dream_requests.jsonl"
+    rows = [json.loads(x) for x in req.read_text(encoding="utf-8").splitlines() if x.strip()] \
+        if req.is_file() else []
+    check_text("请求文件里记下了角色和理由",
+               bool(rows) and rows[-1].get("who") == "baize"
+               and "整理" in str(rows[-1].get("reason")), str(rows)[:120])
+    check("★没有直接动记忆（没生成摘要/梦境记录）★",
+          not (tmp / "data" / "memory" / "baize" / "context" / "digests").exists(), True)
+
 
 def test_standalone_fallback(tmp: Path) -> None:
     print("\n[7] 独立进程（stdio）那条路：没有宿主注入的 hub 也要能用")
