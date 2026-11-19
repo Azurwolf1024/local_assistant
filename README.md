@@ -2454,12 +2454,14 @@ python main.py memsync --dry-run  # 只导出到克隆里看一眼，不提交�
 ```
 memory/<角色>/episodes.jsonl   L2 情景      memory/<角色>/knowledge/   L4 这个角色自己的资料
 memory/<角色>/facts.json       L3 事实      manifest.json              上次同步的清单
-memory/<角色>/sessions.json    L1 索引
+memory/<角色>/sessions.json    L1 索引      memory/<角色>/context/     L1 活动上下文（段/摘要/段号）
 ```
 
 | 设计点 | 为什么 |
 | --- | --- |
-| **L1 原始对话不上云** | 它是「滑窗会清掉」的工作记忆，云端留一份没用（下次归档会重算），而且整段对话原文最隐私 |
+| **滑窗日志（`sessions/*.jsonl`）不上云** | 它是「会被清掉」的工作记忆，云端留一份没用，而且整段对话原文最隐私 |
+| **活动上下文（`context/segments/*.jsonl`）★上云★** | 换机器/换设备后「今天聊到哪儿」要接得上。★注意：段里存的就是 user/assistant 原文★（摘要只用来压缩提示词，不替代存档） |
+| **`context/dreams/` 不上云** | 它是 episodes/facts 的全量前镜像，只对本机「反悔」有意义 |
 | **本地 → 云端是镜像** | 本地删了云端也删，这样「忘掉一条」不会被下一次 pull 又拉回来；删掉的旧值在 git 历史里还能捞 |
 | **云端 → 本地是合并** | 按 episode `id` / fact `key` 取新的那份（`updated_at` / `last_seen` 晚的赢），本地独有的照样留着 |
 | **推之前先问一次是不是 Public** | 匿名查 GitHub：认出来是公开仓库就**拒推**（记忆里全是个人信息），要硬推得 `--allow-public` |

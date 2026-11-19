@@ -5086,6 +5086,13 @@ pending = context.new_turns()        # 上次做梦之后新长出来的
 
 `memory/<角色>/context/{segments,digests,state.json}` 也镜像过去：换机器后
 「今天聊到哪儿」接得上（段是追加文件，镜像过去字节不变，前缀缓存照样命中）。
+
+★隐私边界因此变了，必须写清楚★：段文件里存的是 **user/assistant 原文**
+（摘要只用来压缩提示词，不替代存档），所以「L1 不上云」现在**只对滑窗日志成立**
+（`sessions/session-*.jsonl` 仍然不上去）。`context/dreams/` 也不上云 ——
+那是 episodes/facts 的全量前镜像，只对本机「反悔」有意义。`.lock` / `.tmp` 一律跳过
+（本机跨进程锁，上云只会让另一台机器读出脏数据）。
+
 `--pull` 时：
 
 - **段按 `uid` 合并**（两台机器各自追加过同一段时，整段覆盖会丢行），按 `seq` 排序；
