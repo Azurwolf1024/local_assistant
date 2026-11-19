@@ -8,6 +8,10 @@
       const { h, card, table, secs } = UI;
       let data = null;      // 最近一次 /api/overview
       let live = null;      // 最近一次 ping 回来「服务自报」
+      // ★动作的回执要活在闭包外面★：服务状态一变就 `renderAll()` 重建整块卡片，
+      // 只把文字写进那个 `<p>` 的话，几秒后就被新节点替换掉了（看起来"点了没反应"）。
+      let syncMsg = "";
+      let dreamMsg = "";
 
       // ---------------- 动作条 ----------------
       const audition = h("input", { value: "你好呀，我是本地语音助手。", placeholder: "要念的话" });
@@ -76,16 +80,16 @@
 
         // ★记忆上云★：放在概览，是因为「同步」是一次动作，不该每轮对话都去碰网络
         const ms = data.memory_sync || {};
-        const syncBox = h("p", { class: "muted", text: "" });
+        const syncBox = h("p", { class: "muted", text: syncMsg });
         const syncBtn = h("button", {
           class: "btn small", text: "同步到云端",
           onclick: async () => {
             syncBtn.disabled = true;
-            syncBox.textContent = "正在导出 → 提交 → 推送…（第一次可能要几秒）";
+            syncBox.textContent = syncMsg = "正在导出 → 提交 → 推送…（第一次可能要几秒）";
             const r = await ctx.api.safe(() => ctx.api.post("/api/overview/memory-sync", {}));
             syncBtn.disabled = false;
-            if (!r) { syncBox.textContent = "请求失败（看日志页）"; return; }
-            syncBox.textContent = (r.ok ? "√ " : "× ") + (r.summary || r.error || "");
+            if (!r) { syncBox.textContent = syncMsg = "请求失败（看日志页）"; return; }
+            syncBox.textContent = syncMsg = (r.ok ? "√ " : "× ") + (r.summary || r.error || "");
             if (r.ok) ctx.toast("记忆已同步", "ok");
             else ctx.toast("同步没成：" + (r.error || ""), "err");
           },
@@ -94,10 +98,10 @@
           class: "btn small", text: "从云端合并回来",
           onclick: async () => {
             pullBtn.disabled = true;
-            syncBox.textContent = "正在拉取并合并…";
+            syncBox.textContent = syncMsg = "正在拉取并合并…";
             const r = await ctx.api.safe(() => ctx.api.post("/api/overview/memory-sync", { pull: true }));
             pullBtn.disabled = false;
-            syncBox.textContent = r ? ((r.ok ? "√ " : "× ") + (r.summary || r.error || ""))
+            syncBox.textContent = syncMsg = r ? ((r.ok ? "√ " : "× ") + (r.summary || r.error || ""))
               : "请求失败（看日志页）";
           },
         });
@@ -120,16 +124,16 @@
 
         // ★日上下文 + 做梦★：今天的对话记得多连、缓存省了多少、上次整理是什么时候
         const md = data.memory_dream || {};
-        const dreamBox = h("p", { class: "muted", text: "" });
+        const dreamBox = h("p", { class: "muted", text: dreamMsg });
         const dreamBtn = h("button", {
           class: "btn small", text: "现在整理一次（规则版）",
           onclick: async () => {
             dreamBtn.disabled = true;
-            dreamBox.textContent = "正在整理上下文 → 记忆…";
+            dreamBox.textContent = dreamMsg = "正在整理上下文 → 记忆…";
             const r = await ctx.api.safe(() => ctx.api.post("/api/overview/dream", {}));
             dreamBtn.disabled = false;
-            if (!r) { dreamBox.textContent = "请求失败（看日志页）"; return; }
-            dreamBox.textContent = (r.ok ? "√ " : "× ") + (r.summary || r.error || "");
+            if (!r) { dreamBox.textContent = dreamMsg = "请求失败（看日志页）"; return; }
+            dreamBox.textContent = dreamMsg = (r.ok ? "√ " : "× ") + (r.summary || r.error || "");
             if (r.ok) ctx.toast("整理完了", "ok");
           },
         });
