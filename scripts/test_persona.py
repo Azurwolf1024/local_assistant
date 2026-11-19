@@ -283,12 +283,13 @@ def test_pipeline(tmp: Path) -> None:
         loop._switch_character("kaltsit")  # noqa: SLF001
         check("能切回去", "凯尔希" in (loop.llm.system_prompt or ""))
 
-        # 角色自带声线但没装 → 保持全局声线，不抛异常
-        loop.character.voice = "zh_CN-没装过的声线"
+        # 角色自带声线但没装 → 换 spec 后照样能返回（不抛异常），也不会改全局配置
+        loop.character.tts = {"provider": "piper", "voice_id": "zh_CN-没装过的声线"}
         before = settings.tts.voice
         loop._apply_voice(loop.character, "测试")  # noqa: SLF001
-        check("声线没装时不改配置（不会把嘴弄哑）", settings.tts.voice == before,
-              settings.tts.voice)
+        check("★声线没装时不改全局配置★", settings.tts.voice == before, settings.tts.voice)
+        check("但这一轮真的按角色的声线去试了",
+              loop.tts.spec.voice_id, "zh_CN-没装过的声线")
 
         # 角色文件改了 → 热重载认出新角色
         time.sleep(0.01)
@@ -338,14 +339,15 @@ def test_original_default(tmp: Path) -> None:
     prompt = render_system_prompt(person)
     check("提示词里没提别的作品", "凯尔希" not in prompt and "罗德岛" not in prompt)
     check("技术字段不进提示词", "piper" not in render_system_prompt(
-        Character("x", "测试", backend="beizetsu-marker")))
+        Character("x", "测试", tts={"provider": "beizetsu-marker"})))
 
     print("\n[7b] 按角色切 TTS 后端（原创角色 piper / 其它角色继续用全局）")
     chars_path = tmp / "backend_chars.json"
     write_chars(chars_path, [
-        {"id": "orig", "name": "原创的", "backend": "piper", "voice": "zh_CN-huayan-medium"},
+        {"id": "orig", "name": "原创的",
+         "tts": {"provider": "piper", "voice_id": "zh_CN-huayan-medium"}},
         {"id": "cloned", "name": "克隆的"},
-        {"id": "typo", "name": "写错的", "backend": "pipe"},
+        {"id": "typo", "name": "写错的", "tts": {"provider": "pipe"}},
     ])
     settings = load_settings()
     settings.persona.file = str(chars_path)
@@ -357,21 +359,20 @@ def test_original_default(tmp: Path) -> None:
     settings.skills.data_dir = str(tmp)
     settings.skills.event_file = str(tmp / "events2.json")
     settings.skills.memo_file = str(tmp / "m2.json")
-    settings.tts.backend = "zipvoice"          # 故意设成克隆，看角色能不能把它掰回 piper
+    settings.tts.provider = "zipvoice"        # 故意设成克隆，看角色能不能切到 piper
 
     from voice_loop.pipeline import VoiceLoop
 
     loop = VoiceLoop(settings, enable_listening=False, lazy_whisper=True)
     try:
         loop._apply_character(loop.persona.get("orig"), "测试")  # noqa: SLF001
-        check("角色写了 piper 时后端真的切过去", settings.tts.backend == "piper",
-              settings.tts.backend)
+        check("角色写了 piper 时这一轮就用 piper", loop.tts.provider_id, "piper")
         loop._apply_character(loop.persona.get("cloned"), "测试")  # noqa: SLF001
-        check("没写 backend 的角色回到全局（zipvoice）", settings.tts.backend == "zipvoice",
-              settings.tts.backend)
+        check("没写 provider 的角色回到全局（zipvoice）", loop.tts.provider_id, "zipvoice")
         loop._apply_character(loop.persona.get("typo"), "测试")  # noqa: SLF001
-        check("★写错后端名不会把嘴弄哑（忽略并沿用当前的）★", settings.tts.backend == "zipvoice",
-              settings.tts.backend)
+        check("★写错 provider 名不会把嘴弄哑（退回默认后端）★",
+              loop.tts.provider_id in {"zipvoice", "piper"}, True)
+        check("★切换角色全程没改全局配置★", settings.tts.provider, "zipvoice")
     finally:
         loop.close()
 

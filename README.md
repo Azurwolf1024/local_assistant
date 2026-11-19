@@ -238,8 +238,11 @@ flowchart LR
 │  ├─ names.py                 # ★ 数值朗读：把 3810 念成「三千八百一十」
 │  ├─ voice_data.py            # 角色声线素材：够不够、缺什么（persona_voice 用）
 │  ├─ asr/                     # base.py（接口）/ sensevoice.py（快）/ whisper_ov.py（准）/ router.py
-│  └─ tts/                     # base.py（接口）/ piper_tts.py（快）/ zipvoice_tts.py（音色克隆）
+│  └─ tts/                     # base.py（引擎契约）/ spec.py（VoiceSpec·ProviderSpec）/ registry.py（发现·降级·LRU）
+│                              # session.py（可换声线的外壳）/ providers/（★每个后端一个文件★：piper/zipvoice/deepseek/edge/http）
+│                              # piper_tts.py / zipvoice_tts.py / api_tts.py / edge_tts.py / http_tts.py（引擎实现）
 │                              # lazy.py（按需加载）/ pacing.py（停顿与断句）/ refclean.py（参考净化+去嘶声）
+│                              # audio_decode.py（wav/pcm/mp3 解码）/ async_bridge.py（同步里跑异步）
 │                              # ★ textcheck.py（合成回听：丢了字自动重采）/ pitch.py（音区量尺+守卫）
 │                              # precision.py（int8/fp32 选哪份模型）
 ├─ scripts/
@@ -285,6 +288,8 @@ flowchart LR
 │  ├─ test_mcp.py              # ★ MCP：协议 / 真管道 stdio / 白名单 / 路由 / 接进 pipeline
 │  ├─ test_api_llm.py          # ★ 可选 API：配置 / 人格字段 / OpenAI 兼容流 / 本地-API 切换（不联网）
 │  ├─ test_api_tts.py          # ★ 官方 TTS：PCM/WAV 流 / 失败回 Piper / 按角色切后端（不联网）
+│  ├─ test_tts_registry.py     # ★ TTS 解耦：注册表 / 声音描述 / 副本配置 / 降级链 / 云端能力 / http 端到端
+│  ├─ migrate_tts_format.py    # 旧声线字段 → 一份 "tts"（一次性迁移，留 .bak-tts）
 │  ├─ test_agent_tools.py      # ★ harness agent：多轮工具循环 / 文件边界 / 预设 / 默认隐藏（不联网）
 │  ├─ test_persona.py          # ★ 角色：结构化人设 / 多角色唤醒归属 / 切换 / 热重载
 │  ├─ test_persona_guard.py    # ★ 兜底：第一句出戏（拒绝/议论/复述）→ 换人设重答
@@ -1749,6 +1754,88 @@ API 角色可以在 `api_tools`（或 `[api] extra_tools`）里按 **预设名**
 流水线不用改；名字找不到只打警告，不会让这一轮失败。
 （具体还要加哪些工具，等下一步讨论。）
 
+### 声音（TTS）：换成任何模型 / 任何 API 都不用改代码
+
+TTS 这一层现在是**数据驱动**的：一个「后端（provider）」= 一个声明文件
+（`voice_loop/tts/providers/*.py`），它自己说清能力、参数、怎么造引擎。
+加一个新模型/服务**只加一个文件 + 一段 config**，pipeline / settings / 控制台一行不改。
+
+内置的五个：
+
+| provider | 在哪 | 要什么 | 能力 |
+| --- | --- | --- | --- |
+| `piper` | 本地 | 一个 onnx（`models/tts/piper/`） | 低延迟；★所有后端的保底退路★ |
+| `zipvoice` | 本地 | 克隆模型 + 参考音频 | 零样本克隆、分风格参考 |
+| `deepseek` | 云端 | `[api]` 的 key | 官方音色 `stella`/`tide`；按字符计费 |
+| `edge` | 云端 | **什么都不用**（免费） | 音色多、可调语速；`pip install edge-tts` |
+| `http` | 云端 | 一段 config（url/headers/body） | ★任意云端 TTS★：不写 Python |
+
+```toml
+[tts]
+provider = "zipvoice"          # 默认用哪个；角色卡可以覆盖
+fallback = ["piper"]           # 缺模型/缺 key 时依次往下试（★末尾永远还有 piper★）
+max_loaded = 1                 # 同时留几个引擎（克隆模型几百 MB）
+
+[tts.providers.piper]          # 各后端的私有参数：加后端只往这里加，不动 dataclass
+voice = "zh_CN-huayan-medium"
+[tts.providers.deepseek]
+voice_id = "stella"
+fallback_voice = "zh_CN-huayan-medium"
+[tts.providers.edge]
+voice_id = "zh-CN-XiaoxiaoNeural"
+rate = "+0%"
+[tts.providers.http]           # 「给个 API 就能接」：取消注释、填好就能用
+# url = "https://api.example.com/v1/audio/speech"
+# headers = { Authorization = "Bearer {key}" }
+# body = '{"input": "{text}", "voice": "{voice}", "response_format": "mp3"}'
+# audio_format = "mp3"; key_env = "EXAMPLE_TTS_KEY"
+```
+
+角色卡上只写**一份**「嗓音描述」（不再有 `backend` / `voice_ref` / `tts_voice`
+那样一堆平铺字段）：
+
+```jsonc
+// data/personas/bluefish.json
+"tts": {
+  "provider": "deepseek",                  // 空 = 跟 [tts] provider
+  "voice_id": "stella",                    // 官方音色 / piper 声线名 / edge 音色
+  "fallback": ["piper:zh_CN-huayan-medium"],   // 云端挂了用这个嗓子
+  "params": {"tts_block_seconds": 0.2}     // 这个后端的私有参数（原样透传）
+}
+```
+
+| 设计点 | 为什么 |
+| --- | --- |
+| **能力协商，不认名字** | pipeline 只问 `clone` / `voice_id` / `cloud` 这些能力，永远不写 `if backend == "piper"` |
+| **每个 spec 一份配置副本** | 以前切角色 = 改全局配置 + unload（两个角色没法共存）；现在全局只表示「默认值」，切换互不影响 |
+| **降级链收在注册表** | 缺模型/缺 key 只是「换下一个」，配置问题只提示一次；云端中途失败 → 这一句回本地，不哑 |
+| **`cloud` 是能力，不是注释** | 自测里有一条「纯本地角色解析出来不是云端」，隐私不变量靠它守着 |
+| **控制台表单从注册表生成** | 声音后端下拉、可选音色都是现算的 —— 再不会出现「下拉里没有新值，浏览器把她的音色悄悄清空」 |
+
+**从旧格式升级**：旧人格文件里的 `backend` / `voice` / `voice_ref` / `voice_refs` /
+`voice_model` / `tts_voice` 不再生效，用一次迁移脚本搬过去（留 `.bak-tts`）：
+
+```powershell
+python scripts/migrate_tts_format.py --dry-run   # 先看会改成什么
+python scripts/migrate_tts_format.py             # 真写
+```
+
+**加一个后端**（全程不改别处）：
+
+```python
+# voice_loop/tts/providers/my_tts.py
+from ..spec import CAP_CLOUD, CAP_VOICE_ID, FieldSpec, ProviderSpec
+
+PROVIDER = ProviderSpec(
+    id="my-tts", label="我的 TTS",
+    capabilities=frozenset({CAP_VOICE_ID, CAP_CLOUD}),
+    fields=(FieldSpec("voice_id", "音色", "select", options=("a", "b")),),
+    ready=lambda settings: (True, ""),
+    create=lambda settings, spec: MyEngine(settings, spec),
+    hint="…",
+)
+```
+
 ### 官方 TTS：让 API 角色用云端嗓子（可选）
 
 「蓝色大肥鱼」不只是脑子走 DeepSeek，**嗓子也可以**。官方接口是
@@ -1764,21 +1851,21 @@ tts_block_seconds = 0.2    # 边收边播：收够 0.2 秒就先交给扬声器
 
 ```jsonc
 // data/personas/bluefish.json
-{
-  "backend": "api",                 // ★声音也走官方 TTS★
-  "tts_voice": "stella",            // 空 = 跟 [api] tts_voice
-  "voice": "zh_CN-huayan-medium"    // ★退路★：API 不可用时自动用这个 Piper 声线
+"tts": {
+  "provider": "deepseek",                       // ★声音走官方 TTS★
+  "voice_id": "stella",                         // 空 = 跟 [tts.providers.deepseek] voice_id
+  "fallback": ["piper:zh_CN-huayan-medium"]     // ★退路★：API 不可用时用这个 Piper 声线
 }
 ```
 
 | 情况 | 会发生什么 |
 | --- | --- |
-| `[api]` 没配 key / `tts_enabled=false` | 这个角色自动用 Piper 出声（角色卡上的 `voice` 那一栏） |
-| API 400 / 429 / 503 / 超时 | 还没出声 → 这一段改用 Piper；已经播了半句 → 保留已播部分，不重复 |
-| **角色卡上的 `backend` 被清空** | 她就去跟 `[tts] backend`（本项目默认是**克隆**）——听起来就是「换了个人」。控制台保存时会明确告警，概览页也会写出她实际用的那一路 |
+| `[api]` 没配 key / `tts_enabled=false` | 降级链退到 `piper`（用 `fallback` 里那把嗓子，或 `[tts.providers.piper]`） |
+| API 400 / 429 / 503 / 超时 | 还没出声 → 这一段改用本地；已经播了半句 → 保留已播部分，不重复 |
+| **`provider` 那一栏被清空** | 她就去跟 `[tts] provider`（本项目默认是**克隆**）——听起来就是「换了个人」。控制台保存时会明确告警，概览页也会写出她实际用的那一路 |
 | 音色 | 官方只有 `stella` / `tide`，**没有克隆、没有语速参数** |
 | 计费 | 每 10000 字符 $0.45（限时 $0.225）；中文一个字按 2 字符算 |
-| 控制台 | 角色卡第 ⑤ 组「TTS 后端 / 官方 TTS 音色」；概览页每个角色显示「TTS：DeepSeek 官方 · stella」这种真话 |
+| 控制台 | 角色卡第 ⑤ 组（后端下拉由注册表生成）+ 概览页「TTS：deepseek · stella」这种真话 |
 
 ### API 角色的 harness agent（多轮工具 + 联网 / 文件 / 命令）
 

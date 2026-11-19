@@ -36,12 +36,13 @@ def check(name: str, got, want=_UNSET, detail: str = "") -> None:
 
 
 CHAR = {"id": "kaltsit", "name": "凯尔希",
-        "voice_ref": "data/personas/kaltsit/干员报到.wav",
-        "voice_ref_text": "博士，请坐。",
-        "voice_refs": {"calm": "data/personas/kaltsit/完成高难行动.wav",
-                       "催促": {"ref": "data/personas/kaltsit/精英化晋升1.wav",
-                                "text": "文件在这里，自己看。"},
-                       "空的": ""}}
+        "tts": {"provider": "zipvoice",
+                "ref_audio": "data/personas/kaltsit/干员报到.wav",
+                "ref_text": "博士，请坐。",
+                "styles": {"calm": "data/personas/kaltsit/完成高难行动.wav",
+                           "催促": {"ref": "data/personas/kaltsit/精英化晋升1.wav",
+                                    "text": "文件在这里，自己看。"},
+                           "空的": ""}}}
 
 
 def test_parse_tag() -> None:
@@ -110,12 +111,13 @@ def test_pick_ref() -> None:
 
 
 def test_persona_field() -> None:
-    print("\n[4] 人格解析：voice_refs 必须真的搬进来（白名单构造的坑）")
+    print("\n[4] 人格解析：styles 必须真的搬进来（白名单构造的坑）")
     char = Character.from_dict(CHAR)
     check("字段搬进来了", list(char.voice_refs), ["calm", "催促"])
     check("值也原样在", char.voice_refs["calm"], "data/personas/kaltsit/完成高难行动.wav")
-    check("to_dict 能带出来", "voice_refs" in char.to_dict(), True)
-    weird = Character.from_dict({"id": "x", "name": "X", "voice_refs": ["calm"]})
+    check("to_dict 能带出来（在新的 tts 结构里）",
+          list((char.to_dict().get("tts") or {}).get("styles") or {}), ["calm", "催促"])
+    weird = Character.from_dict({"id": "x", "name": "X", "tts": {"styles": ["calm"]}})
     check("写错类型（列表）不炸、当成空", weird.voice_refs, {})
 
 
@@ -137,29 +139,30 @@ def test_pipeline_switch(tmp: Path) -> None:
     loop = object.__new__(VoiceLoop)          # ★不要真建 VoiceLoop★（会开 Tk/加载模型）
     loop.settings = settings
     loop.character = registry.get("kaltsit")
-    loop.tts = None                            # 引擎没加载：只改配置，下次加载自然生效
-    loop._base_clone_audio = "data/personas/kaltsit/干员报到.wav"
-    loop._base_clone_dir = settings.tts.clone_dir
-    loop._base_backend = "zipvoice"
-    loop._base_voice = "zh_CN-huayan-medium"
+    # 真外壳但不 load：只换 spec，不加载克隆模型（几秒 + 几百 MB）
+    from voice_loop.tts import create_tts  # noqa: PLC0415
+
+    loop.tts = create_tts(settings, lazy=True)
     loop.log = logging.getLogger("test_style")
-    settings.tts.clone_audio = ""
-    settings.tts.clone_text = ""
+
+    def ref() -> str:
+        return Path(getattr(loop.tts.spec, "ref_audio", "") or "").name
+
+    def text() -> str:
+        return str(getattr(loop.tts.spec, "ref_text", "") or "")
 
     check("初始风格为空", loop.style, "")
     check("切到 calm → 参考换成那一条",
-          (loop.set_style("calm"), Path(settings.tts.clone_audio).name),
-          ("calm", "完成高难行动.wav"))
-    check("字符串档的文本是空的（由清单/自动转写去补）", settings.tts.clone_text, "")
-    check("带文本的档也把文本带上",
-          (loop.set_style("催促"), settings.tts.clone_text),
+          (loop.set_style("calm"), ref()), ("calm", "完成高难行动.wav"))
+    check("字符串档的文本是空的（由清单/自动转写去补）", text(), "")
+    check("带文本的档也把文本带上", (loop.set_style("催促"), text()),
           ("催促", "文件在这里，自己看。"))
     check("★不知道的档 → 不动★（返回空串，保持当前）",
           (loop.set_style("不存在"), loop.style), ("", "催促"))
-    check("切回默认（空键）→ 回到 voice_ref 那一档",
-          (loop.set_style(""), Path(settings.tts.clone_audio).name),
-          ("", "干员报到.wav"))
-    check("★没写 voice_refs 的角色：set_style 是空操作★",
+    check("切回默认（空键）→ 回到默认那一档",
+          (loop.set_style(""), ref()), ("", "干员报到.wav"))
+    check("★全局配置全程没被改★", settings.tts.clone_audio, "data/personas/kaltsit/干员报到.wav")
+    check("★没写 styles 的角色：set_style 是空操作★",
           (lambda: (setattr(loop, "character", Character.from_dict({"id": "x", "name": "X"})),
                     loop.set_style("calm"))[1])(), "")
 

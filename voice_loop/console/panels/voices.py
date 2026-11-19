@@ -26,6 +26,7 @@ def register(app, ctx) -> None:
 
     def character_rows() -> list[dict]:
         from ...console import clone as clone_mod  # noqa: PLC0415
+        from ..persona_card import describe_voice as card_describe  # noqa: PLC0415
 
         registry = ctx.characters()
         default_id = str(ctx.settings.persona.default or "")
@@ -60,8 +61,11 @@ def register(app, ctx) -> None:
                 "ack": char.ack or "",
                 "engine": char.engine or "",
                 "api_model": char.api_model or "",
-                "tts_backend": char.backend or "",
+                # ★嗓子：新结构 + 展开出来的展示字段★（前端旧代码还在读 tts_backend 那套）
+                "tts": dict(char.tts or {}),
+                "tts_provider": char.backend or "",
                 "tts_voice": char.tts_voice or "",
+                "tts_fallback": list((char.tts or {}).get("fallback") or []),
                 "style": list(char.style or []),
                 "voice": char.voice or "",
                 "voice_ref": ref,
@@ -72,6 +76,7 @@ def register(app, ctx) -> None:
                     char.voice_model and ctx.settings.resolve(char.voice_model).is_dir()
                 ),
                 "voice_dir": char.voice_dir or "",
+                "tts_line": card_describe(ctx.settings, char),
                 "materials_dir": room_text,
                 "materials_exists": bool(room is not None and room.is_dir()),
                 "materials_count": len(cands),
@@ -100,7 +105,10 @@ def register(app, ctx) -> None:
             "resolved_default": default_name or settings.persona.default,
             "persona_file": settings.persona.file,
             "tts": {
-                "backend": settings.tts.backend,
+                "provider": settings.tts.provider,
+                "fallback": list(settings.tts.fallback or []),
+                "max_loaded": settings.tts.max_loaded,
+                "providers": sorted((settings.tts.providers or {}).keys()),
                 "clone_dir": settings.tts.clone_dir,
                 "clone_audio": settings.tts.clone_audio,
                 "clone_steps": settings.tts.clone_steps,
@@ -178,7 +186,8 @@ def register(app, ctx) -> None:
             "materials_with_text": sum(1 for r in rows if r.get("text")),
             "voice_ref": char.voice_ref or "",
             "voice_ref_text": char.voice_ref_text or "",
-            "backend": char.backend or ctx.settings.tts.backend,
+            "tts": dict(char.tts or {}),
+            "provider": char.backend or ctx.settings.tts.provider,
             "say": clone_mod.preview_sentence(char),
             "limits": {"min_seconds": clone_mod.MIN_SECONDS,
                        "max_seconds": clone_mod.MAX_SECONDS,

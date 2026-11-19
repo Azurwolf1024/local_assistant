@@ -186,14 +186,21 @@ def test_fallback(tmp: Path) -> None:
 
 def test_backend(tmp: Path) -> None:
     print("\n[5] 后端起用与回退")
-    from voice_loop.tts import resolve_backend
+    from voice_loop.tts import VoiceSpec, registry_for
 
     s = base_settings(tmp)
-    s.tts.backend = "api"
-    check("配好 key 时用 ApiTts", resolve_backend(s)[0], ApiTts)
-    check("说明里带音色", "stella" in resolve_backend(s)[1], True)
+    s.tts.provider = "deepseek"
+    spec = VoiceSpec(provider="deepseek", voice_id="stella")
+    reg = registry_for(s)
+    resolved = reg.effective(spec)
+    check("配好 key 时落到 ApiTts", resolved.provider.id, "deepseek")
+    check("实例就是 ApiTts", type(reg.open(spec)).__name__, "ApiTts")
+    check("说明里带音色", "stella" in resolved.settings.api.tts_voice, True,
+          resolved.settings.api.tts_voice)
     s.api.tts_enabled = False
-    check("关掉 API TTS 就回 Piper", resolve_backend(s)[0], PiperTts)
+    reg2 = registry_for(s)
+    check("关掉 API TTS → 降级链退到 Piper",
+          reg2.open(spec).__class__.__name__, "PiperTts")
 
 
 def test_pipeline(tmp: Path) -> None:
@@ -202,11 +209,12 @@ def test_pipeline(tmp: Path) -> None:
     personas.mkdir(parents=True)
     (personas / "fish.json").write_text(json.dumps({
         "id": "fish", "name": "海鱼", "wake_words": ["海鱼"], "engine": "api",
-        "backend": "api", "tts_voice": "tide", "voice": "zh_CN-huayan-medium",
+        "tts": {"provider": "deepseek", "voice_id": "tide",
+                "fallback": ["piper:zh_CN-huayan-medium"]},
     }, ensure_ascii=False), encoding="utf-8")
     (personas / "local.json").write_text(json.dumps({
         "id": "local", "name": "本地", "wake_words": ["本地"],
-        "backend": "piper", "voice": "zh_CN-huayan-medium",
+        "tts": {"provider": "piper", "voice_id": "zh_CN-huayan-medium"},
     }, ensure_ascii=False), encoding="utf-8")
     (tmp / "characters.json").write_text(json.dumps({
         "default": "local",
@@ -238,12 +246,14 @@ def test_pipeline(tmp: Path) -> None:
     loop = VoiceLoop(s, enable_listening=False, lazy_whisper=True)
     try:
         loop._apply_character(loop.persona.get("fish"), "测试")   # noqa: SLF001
-        check("角色把后端切到 api", settings_backend(loop), "api")
-        check("角色音色覆盖为 tide", loop.settings.api.tts_voice, "tide")
+        check("角色把后端切到 deepseek", loop.tts.provider_id, "deepseek")
+        check("角色音色覆盖为 tide（只在副本里）", loop.settings.api.tts_voice, "stella")
+        check("★全局配置没被改，但这一轮真的用 tide★",
+              loop.tts.spec.voice_id, "tide")
         check("横幅说的是官方 TTS", "DeepSeek TTS" in loop._tts_label(),
               detail=loop._tts_label())  # noqa: SLF001
         loop._apply_character(loop.persona.get("local"), "测试")  # noqa: SLF001
-        check("本地角色切回 piper", settings_backend(loop), "piper")
+        check("本地角色切回 piper", loop.tts.provider_id, "piper")
 
         # key 没了 → 同一个 API 角色也不能把嘴弄哑
         loop.settings.api.api_key_file = str(tmp / "no-key.txt")
@@ -254,7 +264,18 @@ def test_pipeline(tmp: Path) -> None:
 
 
 def settings_backend(loop) -> str:
-    return str(loop.settings.tts.backend or "").lower()
+    """这一轮**实际会出声**的后端：按降级链挑第一个可用的（不看全局配置）。"""
+    reg = getattr(loop.tts, "registry", None)
+    spec = getattr(loop.tts, "spec", None)
+    if reg is None or spec is None:
+        return str(getattr(loop.tts, "name", "") or "").lower()
+    for candidate in reg.chain(spec):
+        provider = reg.get(candidate.provider)
+        if provider is None:
+            continue
+        if reg._ready(provider)[0]:              # noqa: SLF001 - 自测里用内部判定
+            return provider.id
+    return ""
 
 
 # --------------------------------------------------------------------------- #

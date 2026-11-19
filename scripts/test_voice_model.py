@@ -56,9 +56,7 @@ with tempfile.TemporaryDirectory() as tmp:
                 "id": "amestris",
                 "name": "测试角色",
                 "wake_words": ["测试"],
-                "voice_ref": "data/personas/amestris/ref.wav",
-                "voice_ref_text": "这是一句参考文本。",
-                "voice_model": "models/tts/zipvoice/personas/amestris",
+                "tts": {"provider": "zipvoice", "ref_audio": "data/personas/amestris/ref.wav", "ref_text": "这是一句参考文本。", "model": "models/tts/zipvoice/personas/amestris"},
                 "voice_dir": "somewhere/audio",
             },
             ensure_ascii=False,
@@ -161,22 +159,17 @@ with tempfile.TemporaryDirectory() as tmp:
             fn(_Engine())
 
     settings = load_settings()
-    settings.tts.backend = "zipvoice"
-    settings.tts.clone_dir = "BASE_MODEL"
-    settings.tts.clone_audio = "BASE_REF.wav"
+    settings.tts.provider = "zipvoice"
+    base_dir = str(settings.tts.clone_dir)
 
-    from voice_loop.pipeline import VoiceLoop
+    from voice_loop.persona import voice_spec_for
+    from voice_loop.tts import registry_for
 
-    loop = object.__new__(VoiceLoop)
-    loop.settings = settings
-    import logging
+    registry = registry_for(settings)
 
-    loop.log = logging.getLogger("voice_loop.test")
-    loop._base_voice = ""
-    loop._base_clone_dir = "BASE_MODEL"
-    loop._base_clone_audio = "BASE_REF.wav"
-    loop._base_clone_text = ""
-    loop.tts = FakeTts()
+    def effective(char):
+        """这个角色最终会拿到哪一份 tts 配置（= 引擎真正读到的）。"""
+        return registry.effective(voice_spec_for(char)).settings.tts
 
     # 造两个角色的模型目录：一个完整、一个缺文件
     with tempfile.TemporaryDirectory() as tmp3:
@@ -192,36 +185,34 @@ with tempfile.TemporaryDirectory() as tmp:
         ref = root / "ref.wav"
         make_wav(ref, 3.0)
 
-        tuned = Character(
-            id="tuned", name="配好模型的", voice_model=str(good), voice_ref=str(ref), voice_ref_text="参考"
-        )
-        broken = Character(id="broken", name="模型不全的", voice_model=str(bad), voice_ref=str(ref))
+        tuned = Character(id="tuned", name="配好模型的",
+                          tts={"provider": "zipvoice", "model": str(good),
+                               "ref_audio": str(ref), "ref_text": "参考"})
+        broken = Character(id="broken", name="模型不全的",
+                           tts={"provider": "zipvoice", "model": str(bad),
+                                "ref_audio": str(ref)})
         plain = Character(id="plain", name="没配模型的")
 
-        loop._apply_reference(tuned, "测试")
-        check("配了模型 → clone_dir 换成角色目录", settings.tts.clone_dir == str(good), settings.tts.clone_dir)
-        check("配了模型 → 卸载了引擎（下次用新模型加载）", loop.tts.unloaded == 1, str(loop.tts.unloaded))
-        check("参考音频也换了", settings.tts.clone_audio == str(ref), settings.tts.clone_audio)
+        got = effective(tuned)
+        check("配了模型 → clone_dir 换成角色目录", got.clone_dir == str(good), got.clone_dir)
+        check("参考音频也换了", got.clone_audio == str(ref), got.clone_audio)
+        check("★全局配置没被改★", settings.tts.clone_dir, base_dir)
 
-        loop._apply_reference(plain, "测试")
-        check("角色没配模型 → 切回默认模型", settings.tts.clone_dir == "BASE_MODEL", settings.tts.clone_dir)
-        check("模型换了就再卸载一次", loop.tts.unloaded == 2, str(loop.tts.unloaded))
+        got = effective(plain)
+        check("角色没配模型 → 还是默认模型", got.clone_dir, base_dir)
 
-        unloads_before = loop.tts.unloaded
-        loop._apply_reference(broken, "测试")
-        check("模型目录不全 → 不切（继续用默认）", settings.tts.clone_dir == "BASE_MODEL", settings.tts.clone_dir)
-        check("模型目录不全 → 不卸载", loop.tts.unloaded == unloads_before, str(loop.tts.unloaded))
+        got = effective(broken)
+        check("★模型目录不全 → 不切（继续用默认）★", got.clone_dir, base_dir)
 
-        # 只换参考音频（模型目录相同）时不该触发重载
-        before = loop.tts.unloaded
+        # 只换参考音频：spec 变了（下一次出声会按新 spec 重建），但全局配置不变
         other_ref = root / "ref2.wav"
         make_wav(other_ref, 3.0)
-        loop._apply_reference(
-            Character(id="r2", name="只换参考", voice_ref=str(other_ref), voice_ref_text=""), "测试"
-        )
-        check("只换参考音频 → 不重载", loop.tts.unloaded == before, str(loop.tts.unloaded))
-        check("只换参考音频 → 当场生效（configure）", loop.tts.reference_calls[-1][0] == str(other_ref))
-        check("默认模型没被弄坏", settings.tts.clone_dir == "BASE_MODEL")
+        r2 = Character(id="r2", name="只换参考",
+                       tts={"provider": "zipvoice", "ref_audio": str(other_ref)})
+        check("换参考 → spec 跟着变",
+              Path(effective(r2).clone_audio).name, "ref2.wav")
+        check("换参考 → 全局还是原来的",
+              Path(settings.tts.clone_audio).name != "ref2.wav", True)
 
 print()
 if _failures:

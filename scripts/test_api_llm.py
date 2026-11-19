@@ -82,7 +82,7 @@ def test_character_fields() -> None:
         "id": "fish", "name": "鱼", "engine": "API",
         "api_model": "deepseek-reasoner", "api_base": "https://x.test/v1",
         "api_key": "env:MY_KEY", "api_tools": ["memory", " web_search "],
-        "backend": "api", "tts_voice": "Stella",
+        "tts": {"provider": "api", "voice_id": "stella"},
     }
     char = Character.from_dict(raw)
     check("engine 小写归一", char.engine, "api")
@@ -90,7 +90,7 @@ def test_character_fields() -> None:
     check("api_base 进来了", char.api_base, "https://x.test/v1")
     check("api_key 进来了", char.api_key, "env:MY_KEY")
     check("api_tools 去空白", char.api_tools, ["memory", "web_search"])
-    check("tts_voice 小写归一", char.tts_voice, "stella")
+    check("voice_id 读进来了（不再强制小写：edge 的音色带大小写）", char.tts_voice, "stella")
     again = Character.from_dict(char.to_dict())
     check("to_dict → from_dict 不丢字段",
           (again.engine, again.api_model, again.api_base, again.api_key, again.api_tools,
@@ -309,12 +309,12 @@ def test_shipped_characters() -> None:
         return
     check("它是 API 角色", fish.engine, "api")
     check("模型是 deepseek-chat", fish.api_model, "deepseek-chat")
-    check("TTS 也走官方 API", (fish.backend, fish.tts_voice), ("api", "stella"))
+    check("TTS 也走官方 API", (fish.backend, fish.tts_voice), ("deepseek", "stella"))
     check("额外开放了 harness 工具", {"web", "files"} <= set(fish.api_tools),
           detail=str(fish.api_tools))
     check("退路是出厂 Piper（不碰克隆素材）",
-          (fish.voice, fish.voice_ref, fish.voice_model),
-          ("zh_CN-huayan-medium", "", ""))
+          (fish.voice_ref, fish.voice_model, (fish.tts or {}).get("fallback")),
+          ("", "", ["piper:zh_CN-huayan-medium"]))
     check("没有把密钥写进文件", bool((fish.api_key or "").strip()), False)
 
 

@@ -226,9 +226,16 @@ sync_timeout = 120            # 单条 git 命令超时（秒）；没凭据会�
 #   "piper"    = 低延迟固定音色（首段 0.13s），想要「反应快」时改回去
 # 两个都不会哑：克隆模型没装全 / 参考音频不可用时自动退回 Piper 出声。
 [tts]
-backend = "zipvoice"          # ★角色可以用自己的 backend 覆盖它★（见人格文件的 backend 字段）：
-                              #   默认角色「白泽」是原创助手，固定 piper（用公开的出厂声线，
-                              #   跟任何参考音频/克隆素材无关）；没写 backend 的角色就跟着这一行。
+# ★provider = 用哪个 TTS 后端★（可选：piper / zipvoice / deepseek / edge / http，或自己加的后端）
+#   ★加一个新模型/服务不用改代码★：在 voice_loop/tts/providers/ 放一个文件，这里选它的 id。
+#   角色可以覆盖它（人格文件里的 "tts": {"provider": "..."}）；没写的角色就跟着这一行。
+#   默认角色「白泽」是原创助手，固定 piper（用公开的出厂声线，跟任何克隆素材无关）。
+provider = "zipvoice"
+# ★降级链★：这里的后端缺模型/缺 key 时依次往下试；★末尾永远还有 piper★（不会哑）
+fallback = ["piper"]
+# 同时最多留几个引擎实例（克隆模型几百 MB；1 = 换角色就卸掉上一个）
+max_loaded = 1
+
 voice = "zh_CN-huayan-medium"                 # piper 后端用的声线（中文女声）
 model = "models/tts/piper/zh_CN-huayan-medium.onnx"
 config = "models/tts/piper/zh_CN-huayan-medium.onnx.json"
@@ -362,6 +369,42 @@ pitch_guard_tries = 2        # 最多采几遍（含第一遍）；2 = 最坏情
 # 代价：多一次本地 ASR（RTF 0.014，6 秒音频几十毫秒），只有重采才多花合成时间。
 # ★它不万能★：ASR 自己会把小的丢字「脑补」回来（会漏报，很少误报）。
 text_guard_min = 0.99        # 相似度低于它就重采（0 = 关）
+
+# ── 各后端的私有参数（★加后端从这里配，不用改 settings.py / pipeline★）──────────
+# 优先级（低 → 高）：上面这些公用默认值 → 这里的块 → 人格文件里的 "tts.params"
+# 只写要覆盖的键即可；不认识的键会在日志里说一句然后忽略（不再静默吞掉）。
+
+[tts.providers.piper]
+# 出厂声线；空 = 用上面的 voice/model/config
+voice = "zh_CN-huayan-medium"
+length_scale = 1.0
+
+[tts.providers.zipvoice]
+# 克隆：模型目录 + 参考音频。角色卡里的 "tts".model / ref_audio 会覆盖这里。
+clone_dir = "models/tts/zipvoice/sherpa-onnx-zipvoice-distill-int8-zh-en-emilia"
+clone_steps = 4
+clone_precision = "int8"
+
+[tts.providers.deepseek]
+# 官方只有 stella / tide；key 在 [api] 里配。角色卡里 "tts".voice_id 会覆盖这里。
+voice_id = "stella"
+# 云端这一段彻底失败时用哪把本地声线兜底（角色卡里的 tts.fallback 优先）
+fallback_voice = "zh_CN-huayan-medium"
+
+[tts.providers.edge]
+# 免费、不用 key；完整音色表：edge-tts --list-voices
+voice_id = "zh-CN-XiaoxiaoNeural"
+rate = "+0%"
+volume = "+0%"
+pitch = "+0Hz"
+
+[tts.providers.http]
+# 通用 HTTP TTS：「给个 API 就能接」。取消注释并填好就能用（provider = "http"）：
+# url = "https://api.example.com/v1/audio/speech"
+# headers = { Authorization = "Bearer {key}", Content-Type = "application/json" }
+# body = '{"input": "{text}", "voice": "{voice}", "response_format": "mp3"}'
+# audio_format = "mp3"
+# key_env = "EXAMPLE_TTS_KEY"        # ★密钥只放环境变量，别写进仓库★
 
 # ── 唤醒词 / 常驻服务 ───────────────────────────────────────────────────────
 [wake]

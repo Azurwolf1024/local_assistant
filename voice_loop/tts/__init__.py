@@ -1,81 +1,65 @@
-"""语音合成引擎集合。
+"""TTS 层对外只留一个入口：:func:`create_tts`。
 
-- ``piper``    ：低延迟固定音色（RTF ~0.04、首段 0.13s）
-- ``zipvoice`` ：零样本音色克隆（sherpa-onnx / CPU，RTF ~1.1~1.4），用参考音频把角色音色搬到中文上
-- ``api``      ：DeepSeek 官方 TTS（云端，24 kHz PCM；需要 [api] 里配好 key）
+以前这里有 ``BACKENDS = ("piper", "zipvoice", "api")`` 和一大串 ``if backend == ...``。
+现在那些都变成了数据（见 :mod:`voice_loop.tts.spec` / :mod:`voice_loop.tts.registry`）：
 
-三者接口一样，改 ``[tts] backend`` 就能切换。
-**无论选哪个都不会哑**：克隆模型没装全、参考音频不可用、API 没配好/调用失败时，
-都会自动退回 Piper 出声。
+    voice_loop/tts/providers/
+      piper.py     zipvoice.py     deepseek.py     edge.py     http.py
+                                    ↑ 加后端 = 在这里加一个文件
+
+对外仍然导出老名字（``PiperTts`` / ``ZipVoiceTts`` / ``ApiTts`` / ``LazyTts`` / ``BACKENDS``），
+因为脚本和自测一直在用；但它们只是转发，真正的选择逻辑已经不在这个文件里了。
 """
 
-import sys
+from __future__ import annotations
 
 from .api_tts import ApiTts, api_tts_ready, voice_of
 from .base import TtsEngine
 from .lazy import LazyTts
 from .piper_tts import PiperTts
+from .registry import TtsRegistry
+from .session import VoiceShell
+from .spec import (
+    CAP_CLONE, CAP_CLOUD, CAP_SPEED, CAP_STREAM, CAP_STYLE, CAP_VOICE_ID,
+    FieldSpec, ProviderSpec, TtsConfigError, VoiceSpec,
+)
 from .zipvoice_tts import ZipVoiceTts, missing_files
 
-__all__ = ["TtsEngine", "PiperTts", "ZipVoiceTts", "ApiTts", "LazyTts", "create_tts",
-           "resolve_backend", "missing_files"]
+__all__ = [
+    "BACKENDS", "CAP_CLONE", "CAP_CLOUD", "CAP_SPEED", "CAP_STREAM", "CAP_STYLE",
+    "CAP_VOICE_ID", "ApiTts", "FieldSpec", "LazyTts", "PiperTts", "ProviderSpec",
+    "TtsConfigError", "TtsEngine", "TtsRegistry", "VoiceShell", "VoiceSpec",
+    "ZipVoiceTts", "api_tts_ready", "create_tts", "missing_files", "registry_for",
+    "voice_of",
+]
 
-BACKENDS = ("piper", "zipvoice", "api")
+#: 兼容用：真正有哪些后端以注册表为准（`TtsRegistry.ids()`）
+BACKENDS = ("piper", "zipvoice", "deepseek", "edge", "http")
 ZIPVOICE_HINT = "python scripts/download_models.py --only zipvoice"
 
 
-def resolve_backend(settings) -> tuple[type, str]:
-    """按当前 settings 决定「用哪一类引擎」+ 一句说明。
+def registry_for(settings, logger=None) -> TtsRegistry:
+    """扫一遍 `providers/` 建注册表（结果不缓存：设置可能被换掉）。"""
+    registry = TtsRegistry(settings, logger)
+    registry.discover()
+    return registry
 
-    ★每次**加载**时都重新算一遍★，而不是在 `create_tts` 那一刻定死：
-    `[tts] backend` 会被**角色**临时覆盖（`Character.backend` —— 原创默认助手「白泽」
-    固定用出厂 Piper，凯尔希她们继续用克隆），切角色时只要改 settings + `unload()`，
-    下一次出声就按新后端重建引擎。要是把类定死，按角色切后端就得重建整个 TTS 外壳，
-    而外壳上挂着「文本保真守卫」这类补丁（pipeline 用 `on_load` 挂的），很容易漏。
+
+def create_tts(settings, logger=None, lazy: bool = True,
+               spec: VoiceSpec | str | dict | None = None) -> TtsEngine:
+    """按配置创建 TTS。
+
+    ``spec``：这次要用的声音（空 = 跟着 `[tts] provider`）。
+    管线拿到角色后再调 ``shell.use(角色的 spec)``，不需要重建整个 TTS。
+    ``lazy=True``（默认）返回按需加载的外壳：待唤醒状态完全不占内存。
     """
-    backend = (settings.tts.backend or "piper").strip().lower()
-    if backend == "zipvoice":
-        missing = missing_files(settings)
-        if missing:  # 模型没装全就退回 Piper：宁可音色不对，也不能把嘴弄哑
-            print(
-                f"[tts] ZipVoice 模型没装全（缺 {missing[0]}），先用 Piper 出声。\n"
-                f"      想用克隆音色就执行：{ZIPVOICE_HINT}",
-                file=sys.stderr,
-                flush=True,
-            )
-            backend = "piper"
-    if backend == "api":
-        ok, why = api_tts_ready(settings)
-        if not ok:
-            print(f"[tts] 官方 TTS 用不了（{why}），先用 Piper 出声。", file=sys.stderr,
-                  flush=True)
-            backend = "piper"
-
-    if backend == "piper":
-        return PiperTts, f"piper / {settings.tts.voice}"
-    if backend == "zipvoice":
-        ref = str(getattr(settings.tts, "clone_audio", "") or "").strip()
-        return ZipVoiceTts, f"zipvoice / 参考 {ref or '（未设）'}"
-    if backend == "api":
-        return ApiTts, f"DeepSeek TTS / {voice_of(settings.api)}"
-    raise ValueError(f"暂不支持 TTS 后端：{backend}（可选：{'、'.join(BACKENDS)}）")
-
-
-def create_tts(settings, logger=None, lazy: bool = True) -> TtsEngine:
-    """按配置创建 TTS 引擎。
-
-    ``lazy=True``（默认）返回按需加载的封装：待唤醒状态完全不占内存，
-    被唤醒时才加载，睡回去时释放（克隆模型 156 MB，这一条很重要）。
-    """
-    engine_cls, desc = resolve_backend(settings)
-    if lazy:
-        # 工厂里**再算一次**：运行期换 [tts] backend（按角色切后端）只要 unload 就够了
-        engine: TtsEngine = LazyTts(
-            settings, lambda s: resolve_backend(s)[0](s), logger,
-            name=(settings.tts.backend or "piper").strip().lower(),
-        )
-    else:
-        engine = engine_cls(settings)
-    if logger:
-        logger.info(f"TTS: {desc}" + ("（按需加载）" if lazy else ""))
-    return engine
+    registry = registry_for(settings, logger)
+    if not registry.providers:
+        raise TtsConfigError("没有发现任何 TTS 后端（voice_loop/tts/providers/ 是空的？）")
+    parsed = VoiceSpec.parse(spec)
+    # ★永远返回外壳★（lazy 只决定「要不要马上加载」）：外壳才是能换声线的那一层，
+    # 早加载 / 晚加载只是内存策略，不该让调用方分成两种用法。
+    shell = VoiceShell(settings, registry, parsed, logger)
+    if not lazy:
+        shell.load()
+    return shell

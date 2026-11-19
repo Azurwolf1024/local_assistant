@@ -41,6 +41,17 @@ def register(app, ctx) -> None:
     from .. import persona_card as card  # noqa: PLC0415
     from . import voices as voice_routes   # noqa: PLC0415
 
+    def _tts_providers(settings_or_ctx) -> list[dict]:
+        """声音后端清单（能力 / 参数表 / 可选音色 / 现在能不能用）。"""
+        settings = getattr(settings_or_ctx, "settings", settings_or_ctx)
+        try:
+            from ...tts import registry_for  # noqa: PLC0415
+
+            return registry_for(settings).describe()
+        except Exception as exc:  # noqa: BLE001 - 列不出来不该让表单打不开
+            return [{"id": "", "label": f"（读不到后端清单：{exc}）", "fields": [],
+                     "voices": [], "capabilities": [], "ready": False, "why": str(exc)}]
+
     def plan_dict(plan) -> dict:  # noqa: ANN001 - persona_import.CharPlan
         """把扫描计划变成前端好渲染的结构（路径都相对项目根）。"""
         return {
@@ -78,12 +89,15 @@ def register(app, ctx) -> None:
         if example_char is None:
             example_char = registry.get(str(ctx.settings.persona.default or "")) or registry.default()
         return {
-            "groups": card.groups(),
+            "groups": card.groups(_tts_providers(ctx)),
             "example": card.example(example_char),
             "ids": card.existing_ids(ctx.settings),
             "personas_dir": card.rel(ctx.settings, card.persona_path(ctx.settings, "x").parent),
             "index": card.rel(ctx.settings, card.index_path(ctx.settings)),
             "tool_presets": tool_presets.describe(),
+            # ★声音后端是数据★：控制台的「声音后端」下拉、可选音色都从注册表来，
+            # 加一个后端不需要改前端，也不会再出现「下拉里没有新值」那种事故。
+            "tts_providers": _tts_providers(ctx),
         }
 
     @app.post("/api/persona/preview")

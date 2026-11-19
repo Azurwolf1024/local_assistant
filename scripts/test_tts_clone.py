@@ -53,32 +53,30 @@ def check_true(cond, label: str) -> None:
 # --------------------------------------------------------------------------- #
 def test_backend_dispatch(settings) -> None:
     print("\n[1] 后端分发")
-    try:
-        settings.tts.backend = "no-such-backend"
-        create_tts(settings, lazy=False)
-        check("没报错", "应该报错", "未知 backend 必须报错")
-    except ValueError as exc:
-        check_true("no-such-backend" in str(exc), f"未知 backend 报错清晰（{exc}）")
-    finally:
-        settings.tts.backend = "piper"
+    # ★变量：写错后端名不再抛异常★ —— 降级链会退到默认后端（piper），
+    # 因为「宁可声音不对，也不能把人弄哑」是全局不变量。
+    settings.tts.provider = "no-such-backend"
+    fallback = create_tts(settings, lazy=False)
+    check(fallback.name, "piper", "未知 provider → 自动退回 piper（不报错、不哑）")
+    settings.tts.provider = "piper"
 
     engine = create_tts(settings, lazy=True)
     check_true(hasattr(engine, "unload"), "懒加载壳有 unload()")
     check_true(hasattr(engine, "configure"), "懒加载壳有 configure()")
+    check_true(hasattr(engine, "use"), "外壳能换声线（use）")
     check(engine.loaded, False, "刚创建时没有加载模型")
-
 
     print("    · 克隆模型没装全时不能把嘴弄哑")
     real_dir = settings.tts.clone_dir
     try:
-        settings.tts.backend = "zipvoice"
+        settings.tts.provider = "zipvoice"
         settings.tts.clone_dir = "models/tts/zipvoice/不存在的模型目录"
         check(len(missing_files(settings)) > 0, True, "缺文件能报出来（给下载脚本提示用）")
         fallback = create_tts(settings, lazy=False)
         check(fallback.name, "piper", "模型没装全 → 自动退回 Piper 出声（不报错、不哑）")
     finally:
         settings.tts.clone_dir = real_dir
-        settings.tts.backend = "piper"
+        settings.tts.provider = "piper"
     check(missing_files(settings), [], "模型真装好了（缺文件列表为空）")
 
 
@@ -161,13 +159,15 @@ def test_reference_text(settings) -> None:
 
 
 def test_persona_fields(settings) -> None:
-    print("\n[4] 角色字段")
+    print("\n[4] 角色字段（新结构：一份 tts）")
     char = Character.from_dict(
-        {"id": "t", "name": "T", "voice_ref": "a/b.wav", "voice_ref_text": "x"}
+        {"id": "t", "name": "T",
+         "tts": {"provider": "zipvoice", "ref_audio": "a/b.wav", "ref_text": "x"}}
     )
-    check(char.voice_ref, "a/b.wav", "voice_ref 读得进")
-    check(char.voice_ref_text, "x", "voice_ref_text 读得进")
-    check_true("voice_ref" in char.to_dict(), "voice_ref 会写回 json")
+    check(char.voice_ref, "a/b.wav", "ref_audio 读得进")
+    check(char.voice_ref_text, "x", "ref_text 读得进")
+    check_true("tts" in char.to_dict(), "会写回 tts 结构")
+    check(char.backend, "zipvoice", "provider 读得进")
 
     from voice_loop.persona import CharacterRegistry
 

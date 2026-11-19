@@ -205,7 +205,23 @@ class VisionConfig:
 
 @dataclass
 class TtsConfig:
-    backend: str = "piper"
+    # ★provider = 用哪个 TTS 后端★（`voice_loop/tts/providers/` 里注册的那些 id）
+    #
+    #   provider = "piper" | "zipvoice" | "deepseek" | "edge" | "http" | 自己加的任何 id
+    #
+    # 以前这一栏叫 `backend`，而且三个后端是写死在代码里的；现在后端是**数据**：
+    # 加一个后端 = 在 `voice_loop/tts/providers/` 放一个文件，这里只是选 id。
+    # `backend` 这个名字还留着（只读别名），免得一堆脚本/自测当场炸掉。
+    provider: str = "piper"
+    # ★降级链★：provider 缺模型/缺 key 时依次试这些（id 或 "id:音色"）；末尾永远还有 piper
+    fallback: list[str] = field(default_factory=lambda: ["piper"])
+    # 同时最多留几个引擎实例（克隆模型几百 MB，默认 1 = 换角色就卸掉上一个）
+    max_loaded: int = 1
+    # ★各后端的私有参数★：{ "zipvoice": {...}, "edge": {...}, "http": {...} }
+    # 这些键不再需要进 dataclass（以前加后端必须改这里，还会被 `_build` 的白名单吞掉）
+    providers: dict[str, dict] = field(default_factory=dict)
+
+    # 下面这些是「所有后端公用」的默认值；某个后端要覆盖就在 [tts.providers.<id>] 里写
     voice: str = "zh_CN-huayan-medium"
     model: str = "models/tts/piper/zh_CN-huayan-medium.onnx"
     config: str = "models/tts/piper/zh_CN-huayan-medium.onnx.json"
@@ -309,6 +325,16 @@ class TtsConfig:
     #   所以先默认关，要的人自己开（开了没标签也不会出错，只是按默认语气说）。
     style_from_llm: bool = False      # true = 允许 LLM 用 <style=键> 指定语气（需角色写了 voice_refs）
     style_default: str = ""           # 启动时的默认风格键（空 = 用 voice_ref 那一档）
+
+    # ---------------------------------------------------------------- 兼容别名
+    @property
+    def backend(self) -> str:
+        """老名字（= provider）。脚本/自测里还有 `settings.tts.backend = "zipvoice"`。"""
+        return self.provider
+
+    @backend.setter
+    def backend(self, value: str) -> None:
+        self.provider = str(value or "").strip().lower()
 
 
 @dataclass

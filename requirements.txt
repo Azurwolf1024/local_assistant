@@ -26,6 +26,11 @@ piper-tts>=1.3            # 自带 espeak-ng-data，无需另外安装
 # 它把日语转成罗马字，因为 ZipVoice 的文本前端只认中文/英文（见 README 第 14 节）。
 pykakasi>=2.2             # 纯 Python，无需编译
 
+# ── TTS: Edge 在线朗读（可选，provider = "edge"）────────────
+# 免费、不用 key；装了才能在角色卡里选 edge 音色（没装只影响这一个后端）。
+# 文本会发到微软的朗读服务，见 README 第 14 节「声音（TTS）」。
+edge-tts>=7.0
+
 # ── 看图（摄像头 / 屏幕截图 / 读文件）────────────────────────
 pillow>=11.0              # 截屏 (ImageGrab)、裁剪降采样
 opencv-python>=4.10       # 摄像头取帧（不装就只有截屏，摄像头那句会提示装它）

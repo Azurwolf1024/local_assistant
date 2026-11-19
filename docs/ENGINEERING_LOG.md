@@ -94,6 +94,13 @@
     + 60.2 两个方向两套语义：本地→云端镜像（忘掉就是忘掉）、云端→本地合并（换机器不丢本地的）
     + 60.3 三道闸门：公开仓库拒推、本地空目录拒绝同步、git 全程不交互
     + 60.4 顺带修掉：`[memory]` 整段配置**从来没被读过**（`Settings(...)` 漏了这一行）
+  - **61. TTS 解耦**：加一个语音模型/云端 API = **加一个文件**（★按能力协商，不认后端名字★）
+    + 61.1 旧结构的四个病灶：名字分支 / 改全局配置 / 59 个平铺字段 / 控制台硬编码下拉
+    + 61.2 两层数据：`VoiceSpec`（角色卡里的「谁的声音」）+ `ProviderSpec`（后端自述能力与参数）
+    + 61.3 每个 spec 一份**配置副本**：两个角色可以同时持有不同后端，切角色不再改全局
+    + 61.4 降级链与 `cloud` 能力：末尾永远是 piper；「本地角色不联网」变成可断言的不变量
+    + 61.5 验收：`edge`（免费在线）+ `http`（纯 config，本地假服务器跑通）只加文件
+    + 61.6 一次性迁移：`scripts/migrate_tts_format.py`（旧 8 个字段 → 一份 `tts`）
 
 
 ---
@@ -4859,3 +4866,90 @@ manifest.json                  上次同步的清单：角色 / 条数 / 设备 
 | 防手滑 | 第 [5b] 节：本地空目录 → 拒绝同步且云端一条没少；云端独有角色不会凭空在本地造 | 全过 |
 | 真机 | `python main.py memsync` 推了 6 个角色；再跑一次 → 「云端没有变化，不提交」 | 通过 |
 | 回归 | 12 个测试脚本（含 test_memory / test_memory_mcp / test_persona_card / test_offline） | 全 EXIT=0 |
+
+---
+## 61. TTS 解耦：加一个语音模型/云端 API = 加一个文件（2026-11-19）
+
+### 61.1 旧结构的四个病灶
+
+`TtsEngine.synth(text) -> Iterator[(rate, pcm)]` 这个契约一直是对的，问题全在它外面那圈
+「选谁、用哪把嗓子」：
+
+| 病灶 | 具体长相 | 加一个后端要改几处 |
+| --- | --- | --- |
+| 按**名字**分支 | `BACKENDS = ("piper","zipvoice","api")` + `resolve_backend()` 的 if/elif；`pipeline._apply_voice` 里三个 `_apply_*_voice` | 4 处（tts/__init__ / pipeline / settings / 控制台） |
+| 换嗓子 = **改全局配置** | `_apply_reference` / `_apply_api_voice` 往 `settings.tts.voice / clone_audio / settings.api.tts_voice` 里写，再 `unload()` 等下次重建 | 顺带副作用：两个角色没法同时持有不同后端；正确性依赖 `on_load` 补丁的时序 |
+| 配置**平铺 59 个字段** | `TtsConfig` 里 piper 的、zipvoice 的、后处理的混在一起；`_build` 是白名单，新键会被静默吞掉 | 加后端就得动 dataclass |
+| 控制台**硬编码下拉** | `options: ["", "piper", "zipvoice", "api"]` | 漏了就是 §59 那次事故（值不在选项里 → 浏览器退回空 → 「她换了嗓子」） |
+
+### 61.2 两层数据（这次新增的核心）
+
+```python
+VoiceSpec      # 「谁的声音」——角色卡里存的就是它
+  provider / voice_id / model / ref_audio / ref_text / params / fallback / note
+ProviderSpec   # 「一个后端怎么接」——每个 providers/*.py 交出一份
+  id / label / capabilities / fields / defaults / ready() / create() / apply() / voices()
+```
+
+- `capabilities` 是**能力**不是名字：`clone` / `voice_id` / `speed` / `stream` / `cloud`。
+  管线从此不再写 `if backend == "zipvoice"`。
+- `fields` 是**参数表**：控制台表单、校验、默认值全从它生成（加后端不用改前端）。
+- 注册表用 `pkgutil` 扫 `voice_loop/tts/providers/`，**按需 import**：
+  扫目录时只读声明，piper / sherpa / edge-tts 都在 `create()` 里才 import。
+
+### 61.3 每个 spec 一份**配置副本**（这一步才真正解耦）
+
+`TtsRegistry.effective(spec)` 拿 `dataclasses.replace(settings.tts)` 造副本，
+按 `TtsConfig 默认 → provider.defaults → [tts.providers.<id>] → spec.params → provider.apply()`
+逐层覆盖，然后把**副本 settings** 交给引擎构造。于是：
+
+| 以前 | 现在 |
+| --- | --- |
+| 切角色 → 改全局 → `unload()` → 下次出声重建 | 切角色 → `VoiceShell.use(spec)` → 只是换一个缓存键 |
+| 同一时刻只能有一个角色的声线配置成立 | 两个角色各持一份副本，缓存里可以并存（`max_loaded` 控制内存） |
+| 「回退到全局声线」要自己存 6 个 `_base_*` 快照 | 空 spec = 跟全局，注册表天然处理 |
+
+`VoiceShell` 复用了原来的 `LazyTts`（组合，不是重写）：懒加载、`on_load` 补丁、
+`configure` 语义全部保留，所以「合成回听」的守卫在换嗓子之后仍然生效。
+
+### 61.4 降级链与 `cloud` 能力
+
+- `chain(spec)` = 自己 → `spec.fallback` → `[tts] fallback` → **piper**（去重）。
+  缺模型/缺 key 只是「换下一个」，同一句原因只提示一次；云端**中途**失败由引擎自己兜
+  （`api_tts` 的 `_fallback_engine` 现在走注入的工厂，退路可以是链上的任意后端）。
+- `cloud` 是能力位，`ProviderSpec.cloud` 由它派生。自测里有一条
+  「纯本地角色解析出来不是云端」——解耦之后「本地角色绝不联网」仍然可断言。
+
+### 61.5 验收：只加文件就能接新东西
+
+| 新增 | 加了什么 | 没改什么 |
+| --- | --- | --- |
+| `edge`（微软在线朗读，免费无 key） | `tts/edge_tts.py`（引擎）+ `providers/edge.py`（声明）+ 一段 config | pipeline / settings / 控制台 |
+| `http`（通用云端 TTS） | `tts/http_tts.py` + `providers/http.py` | 同上 —— 换厂商只改 config 的 url/headers/body |
+
+`http` 的端到端在自测里用**本地假服务器**跑通（不联网）：模板占位符替换、`{key}` 从
+环境变量取、WAV 解码、失败自动回本地。`edge` 真机合成过（24 kHz，3.4 s 文本 2.2 s 出音）。
+
+顺带落地的小件：`audio_decode.py`（wav / 裸 PCM / mp3，soundfile 1.2.2 实测能解 MP3）、
+`async_bridge.py`（同步线程里跑 edge 的异步接口，线程里已有事件循环也安全）。
+
+### 61.6 迁移与验证
+
+旧人格文件里的 `backend / voice / voice_ref / voice_ref_text / voice_refs /
+voice_model / tts_voice` **不再生效**（解析器只认 `"tts": {...}`）。
+`scripts/migrate_tts_format.py` 一次性搬过去（留 `.bak-tts`），映射规则见脚本头部表格；
+仓库里 6 个人格文件已经搬完，`config.toml` 也换成了
+`provider / fallback / max_loaded / [tts.providers.*]`。
+
+| 验的东西 | 怎么验的 | 结果 |
+| --- | --- | --- |
+| 注册表 / 能力 / 参数表 | `scripts/test_tts_registry.py` [1][2] | 全过 |
+| 副本不污染全局 | 同上 [3]：对比切换前后的 `settings.tts.*` / `settings.api.tts_voice` | 一个字节都没变 |
+| 换嗓子幂等 + 补丁还在 | 同上 [4]：同 spec 第二次 `use()` 返回 False；`on_load` 补丁打到新引擎 | 全过 |
+| 降级链 / 只提示一次 / LRU | 同上 [5][6] | 全过 |
+| 云端能力自报 | 同上 [7] | 全过 |
+| 旧字段不再生效 + 迁移脚本 | 同上 [8][9] | 全过 |
+| `http` 端到端（假服务器） | 同上 [10] | 全过 |
+| 真机合成 | `--online`：[12] piper 3.15 s、edge 3.43 s 都出了音频 | 通过 |
+| 控制台 | 重启后：声音后端下拉 = 注册表（带「可用/不可用（原因）」）、编辑大肥鱼保存 → 「内容没变」、概览页 `TTS：deepseek · stella` | 通过 |
+| 回归 | 25 个脚本（persona / persona_card / style / voice_model / precision / tts_clone / api_tts / api_llm / console / route / mcp / agent_tools / memory / offline …） | 全 EXIT=0（`test_bargein` 有一条已知 flaky：能量比阈值卡在边界，重跑即过，与本次改动无关） |

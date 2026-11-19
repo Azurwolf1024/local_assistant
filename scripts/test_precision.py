@@ -149,26 +149,25 @@ def test_missing_files() -> None:
 
 
 def test_pipeline_missing() -> None:
-    print("\n[5] 切角色时的模型完整性检查（pipeline）")
-    from voice_loop.pipeline import VoiceLoop
+    print("\n[5] 切角色时的模型完整性检查（provider 里的规则）")
+    from voice_loop.tts.providers import zipvoice as zipvoice_provider
 
     with tempfile.TemporaryDirectory() as tmp:
         base = Path(tmp)
-        loop = object.__new__(VoiceLoop)
-        loop.settings = load_settings()
+        settings = load_settings()
         for precision in ("int8", "fp32"):
             d = fake_persona_dir(base, precision)
-            check(loop._missing_voice_model(d), [], f"只有 {precision} 的目录 → 不算缺")
+            check(zipvoice_provider._missing_model(settings, d), [], f"只有 {precision} 的目录 → 不算缺")
         empty = base / "empty"
         empty.mkdir()
-        missing = loop._missing_voice_model(empty)
+        missing = zipvoice_provider._missing_model(settings, empty)
         check_true(len(missing) == 3, f"空目录 → 报缺 tokens/lexicon/espeak（得到 {len(missing)} 项）")
         half = base / "half"
         half.mkdir()
         for name in ("tokens.txt", "lexicon.txt"):
             (half / name).write_text("x", encoding="utf-8")
         (half / "espeak-ng-data").mkdir()
-        check_true(bool(loop._missing_voice_model(half)), "文件都在但没有 onnx → 算缺")
+        check_true(bool(zipvoice_provider._missing_model(settings, half)), "文件都在但没有 onnx → 算缺")
 
 
 def test_platform_names() -> None:

@@ -34,7 +34,7 @@ GOOD = {"id": "shining", "name": "临光", "title": "罗德岛干员",
         "aliases": {"临光": ["邻光"]},
         "style": ["句子短"], "rules": ["不要编造"], "avoid": ["作为一个AI"],
         "lines": [{"scene": "打招呼", "text": "在。"}],
-        "temperature": 0.5, "backend": "piper", "notes": "自测用"}
+        "temperature": 0.5, "tts_provider": "piper", "tts_voice_id": "zh_CN-huayan-medium", "notes": "自测用"}
 
 
 def check(name: str, got, want=_UNSET, detail: str = "") -> None:
@@ -111,14 +111,14 @@ def test_parse() -> None:
     check("aliases 给数组会拦（该是对象）", bool(card.parse({**GOOD, "aliases": "[1,2]"})[1]), True)
     check("温度不是数字会拦", bool(card.parse({**GOOD, "temperature": "很热"})[1]), True)
     check("温度超出范围会拦", bool(card.parse({**GOOD, "temperature": 5})[1]), True)
-    check("backend 只认三个值", bool(card.parse({**GOOD, "backend": "gpt"})[1]), True)
-    check("backend 留空是对的", card.parse({**GOOD, "backend": ""})[1], [])
+    check("声音后端写错只告警（不拦）", any("gpt" in w for w in card.parse({**GOOD, "tts_provider": "gpt"})[2]), True)
+    check("声音后端留空是对的", card.parse({**GOOD, "tts_provider": ""})[1], [])
     check("唤醒词为空只是提醒（还能手动切）",
           card.parse({**GOOD, "wake_words": []})[2][0].startswith("唤醒词为空"), True)
     check("★写了人格文件不认识的字段会提醒★（否则会被静默忽略）",
           any("不认识" in w for w in card.parse({**GOOD, "favorit_food": "胡萝卜"})[2]), True)
     check("参考音频不是 wav 会提醒",
-          any("wav" in w for w in card.parse({**GOOD, "voice_ref": "a.mp3"})[2]), True)
+          any("wav" in w for w in card.parse({**GOOD, "tts_ref_audio": "a.mp3"})[2]), True)
 
 
 def test_preview(tmp: Path) -> None:
@@ -290,16 +290,16 @@ def test_endpoints(tmp: Path) -> None:
     # ★旧前端少送一栏★（控制台进程比人格文件旧）：这一栏不能被当成「用户清空了」
     keep = tmp / "personas" / "shining.json"
     raw = json.loads(keep.read_text(encoding="utf-8"))
-    raw.update({"backend": "api", "tts_voice": "stella"})
+    raw.update({"tts": {"provider": "deepseek", "voice_id": "stella", "fallback": ["piper:zh_CN-huayan-medium"]}})
     keep.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
     part = {k: v for k, v in card.fields_of(
-        CharacterRegistry(tmp / "characters.json").get("shining")).items() if k != "tts_voice"}
+        CharacterRegistry(tmp / "characters.json").get("shining")).items() if k not in ("tts_voice_id", "tts_provider", "tts_fallback")}
     part["title"] = "改个介绍"
     upd2 = client.post("/api/persona/update", json={"fields": part, "apply": True})
     saved = json.loads(keep.read_text(encoding="utf-8"))
     check("★少送一栏的旧前端也不会把她的嗓子改掉★",
-          (upd2.status_code, saved.get("backend"), saved.get("tts_voice")),
-          (200, "api", "stella"))
+          (upd2.status_code, (saved.get("tts") or {}).get("provider"), (saved.get("tts") or {}).get("voice_id")),
+          (200, "deepseek", "stella"))
     check("导出不存在的角色 → 404", client.get("/api/persona/export", params={"cid": "无"}).status_code, 404)
     over = client.post("/api/persona/import", json={"filename": "x.json", "data": _b64("x" * 10)})
     check("不是 JSON 的文件给 200 + problems", len(over.json()["problems"]), 1)
@@ -363,21 +363,21 @@ def test_update(tmp: Path) -> None:
     #   于是一张身份卡改完，她悄悄从官方 TTS 掉回全局克隆声线。
     blue = tmp / "personas" / "shining.json"
     raw = json.loads(blue.read_text(encoding="utf-8"))
-    raw.update({"backend": "api", "tts_voice": "stella"})
+    raw.update({"tts": {"provider": "deepseek", "voice_id": "stella", "fallback": ["piper:zh_CN-huayan-medium"]}})
     blue.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
     form = card.fields_of(CharacterRegistry(tmp / "characters.json").get("shining"))
-    form.pop("tts_voice")                       # 旧控制台：这一栏压根不认识
+    form.pop("tts_voice_id")                    # 旧控制台：这一栏压根不认识
     rep = card.update(settings, form, dry_run=False, sent=set(form))
     saved = json.loads(blue.read_text(encoding="utf-8"))
-    check("★表单没送到的那一栏原样保住（不当成「清空」）★", saved.get("tts_voice"), "stella")
-    check("保住的栏不算改动", "tts_voice" in rep["changed"], False)
+    check("★表单没送到的那一栏原样保住（不当成「清空」）★", (saved.get("tts") or {}).get("voice_id"), "stella")
+    check("保住的栏不算改动", "tts_voice_id" in rep["changed"], False)
     form2 = dict(card.fields_of(CharacterRegistry(tmp / "characters.json").get("shining")))
-    form2["backend"] = ""                       # 明确清空 = 跟全局
+    form2["tts_provider"] = ""                  # 明确清空 = 跟全局
     rep2 = card.update(settings, form2, dry_run=False, sent=set(form2))
-    check("明确清空 backend 才真的删掉", "backend" in json.loads(
-        blue.read_text(encoding="utf-8")), False)
+    check("明确清空 provider 才真的删掉",
+          "provider" in (json.loads(blue.read_text(encoding="utf-8")).get("tts") or {}), False)
     check("★清掉声线类的栏会告警★（不再一声不响地换嗓子）",
-          any("backend" in w and "清空" in w for w in rep2["warnings"]), True)
+          any("tts_provider" in w and "清空" in w for w in rep2["warnings"]), True)
 
     # ★同一类坑：明确关掉的布尔值也不能被当成「空」★
     #   `to_dict()` 会把 False 一起滤掉，以前保存一次就把 knowledge_shared=false 删了，

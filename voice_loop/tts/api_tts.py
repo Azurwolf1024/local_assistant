@@ -84,13 +84,24 @@ class ApiTts:
 
     name = "deepseek-tts"
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, spec=None) -> None:
         self.settings = settings
+        self.spec = spec
         self.cfg = settings.api
         self.log = logging.getLogger("voice_loop")
         block = max(0.05, float(getattr(self.cfg, "tts_block_seconds", 0.2) or 0.2))
         self._block_samples = max(128, int(API_TTS_SAMPLE_RATE * block))
         self._fallback = None
+        self._fallback_factory = None
+
+    def set_fallback_factory(self, fn) -> None:
+        """注册表注入的退路工厂：这一句彻底失败时拿一个本地引擎（默认是 Piper）。
+
+        ★为什么由外面注入★：以前这里是 `from .piper_tts import PiperTts` 写死的，
+        等于「云端后端的退路只能是 Piper」。现在退路是**降级链上的下一个**，
+        换成 edge / 本地模型都行，引擎自己不需要知道有谁。
+        """
+        self._fallback_factory = fn
 
     # ------------------------------------------------------------------ 状态
     @property
@@ -234,6 +245,10 @@ class ApiTts:
 
     def _fallback_engine(self):
         if self._fallback is None:
+            if self._fallback_factory is not None:
+                print("[tts:api] 退回本地引擎出声", file=sys.stderr, flush=True)
+                self._fallback = self._fallback_factory()
+                return self._fallback
             from .piper_tts import PiperTts  # noqa: PLC0415 - 只有失败时才加载
 
             print("[tts:api] 退回 Piper 出声", file=sys.stderr, flush=True)

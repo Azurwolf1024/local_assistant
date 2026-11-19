@@ -49,9 +49,9 @@ from .tools import (
 )
 from .memory import MemoryHub
 from .memory.schedule import SharedSchedule
-from .tts import BACKENDS as TTS_BACKENDS, create_tts
-from .tts.zipvoice_tts import _resample
-from .tts import precision
+from .tts import create_tts
+from .tts.pacing import resample as _resample
+
 from . import ui
 from .wake import WakeSession, WakeWordMatcher, is_standby
 
@@ -150,18 +150,11 @@ class VoiceLoop:
         self.tts = create_tts(settings, self.log, lazy=self.lazy)
         # ★合成回听★：有 ASR 就把「说的是不是这句」的校验器接上去（见 textcheck.py）
         self._wire_text_guard()
-        # ★角色声线的「默认值」快照★：切角色时用角色自己的，切回来时得能回默认，
-        # 否则一个角色换过模型/声线后，另一个没配声线的角色会跟着沿用她
-        self._base_voice = str(getattr(settings.tts, "voice", "") or "")
-        # ★全局后端★：角色没写 backend 时就回到它（见 _apply_voice）
-        self._base_backend = (str(getattr(settings.tts, "backend", "") or "piper")).strip().lower()
-        self._base_clone_dir = str(getattr(settings.tts, "clone_dir", "") or "")
-        self._base_clone_audio = str(getattr(settings.tts, "clone_audio", "") or "")
-        self._base_clone_text = str(getattr(settings.tts, "clone_text", "") or "")
-        # ★API TTS 的全局音色★：角色卡没写 tts_voice 时回到它（stella/tide）
-        self._base_api_tts_voice = str(
-            getattr(getattr(settings, "api", None), "tts_voice", "") or "stella"
-        )
+        # 注：以前这里还存了 6 个「全局声线快照」（_base_voice / _base_backend /
+        # _base_clone_* / _base_api_tts_voice），用来在切角色失败时回退。
+        # 现在**不需要**了：全局值只作为注册表合成配置时的默认值（见
+        # voice_loop/tts/registry.py::effective），角色 spec 为空就是「跟全局」，
+        # 切换更不会污染全局，所以没有「回退」这回事。
         # 技能与提醒
         self.skills: Skills | None = Skills(settings, self.log) if enable_skills else None
         # 工具层（旧的进程内注册表）：MCP 宿主没就绪时当兼底，也还是不少单测的入口
@@ -908,12 +901,8 @@ class VoiceLoop:
     def _tts_label(self) -> str:
         """启动横幅用的一行说明（不加载模型，纯看配置）。"""
         cfg = self.settings.tts
-        backend = (cfg.backend or "piper").strip().lower()
-        if backend == "api":
-            api = getattr(self.settings, "api", None)
-            voice = str(getattr(api, "tts_voice", "") or "stella")
-            return f"DeepSeek TTS / {voice}（云端，失败自动回 Piper）"
-        if backend == "zipvoice":
+        provider = self._tts_provider_id()
+        if provider == "zipvoice":
             ref = str(getattr(cfg, "clone_audio", "") or "").strip()
             name = ref.replace("\\", "/").rsplit("/", 1)[-1] if ref else "未设参考音频"
             model = str(getattr(cfg, "clone_dir", "") or "").replace("\\", "/").rstrip("/")
@@ -922,121 +911,65 @@ class VoiceLoop:
                 f"zipvoice（模型 {model}，参考 {name}，"
                 f"{int(getattr(cfg, 'clone_steps', 4) or 4)} 步）"
             )
-        return f"piper / {cfg.voice}"
+        if provider == "deepseek":
+            api = getattr(self.settings, "api", None)
+            voice = str(getattr(api, "tts_voice", "") or "stella")
+            return f"DeepSeek TTS / {voice}（云端，失败自动回本地）"
+        return f"{provider} / {self._tts_voice_hint()}"
+
+    def _tts_provider_id(self) -> str:
+        provider = getattr(self.tts, "provider_id", None)
+        if isinstance(provider, str) and provider:
+            return provider
+        return (str(getattr(self.settings.tts, "provider", "") or "piper")).strip().lower()
+
+    def _tts_voice_hint(self) -> str:
+        """当前 provider 的「音色」一行字（piper 声线 / 官方音色 / 参考音频）。"""
+        options = getattr(self.tts, "registry", None)
+        spec = getattr(self.tts, "spec", None)
+        if options is not None and spec is not None:
+            try:
+                resolved = options.effective(spec)
+                cfg = resolved.settings.tts
+            except Exception:  # noqa: BLE001 - 只为了显示，失败就用全局值
+                cfg = self.settings.tts
+        else:
+            cfg = self.settings.tts
+        ref = str(getattr(cfg, "clone_audio", "") or "").strip()
+        if ref and self._tts_provider_id() == "zipvoice":
+            return ref.replace("\\", "/").rsplit("/", 1)[-1]
+        return str(getattr(cfg, "voice", "") or "")
 
     def _apply_voice(self, char: Character, reason: str = "") -> None:
-        """角色自带声线时换声线（Piper 换模型，克隆后端换模型+参考音频）。
+        """角色 → 声音描述（VoiceSpec）→ 让当前 TTS 会话换嗓子。
 
-        ★「不同角色唤醒不同声线」就在这一条路上★：唤醒词命中 → _switch_character
-        → _apply_character → _apply_voice。
+        ★这一版最本质的变化★：这里**不再改 `settings.tts`**。
+        以前切角色 = 往全局配置里写 voice/model/clone_audio，再 unload 等下次重建，
+        所以「两个角色各用不同后端」根本不可能同时成立（还要靠 on_load 补丁的时序兜）。
+        现在角色的 spec 交给注册表，它按 spec 合成**一份配置副本**，
+        全局那份只表示「默认值」—— 谁的切换都不会污染别人。
 
-        Piper 的声线绑在 onnx 模型上，换就必须卸载重载；ZipVoice 多了个「模型目录」
-        维度（微调过的角色用自己那份），同样要卸载重载；只换参考音频则当场生效。
-        声线/模型/参考不存在就只警告、继续用当前的——**绝不能因为换声线把嘴弄哑了**。
+        换声音失败（人格文件写错）只记日志继续用当前的：嗓子可以不对，不能哑。
         """
-        # ★先定后端，再定声线★：角色可以指定自己的后端（Character.backend）。
-        # 默认角色「白泽」是原创助手，固定 backend=piper —— 用**公开的出厂声线**，
-        # 不跟着全局的克隆后端去用某条参考音频（那是别人的配音素材）。
-        # 空 = 跟 config.toml 的 [tts] backend（也就是原来的行为）。
-        want_backend = (getattr(char, "backend", "") or "").strip().lower() or self._base_backend
-        cur_backend = (str(getattr(self.settings.tts, "backend", "") or "piper")).strip().lower()
-        if want_backend == "api":
-            from .tts.api_tts import api_tts_ready  # noqa: PLC0415
+        from .persona import voice_spec_for  # noqa: PLC0415 - 避免顶层循环导入
 
-            ok, why = api_tts_ready(self.settings)
-            if not ok:
-                # ★API TTS 没配好不能把嘴弄哑★：退回 Piper（用这个角色自己的 piper 声线）
-                self.log.warning(f"角色 {char.name} 想用官方 TTS，但用不了（{why}），改用 Piper")
-                print(f"[角色] 官方 TTS 用不了（{why}），{char.name} 先用 Piper 出声", flush=True)
-                want_backend = "piper"
-        if want_backend not in TTS_BACKENDS:
-            # ★写错后端名不能把嘴弄哑★：忽略它、继续用当前的（跟「声线没装就沿用旧的」一个道理）
-            self.log.warning(f"角色 {char.name} 的 backend={want_backend!r} 不认识，忽略")
-            want_backend = cur_backend
-        if want_backend != cur_backend:
-            self.settings.tts.backend = want_backend
-            # 换后端必须把当前引擎卸掉（克隆那份可能几百 MB ~ 几 GB）；
-            # 下次出声时按新后端重建 —— 这就是 create_tts 把「选哪一类引擎」
-            # 推迟到加载那一刻的原因（见 voice_loop/tts/__init__.py 的 resolve_backend）。
-            unload_old = getattr(self.tts, "unload", None)
-            if callable(unload_old):
-                unload_old()
-            self.log.info(f"[角色] 后端：{cur_backend} → {want_backend}（{char.name} 指定）")
-            print(f"[角色] TTS 后端切到 {want_backend}（{char.name} 指定的）", flush=True)
-        if want_backend == "api":
-            self._apply_api_voice(char, reason)
-            self._apply_piper_fallback_voice(char)
+        try:
+            spec = voice_spec_for(char, self.style)
+        except Exception as exc:  # noqa: BLE001 - 配置坏了不该让切换失败
+            self.log.warning(f"角色 {char.name} 的声音配置读不了（{exc}），继续用当前声线")
             return
-        if want_backend == "zipvoice":
-            self._apply_reference(char, reason)
+        use = getattr(self.tts, "use", None)
+        if not callable(use):
+            return                       # 非懒加载外壳（老路径）：保持现状
+        try:
+            changed = use(spec, reason=reason or "切换角色")
+        except Exception as exc:  # noqa: BLE001
+            self.log.warning(f"角色 {char.name} 换声线失败（继续用当前的）：{exc}")
             return
-        want = (char.voice or "").strip() or self._base_voice
-        tts_cfg = self.settings.tts
-        current = str(getattr(tts_cfg, "voice", "") or "")
-        if not want or want == current:
-            return
-        model = self.settings.resolve(f"models/tts/piper/{want}.onnx")
-        if not model.exists():
-            self.log.warning(f"角色 {char.name} 想用声线 {want}，但没装（继续用 {current}）")
-            print(
-                f"[角色] 「{want}」声线没装，继续用 {current}"
-                f"（想用就把 {want}.onnx 与 .onnx.json 放进 models/tts/piper/）",
-                flush=True,
-            )
-            return
-        tts_cfg.voice = want
-        tts_cfg.model = f"models/tts/piper/{want}.onnx"
-        tts_cfg.config = f"models/tts/piper/{want}.onnx.json"
-        unload = getattr(self.tts, "unload", None)
-        if callable(unload):
-            unload()
-        self.log.info(f"[角色] 声线：{current} → {want}（{reason or '切换'}）")
-
-    def _apply_api_voice(self, char: Character, reason: str = "") -> None:
-        """API TTS 没有「音色克隆」，只有官方给的两个 voice_id（stella / tide）。
-
-        角色卡上的 ``tts_voice`` 优先；没写就回到全局 ``[api] tts_voice``。
-        换音色要 ``unload()``（引擎读的是 settings 里的值，重建时才会用新的）。
-        """
-        from .tts.api_tts import API_TTS_VOICES  # noqa: PLC0415
-
-        api_cfg = getattr(self.settings, "api", None)
-        if api_cfg is None:
-            return
-        want = (getattr(char, "tts_voice", "") or "").strip().lower() or self._base_api_tts_voice
-        if want not in API_TTS_VOICES:
-            self.log.warning(f"角色 {char.name} 的 tts_voice={want!r} 不支持，改用 "
-                             f"{self._base_api_tts_voice}")
-            print(f"[角色] {want!r} 不是官方音色（可选：{'、'.join(API_TTS_VOICES)}），"
-                  f"改用 {self._base_api_tts_voice}", flush=True)
-            want = self._base_api_tts_voice
-        current = str(getattr(api_cfg, "tts_voice", "") or "")
-        if want == current:
-            return
-        api_cfg.tts_voice = want
-        unload = getattr(self.tts, "unload", None)
-        if callable(unload):
-            unload()
-        self.log.info(f"[角色] API TTS 音色：{current or '（默认）'} → {want}"
-                      f"（{reason or '切换'}）")
-
-    def _apply_piper_fallback_voice(self, char: Character) -> None:
-        """API TTS 失败时会退回 Piper；先把「退路声线」摆好（不卸载当前引擎）。
-
-        不这么做的话，角色卡里 `voice` 那一栏对 API 角色就是摆设 ——
-        全局 `[tts] voice` 恰好一样时看不出来，换一个角色就会用错嗓子。
-        """
-        want = (getattr(char, "voice", "") or "").strip() or self._base_voice
-        tts_cfg = self.settings.tts
-        if not want or want == str(getattr(tts_cfg, "voice", "") or ""):
-            return
-        model = self.settings.resolve(f"models/tts/piper/{want}.onnx")
-        if not model.exists():
-            self.log.warning(f"角色 {char.name} 的退路声线 {want} 没装，失败时用当前 Piper")
-            return
-        tts_cfg.voice = want
-        tts_cfg.model = f"models/tts/piper/{want}.onnx"
-        tts_cfg.config = f"models/tts/piper/{want}.onnx.json"
+        if changed:
+            describe = getattr(self.tts, "describe", None)
+            line = describe() if callable(describe) else spec.display()
+            print(f"[角色] 嗓子 → {line}", flush=True)
 
     @property
     def style(self) -> str:
@@ -1044,15 +977,18 @@ class VoiceLoop:
         return str(getattr(self, "_style", "") or "")
 
     def set_style(self, key: str, reason: str = "") -> str:
-        """换风格键 → 真的去换参考音频（只换参考是**当场生效**的）。
+        """换风格键 → 换参考音频（只换参考是当场生效的，不重载模型）。
 
         返回实际生效的键：角色没写这一档就**不动**、返回空串（宁可不变，也别把声线弄坏）。
-        角色没写 `voice_refs` 时它就是个空操作 —— 默认行为一点没变。
+        ★实现只有一句★：把风格写进 `_style`，再按「角色 + 风格」重新算一次 spec
+        （`voice_spec_for` 会挑对应的参考音频）。没有 `styles` 的角色 = 空操作。
         """
         want = str(key or "").strip()
         if want == self.style:
             return want
         char = self.character
+        if char is None:
+            return ""
         if want:
             from .tts import style as stylekit  # noqa: PLC0415
 
@@ -1063,81 +999,8 @@ class VoiceLoop:
                 )
                 return ""
         self._style = want
-        backend = (getattr(char, "backend", "") or "").strip().lower() or self._base_backend
-        if backend == "zipvoice":
-            # ★引擎没加载也要改配置★：不然「空闲时切了风格」要等到下次换角色才生效。
-            # _apply_reference 自己会分开处理「已加载（configure 当场换）」和「没加载（改配置）」两路。
-            self._apply_reference(char, reason or f"风格 {want or '默认'}")
+        self._apply_voice(char, reason or f"风格 {want or '默认'}")
         return want
-
-    def _apply_reference(self, char: Character, reason: str = "") -> None:
-        """克隆后端下，换角色 = 换「模型目录」+「参考音频」（都没配就用回默认）。
-
-        两种代价分开算：
-        - 只换参考音频：``configure(set_reference)`` 当场生效，不用重载；
-        - 换模型目录：必须 ``unload()``，下次说话时用新目录重新构造引擎
-            （代价≈一次加载，实测 ZipVoice 加载几秒到十几秒）。
-        模型目录里的文件不齐就不要切——宁可音色不对，也不能哑。
-        """
-        tts_cfg = self.settings.tts
-        # ---- ① 模型目录（微调过的角色声线）----
-        want_model = str(getattr(char, "voice_model", "") or "").strip()
-        target_model = want_model or self._base_clone_dir
-        current_model = str(getattr(tts_cfg, "clone_dir", "") or "")
-        model_changed = False
-        if target_model and target_model != current_model:
-            if want_model:  # 角色指定的：先确认目录真的可用
-                path = self.settings.resolve(want_model)
-                missing = self._missing_voice_model(path) if path.is_dir() else [path]
-                if missing:
-                    self.log.warning(
-                        f"角色 {char.name} 的声音模型不完整：{missing[0]}（继续用 {current_model}）"
-                    )
-                    print(
-                        f"[角色] 声音模型 {want_model} 缺文件（{missing[0]}），继续用当前模型",
-                        flush=True,
-                    )
-                else:
-                    tts_cfg.clone_dir = want_model
-                    model_changed = True
-            else:  # 角色没配 → 回默认（比如刚从配过的角色切过来）
-                tts_cfg.clone_dir = self._base_clone_dir
-                model_changed = True
-        # ---- ② 参考音频 ----
-        # ★风格★：角色写了 `voice_refs` 就按**当前风格键**取那一档（见 voice_loop/tts/style.py）；
-        # 没写、或没这一档 → 退回 `voice_ref`（老行为，什么都不变）。
-        # 这是当前模型下唯一能做的「情绪控制」：ZipVoice 没有风格输入维度，
-        # 风格只能从参考音频里来（实测参考音只差 1.4 倍，输出就放大 2.5 倍）。
-        from .tts import style as stylekit  # noqa: PLC0415 - 只在切声线时用得上
-
-        want, text = stylekit.pick_ref(char, self.style)
-        want = want or self._base_clone_audio
-        ref_changed = False
-        if want:
-            path = self.settings.resolve(want)
-            if not path.exists():
-                self.log.warning(f"角色 {char.name} 想用参考音色 {want}，但文件不在（继续用当前参考）")
-                print(f"[角色] 参考音频 {want} 不存在，继续用当前的", flush=True)
-            elif want != str(getattr(tts_cfg, "clone_audio", "") or "") or text != str(
-                getattr(tts_cfg, "clone_text", "") or ""
-            ):
-                tts_cfg.clone_audio = want
-                tts_cfg.clone_text = text
-                ref_changed = True
-        if model_changed:
-            # 构造函数会自己按 clone_audio 设参考，所以卸载后不用再 configure
-            unload = getattr(self.tts, "unload", None)
-            if callable(unload):
-                unload()
-            self.log.info(
-                f"[角色] 声音模型：{current_model.rsplit('/', 1)[-1] or '（默认）'} → "
-                f"{target_model.rsplit('/', 1)[-1]}（{reason or '切换'}，下次说话时加载）"
-            )
-        elif ref_changed:
-            configure = getattr(self.tts, "configure", None)
-            if callable(configure):  # 已经加载了就当场换；没加载等下次加载自然生效
-                configure(lambda engine: engine.set_reference(want, text))
-            self.log.info(f"[角色] 参考音色 → {want}（{reason or '切换'}）")
 
     def _wire_text_guard(self) -> None:
         """把「合成回听」的校验器接给 TTS（见 voice_loop/tts/textcheck.py）。
@@ -1171,26 +1034,19 @@ class VoiceLoop:
 
         # ★必须用 on_load 而不是 configure★：管线是在「引擎还没加载」时接这一手的，
         # configure 那种「没加载就丢掉」的语义会让守卫**一声不响地失效**（见 LazyTts.on_load）。
+        # ★按能力判断，不按后端名字★：云端后端不做重采（按次计费），
+        # 它自己实现 set_text_verifier 只是为了接口兼容；没这方法的引擎就跳过。
+        def attach(engine) -> None:
+            fn = getattr(engine, "set_text_verifier", None)
+            if callable(fn):
+                fn(verify)
+
         on_load = getattr(self.tts, "on_load", None)
         if callable(on_load):
-            on_load(lambda engine: engine.set_text_verifier(verify))
+            on_load(attach)
         elif hasattr(self.tts, "set_text_verifier"):
             self.tts.set_text_verifier(verify)
         self.log.info(f"TTS 文本保真守卫已开（相似度 < {min_ratio:g} 就重采）")
-
-    def _missing_voice_model(self, path) -> list[str]:
-        """角色的声音模型目录缺哪些文件（空列表 = 齐了）。
-
-        精度按 ``tts.clone_precision`` 算，且**只要有一套能用就不算缺**——
-        目录里常会有 int8 / fp32 两份（做 A/B 用），报告得跟运行时一致。
-        """
-        wanted = ["tokens.txt", "lexicon.txt", "espeak-ng-data"]
-        missing = [str(path / name) for name in wanted if not (path / name).exists()]
-        if missing:
-            return missing
-        if precision.has_any(path):
-            return []
-        return [str(path / name) for name in precision.PRECISION_FILES[precision.want_precision(self.settings)]]
 
     def reload_voice(self) -> str:
         """按**当前角色**重新应用一次声线（控制台刚改了参考音频/声线时用）。

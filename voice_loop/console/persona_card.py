@@ -114,30 +114,32 @@ SPEC: list[dict] = [
     },
     {
         "title": "⑤ 声线（可全部留空 = 用全局）",
-        "note": "不填就用 config.toml 的 [tts]。克隆类字段的细节见 README 第 14 节；"
-                "素材不会挑就用 python scripts/pick_voice_ref.py --who <id>。",
+        "note": "不填就用 config.toml 的 [tts]。★Provider 一栏决定用哪种声音★："
+                "piper（本地低延迟）/ zipvoice（本地克隆）/ deepseek（云端官方）/ edge（云端免费）"
+                "/ http（自己填接口）—— 下拉里的选项由后端注册表自动生成，加后端不用改这里。",
         "fields": [
-            {"key": "backend", "label": "TTS 后端", "kind": "select",
-             "options": ["", "piper", "zipvoice", "api"],
-             "hint": "空 = 跟着全局；原创角色建议 piper（不碰任何克隆素材）；"
-                     "api = DeepSeek 官方 TTS（需要 [api] 里配好 key；失败自动回 Piper）"},
-            {"key": "tts_voice", "label": "官方 TTS 音色", "kind": "select",
-             "options": ["", "stella", "tide"],
-             "hint": "只在 backend = api 时生效：stella（女，默认）/ tide（男）；"
-                     "空 = 跟 [api] tts_voice"},
-            {"key": "voice", "label": "piper 声线名", "kind": "text",
-             "placeholder": "zh_CN-huayan-medium", "hint": "用的是 models/tts/piper/ 里的 onnx"},
-            {"key": "voice_ref", "label": "克隆参考音频", "kind": "text",
+            {"key": "tts_provider", "label": "声音后端（provider）", "kind": "select",
+             "options": ["", "piper", "zipvoice", "deepseek", "edge", "http"],
+             "hint": "空 = 跟着 [tts] provider；云端后端失败会自动退回本地的 piper"},
+            {"key": "tts_voice_id", "label": "音色 / 声线", "kind": "text",
+             "placeholder": "zh_CN-huayan-medium / stella / zh-CN-XiaoxiaoNeural",
+             "hint": "piper 填声线名，deepseek 填 stella|tide，edge 填 zh-CN-…Neural；空 = 后端默认"},
+            {"key": "tts_ref_audio", "label": "克隆参考音频", "kind": "text",
              "placeholder": "data/personas/<id>/xxx.wav",
-             "hint": "零样本克隆的默认参考；文本可留空（同名 .txt / 清单 / 自动转写）"},
-            {"key": "voice_ref_text", "label": "参考音频的逐字文本", "kind": "text",
+             "hint": "只有克隆类后端（zipvoice 等）用得上；文本可留空（同名 .txt / 清单 / 自动转写）"},
+            {"key": "tts_ref_text", "label": "参考音频的逐字文本", "kind": "text",
              "hint": "必须和音频逐字一致；不一致音色会明显退化"},
-            {"key": "voice_refs", "label": "分风格的多条参考", "kind": "json",
+            {"key": "tts_styles", "label": "分风格的多条参考", "kind": "json",
              "placeholder": "{\"calm\": \"data/personas/<id>/a.wav\"}",
-             "hint": "★当前模型下唯一的「情绪控制」手段★：换参考 = 换语气（见 README 第 14 节）"},
-            {"key": "voice_model", "label": "专属模型目录", "kind": "text",
+             "hint": "★当前克隆模型下唯一的「情绪控制」手段★：换参考 = 换语气"},
+            {"key": "tts_model", "label": "专属模型目录", "kind": "text",
              "placeholder": "models/tts/zipvoice/personas/<id>",
-             "hint": "训过专属声线才填；不填就用通用模型"},
+             "hint": "训过专属声线才填；不填就用后端默认模型"},
+            {"key": "tts_params", "label": "后端私有参数", "kind": "json",
+             "placeholder": "{\"clone_steps\": 4}",
+             "hint": "原样交给这个后端（不同后端认得的不一样，见 config.toml 的 [tts.providers.*]）"},
+            {"key": "tts_fallback", "label": "退路（按顺序试）", "kind": "list",
+             "hint": "一行一个，如 piper:zh_CN-huayan-medium；空 = 跟 [tts] fallback（末尾总有 piper）"},
         ],
     },
     {
@@ -164,15 +166,39 @@ KNOWN_KEYS = {f["key"] for group in SPEC for f in group["fields"]}
 KNOWN_KEYS_LIST = [f["key"] for group in SPEC for f in group["fields"]]
 # 这几个字段允许写在人格文件里，但表单不暴露（索引/工具在管）
 QUIET_KEYS = {"enabled", "default", "voice_dir", "knowledge_all", "knowledge_title", "world"}
+# 人格文件里存在、但表单是「拆成 8 个平铺键」的复合字段（导入时不该报「不认识」）
+RAW_ONLY_KEYS = {"tts"}
+
+
+_PROVIDERS_CACHE: set[str] | None = None
+
+
+def _known_providers() -> set[str]:
+    """注册表里有哪些声音后端（只为了在表单上给出「你写错了」的提示）。"""
+    global _PROVIDERS_CACHE
+    if _PROVIDERS_CACHE is not None:
+        return _PROVIDERS_CACHE
+    fallback = {"piper", "zipvoice", "deepseek", "edge", "http", "api"}
+    try:
+        from types import SimpleNamespace  # noqa: PLC0415
+
+        from ..tts.registry import ALIASES, TtsRegistry  # noqa: PLC0415
+
+        registry = TtsRegistry(SimpleNamespace(tts=SimpleNamespace(provider="")))
+        registry.discover()
+        _PROVIDERS_CACHE = set(registry.ids()) | set(ALIASES)
+    except Exception:  # noqa: BLE001 - 拿不到就别拦（声音写坏不该挡住表单）
+        return fallback
+    return _PROVIDERS_CACHE or fallback
 # ★一改就换嗓子 / 换脑子★：被清空时必须明确告警，否则「只改了介绍」就会变成「声音变了」
 SENSITIVE_KEYS = {
-    "backend": "TTS 后端；清掉就跟 config.toml 的 [tts] backend",
-    "tts_voice": "官方 TTS 音色；清掉就跟 [api] tts_voice",
-    "voice": "piper 声线；清掉就跟全局声线",
-    "voice_ref": "克隆参考音频；清掉就没有她的克隆声线了",
-    "voice_ref_text": "参考音频的逐字文本；清掉克隆会声不对词",
-    "voice_refs": "分风格的多条参考",
-    "voice_model": "专属模型目录；清掉就用通用模型",
+    "tts_provider": "声音后端；清掉就跟 [tts] provider",
+    "tts_voice_id": "音色/声线；清掉就跟后端默认",
+    "tts_ref_audio": "克隆参考音频；清掉就没有她的克隆声线了",
+    "tts_ref_text": "参考音频的逐字文本；清掉克隆会声不对词",
+    "tts_styles": "分风格的多条参考",
+    "tts_model": "专属模型目录；清掉就用后端默认模型",
+    "tts_fallback": "退路；清掉就只跟 [tts] fallback",
     "engine": "AI 引擎；清掉就回到本地模型",
     "api_model": "API 模型名；清掉就跟 [api] model",
     "api_base": "API 地址；清掉就跟 [api] base_url",
@@ -181,14 +207,36 @@ SENSITIVE_KEYS = {
 
 
 # --------------------------------------------------------------------------- #
-def groups() -> list[dict]:
-    """给前端的表单规范（深拷一份，免得调用方改到 SPEC）。"""
+def groups(tts_providers: list[dict] | None = None) -> list[dict]:
+    """给前端的表单规范（深拷一份，免得调用方改到 SPEC）。
+
+    ``tts_providers``：注册表里的声音后端（见 `TtsRegistry.describe()`）。
+    给了就用它**生成**「声音后端」下拉与可选音色 —— 加后端不用改前端，
+    也不会再出现「人格文件里有新值、下拉里没有 → 浏览器把它悄悄退回空」那种事故。
+    """
     out = json.loads(json.dumps(SPEC, ensure_ascii=False))
     names = "、".join(p["name"] for p in tool_presets.describe())
     if names:
         for group in out:
             if any(f.get("key") == "api_tools" for f in group.get("fields", [])):
                 group["note"] = f"{group.get('note', '')} 现在可用的预设：{names}。"
+    if tts_providers:
+        ids = [""] + [str(p.get("id") or "") for p in tts_providers if p.get("id")]
+        voices: list[str] = []
+        labels: list[str] = []
+        for provider in tts_providers:
+            for voice in provider.get("voices") or []:
+                if voice not in voices:
+                    voices.append(voice)
+            state = "可用" if provider.get("ready") else f"不可用（{provider.get('why') or '缺依赖'}）"
+            labels.append(f"{provider.get('id')}：{provider.get('label')} · {state}")
+        for group in out:
+            for field in group.get("fields", []):
+                if field.get("key") == "tts_provider":
+                    field["options"] = ids
+                    field["hint"] = (f"空 = 跟着 [tts] provider。现在有：{'；'.join(labels)}")
+                elif field.get("key") == "tts_voice_id":
+                    field["voice_options"] = voices
     return out
 
 
@@ -227,11 +275,16 @@ def example(char: Any = None) -> dict:
                 "aliases": {"临光": ["邻光", "林光"]}, "ack": "在。",
                 "style": ["句子短，先给结论", "自称「我」，称呼对方「博士」"],
                 "rules": ["★用第一人称说话，不要自我介绍★", "不知道就说不确定，绝不编造"],
-                "avoid": ["不要说「作为一个AI」"], "temperature": 0.0, "backend": "piper",
+                "avoid": ["不要说「作为一个AI」"], "temperature": 0.0,
+                "tts_provider": "piper", "tts_voice_id": "zh_CN-huayan-medium",
                 "notes": "★资料卡★ 手写的原创角色"}
     data = char.to_dict() if hasattr(char, "to_dict") else dict(char or {})
     out = _blank()
+    # 嗓子那 8 栏不在 to_dict 的平铺键里，单独摊开
+    out.update(flatten_tts(data.get("tts") if isinstance(data, dict) else None))
     for key in out:
+        if key in TTS_FLAT:
+            continue
         if key in data:
             out[key] = data[key]
         elif isinstance(out[key], bool) and hasattr(char, key):
@@ -297,6 +350,96 @@ def existing_ids(settings: Any) -> list[str]:
 
 
 # --------------------------------------------------------------------------- #
+# ★嗓子的扁平视图★：表单里是 `tts_provider` / `tts_ref_audio` 这样的平铺键，
+# 文件里是结构化的一份 `"tts": {...}`。这一对映射只在本文件里，别处不用知道。
+TTS_FLAT = {
+    "tts_provider": "provider",
+    "tts_voice_id": "voice_id",
+    "tts_model": "model",
+    "tts_ref_audio": "ref_audio",
+    "tts_ref_text": "ref_text",
+    "tts_styles": "styles",
+    "tts_params": "params",
+    "tts_fallback": "fallback",
+}
+
+
+def flatten_tts(tts: Any) -> dict:
+    """`"tts": {...}` → 表单用的 8 个平铺键。"""
+    from ..tts.spec import TtsConfigError, VoiceSpec  # noqa: PLC0415
+
+    raw = tts if isinstance(tts, dict) else {}
+    try:
+        spec = VoiceSpec.parse(raw)
+    except TtsConfigError:
+        spec = VoiceSpec()
+    styles = raw.get("styles") if isinstance(raw.get("styles"), dict) else {}
+    return {
+        "tts_provider": spec.provider,
+        "tts_voice_id": spec.voice_id,
+        "tts_model": spec.model,
+        "tts_ref_audio": spec.ref_audio,
+        "tts_ref_text": spec.ref_text,
+        "tts_styles": dict(styles),
+        "tts_params": dict(spec.params or {}),
+        "tts_fallback": list(spec.fallback),
+    }
+
+
+def build_tts(flat: dict) -> dict:
+    """表单的 8 个平铺键 → 写进文件的 `"tts": {...}`（空的整条不要）。"""
+    out: dict[str, Any] = {}
+    for key, name in TTS_FLAT.items():
+        value = flat.get(key)
+        if name == "styles":
+            if isinstance(value, dict) and value:
+                out["styles"] = value
+            continue
+        if name == "params":
+            if isinstance(value, dict) and value:
+                out["params"] = value
+            continue
+        if name == "fallback":
+            items = [str(x).strip() for x in (value or []) if str(x).strip()]
+            if items:
+                out["fallback"] = items
+            continue
+        text = str(value or "").strip()
+        if text:
+            out[name] = text
+    return out
+
+
+def flat_view(preview_json: dict) -> dict:
+    """归一化后的人格 JSON → 表单平铺视图（非 tts 键原样 + 8 个 tts 键）。"""
+    out = {k: v for k, v in (preview_json or {}).items() if k != "tts"}
+    out.update(flatten_tts((preview_json or {}).get("tts")))
+    return out
+
+
+def describe_voice(settings: Any, char: Any) -> str:
+    """一行「她现在用哪个嗓子」（控制台各页共用，避免每页各写一套判断）。"""
+    try:
+        from ..persona import voice_spec_for  # noqa: PLC0415
+        from ..tts.registry import ALIASES  # noqa: PLC0415
+
+        spec = voice_spec_for(char)
+    except Exception:  # noqa: BLE001 - 只为了显示，读不出来就说读不出来
+        return "TTS：（读不到）"
+    provider = ALIASES.get(spec.provider, spec.provider) or str(
+        getattr(settings.tts, "provider", "") or "piper")
+    bits = [provider]
+    if spec.voice_id:
+        bits.append(spec.voice_id)
+    if spec.ref_audio:
+        bits.append("参考 " + str(spec.ref_audio).replace("\\", "/").rsplit("/", 1)[-1])
+    if spec.model:
+        bits.append("模型 " + str(spec.model).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1])
+    if not spec.provider and not spec.voice_id and not spec.ref_audio:
+        return f"TTS：跟全局（{provider}）"
+    return "TTS：" + " · ".join(bits)
+
+
 def _as_list(value: Any) -> list[str]:
     """list 字段：前端给数组，导入的文件可能给字符串（按行拆）。"""
     if isinstance(value, list):
@@ -341,7 +484,7 @@ def parse(raw: dict) -> tuple[dict, list[str], list[str]]:
             if kind == "list":
                 fields[key] = value
             elif kind == "json":
-                want = dict if key in ("aliases", "voice_refs") else list
+                want = dict if key in ("aliases", "tts_styles", "tts_params") else list
                 got, err = _as_json(value, want)
                 if err:
                     problems.append(f"{f['label']}：{err}")
@@ -375,14 +518,31 @@ def parse(raw: dict) -> tuple[dict, list[str], list[str]]:
     if not 0.0 <= float(fields.get("temperature") or 0.0) <= 2.0:
         problems.append("温度：得在 0~2 之间（0 = 用全局）")
 
+    # ---- 嗓子：8 个平铺键 → 一份嵌套的 tts ----
+    # 校验就走 VoiceSpec（它认得 provider:voice 的短写法），错了只告警不拦：
+    # 声音写坏最多是「声音不对」，不该让人连名字都改不了。
+    from ..tts.spec import TtsConfigError, VoiceSpec  # noqa: PLC0415
+
+    flat_tts = {key: fields.pop(key, None) for key in TTS_FLAT}
+    tts = build_tts(flat_tts)
+    try:
+        spec = VoiceSpec.parse(tts)
+    except TtsConfigError as exc:
+        warnings.append(f"声音配置读不懂（{exc}），已按「跟全局」处理")
+        spec = VoiceSpec()
+        tts = {}
+    if spec.provider and spec.provider not in _known_providers():
+        warnings.append(f"声音后端 {spec.provider!r} 没在注册表里 —— 会退回默认后端")
+    fields["tts"] = tts
+
     # ---- 提醒「写了但会被忽略」的字段（白名单之外的）----
     unknown = [k for k in raw if k not in KNOWN_KEYS and k not in QUIET_KEYS
-               and not str(k).startswith("_")]
+               and k not in RAW_ONLY_KEYS and not str(k).startswith("_")]
     if unknown:
         warnings.append("这些字段人格文件不认识，会被忽略：" + "、".join(sorted(unknown)[:6]))
 
     # ---- 声线字段的现实检查 ----
-    ref = str(fields.get("voice_ref") or "")
+    ref = str(tts.get("ref_audio") or "")
     if ref and not str(ref).endswith(".wav"):
         warnings.append(f"参考音频一般用 wav（现在写的是 {ref}）")
     return fields, problems, warnings
@@ -432,7 +592,7 @@ def _normalized(raw: dict) -> dict:
 
 
 def _form_values(settings: Any, fields: dict, raw: dict | None = None) -> dict:
-    """交给 :func:`merge_into` 的表单值：``preview()`` 的结果 + ★明确给出来的假值★。
+    """交给 :func:`merge_into` 的表单值：**扁平视图**（8 个 tts 键 + 其余平铺键）。
 
     `preview()` 走的是 `Character.to_dict()`，它把 `False` / `0.0` 也当「空」滤掉。
     对合并来说这是个陷阱：`knowledge_shared: false`（全隔离）被滤掉 = 下次保存时
@@ -440,8 +600,8 @@ def _form_values(settings: Any, fields: dict, raw: dict | None = None) -> dict:
     （「只改了个介绍，怎么权限也变了」）。所以布尔值要按两件事补回来：
     文件里本来就写着它，或者它跟解析器的缺省值不同（那才是用户的意思）。
     """
-    data = preview(settings, fields)
-    defaults = _normalized({})
+    data = flat_view(preview(settings, fields))
+    defaults = flat_view(_normalized({}))
     for key, value in fields.items():
         if key in data or key not in KNOWN_KEYS or not isinstance(value, bool):
             continue
@@ -477,9 +637,9 @@ def merge_into(raw: dict, form: dict, *, sent: Iterable[str] | None = None
     ★只写真的变了的★：跟归一化后的当前值一样就不写（见 :func:`_normalized`），
     否则报告里会刷出一大片假的「改了 user_title」。
     """
-    merged = dict(raw)
-    base = _normalized(raw)
+    base = flat_view(_normalized(raw))
     allowed = None if sent is None else {str(k) for k in sent}
+    merged: dict[str, Any] = dict(base)
     changed: list[str] = []
     removed: list[str] = []
     for key in KNOWN_KEYS_LIST:
@@ -487,19 +647,35 @@ def merge_into(raw: dict, form: dict, *, sent: Iterable[str] | None = None
             continue                     # 客户端没提这一栏 → 不是「清空」，原样保留
         if key in form:
             cur = base.get(key)
-            if isinstance(form[key], bool) and key in merged:
-                # ★布尔值要按文件里的原值比★：`to_dict()` 把 False 滤掉了，
-                # 归一化后拿不到它 —— 否则每次保存都会报一次假的「改了 knowledge_shared」
-                cur = bool(merged[key])
+            if isinstance(form[key], bool) and key in base:
+                cur = bool(base[key])
             if cur != form[key]:
                 changed.append(key)
                 merged[key] = form[key]
         elif key in merged:
             if not _empty(base.get(key)):
                 removed.append(key)
-            merged.pop(key)
-    ordered = {k: merged[k] for k in ("id", "name") if k in merged}
-    ordered.update({k: v for k, v in merged.items() if k not in ordered})
+            merged.pop(key, None)
+
+    # ---- 重建整份 JSON：非 tts 键照抄（含表单不管的键），tts 重新拼 ----
+    # ★只写「文件里本来就有」或「真的改了」的键★：否则解析器的默认值
+    # （比如 user_title 缺省「你」）会被顺手写进文件，看着像改了很多东西。
+    out: dict[str, Any] = {k: v for k, v in raw.items() if k != "tts"}
+    for key in removed:
+        if key not in TTS_FLAT:
+            out.pop(key, None)
+    for key, value in merged.items():
+        if key in TTS_FLAT:
+            continue
+        if key in out or key in changed:
+            out[key] = value
+    tts = build_tts(merged)
+    if tts:
+        out["tts"] = tts
+    else:
+        out.pop("tts", None)
+    ordered = {k: out[k] for k in ("id", "name") if k in out}
+    ordered.update({k: v for k, v in out.items() if k not in ordered})
     return ordered, changed, removed
 
 
@@ -533,7 +709,9 @@ def create(settings: Any, fields: dict, *, overwrite: bool = False,
         entries.append(add_row)
     new_index = {**raw_index, "characters": entries}
 
-    data = _form_values(settings, fields)
+    # 新建时写出去的**真实文件内容**是嵌套结构（`preview()` 过一遍真解析器）；
+    # 合并分支再用扁平视图做对比，别把表单键写进文件。
+    data = preview(settings, fields)
     changed: list[str] = []
     removed: list[str] = []
     overwriting = char_id in ids and overwrite
@@ -587,12 +765,14 @@ def update(settings: Any, fields: dict, *, dry_run: bool = True,
         raw = json.loads(target.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise ValueError(f"{rel(settings, target)} 读不动（{exc}）——先修好它再编辑") from exc
-    data, changed, removed = merge_into(
-        raw, _form_values(settings, fields, raw), sent=sent)
+    flat = _form_values(settings, fields, raw)
+    data, changed, removed = merge_into(raw, flat, sent=sent)
     # ★换嗓子的栏被清空要说出来★：事故现场是「只改了身份卡上的介绍」，
     # 报告里只有一行「清掉了 backend」，谁也没注意她已经从官方 TTS 换成全局克隆声线了。
-    for key in removed:
-        if key in SENSITIVE_KEYS:
+    for key in [*removed, *changed]:
+        if key not in SENSITIVE_KEYS:
+            continue
+        if key in removed or _empty(flat.get(key)):
             warnings.append(
                 f"★{key} 被清空了★（{SENSITIVE_KEYS[key]}）—— 这等于换嗓子/换脑子，"
                 "不是「只改了介绍」；不想这样就把它填回去再保存")

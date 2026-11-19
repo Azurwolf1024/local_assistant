@@ -81,7 +81,10 @@ import json
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:                                  # 只为类型标注：运行时按需 import
+    from .tts.spec import VoiceSpec
 
 # 「输出会被朗读」这类工程性要求：跟角色无关，所有角色都拼在后面
 SPEECH_RULES = (
@@ -327,18 +330,22 @@ class Character:
     rules: list[str] = field(default_factory=list)      # 硬性要求
     avoid: list[str] = field(default_factory=list)      # 明确不要出现的东西
     lines: list[dict] = field(default_factory=list)     # 示例台词 [{scene, text}]
-    voice: str = ""                       # piper 声线名（空 = 用 config.toml 的 [tts]）
-    voice_ref: str = ""                   # 克隆音色的参考音频（backend = "zipvoice" 时生效）
-    voice_ref_text: str = ""              # 参考音频的逐字文本（空 = 同名 .txt / 自动转写）
-    voice_refs: dict[str, Any] = field(default_factory=dict)   # ★分风格的多条参考★：{"calm": "..."}
-                                          #   键名自己定（calm/催促/happy 都行）；
-                                          #   值可以是路径字符串，也可以是 {ref, text}；
-                                          #   取不到那一档就退回 voice_ref（老行为）。
-                                          #   ★这是当前模型下唯一能做的「情绪控制」★：
-                                          #   ZipVoice 没有风格输入维度，风格只能从参考音里来。
-                                          #   素材不会挑？python scripts/pick_voice_ref.py --who <id>
-    voice_model: str = ""                 # 这个角色专用的 ZipVoice 模型目录
-                                          #   （空 = 用 [tts] clone_dir；见 scripts/persona_voice.py）
+    # ★她的嗓子：一份与后端无关的「声音描述」★（见 voice_loop/tts/spec.py::VoiceSpec）
+    #
+    #   "tts": {
+    #     "provider": "zipvoice",              // piper / zipvoice / deepseek / edge / http / 自己加的
+    #     "voice_id": "",                      // stella / zh-CN-XiaoxiaoNeural / piper 声线名
+    #     "model": "models/tts/zipvoice/...",  // 专属模型目录（clone 类后端）
+    #     "ref_audio": "data/personas/x/a.wav",// 克隆参考音频
+    #     "ref_text": "……",                    // 参考音频的逐字文本
+    #     "params": { "clone_steps": 4 },      // 这个后端的私有参数
+    #     "fallback": ["piper:zh_CN-huayan-medium"],
+    #     "styles": { "calm": "...wav" }       // 分风格的参考（原来的 voice_refs）
+    #   }
+    #
+    # ★以前这里是 8 个平铺字段（backend / voice / voice_ref / voice_ref_text /
+    #   voice_refs / voice_model / tts_voice），换一个后端就得加字段，而且只能有一个后端成立。★
+    tts: dict = field(default_factory=dict)
     voice_dir: str = ""                   # 语音素材目录（空 = data/personas/<id>/）
     # ★这个角色专属的知识库（L4）★：不同 IP 的角色各看各的世界观，见模块说明。
     knowledge: list[str] = field(default_factory=list)   # 文件/目录（相对路径按项目根算）
@@ -360,11 +367,6 @@ class Character:
     default: bool = False
     enabled: bool = True
     notes: str = ""                       # 给自己看的备注（不会进提示词）
-    # ★可选：这个角色用哪个 TTS 后端（piper / zipvoice）★
-    # 空 = 跟 config.toml 的 [tts] backend。存在的意义：默认角色「白泽」是原创助手，
-    # 它必须用**公开可商用的出厂 Piper 声线**，不能跟着全局的克隆后端去用某条参考音频。
-    # 放在最后（而不是挪到 voice 旁边）：dataclass 的字段顺序会被位置构造依赖。
-    backend: str = ""
     # ★可选：属于哪个作品★（提示词第一行的「你是《X》里的…」）。
     # 空 = 用 worlds[0]；再没有就**不提作品名**（原创角色不该被塞进某个游戏的世界观里 ——
     # 以前这里是写死的「《明日方舟》」，白泽也被写成「《明日方舟》里的白泽」，
@@ -383,11 +385,41 @@ class Character:
     # ★API 角色额外开放的工具★：预设名（见 voice_loop/tool_presets.py）或具体工具名。
     # 只在 engine = api 时生效；留空 = 跟 [api] extra_tools。
     api_tools: list[str] = field(default_factory=list)
-    # ★后端 = "api" 时用哪个官方 TTS 音色★（stella / tide）；空 = 跟 [api] tts_voice。
-    # 跟 `voice`（Piper 声线）分开存：切回本地时 Piper 声线还得是原来那个。
-    tts_voice: str = ""
 
     # ------------------------------------------------------------------ 基础
+    # ★嗓子的只读视图★：文件里只有 `tts` 一份真相，这些属性让旧的读取点
+    # （控制台、克隆面板、风格挑选、自测）不用关心结构。赋值请改 `self.tts`。
+    @property
+    def backend(self) -> str:
+        """用哪个 TTS 后端（= tts.provider；老名字）。"""
+        return str(self.tts.get("provider") or "")
+
+    @property
+    def voice(self) -> str:
+        """音色 id：piper 声线名 / stella / zh-CN-XiaoxiaoNeural …"""
+        return str(self.tts.get("voice_id") or "")
+
+    @property
+    def tts_voice(self) -> str:
+        return self.voice
+
+    @property
+    def voice_ref(self) -> str:
+        return str(self.tts.get("ref_audio") or "")
+
+    @property
+    def voice_ref_text(self) -> str:
+        return str(self.tts.get("ref_text") or "")
+
+    @property
+    def voice_refs(self) -> dict[str, Any]:
+        styles = self.tts.get("styles")
+        return dict(styles) if isinstance(styles, dict) else {}
+
+    @property
+    def voice_model(self) -> str:
+        return str(self.tts.get("model") or "")
+
     @property
     def label(self) -> str:
         return f"{self.name}（{self.title}）" if self.title else self.name
@@ -434,16 +466,9 @@ class Character:
             rules=[str(s).strip() for s in _list("rules")],
             avoid=[str(s).strip() for s in _list("avoid")],
             lines=lines,
-            # ★backend 要在这儿显式搬一次★：解析是「白名单式」的显式构造，
-            # 新增字段只加 dataclass 不改这里 = 配置被静默忽略（test_persona [7] 就是守这个的）。
-            backend=str(raw.get("backend") or "").strip(),
+            # ★嗓子：一份与后端无关的描述★（结构见 VoiceSpec；这里只做归一化，不猜默认值）
+            tts=normalize_tts(raw.get("tts")),
             work=str(raw.get("work") or "").strip(),
-            voice=str(raw.get("voice") or "").strip(),
-            voice_ref=str(raw.get("voice_ref") or "").strip(),
-            voice_ref_text=str(raw.get("voice_ref_text") or "").strip(),
-            voice_refs=({str(k): v for k, v in (raw.get("voice_refs") or {}).items()
-                         if str(k).strip() and v} if isinstance(raw.get("voice_refs"), dict) else {}),
-            voice_model=str(raw.get("voice_model") or "").strip(),
             voice_dir=str(raw.get("voice_dir") or "").strip(),
             # ★新增字段必须在这里显式搬一次★（白名单式构造，漏了就是静默忽略；
             #   test_memory_mcp 里有专门的断言守这个）
@@ -465,8 +490,43 @@ class Character:
             api_base=str(raw.get("api_base") or "").strip(),
             api_key=str(raw.get("api_key") or "").strip(),
             api_tools=[str(t).strip() for t in _list("api_tools") if str(t).strip()],
-            tts_voice=str(raw.get("tts_voice") or "").strip().lower(),
         )
+
+
+# --------------------------------------------------------------------------- #
+def normalize_tts(raw: Any) -> dict:
+    """把人格文件里的 ``tts`` 归一化成 VoiceSpec 的形状（不认识就退回空 = 跟全局）。"""
+    from .tts.spec import TtsConfigError, VoiceSpec  # noqa: PLC0415 - 按需，别拖慢启动
+
+    try:
+        spec = VoiceSpec.parse(raw)
+    except TtsConfigError:
+        return {}
+    data = spec.as_dict()
+    styles = raw.get("styles") if isinstance(raw, dict) else None
+    if isinstance(styles, dict):
+        clean = {str(k).strip(): v for k, v in styles.items() if str(k).strip() and v}
+        if clean:
+            data["styles"] = clean
+    return data
+
+
+def voice_spec_for(char: Any, style: str = "") -> VoiceSpec:
+    """角色 → 这一句话该用的声音（按风格挑参考音频；没有就退回默认那档）。
+
+    ★只在这一处做「角色 → spec」的翻译★：管线、控制台、自测都调它，
+    所以「换嗓子」的规则永远不会有两份实现。
+    """
+    from .tts import style as stylekit  # noqa: PLC0415 - 只有说话/试听时才需要
+    from .tts.spec import VoiceSpec     # noqa: PLC0415
+
+    spec = VoiceSpec.parse(getattr(char, "tts", None))
+    ref, text = stylekit.pick_ref(char, style)
+    if ref:
+        # ★文本按音频走，绝不借用另一条音频的文本★：换了参考音却留着上一段的文本，
+        # 就成了「声不对词」，克隆质量会明显退化（清单/自动转写负责补空）。
+        spec = spec.replace(ref_audio=ref, ref_text=text)
+    return spec
 
 
 # --------------------------------------------------------------------------- #
@@ -953,8 +1013,10 @@ class CharacterRegistry:
         # `maybe_reload` 才会真的重装人设（否则改了引擎要重启服务才生效）。
         return [
             (c.id, c.name, tuple(c.wake_words), c.ack, c.engine, c.api_model,
-             c.api_base, c.api_key, tuple(c.api_tools), c.backend, c.voice,
-             c.tts_voice)
+             c.api_base, c.api_key, tuple(c.api_tools),
+             # 嗓子：整个 tts 描述都进签名（换 provider/音色/参考/参数都要热加载）
+             json.dumps(c.tts, ensure_ascii=False, sort_keys=True),
+             c.voice_dir)
             for c in self.characters
         ]
 

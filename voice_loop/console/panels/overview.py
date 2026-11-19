@@ -53,6 +53,7 @@ def register(app, ctx) -> None:
                     # backend=api 时真正出声的是官方 TTS 的音色（tts_voice）
                     "backend": c.backend or "",
                     "tts_voice": getattr(c, "tts_voice", "") or "",
+                    "tts_line": _voice_line(settings, c),
                     "engine": c.engine or getattr(settings.api, "engine", "local"),
                 }
                 for c in registry.all()
@@ -174,6 +175,13 @@ def _live_status(ctx) -> dict:
     前端加载时会顺手打一次 `/api/overview/ping`，结果缓存在 ctx.cache 里。
     """
     return dict(ctx.cache.get("last_ping") or {})
+
+
+def _voice_line(settings, char) -> str:
+    """「她现在用哪个嗓子」一行字（跟角色卡/声线页同一份实现）。"""
+    from ..persona_card import describe_voice  # noqa: PLC0415
+
+    return describe_voice(settings, char)
 
 
 def _memory_sync_state(settings) -> dict:

@@ -62,6 +62,19 @@
         } else {
           el = h("input", { id, placeholder: f.placeholder || "" });
         }
+        // ★音色候选（来自后端注册表）★：文本栏 + datalist，既能选也能手填，
+        // 不会因为「下拉里没有这个值」把她的音色悄悄清空（上次事故就是这么来的）。
+        if (Array.isArray(f.voice_options) && f.voice_options.length) {
+          const listId = id + "-voices";
+          el.setAttribute("list", listId);
+          el.dataset.voices = listId;
+          el.addEventListener("focus", () => {
+            if (document.getElementById(listId)) return;
+            const dl = h("datalist", { id: listId });
+            f.voice_options.forEach((v) => dl.appendChild(h("option", { value: v })));
+            el.parentNode && el.parentNode.appendChild(dl);
+          });
+        }
         inputs[f.key] = { kind: f.kind, el };
         return h("div", { class: "row", style: "align-items:flex-start" }, [
           h("label", { class: "muted", style: "min-width:150px;padding-top:4px",
@@ -431,9 +444,10 @@
           h("p", { class: "muted", text: "引擎：" + (c.engine === "api"
             ? "云端 API" + (c.api_model ? "（" + c.api_model + "）" : "")
             : (c.engine === "local" ? "本地 Ollama" : "跟全局")) }),
-          h("p", { class: "muted", text: "TTS：" + (c.tts_backend === "api"
-            ? "DeepSeek 官方" + (c.tts_voice ? "（" + c.tts_voice + "）" : "")
-            : (c.tts_backend || "跟全局")) }),
+          h("p", { class: "muted", text: "TTS：" + (c.tts_provider
+            ? c.tts_provider + (c.tts_voice ? " · " + c.tts_voice : "")
+              + ((c.tts_fallback || []).length ? " · 退路 " + c.tts_fallback.join("→") : "")
+            : "跟全局（" + (c.tts_voice || "默认音色") + "）") }),
           h("p", { class: "muted", text: "称呼你：「" + (c.user_title || "你") + "」"
             + (c.ack ? " · 应答语：" + c.ack : "") }),
           c.style && c.style.length ? h("p", { class: "muted", text: "风格：" + c.style.join(" / ") }) : null,

@@ -190,10 +190,12 @@
       "text": "那些离去者的名字，我都记得，那些战场上的恐惧、愤怒和痛苦，我也仍然能触摸到余音。但要在大家面前演讲的话，我更想说些心怀希望的故事。博士，我有点紧张……可以握住我的手吗？"
     }
   ],
-  "voice": "",
-  "voice_ref": "data/personas/amiya/交谈1.wav",
-  "voice_model": "",
-  "worlds": ["明日方舟"],
+  "worlds": [
+    "明日方舟"
+  ],
   "temperature": 0.0,
-  "notes": "第二个角色的现成例子：改 name/background/lines 就能换成别人；喊「阿米娅」就会切到她，喊「凯尔希」再切回来。"
+  "notes": "第二个角色的现成例子：改 name/background/lines 就能换成别人；喊「阿米娅」就会切到她，喊「凯尔希」再切回来。",
+  "tts": {
+    "ref_audio": "data/personas/amiya/交谈1.wav"
+  }
 }

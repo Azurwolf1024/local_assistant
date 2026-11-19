@@ -198,19 +198,21 @@
       "text": "合上那封所谓的贺信吧，好吗？我的去向没能如赫拉提娅所愿，她确实无法释怀。但那封信就只是她在笨拙地试图表达情感——让您想起谁了吗？抱歉。但愿您想的那个人，不会太苛责您如今的选择。"
     }
   ],
-  "backend": "zipvoice",
-  "voice_ref": "data/personas/clementia/任命队长.wav",
-  "voice_ref_text": "您要我定夺这些人的生死……给我一个理由。",
-  "voice_refs": {
-    "low": "data/personas/clementia/行动失败.wav",
-    "mid": "data/personas/clementia/编入队伍.wav",
-    "high": "data/personas/clementia/信赖触摸.wav",
-    "lively": "data/personas/clementia/问候.wav"
-  },
   "worlds": [
     "明日方舟"
   ],
   "knowledge": [],
   "temperature": 0,
-  "notes": "★由 scripts/import_persona.py 导入素材★：lines 来自 data/personas/clementia/clementia.txt（38 条），知识库来自 profile.txt → data/knowledge/clementia/档案.md。voice_ref 与 voice_refs 是 scripts/pick_voice_ref.py --who clementia 的实测推荐（任命队长.wav 安静帧高频 0.48% 最干净、像她 0.875）。别名的生僻说法还要拿 scripts/test_wake.py 实测补。"
+  "notes": "★由 scripts/import_persona.py 导入素材★：lines 来自 data/personas/clementia/clementia.txt（38 条），知识库来自 profile.txt → data/knowledge/clementia/档案.md。voice_ref 与 voice_refs 是 scripts/pick_voice_ref.py --who clementia 的实测推荐（任命队长.wav 安静帧高频 0.48% 最干净、像她 0.875）。别名的生僻说法还要拿 scripts/test_wake.py 实测补。",
+  "tts": {
+    "provider": "zipvoice",
+    "ref_audio": "data/personas/clementia/任命队长.wav",
+    "ref_text": "您要我定夺这些人的生死……给我一个理由。",
+    "styles": {
+      "low": "data/personas/clementia/行动失败.wav",
+      "mid": "data/personas/clementia/编入队伍.wav",
+      "high": "data/personas/clementia/信赖触摸.wav",
+      "lively": "data/personas/clementia/问候.wav"
+    }
+  }
 }

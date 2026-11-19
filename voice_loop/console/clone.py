@@ -298,23 +298,34 @@ def _as_ref(settings: Any, path: Path) -> str:
 
 
 def _write_persona(settings: Any, char: Any, fields: dict) -> dict:
-    """把几个字段写回人格文件：改前备份、只动这几个键、写完校验 JSON。
+    """把嗓子那几个字段写回人格文件：改前备份、只动这几个键、写完校验 JSON。
 
     ★人格文件是唯一真相★（§14）：声线、参考、称呼都从它读，
     所以「克隆」这件事的最后一公里就是这里 —— 写坏了角色就起不来，
     因此每一步都要能回滚（.bak 就在旁边）。
+
+    ``fields`` 现在是**嗓子描述**（provider / ref_audio / ref_text / model…），
+    会合进文件里的 ``"tts"`` 那一份结构（不再往顶层平铺）。
     """
+    from .persona_card import build_tts, flatten_tts  # noqa: PLC0415
+
     target = _persona_file(settings, char)
     data = json.loads(target.read_text(encoding="utf-8"))
-    changed = {k: v for k, v in fields.items() if str(data.get(k) or "") != str(v or "")}
+    current = flatten_tts(data.get("tts"))
+    wanted = dict(current)
+    for key, value in fields.items():
+        flat_key = key if key.startswith("tts_") else f"tts_{key}"
+        wanted[flat_key] = value
+    merged = build_tts(wanted)
+    changed = {k: v for k, v in merged.items() if (data.get("tts") or {}).get(k) != v}
     if not changed:
-        return {"file": str(target), "changed": {}, "backup": ""}
+        return {"file": str(target), "changed": {}, "backup": "", "tts": merged}
     backup = target.with_suffix(target.suffix + ".bak")
     shutil.copy2(target, backup)
-    data.update(fields)
+    data["tts"] = merged
     target.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     json.loads(target.read_text(encoding="utf-8"))       # 写完校验（写坏了至少当场知道）
-    return {"file": str(target), "changed": changed, "backup": str(backup)}
+    return {"file": str(target), "changed": changed, "backup": str(backup), "tts": merged}
 
 
 def install(settings: Any, char: Any, *, clip: str = "", data_base64: str = "",
@@ -373,16 +384,17 @@ def install(settings: Any, char: Any, *, clip: str = "", data_base64: str = "",
                                Path(chosen).stem, room=room)
     text = ref_text.strip() or matched
     cleared = False
-    fields = {"voice_ref": rel}
+    current_tts = current.get("tts") if isinstance(current.get("tts"), dict) else {}
+    fields = {"ref_audio": rel}
     if text:
-        fields["voice_ref_text"] = text
-    elif str(current.get("voice_ref_text") or "").strip() \
-            and str(current.get("voice_ref") or "") != rel:
-        fields["voice_ref_text"] = ""
+        fields["ref_text"] = text
+    elif str(current_tts.get("ref_text") or "").strip() \
+            and str(current_tts.get("ref_audio") or "") != rel:
+        fields["ref_text"] = ""
         cleared = True
-    if not str(current.get("backend") or getattr(char, "backend", "") or "").strip():
-        # 单条克隆走的是 ZipVoice（零样本）——不写 backend 会跟全局走，写明白更稳
-        fields["backend"] = "zipvoice"
+    if not str(current_tts.get("provider") or getattr(char, "backend", "") or "").strip():
+        # 单条克隆走的是 ZipVoice（零样本）——provider 留空会跟全局走，写明白更稳
+        fields["provider"] = "zipvoice"
     report = _write_persona(settings, char, fields) if not dry_run else \
         {"file": "(试运行没写)", "changed": fields, "backup": ""}
     return {
