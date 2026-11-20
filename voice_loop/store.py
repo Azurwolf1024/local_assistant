@@ -38,7 +38,11 @@ from typing import Any, Iterable, Iterator
 _LOCKS: dict[str, threading.RLock] = {}
 _LOCKS_GUARD = threading.Lock()
 _DEPTH = threading.local()          # 每线程持有的路径计数（用于可重入）
-LOCK_TIMEOUT = 5.0                  # 等锁超时（秒）
+#: 等锁超时。★别看它长★：这里等的是一次「读-改-写小 JSON」，正常几十微秒；
+#: 但整套自测并跑 + 服务在后台说话/调模型时，机器会被压到几百毫秒级别的停顿，
+#: 5 秒曾经真的超时过一次（表现是那条 append 直接少了，测试只报「条数对不上」）。
+#: 丢一次写入比多等 25 秒糟得多，所以宁长不短。
+LOCK_TIMEOUT = 30.0
 
 
 def _lock_for(key: str) -> threading.RLock:

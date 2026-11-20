@@ -144,6 +144,29 @@ class Triage:
         return max(0, int(getattr(self.cfg, "classify_chars", 400) or 0))
 
     @property
+    def max_age_days(self) -> int:
+        """超过这么多天的旧邮件**只走规则**（不送模型）。0 = 不限。"""
+        try:
+            return int(getattr(self.cfg, "classify_max_age_days", 7) or 0)
+        except (TypeError, ValueError):
+            return 7
+
+    def is_stale(self, msg: dict, now: datetime | None = None) -> bool:
+        """这封邮件老到不值得花 token 了吗（按收信时间算）。"""
+        days = self.max_age_days
+        if days <= 0:
+            return False
+        stamp = str(msg.get("received_at") or "")
+        if not stamp:
+            return False
+        try:
+            when = datetime.fromisoformat(stamp.replace("Z", "+00:00")).astimezone()
+        except ValueError:
+            return False
+        moment = now or datetime.now().astimezone()
+        return (moment - when).days > days
+
+    @property
     def model(self) -> str:
         return str(getattr(self.cfg, "classify_model", "") or "")
 
@@ -252,8 +275,12 @@ class Triage:
         }
 
     # ---------------------------------------------------------------- 合并
-    def classify(self, msg: dict, *, use_cache: bool = True) -> dict[str, Any]:
-        """返回 ``{score, level, category, needs_reply, deadline, one_line, reasons, model}``。"""
+    def classify(self, msg: dict, *, use_cache: bool = True, allow_llm: bool = True) -> dict[str, Any]:
+        """返回 ``{score, level, category, needs_reply, deadline, one_line, reasons, model}``。
+
+        ★老邮件不花 token★：收信超过 ``classify_max_age_days`` 天的只走规则
+        （``allow_llm`` 也会被强制关掉）—— 三周前的促销值不得一次模型调用。
+        """
         message_id = str(msg.get("id") or "")
         cached = self._cached(message_id)
         if use_cache and cached is not None:
@@ -268,7 +295,10 @@ class Triage:
         model_used = ""
         reasons = list(base["reasons"])
 
-        llm = self._ask_llm(msg)
+        if allow_llm and self.is_stale(msg):
+            allow_llm = False
+            reasons.append(f"超过 {self.max_age_days} 天，只走规则（省 token）")
+        llm = self._ask_llm(msg) if allow_llm else None
         if llm is not None:
             model_used = self.model or "llm"
             # 模型能抬高；但如果它明确说是群发/促销，且规则分不高 → 压下来

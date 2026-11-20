@@ -246,6 +246,9 @@ class VoiceLoop:
                     enabled=True,
                     timeout=float(settings.skills.visual_timeout),
                     logger=self.log,
+                    theme=str(getattr(getattr(settings, "ui", None), "theme", "auto")),
+                    width=int(getattr(getattr(settings, "ui", None), "width", 420)),
+                    shadow=int(getattr(getattr(settings, "ui", None), "shadow", 3)),
                 )
                 self.toast.start()
             except Exception as exc:  # noqa: BLE001
@@ -267,6 +270,7 @@ class VoiceLoop:
                     show_user_text=bool(sub_cfg.show_user_text),
                     margin=int(sub_cfg.margin),
                     logger=self.log,
+                    theme=str(getattr(getattr(settings, "ui", None), "theme", "auto")),
                 )
                 # ★字幕跟声音同步★：还在生成回答、或者扬声器里还有没放完的音频，
                 # 就一直不隐藏；真的停下来之后再停留 hold_seconds 秒（见 subtitle._tick）
@@ -426,6 +430,7 @@ class VoiceLoop:
             ApprovalQueue(self.mail.outbox, log=self.log, on_result=self._on_mail_result),
             timeout=float(getattr(cfg, "approval_ttl", 300) or 300),
             log=self.log,
+            theme=str(getattr(getattr(settings, "ui", None), "theme", "auto")),
         )
         self.mail_approval = approval
         self.mail.on_draft = approval.submit
@@ -434,6 +439,7 @@ class VoiceLoop:
             self.mail.queue_event,
             timeout=float(getattr(cfg, "approval_ttl", 300) or 300),
             log=self.log,
+            theme=str(getattr(getattr(settings, "ui", None), "theme", "auto")),
         )
         self.mail_proposal = proposal_card
         self.mail.on_proposal = proposal_card.submit
@@ -476,22 +482,24 @@ class VoiceLoop:
         """
         if self.skills is None:
             raise RuntimeError("技能层没开（[skills] enabled = false），加不了日程")
-        from .event_text import parse_datetime  # noqa: PLC0415
+        from . import event_text as et  # noqa: PLC0415
 
         when_text = str(item.get("when_text") or "").strip()
-        when = parse_datetime(when_text) if when_text else None
+        when = et.parse_datetime(when_text) if when_text else None
         if when is None:
             raise RuntimeError(f"听不懂这个时间：{when_text or '（空）'}")
-        fields = {
+        fields = et.to_item({
             "title": str(item.get("title") or "邮件提到的事")[:60],
             "start": when,
             "location": str(item.get("place") or ""),
             "note": str(item.get("reason") or "")[:200],
             "category": "mail",
-        }
-        event = self.skills.store.append(et.to_item(fields))
+        })
+        # ★留痕★：写清「这条是从哪封邮件来的」，事后追得回来
+        fields["source"] = f"mail:{item.get('message_id') or ''}"[:200]
+        event = self.skills.store.append(fields)
         event_id = int(event.get("id") or 0)
-        self.log.info(f"[mail] 已加入日程 #{event_id}：{fields['title']}（{when_text}）")
+        self.log.info(f"[mail] 已加入日程 #{event_id}：{fields.get('title')}（{when_text}）")
         return event_id
 
     # ======================================================================

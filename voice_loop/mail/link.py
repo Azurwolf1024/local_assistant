@@ -97,7 +97,10 @@ class EventProposer:
             "只输出一个 JSON 对象，不要解释、不要 markdown：\n"
             '{"has_event":true/false,"title":"不超过 20 字","when":"YYYY-MM-DD HH:MM 或空串",'
             '"place":"地点或空串","reason":"为什么值得记（不超过 20 字）"}\n'
-            "没有明确时间、或者只是通知/宣传的，has_event 就是 false。"
+            "title 要写成「动作 + 对象」的中文短语（例：「提交 AIAA3102 作业3」「报名羽毛球赛」"
+            "「参加期末考试」），**不要照抄邮件标题**，也不要带「通知/Announcement」这类词。\n"
+            "时间只写邮件里明确给出的那个（截止时间优先）；只给了日期就写 YYYY-MM-DD，"
+            "没给具体时刻不要自己编。没有明确时间、或者只是宣传/群发的，has_event 就是 false。"
         )
         user = (f"今天：{datetime.now().strftime('%Y-%m-%d %A')}\n"
                 f"主题：{subject}\n正文开头：{snippet}")
@@ -241,9 +244,16 @@ class EventQueue:
         try:
             event_id = self.add_event(item)
         except Exception as exc:  # noqa: BLE001 - 写日程失败要能说出来
-            self.log.warning(f"[mail] 加入日程失败：{exc}")
-            self._report(False, f"加入日程失败：{exc}")
-            return False, f"加入日程失败：{exc}"
+            # ★失败也要出队★：留在队列里会让卡片每个 tick 重新弹一次
+            # （实测过：一次 NameError 导致窗口被反复重建，看起来像"点了加入又弹出来"）。
+            # 标记 failed 留档，人可以从 proposals 里看到原因，但不再打扰。
+            self.store.set_proposal(proposal_id, state="failed",
+                                    decided_at=datetime.now().timestamp())
+            self._drop(proposal_id)
+            message = f"加不进日程：{exc}"
+            self.log.warning(f"[mail] {message}")
+            self._report(False, message)
+            return False, message
         self.store.set_proposal(proposal_id, state=STATE_ACCEPTED,
                                 decided_at=datetime.now().timestamp(),
                                 event_id=int(event_id or 0))

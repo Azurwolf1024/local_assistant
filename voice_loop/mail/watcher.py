@@ -77,10 +77,14 @@ class MailWatcher:
             self._warned = False
         try:
             result["sync"] = self.service.sync()
-            fresh = self.service.store.untriaged(limit=5)
+            # ★每封都是一次模型调用★：预算由 [mail] classify_per_sync 说了算，
+            # 而且老邮件在 Triage 里就被挡掉了（只走规则）
+            limit = int(getattr(self.service.cfg, "classify_per_sync", 5) or 5)
+            fresh = self.service.store.untriaged(limit=max(1, limit))
             for msg in fresh:
                 info = self.service.triage.classify(msg)
                 self.service.store.set_triage(str(msg["id"]), info)
+            result["triaged"] = len(fresh)
             pending = self.service.store.unnotified(levels=("high",), limit=5)
             result["notified"] = self.notifier.notify_high(pending)
             moment = self.clock()

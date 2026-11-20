@@ -663,7 +663,7 @@ class MailConfig:
     tenant: str = "consumers"         # 个人账号 = consumers；工作/学校 = organizations；两者都可 = common
 
     folder: str = "inbox"             # 同步哪个文件夹（inbox / all）
-    first_sync_days: int = 30         # 第一次同步往回拉几天
+    first_sync_days: int = 7          # 第一次同步往回拉几天（★越久越费 token★）
     page_size: int = 50
     max_pages: int = 10               # 单轮最多翻几页（防止一次拉爆）
     sync_minutes: float = 3.0         # 巡检间隔（秒级也行，服务里跑）
@@ -671,7 +671,9 @@ class MailConfig:
 
     classify_chars: int = 400         # ★分类时只把「主题 + 前 N 字」发给模型★
     classify_model: str = ""          # 空 = 用 [api] 里的模型；填 ollama:<名字> 走本地
-    classify_per_sync: int = 10       # 每轮最多分级几封（省 token、也防止卡住）
+    classify_per_sync: int = 5        # 每轮最多分级几封（每封 = 一次模型调用，省 token）
+    classify_max_age_days: int = 7    # ★超过这么多天的旧邮件只走规则、不送模型★
+    prune_days: int = 30              # 本地索引保留多少天（mail prune 用；0 = 不删）
     high_score: int = 60              # ≥ 这个分 → 立刻提醒
     medium_score: int = 30            # ≥ 这个分 → 进摘要
     vip_senders: list[str] = field(default_factory=list)      # 地址或 @域名
@@ -693,6 +695,18 @@ class MailConfig:
     send_allowlist: list[str] = field(default_factory=list)   # 空表 = 谁都发不出去
     approval_ttl: int = 300           # 审批通过后多久内必须点发送（秒）
     timeout: float = 20.0
+
+
+@dataclass
+class UiConfig:
+    """界面外观（弹窗 / 字幕 / 审批卡共用一套 token，见 voice_loop/ui_kit.py）。
+
+    参照 DeepSeek Harness 的翻译浮层：圆角卡片、细描边、柔和阴影、分层文字。
+    """
+
+    theme: str = "auto"        # auto = 跟随 Windows 深/浅色；也可写 "dark" / "light"
+    width: int = 420           # 提醒弹窗口宽
+    shadow: int = 3            # 阴影层数（0 = 不要阴影，纯平面）
 
 
 @dataclass
@@ -726,6 +740,7 @@ class Settings:
     wake: WakeConfig = field(default_factory=WakeConfig)
     skills: SkillsConfig = field(default_factory=SkillsConfig)
     subtitle: SubtitleConfig = field(default_factory=SubtitleConfig)
+    ui: UiConfig = field(default_factory=UiConfig)
     bargein: BargeInConfig = field(default_factory=BargeInConfig)
     vision: VisionConfig = field(default_factory=VisionConfig)
     weather: WeatherConfig = field(default_factory=WeatherConfig)

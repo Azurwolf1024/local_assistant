@@ -86,9 +86,16 @@ def section_2() -> None:
         store = JsonStore(path, default=[])
         n_threads, per = 6, 25
 
+        errors: list[str] = []
+
         def work(tag: int) -> None:
             for i in range(per):
-                store.append({"title": f"t{tag}-{i}"})
+                try:
+                    store.append({"title": f"t{tag}-{i}"})
+                except Exception as exc:  # noqa: BLE001
+                    # ★必须记下来★：线程里抛异常会静默少写一条，
+                    # 只看「条数对不上」根本不知道为什么（曾经就是这样查了半天）
+                    errors.append(f"t{tag}-{i}: {type(exc).__name__}: {exc}")
 
         threads = [threading.Thread(target=work, args=(t,)) for t in range(n_threads)]
         for t in threads:
@@ -96,6 +103,7 @@ def section_2() -> None:
         for t in threads:
             t.join()
         items = JsonStore(path, default=[]).load(force=True)
+        check("没有一个 append 抛异常", errors, [])
         check("条数对得上", len(items), n_threads * per)
         check("id 不重复", len({it["id"] for it in items}), len(items))
 

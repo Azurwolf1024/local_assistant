@@ -132,8 +132,12 @@ class ApprovalCard:
         ok_text: str = "",
         no_text: str = "",
         hint: str = "",
+        theme: str = "auto",
     ) -> None:
         self.queue = queue
+        self.theme_name = str(theme or "auto")
+        self._canvas: Any = None
+        self._hint_id: Any = None
         # 邮件草稿 / 日程提议共用这一张卡：只换文案，不换交互（``kind`` 由队列自己声明）
         is_event = str(getattr(queue, "kind", "mail")) == "event"
         self.title = title or ("要不要加进日程？" if is_event else "要发一封邮件")
@@ -195,17 +199,22 @@ class ApprovalCard:
         if self._host is None:
             return
         if self._result is not None:
-            # 把上一步的结果再说一遍（不弹新窗，只在卡片上显示一句）
+            # 上一步的结果：成功才收窗；**失败把窗口留着**并把原因写在卡片上
+            # （以前一律 destroy → 下一个 tick 又因为「队首还在」重建一次，
+            #  看起来就是「点了按钮窗口反复弹出」，实测被用户抓到过）。
             ok, message = self._result
             self._result = None
-            if self._win is not None:
+            self.log.info(f"[mail] 审批结果：{message}")
+            if ok:
+                self._destroy()
+            else:
                 try:
-                    self._win.destroy()
+                    th = ui_kit_theme(self.theme_name)
+                    self._canvas.itemconfigure(self._hint_id, text=ui_kit_ellipsize(message, 30),
+                                               fill=th["danger"])
                 except Exception:  # noqa: BLE001
                     pass
-            self._win = None
-            self._shown = ""
-            self.log.info(f"[mail] 审批结果：{message}")
+                self._deadline = time.monotonic() + self.timeout
 
         draft = self.queue.head()
         if draft is None:
@@ -229,44 +238,75 @@ class ApprovalCard:
                 self._destroy()
                 return
             try:
-                self._countdown.config(text=f"{int(max(0, left))} 秒后自动取消")
+                verb = "自动忽略" if str(getattr(self.queue, "kind", "")) == "event" else "自动取消"
+                self._canvas.itemconfigure(
+                    self._countdown, text=f"{int(max(0, left))} 秒后{verb}")
             except Exception:  # noqa: BLE001
                 pass
         self._place(root)
 
     def _build(self, root, draft: dict) -> Any:  # pragma: no cover - 需要图形环境
+        """画一张圆角审批卡（和提醒弹窗 / 字幕同一套设计件，参照 dsh-translate 浮层）。"""
         import tkinter as tk
 
+        from .. import ui_kit  # noqa: PLC0415
+
+        th = ui_kit.theme(self.theme_name)
         previewer = getattr(self.queue, "preview", None)
         preview = previewer(draft) if callable(previewer) else self.queue.outbox.preview(draft)
+
+        pad = 16
+        s = 3
+        width = self.width
+        inner = width - pad * 2 - s * 2
+        body_chars = max(24, int(inner / 13.5))
+        body_lines = min(6, max(1, -(-len(preview["body"]) // body_chars)))
+        height = (s * 2 + 12 + 20 + 10        # 头
+                  + 20 + 22                    # 收件人 / 主题
+                  + 8 + body_lines * 20 + 8   # 正文
+                  + 30 + 12)                   # 底栏
+
         win = tk.Toplevel(root)
         win.title(self.title)
-        win.attributes("-topmost", True)
         win.resizable(False, False)
-        win.configure(bg="#1b1f2a")
+        win.configure(bg=ui_kit.TRANSPARENT)
+        ui_kit.style_popup(win, alpha=0.99, topmost=True)
 
-        tk.Label(win, text=self.title, bg="#1b1f2a", fg="#8fd3ff",
-                 font=("Microsoft YaHei UI", 11, "bold"), anchor="w").pack(
-            fill="x", padx=14, pady=(10, 2))
-        to_line = preview["to"] + (f"（抄送 {preview['cc']}）" if preview["cc"] else "")
-        tk.Label(win, text=f"{self.who_label}：{to_line}", bg="#1b1f2a", fg="#f2f4f8",
-                 font=("Microsoft YaHei UI", 10), anchor="w",
-                 wraplength=self.width - 28, justify="left").pack(fill="x", padx=14)
-        tk.Label(win, text=f"主题：{preview['subject']}", bg="#1b1f2a", fg="#f2f4f8",
-                 font=("Microsoft YaHei UI", 10, "bold"), anchor="w",
-                 wraplength=self.width - 28, justify="left").pack(fill="x", padx=14, pady=(2, 6))
-        tk.Frame(win, bg="#2c3444", height=1).pack(fill="x", padx=14)
-        tk.Label(win, text=preview["body"], bg="#1b1f2a", fg="#dfe4ee",
-                 font=("Microsoft YaHei UI", 10), anchor="w", justify="left",
-                 wraplength=self.width - 28).pack(fill="both", expand=True, padx=14, pady=(6, 4))
-        self._countdown = tk.Label(win, text="", bg="#1b1f2a", fg="#8b93a7",
-                                   font=("Microsoft YaHei UI", 9), anchor="w")
-        self._countdown.pack(fill="x", padx=14)
-        tk.Label(win, text=self.hint, bg="#1b1f2a", fg="#8b93a7",
-                 font=("Microsoft YaHei UI", 9), anchor="w").pack(fill="x", padx=14)
+        canvas = tk.Canvas(win, width=width, height=height, bg=ui_kit.TRANSPARENT,
+                           highlightthickness=0, bd=0)
+        canvas.pack()
+        ui_kit.draw_card(canvas, width, height, th, shadow=s, inset=s)
 
-        row = tk.Frame(win, bg="#1b1f2a")
-        row.pack(fill="x", padx=14, pady=(4, 10))
+        x0, x1 = s + pad, width - s - pad
+        y = s + 14
+        canvas.create_oval(x0, y, x0 + 7, y + 7, fill=th["accent"], outline="")
+        canvas.create_text(x0 + 13, y + 3, text=self.title, anchor="w", fill=th["fg"],
+                           font=(ui_kit.FONT, ui_kit.SIZE_TITLE, "bold"))
+        cross = canvas.create_text(x1 - 2, y + 3, text="×", anchor="e",
+                                   fill=th["fg_mute"], font=(ui_kit.FONT, 13))
+        y += 18
+        ui_kit.draw_hairline(canvas, x0 - 6, x1 + 6, y, th)
+        y += 10
+
+        canvas.create_text(x0, y, text=f"{self.who_label}", anchor="w",
+                           fill=th["fg_mute"], font=(ui_kit.FONT, ui_kit.SIZE_META))
+        canvas.create_text(x0 + 40, y, text=ui_kit.ellipsize(preview["to"], 46),
+                           anchor="w", fill=th["fg"], font=(ui_kit.FONT, ui_kit.SIZE_BODY))
+        y += 22
+        canvas.create_text(x0, y, text="主题", anchor="w",
+                           fill=th["fg_mute"], font=(ui_kit.FONT, ui_kit.SIZE_META))
+        canvas.create_text(x0 + 40, y, text=ui_kit.ellipsize(preview["subject"], 40),
+                           anchor="w", fill=th["fg"],
+                           font=(ui_kit.FONT, ui_kit.SIZE_BODY, "bold"))
+        y += 14
+        ui_kit.draw_hairline(canvas, x0 - 6, x1 + 6, y, th)
+        y += 8
+
+        canvas.create_text(x0, y, text=ui_kit.ellipsize(preview["body"], body_chars * body_lines),
+                           anchor="nw", width=inner, justify="left",
+                           fill=th["fg"], font=(ui_kit.FONT, ui_kit.SIZE_BODY))
+        y += body_lines * 20 + 8
+        ui_kit.draw_hairline(canvas, x0 - 6, x1 + 6, y, th)
 
         def send() -> None:
             self._decide("send")
@@ -274,33 +314,33 @@ class ApprovalCard:
         def cancel() -> None:
             self._decide("cancel")
 
-        tk.Button(row, text=self.ok_text, command=send, relief="flat", bg="#2f6feb", fg="white",
-                  activebackground="#1d5ad4", activeforeground="white",
-                  font=("Microsoft YaHei UI", 10), padx=18, pady=2,
-                  cursor="hand2").pack(side="right")
-        tk.Button(row, text=self.no_text, command=cancel, relief="flat", bg="#39404f", fg="#e6eaf2",
-                  activebackground="#2b3240", activeforeground="white",
-                  font=("Microsoft YaHei UI", 10), padx=16, pady=2,
-                  cursor="hand2").pack(side="right", padx=(0, 8))
+        btn_h, gap = 26, 8
+        ok_w = max(70, 16 + 12 * len(self.ok_text))
+        no_w = max(62, 16 + 12 * len(self.no_text))
+        y_btn = y + 8
+        ui_kit.CanvasButton(canvas, th, x=x1 - ok_w, y=y_btn, width=ok_w, height=btn_h,
+                            text=self.ok_text, command=send, primary=True)
+        ui_kit.CanvasButton(canvas, th, x=x1 - ok_w - gap - no_w, y=y_btn, width=no_w,
+                            height=btn_h, text=self.no_text, command=cancel)
+
+        self._hint_id = canvas.create_text(
+            x0, y_btn + btn_h / 2,
+            text=ui_kit.ellipsize(self.hint, 22), anchor="w",
+            fill=th["fg_mute"], font=(ui_kit.FONT, ui_kit.SIZE_META),
+        )
+        self._countdown = canvas.create_text(
+            x0, y_btn + btn_h / 2 + 13, text="", anchor="w",
+            fill=th["fg_mute"], font=(ui_kit.FONT, ui_kit.SIZE_META),
+        )
+        self._canvas = canvas
+        for item in (cross,):
+            canvas.tag_bind(item, "<Button-1>", lambda _e: cancel())
+            canvas.tag_bind(item, "<Enter>",
+                            lambda _e: canvas.itemconfigure(cross, fill=th["fg"]))
+            canvas.tag_bind(item, "<Leave>",
+                            lambda _e: canvas.itemconfigure(cross, fill=th["fg_mute"]))
         win.bind("<Escape>", lambda _e: cancel())
         return win
-
-    def _decide(self, action: str) -> None:
-        """按钮回调：网络动作挪到线程里，别冻住 UI。"""
-        draft = self.queue.head()
-        if draft is None or self._busy:
-            return
-        draft_id = str(draft.get("id") or "")
-        self._busy = True
-
-        def work() -> None:
-            try:
-                ok, message = self.queue.decide(draft_id, action)
-                self._result = (ok, message)
-            finally:
-                self._busy = False
-
-        threading.Thread(target=work, name="mail-approve", daemon=True).start()
 
     def _place(self, root) -> None:  # pragma: no cover - 需要图形环境
         win = self._win

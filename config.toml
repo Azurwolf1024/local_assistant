@@ -557,6 +557,14 @@ visual_alert = true           # 提醒时同时弹出右下角可视窗（没开
 visual_timeout = 25           # 可视窗多少秒后自动关闭（可随时点「知道了」或按 Esc 关掉）
 
 # ── 屏幕字幕（底部居中半透明，关掉声音也能沟通）──────────────────────────────
+# ── 界面外观（弹窗 / 字幕 / 审批卡共用一套设计件，见 voice_loop/ui_kit.py）──
+# 参照 DeepSeek Harness 的翻译浮层：12px 圆角卡片 + 1px 细描边 + 多层柔和阴影 +
+# 分层文字（次要信息灰色小字、主要信息亮色大字）。改这里三处一起变。
+[ui]
+theme = "auto"        # auto = 跟随 Windows 深/浅色；也可写 "dark" / "light"
+width = 420           # 提醒弹窗口宽（像素）
+shadow = 3            # 阴影层数（0 = 纯平面）
+
 [subtitle]
 enabled = true                # 总开关
 width = 920                   # 字幕条最大宽度（像素）；屏幕比这窄会自动缩
@@ -664,7 +672,7 @@ client_id = ""                 # ★放在 config.local.toml★（这是应用�
 tenant = "consumers"           # 个人账号；工作/学校账号填 organizations
 
 folder = "inbox"               # 同步哪个文件夹（all = 全部）
-first_sync_days = 30           # 第一次往回拉多少天
+first_sync_days = 7            # 第一次往回拉多少天（★越久越费 token，默认只挖一周★）
 page_size = 50
 max_pages = 10                 # 单轮最多翻几页
 sync_minutes = 3               # 巡检间隔（服务在跑时每 3 分钟问一次 Graph）
@@ -674,7 +682,9 @@ max_body_chars = 6000          # 读正文时最多给模型多少字
 # 只把「主题 + 发件人 + 前 classify_chars 字」发给模型，正文不会整封出去。
 classify_chars = 400
 classify_model = ""            # 空 = 用 [api] 的模型；填 ollama:qwen3.5:4b 就走本地
-classify_per_sync = 10         # 每轮最多分级几封
+classify_per_sync = 5          # 每轮最多分级几封（每封一次模型调用）
+classify_max_age_days = 7      # 超过这么多天的旧邮件只走规则、不送模型（省 token）
+prune_days = 30                # 本地索引保留天数（python main.py mail prune 用；0 = 不删）
 high_score = 60                # ≥ 60 立刻弹窗提醒
 medium_score = 30              # ≥ 30 进摘要（每天 digest_hours 两个时间点）
 vip_senders = []               # 例：["boss@company.com", "@hku.hk"]

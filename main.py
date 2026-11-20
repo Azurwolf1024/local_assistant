@@ -496,6 +496,11 @@ def _cmd_mail(svc, what: str, args: argparse.Namespace) -> int:
                            only_important=not bool(getattr(args, "all", False)))
         print(text)
         return 0
+    if what == "prune":
+        days = int(getattr(args, "days", 0) or getattr(svc.cfg, "prune_days", 30) or 30)
+        n = svc.store.prune(days)
+        print(f"√ 已清掉本地索引里 {days} 天以前的 {n} 封（Outlook 里的邮件没动）")
+        return 0
     if what == "drafts":
         rows = svc.drafts()
         if not rows:
@@ -1847,6 +1852,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_mail.add_argument("--hours", type=float, default=24)
     p_mail.add_argument("--all", action="store_true", help="连一般邮件也算上")
     p_mail.set_defaults(mail_cmd="digest")
+    p_mail = mail_sub.add_parser("prune", help="清掉本地索引里太老的邮件（不动 Outlook）")
+    p_mail.add_argument("--days", type=int, default=0,
+                        help="保留多少天（默认读 [mail] prune_days，再默认 30）")
     p_mail = mail_sub.add_parser("drafts", help="看待批草稿")
     p_mail.set_defaults(mail_cmd="drafts")
     p_mail = mail_sub.add_parser("approve", help="批准并发送（★这一步才会真发★）")

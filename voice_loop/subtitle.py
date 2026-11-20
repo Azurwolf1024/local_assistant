@@ -123,6 +123,7 @@ class SubtitleOverlay:
         show_user_text: bool = True,
         margin: int = 8,
         logger: logging.Logger | None = None,
+        theme: str = "auto",
     ) -> None:
         self.enabled = bool(enabled)
         self.width = max(320, int(width))
@@ -133,6 +134,7 @@ class SubtitleOverlay:
         self.show_user_text = bool(show_user_text)
         self.margin = max(0, int(margin))
         self.log = logger or logging.getLogger("voice_loop")
+        self._theme_name = str(theme or "auto")
 
         self._queue: queue.Queue = queue.Queue()
         self._host: ui.UiHost | None = None
@@ -140,8 +142,7 @@ class SubtitleOverlay:
 
         # 以下都是 UI 线程里的状态
         self._win = None
-        self._lbl_main = None
-        self._lbl_user = None
+        self._canvas = None
         self._font_main = None
         self._area: tuple[int, int, int, int] | None = None
         self._win_width = self.width
@@ -165,11 +166,16 @@ class SubtitleOverlay:
         self._shown_pos: int | None = None
 
         # 配色
-        self._bg = "#0f131a"
-        self._fg = "#f4f7fb"
-        self._fg_user = "#8ab4dc"
-        self._border = "#2d3644"
-        self._family = "Microsoft YaHei UI"
+        # 配色交给共享设计件（参照 dsh-translate 的浮层：圆角卡片 + 细描边 + 柔和阴影）
+        from . import ui_kit  # noqa: PLC0415
+
+        th = ui_kit.theme(getattr(self, "_theme_name", "auto"))
+        self._th = th
+        self._bg = th["bg"]
+        self._fg = th["fg"]
+        self._fg_user = th["fg_mute"]
+        self._border = th["border"]
+        self._family = ui_kit.FONT
 
     # ------------------------------------------------------------------ 生命周期
     @property
@@ -276,8 +282,7 @@ class SubtitleOverlay:
     def _destroy(self, _root) -> None:
         win, self._win = self._win, None
         self._visible = False
-        self._lbl_main = None
-        self._lbl_user = None
+        self._canvas = None
         self._hwnd = 0
         if win is not None:
             try:
@@ -289,66 +294,76 @@ class SubtitleOverlay:
         import tkinter as tk
         from tkinter import font as tkfont
 
-        # 内边距统一交给 grid，label 自己不设 padx/pady，折行宽度就好算
-        pad = max(12, self.font_size // 2)
-        pad_v = max(5, pad // 3)
+        from . import ui_kit  # noqa: PLC0415
 
-        # 桌面可用区域（已排除任务栏）。任务栏在左/右/上、或者屏幕有 DPI 缩放，
-        # 这里算出来的位置都是对的。
+        pad = max(14, self.font_size)
         area = work_area()
         if area is None:
-            area = (
-                0,
-                0,
-                root.winfo_screenwidth(),
-                max(0, root.winfo_screenheight() - 48),
-            )
+            area = (0, 0, root.winfo_screenwidth(),
+                    max(0, root.winfo_screenheight() - 48))
         self._area = area
         self._win_width = min(self.width, max(320, area[2] - area[0]) - 2 * self.margin)
-        self._wrap_px = self._win_width - 2 * pad - 6
+        self._shadow = 3
+        self._pad = pad
+        self._wrap_px = self._win_width - 2 * pad - 2 * self._shadow
 
-        # 显式传 root：只有一个 Tk 解释器时最稳，也免得依赖 _default_root
-        self._font_main = tkfont.Font(
-            root=root, family=self._family, size=self.font_size
-        )
-        font_user = tkfont.Font(
-            root=root, family=self._family, size=max(10, self.font_size - 6)
-        )
+        self._font_main = tkfont.Font(root=root, family=self._family, size=self.font_size)
+        self._font_user = tkfont.Font(root=root, family=self._family,
+                                      size=max(9, self.font_size - 4))
 
         win = tk.Toplevel(root)
-        win.overrideredirect(True)
-        win.configure(bg=self._bg)
-        # 一圈细边框，浅色墙纸下也能看清面板边缘
-        try:
-            win.configure(highlightthickness=1, highlightbackground=self._border)
-        except Exception:  # noqa: BLE001
-            pass
-        win.attributes("-topmost", True)
-        try:
-            win.attributes("-alpha", self.alpha)
-        except Exception:  # noqa: BLE001
-            pass
+        win.configure(bg=ui_kit.TRANSPARENT)
+        ui_kit.style_popup(win, alpha=self.alpha, topmost=True)
 
-        win.grid_columnconfigure(0, weight=1)
-        self._lbl_user = tk.Label(
-            win, text="", bg=self._bg, fg=self._fg_user, font=font_user,
-            justify="left", anchor="w", wraplength=0,
-        )
-        self._lbl_main = tk.Label(
-            win, text="", bg=self._bg, fg=self._fg, font=self._font_main,
-            justify="left", anchor="w", wraplength=0,
-        )
-        # 固定行号：上行「你说」，下行助手回复。用 grid_remove/grid 显隐，
-        # 不会像 pack 那样一加一减就把顺序搞乱。
-        self._lbl_user.grid(row=0, column=0, sticky="ew", padx=pad, pady=(pad_v, 0))
-        self._lbl_main.grid(row=1, column=0, sticky="ew", padx=pad, pady=(pad_v, pad_v))
-        self._lbl_user.grid_remove()
+        self._canvas = tk.Canvas(win, width=self._win_width, height=10,
+                                 bg=ui_kit.TRANSPARENT, highlightthickness=0, bd=0)
+        self._canvas.pack()
 
         self._win = win
         self._hwnd = int(win.winfo_id())
         root.update_idletasks()
         make_click_through(self._hwnd)
         self.log.debug(f"字幕窗口已建立 hwnd={self._hwnd:#x} 宽度={self._win_width}px")
+
+    def _render(self, lines: list[str], user_line: str) -> None:  # pragma: no cover
+        """把「你说 + 助手说」画进圆角卡片（用户那句是灰色小字，像原文）。"""
+        from . import ui_kit  # noqa: PLC0415
+
+        canvas = getattr(self, "_canvas", None)
+        if canvas is None:
+            return
+        th = self._th
+        s = self._shadow
+        pad = self._pad
+        line_h = max(18, self.font_size + 7)
+        user_h = (max(14, self.font_size - 4 + 6) + 4) if user_line else 0
+        height = s * 2 + pad + user_h + (4 if user_line else 0) + len(lines) * line_h + pad
+
+        canvas.configure(width=self._win_width, height=height)
+        canvas.delete("all")
+        ui_kit.draw_card(canvas, self._win_width, height, th, shadow=s, inset=s)
+
+        x0 = s + pad
+        x1 = self._win_width - s - pad
+        y = s + pad * 0.65
+        if user_line:
+            canvas.create_text(x0, y, text=ui_kit.ellipsize(user_line, 120), anchor="nw",
+                               width=max(80, x1 - x0), justify="left",
+                               fill=th["fg_mute"], font=(ui_kit.FONT, max(9, self.font_size - 4)))
+            y += user_h
+            ui_kit.draw_hairline(canvas, x0 - 4, x1 + 4, y - 2, th)
+            y += 6
+        # 左边一个小圆点：在说话的时候是亮蓝色，说完变灰（不用动画，省 CPU）
+        dot = th["accent"] if self._kept or self._keepalive is not None else th["border"]
+        canvas.create_oval(x0, y + line_h / 2 - 4, x0 + 7, y + line_h / 2 + 3,
+                           fill=dot, outline="")
+        canvas.create_text(x0 + 13, y, text="\n".join(lines), anchor="nw",
+                           width=max(80, x1 - x0 - 13), justify="left",
+                           fill=th["fg"], font=(ui_kit.FONT, self.font_size))
+        try:
+            self._win.geometry(f"{self._win_width}x{max(1, int(height))}")
+        except Exception:  # noqa: BLE001
+            pass
 
     def _tick(self, root) -> None:  # pragma: no cover - 需要图形环境
         if self._closing:
@@ -397,12 +412,9 @@ class SubtitleOverlay:
                 lines = self._wrap(
                     self._visible_body(), self._font_main, self._wrap_px, self.max_lines
                 )
-                self._lbl_main.configure(text="\n".join(lines))
-                if self._user_text and self.show_user_text:
-                    self._lbl_user.configure(text=f"你说：{self._user_text}")
-                    self._lbl_user.grid()
-                else:
-                    self._lbl_user.grid_remove()
+                user_line = (f"你说：{self._user_text}"
+                             if (self._user_text and self.show_user_text) else "")
+                self._render(lines, user_line)
                 if not self._visible:
                     self._win.deiconify()
                     self._win.attributes("-topmost", True)

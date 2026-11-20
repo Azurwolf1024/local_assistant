@@ -321,6 +321,25 @@ class MailStore:
         return {"total": int(total), "unread": int(unread),
                 "by_level": by_level, "pending_drafts": int(drafts)}
 
+    # ------------------------------------------------------------------ 清理
+    def prune(self, days: int) -> int:
+        """删掉本地索引里 ``days`` 天以前的邮件（**只动本地库**，不碰 Outlook）。
+
+        为什么要它：索引越久，搜索越慢，而且巡检会一直翻旧邮件要不要分级 ——
+        全是白花的 token。不想留就定期跑一次 ``python main.py mail prune``。
+        """
+        days = int(days or 0)
+        if days <= 0:
+            return 0
+        cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                               time.gmtime(time.time() - days * 86400))
+        rows = self._query("SELECT id FROM messages WHERE received_at < ?", (cutoff,))
+        ids = [str(r["id"]) for r in rows]
+        for message_id in ids:
+            self._exec("DELETE FROM attachments WHERE message_id = ?", (message_id,))
+            self._exec("DELETE FROM messages WHERE id = ?", (message_id,))
+        return len(ids)
+
     # ------------------------------------------------------------------ 草稿
     def create_draft(self, draft: dict) -> None:
         self._exec(

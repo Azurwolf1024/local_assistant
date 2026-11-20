@@ -696,6 +696,105 @@ def test_event_link(tmp: Path) -> None:
     svc.close()
 
 
+def test_add_event_real_path(tmp: Path) -> None:
+    """★真写路径★：pipeline._add_event_from_mail 必须真能写进 events.json。
+
+    为什么单独一条：前面几组都是用**桩**替换 ``add_event``，只验证了「点了才写」，
+    没验证「写的那段代码本身对不对」—— 结果真机上 `et` 这个名字被 import 改丢了，
+    测试全绿、用户一点就报 NameError，卡片还反复弹。
+    """
+    print("\n[13] 真写路径：pipeline._add_event_from_mail 落库（用桩 skills）")
+    from voice_loop.pipeline import VoiceLoop
+    from voice_loop.store import JsonStore
+
+    class FakeSkills:
+        def __init__(self, path: Path) -> None:
+            self.store = JsonStore(path, default=[])
+
+    class FakeLoop:
+        skills = None
+        log = __import__("logging").getLogger("test")
+        _add_event_from_mail = VoiceLoop._add_event_from_mail
+
+    loop = FakeLoop()
+    loop.skills = FakeSkills(tmp / "events.json")
+    event_id = loop._add_event_from_mail({
+        "title": "提交 AIAA3102 作业3",
+        "when_text": "2026-11-24 23:59",
+        "message_id": "m9",
+        "reason": "作业截止",
+    })
+    items = loop.skills.store.load(force=True)
+    check("写进了一条事件", len(items), 1)
+    check("id 回传了", event_id, 1)
+    row = items[0]
+    check("标题没被吃掉", row.get("title"), "提交 AIAA3102 作业3")
+    check("★时间是 11-24 23:59（不是今天）★", row.get("start"), "2026-11-24 23:59:00")
+    check("★留了来源，追得回是哪封邮件★", row.get("source"), "mail:m9")
+
+    try:
+        loop._add_event_from_mail({"title": "听不懂的", "when_text": "随便哪天", "message_id": "m9"})
+        raised = ""
+    except RuntimeError as exc:
+        raised = str(exc)
+    check("时间听不懂就报错（不是静默写一条错的）", "听不懂" in raised, True, detail=raised)
+
+    # 失败要出队 + 标 failed，不然卡片会每个 tick 重弹一次
+    from voice_loop.mail.link import EventQueue
+    from voice_loop.mail.store import MailStore
+
+    mstore = MailStore(tmp / "q.sqlite")
+    mstore.create_proposal({"id": "evt-1", "title": "x", "when_text": "y",
+                            "message_id": "m9", "state": "pending"})
+    queue = EventQueue(mstore, add_event=lambda _it: (_ for _ in ()).throw(RuntimeError("炸了")))
+    queue.submit("evt-1")
+    ok, msg = queue.decide("evt-1", "send")
+    check("失败返回原因", (ok, "炸了" in msg), (False, True), detail=msg)
+    check("★失败后出队（不会再弹一次）★", queue.head(), None)
+    check("状态记成 failed，有据可查", mstore.get_proposal("evt-1")["state"], "failed")
+    mstore.close()
+
+
+def test_token_budget(tmp: Path) -> None:
+    """省 token：老邮件不送模型 / 每轮分级有上限 / prune 只动本地。"""
+    print("\n[14] 省 token：老邮件只走规则，prune 只动本地索引")
+    settings, cfg = make_cfg(tmp / "tok")
+    called: list[str] = []
+
+    def fake_llm(system: str, user: str) -> str:
+        called.append(user[:20])
+        return ('{"important":90,"category":"deadline","needs_reply":true,'
+                '"deadline":"2026-12-01","one_line":"很急"}')
+
+    triage = Triage(cfg, llm=fake_llm)
+    cfg.classify_max_age_days = 7
+    fresh = {"id": "f1", "subject": "截止提醒", "received_at": "2099-01-01T00:00:00Z",
+             "preview": "请提交", "to": [{"address": "me@x.com"}]}
+    old = {"id": "o1", "subject": "三周前的促销", "received_at": "2020-01-01T00:00:00Z",
+           "preview": "限时优惠 退订", "to": [{"address": "me@x.com"}]}
+    triage.classify(fresh)
+    check("新邮件会送模型", len(called), 1)
+    info = triage.classify(old, use_cache=False)
+    check("★老邮件不送模型（token 省下来）★", len(called), 1)
+    check("老邮件仍按规则给了结论", bool(info.get("level")), True, detail=str(info.get("level")))
+    check("理由里说明了为什么没送模型",
+          any("只走规则" in r for r in info.get("reasons") or []), True,
+          detail=str(info.get("reasons")))
+    cfg.classify_max_age_days = 0
+    check("关掉这条限制就都送（0 = 不限）",
+          triage.is_stale(old), False)
+
+    store = MailStore(tmp / "prune.sqlite")
+    store.upsert_messages([
+        normalize_message(raw_msg("new", subject="新的", sender="a@x.com")),
+        normalize_message(raw_msg("old", subject="旧的", sender="b@x.com")),
+    ])
+    store._exec("UPDATE messages SET received_at = '2020-01-01T00:00:00Z' WHERE id = 'old'")  # noqa: SLF001
+    removed = store.prune(days=30)
+    check("★prune 删掉老的、留新的★", (removed, len(store.search("", limit=10))), (1, 1))
+    store.close()
+
+
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="mail_"))
     try:
@@ -711,6 +810,8 @@ def main() -> int:
         test_attachments(tmp)
         test_expired_demote(tmp)
         test_event_link(tmp)
+        test_add_event_real_path(tmp)
+        test_token_budget(tmp)
     finally:
         import shutil
 
