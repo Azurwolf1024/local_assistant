@@ -81,8 +81,11 @@ python main.py mail login
 | 方案 | 做什么 | 代价 |
 | --- | --- | --- |
 | **A. 转发到个人邮箱**（最省事） | 学校邮箱设置「自动转发到我的 outlook.com」→ `tenant` 改 `consumers`、受众改含个人账号 → 用个人账号登录 | 转发可能被学校策略禁用；附件/格式偶有损失 |
-| **B. 让 IT 批一次** | 把管理员同意链接发给 IT：`https://login.microsoftonline.com/<tenant>/adminconsent?client_id=<client_id>` | 要等审批 |
-| **C. 装经典 Outlook** | 走本机 COM/MAPI，完全不碰 Graph | 需要经典 OUTLOOK.EXE（新版 `olk.exe` 不支持 COM） |
+| **B. 让 IT 批一次**（本项目实测走的就是这条） | 把管理员同意链接发给 IT：`https://login.microsoftonline.com/<tenant>/adminconsent?client_id=<client_id>&scope=https%3A%2F%2Fgraph.microsoft.com%2FMail.ReadWrite%20https%3A%2F%2Fgraph.microsoft.com%2FMail.Send%20https%3A%2F%2Fgraph.microsoft.com%2FUser.Read` —— 管理员点一次「接受」即可 | 要等审批（HKUST-GZ 实测：发邮件当天就批了） |
+| **C. 装经典 Outlook** | 走本机 COM/MAPI，完全不碰 Graph | 需要经典 OUTLOOK.EXE；**新版 `olk.exe` 不支持 COM**，Office 家庭版也不含 Outlook |
+
+> 想更规范：先在 **API 权限**里把 `Mail.ReadWrite`、`Mail.Send` 加进「Microsoft Graph → 委托的权限」，
+> 这样管理员在同意页面上看到的是明确清单，而不是链接里临时带的 scope。
 
 ## 日常命令
 
@@ -98,6 +101,32 @@ python main.py mail approve <草稿id>     # ★批准 = 真发送★
 ```
 
 服务（`python main.py listen`）里这些是自动的：巡检、分级、提醒、审批卡弹窗。
+
+## 让大肥鱼用上它（工具集怎么配）
+
+邮件工具是 **hidden** 的：只有人格文件里 `api_tools` 点名了 `mail` 的 API 角色才看得到
+（本地 4B 角色看不到 —— 它连 11 个工具都选不准）。
+
+```json
+// data/personas/bluefish.json
+"api_tools": ["mail", "web", "weather"]
+```
+
+★**别一次开太多**★：实测工具数到 22 个（`mail` + `web` + `weather` + `files`）时，
+`deepseek-chat` 会把「我的邮箱里有什么重要邮件」错选成 `list_memos`；砍到 18 个就稳定选
+`mail_summary`。要读工作区文件再加 `"files"`，要写文件/执行命令再加 `"write"` / `"shell"`。
+
+试一下（不用麦克风）：
+
+```powershell
+python main.py --character bluefish ask "我的邮箱里有什么重要邮件" --no-tts
+```
+
+```
+[路由 model / 工具 mail_summary({'since_hours': 24}) ]
+主人～最近一天就一封要紧的：AIAA3102 的老师在上午 11:15 发了期末项目的评分标准，记得点开看看哦～
+```
+
 
 ## 发给谁 —— 三道闸门
 

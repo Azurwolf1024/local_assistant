@@ -21,6 +21,7 @@ import os
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -34,7 +35,7 @@ from voice_loop.mail.notify import Notifier  # noqa: E402
 from voice_loop.mail.outbox import (  # noqa: E402
     STATE_FAILED, STATE_SENT, STATE_UNKNOWN, Outbox, allowed_by_allowlist, body_hash,
 )
-from voice_loop.mail.service import MailService  # noqa: E402
+from voice_loop.mail.service import MailService, local_stamp  # noqa: E402
 from voice_loop.mail.store import MailStore  # noqa: E402
 from voice_loop.mail.triage import Triage  # noqa: E402
 from voice_loop.mcp.servers import mail as mailsrv  # noqa: E402
@@ -202,6 +203,24 @@ def test_auth(tmp: Path) -> None:
     check("续期失败要人话，且提示重新登录", ("invalid_grant" in raised, "重新登录" in raised),
           (True, True), detail=raised)
     check("失败后 token 被丢掉（不会拿坏的反复试）", a.load(), None)
+
+    # 用户没在 15 分钟内完成 → 提示「重新跑一次」，而不是甩 traceback
+    def post_pending(url, data, timeout):
+        return 400, {"error": "authorization_pending"}
+
+    a._post = post_pending  # noqa: SLF001
+    pending2 = auth_mod.DeviceCode(user_code="ZZZZ", verification_uri="https://x",
+                                   device_code="dev-2", expires_in=2, interval=1)
+    notes: list[str] = []
+    try:
+        a.poll_device_login(pending2, sleeper=lambda _s: None, on_wait=notes.append)
+        expired = ""
+    except auth_mod.AuthError as exc:
+        expired = exc.reason
+    check("★超时说的话能用（让用户重跑一次）★", "重新跑一次" in expired, True, detail=expired)
+    check("等待时每隔一阵报一次剩余时间（不是刷屏）",
+          (len(notes) <= 2, bool(notes) and "还剩" in notes[0]), (True, True),
+          detail=str(notes[:2]))
 
 
 def test_delta(tmp: Path) -> None:
@@ -417,6 +436,11 @@ def test_notify(tmp: Path) -> None:
 
     text = notifier.digest(since_hours=24, force=False)
     check("摘要里既有重要也有一眼扫过的", ("很急" in text or "明天交" in text), True, detail=text)
+
+    # 时间必须是**本机时区**（Graph 给的是 UTC，直接显示会差 8 小时，看列表会懵）
+    want = datetime(2026, 11, 20, 6, 12, tzinfo=timezone.utc).astimezone()
+    check("★UTC 时间按本机时区显示★", local_stamp("2026-11-20T06:12:00Z"),
+          want.strftime("%m-%d %H:%M"), detail=f"{local_stamp('2026-11-20T06:12:00Z')} vs UTC 06:12")
 
     class Clock:
         def __init__(self, hour):

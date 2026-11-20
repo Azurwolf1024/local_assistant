@@ -414,112 +414,127 @@ def cmd_mail(settings: Settings, args: argparse.Namespace) -> int:
     语音/模型没有任何路径能绕过它（见 voice_loop/mail/outbox.py）。
     """
     from voice_loop.mail import MailService  # noqa: PLC0415
+    from voice_loop.mail.auth import AuthError  # noqa: PLC0415
 
     what = str(getattr(args, "mail_cmd", "") or "status")
     svc = MailService(settings, log=logging.getLogger("voice_loop.mail"))
     try:
-        if what == "login":
-            pending = svc.start_login()
-            print(f"  打开 {pending.verification_uri} 并输入：{pending.user_code}")
-            print(f"  （{int(pending.expires_in)} 秒内有效；用你要连的那个邮箱账号登录）")
-            info = svc.finish_login(
-                pending, printer=lambda m: print(f"  {m}", flush=True))
-            print(f"√ 登录成功：{info.get('account') or '（没读到邮箱地址）'}")
-            return 0
-        if what == "status":
-            st = svc.status()
-            print(f"  功能   : {'开' if st['enabled'] else '关'}")
-            print(f"  可工作 : {'是' if st['ready'] else '否 —— ' + str(st['reason'])}")
-            auth = st["auth"]
-            print(f"  账号   : {st['account'] or auth.get('account') or '（未登录）'}")
-            print(f"  有效期 : {auth.get('expires_in')} 秒")
-            print(f"  索引   : {st['total']} 封（未读 {st['unread']}）"
-                  f" 分级 {st['by_level']} 待批草稿 {st['pending_drafts']}")
-            print(f"  数据   : {st['db']}")
-            return 0
-        if what == "sync":
-            got = svc.sync(force_full=bool(getattr(args, "full", False)))
-            if not got.get("ok"):
-                print(f"× 同步失败：{got.get('error')}")
-                return 1
-            print(f"√ 同步完成：新增 {got['added']}、更新 {got['updated']}"
-                  f"（{'全量' if got.get('full') else '增量'} {got.get('pages')} 页）")
-            return 0
-        if what == "search":
-            rows = svc.search(str(args.query or ""), limit=int(args.limit or 10),
-                              unread_only=bool(getattr(args, "unread", False)),
-                              level=str(getattr(args, "level", "") or ""),
-                              since_hours=float(getattr(args, "hours", 0) or 0))
-            if not rows:
-                print("  （没有符合条件的邮件）")
-                return 0
-            for row in rows:
-                mark = {"high": "★", "medium": "·", "low": " "}.get(row.get("level") or "", " ")
-                when = str(row.get("received_at") or "")[5:16].replace("T", " ")
-                who = row.get("sender_name") or row.get("sender")
-                unread = "未读" if row.get("unread") else "已读"
-                print(f"  {mark} {when} {who}：{row.get('subject') or '（无主题）'}（{unread}）")
-                if row.get("one_line"):
-                    print(f"      {row['one_line']}")
-                print(f"      id={row['id']}")
-            return 0
-        if what == "read":
-            got = svc.read(str(args.id))
-            if not got.get("ok"):
-                print(f"× {got.get('error')}")
-                return 1
-            print(f"  主题：{got['subject']}")
-            print(f"  发件人：{got['sender']}")
-            print(f"  时间：{got['received_at']}  分级：{got.get('level') or '未分级'}")
-            print("-" * 70)
-            print(got.get("body") or "（正文是空的）")
-            return 0
-        if what == "digest":
-            text = svc.summary(since_hours=float(getattr(args, "hours", 24) or 24),
-                               only_important=not bool(getattr(args, "all", False)))
-            print(text)
-            return 0
-        if what == "drafts":
-            rows = svc.drafts()
-            if not rows:
-                print("  （没有待批草稿）")
-                return 0
-            for row in rows:
-                print(f"  {row['id']} → {row['to']}")
-                print(f"      主题：{row['subject']}")
-                print(f"      正文：{row['body'][:100]}")
-            return 0
-        if what == "approve":
-            draft_id = str(args.id)
-            draft = svc.outbox.get(draft_id)
-            if draft is None:
-                print("× 找不到这封草稿")
-                return 1
-            preview = svc.outbox.preview(draft)
-            print(f"  收件人：{preview['to']}")
-            print(f"  主题：{preview['subject']}")
-            print("-" * 70)
-            print(preview["body"])
-            print("-" * 70)
-            if not getattr(args, "yes", False):
-                print("  确认要发就说：python main.py mail approve "
-                      f"{draft_id} --yes")
-                return 1
-            ok, token, msg = svc.approve(draft_id)
-            if not ok:
-                print(f"× {msg}")
-                return 1
-            ok2, info = svc.send(draft_id, token)
-            print(("√ " if ok2 else "× ") + ("邮件已发出" if ok2 else str(info.get("error"))))
-            return 0 if ok2 else 1
-        if what == "send":
-            ok, info = svc.send(str(args.id), str(getattr(args, "token", "") or ""))
-            print(("√ 已发送" if ok else f"× {info.get('error')}"))
-            return 0 if ok else 1
-        print(f"× 不认识的子命令：{what}")
+        return _cmd_mail(svc, what, args)
+    except AuthError as exc:
+        # 登录失败/超时是「用户还没做完」，不是程序崩了 —— 别甩 traceback
+        print(f"× {exc}")
         return 2
+    except Exception as exc:  # noqa: BLE001 - 命令行工具：给一句人话，日志里留全部
+        logging.getLogger("voice_loop.mail").debug("邮件命令出错", exc_info=True)
+        print(f"× {type(exc).__name__}: {exc}")
+        return 1
     finally:
         svc.close()
+
+
+def _cmd_mail(svc, what: str, args: argparse.Namespace) -> int:
+    from voice_loop.mail.service import local_stamp  # noqa: PLC0415
+
+    if what == "login":
+        pending = svc.start_login()
+        print(f"  打开 {pending.verification_uri} 并输入：{pending.user_code}")
+        print(f"  （{int(pending.expires_in)} 秒内有效；用你要连的那个邮箱账号登录）")
+        info = svc.finish_login(
+            pending, printer=lambda m: print(f"  {m}", flush=True))
+        print(f"√ 登录成功：{info.get('account') or '（没读到邮箱地址）'}")
+        return 0
+    if what == "status":
+        st = svc.status()
+        print(f"  功能   : {'开' if st['enabled'] else '关'}")
+        print(f"  可工作 : {'是' if st['ready'] else '否 —— ' + str(st['reason'])}")
+        auth = st["auth"]
+        print(f"  账号   : {st['account'] or auth.get('account') or '（未登录）'}")
+        print(f"  有效期 : {auth.get('expires_in')} 秒")
+        print(f"  索引   : {st['total']} 封（未读 {st['unread']}）"
+              f" 分级 {st['by_level']} 待批草稿 {st['pending_drafts']}")
+        print(f"  数据   : {st['db']}")
+        return 0
+    if what == "sync":
+        got = svc.sync(force_full=bool(getattr(args, "full", False)))
+        if not got.get("ok"):
+            print(f"× 同步失败：{got.get('error')}")
+            return 1
+        print(f"√ 同步完成：新增 {got['added']}、更新 {got['updated']}"
+              f"（{'全量' if got.get('full') else '增量'} {got.get('pages')} 页）")
+        return 0
+    if what == "search":
+        rows = svc.search(str(args.query or ""), limit=int(args.limit or 10),
+                          unread_only=bool(getattr(args, "unread", False)),
+                          level=str(getattr(args, "level", "") or ""),
+                          since_hours=float(getattr(args, "hours", 0) or 0))
+        if not rows:
+            print("  （没有符合条件的邮件）")
+            return 0
+        for row in rows:
+            mark = {"high": "★", "medium": "·", "low": " "}.get(row.get("level") or "", " ")
+            when = local_stamp(row.get("received_at") or "")
+            who = row.get("sender_name") or row.get("sender")
+            unread = "未读" if row.get("unread") else "已读"
+            print(f"  {mark} {when} {who}：{row.get('subject') or '（无主题）'}（{unread}）")
+            if row.get("one_line"):
+                print(f"      {row['one_line']}")
+            print(f"      id={row['id']}")
+        return 0
+    if what == "read":
+        got = svc.read(str(args.id))
+        if not got.get("ok"):
+            print(f"× {got.get('error')}")
+            return 1
+        print(f"  主题：{got['subject']}")
+        print(f"  发件人：{got['sender']}")
+        print(f"  时间：{local_stamp(got['received_at'])}  分级：{got.get('level') or '未分级'}")
+        print("-" * 70)
+        print(got.get("body") or "（正文是空的）")
+        return 0
+    if what == "digest":
+        text = svc.summary(since_hours=float(getattr(args, "hours", 24) or 24),
+                           only_important=not bool(getattr(args, "all", False)))
+        print(text)
+        return 0
+    if what == "drafts":
+        rows = svc.drafts()
+        if not rows:
+            print("  （没有待批草稿）")
+            return 0
+        for row in rows:
+            print(f"  {row['id']} → {row['to']}")
+            print(f"      主题：{row['subject']}")
+            print(f"      正文：{row['body'][:100]}")
+        return 0
+    if what == "approve":
+        draft_id = str(args.id)
+        draft = svc.outbox.get(draft_id)
+        if draft is None:
+            print("× 找不到这封草稿")
+            return 1
+        preview = svc.outbox.preview(draft)
+        print(f"  收件人：{preview['to']}")
+        print(f"  主题：{preview['subject']}")
+        print("-" * 70)
+        print(preview["body"])
+        print("-" * 70)
+        if not getattr(args, "yes", False):
+            print("  确认要发就说：python main.py mail approve "
+                  f"{draft_id} --yes")
+            return 1
+        ok, token, msg = svc.approve(draft_id)
+        if not ok:
+            print(f"× {msg}")
+            return 1
+        ok2, info = svc.send(draft_id, token)
+        print(("√ " if ok2 else "× ") + ("邮件已发出" if ok2 else str(info.get("error"))))
+        return 0 if ok2 else 1
+    if what == "send":
+        ok, info = svc.send(str(args.id), str(getattr(args, "token", "") or ""))
+        print(("√ 已发送" if ok else f"× {info.get('error')}"))
+        return 0 if ok else 1
+    print(f"× 不认识的子命令：{what}")
+    return 2
 
 
 def cmd_text(settings: Settings, args: argparse.Namespace) -> int:
@@ -1747,6 +1762,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--log-file", default=None, help="把日志与输出同时写进文件（后台运行需要）")
     ap.add_argument("--character", default=None,
                     help="临时指定角色（id 或名字，见 python main.py persona）")
+    # ★子命令里同名的 --character 都用 default=argparse.SUPPRESS★：
+    # 子解析器的默认值会在解析子命令时把全局值覆盖成 None，于是
+    # `python main.py --character bluefish ask ...` 静默失效（角色没切、引擎还是本地）。
+    # SUPPRESS = "没显式写就别动这一项"，前后两种写法就都能用了。
     sub = ap.add_subparsers(dest="command")
 
     # ★三条和「部署」有关的命令放在最前面★：新用户第一眼就该看到它们。
@@ -1781,7 +1800,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--strategy", choices=["sensevoice", "whisper", "hybrid"], default=None)
     p.add_argument("--device", default=None, help="Whisper 设备：CPU / GPU / AUTO")
     p.add_argument("--llm", default=None, help="覆盖 Ollama 模型名")
-    p.add_argument("--character", default=None, help="用哪个角色（默认用角色文件里的默认角色）")
+    # ★default=SUPPRESS★：子解析器默认值会覆盖全局 --character（详见 main() 上面的注释）
+    p.add_argument("--character", default=argparse.SUPPRESS, help="用哪个角色（默认用角色文件里的默认角色）")
     p.set_defaults(func=cmd_chat)
 
     p = sub.add_parser("listen", help="唤醒词服务（后台跑闹钟/日程提醒）")
@@ -1794,7 +1814,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--strategy", choices=["sensevoice", "whisper", "hybrid"], default=None)
     p.add_argument("--device", default=None)
     p.add_argument("--llm", default=None)
-    p.add_argument("--character", default=None, help="默认角色（唤醒词喊了别人仍然会切过去）")
+    p.add_argument("--character", default=argparse.SUPPRESS,
+                   help="默认角色（唤醒词喊了别人仍然会切过去）")
     p.set_defaults(func=cmd_listen)
 
     p = sub.add_parser("stop", help="停止后台运行的唤醒服务")
@@ -1842,7 +1863,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-tts", action="store_true", help="只输出文字")
     p.add_argument("--strategy", choices=["sensevoice", "whisper", "hybrid"], default=None)
     p.add_argument("--llm", default=None)
-    p.add_argument("--character", default=None, help="用哪个角色")
+    p.add_argument("--character", default=argparse.SUPPRESS, help="用哪个角色")
     p.set_defaults(func=cmd_text)
 
     p = sub.add_parser("skills", help="查看/测试生活技能（时间、闹钟、备忘、日程）")
@@ -1854,7 +1875,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("text", help="要提问的内容")
     p.add_argument("--no-tts", action="store_true", help="只输出文字不合成语音")
     p.add_argument("--llm", default=None)
-    p.add_argument("--character", default=None, help="用哪个角色")
+    p.add_argument("--character", default=argparse.SUPPRESS, help="用哪个角色")
     p.set_defaults(func=cmd_ask)
 
     p = sub.add_parser("see", help="看图：摄像头 / 屏幕 / 剪贴板 / 文件")

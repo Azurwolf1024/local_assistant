@@ -262,14 +262,14 @@ class MailService:
             return ("这段时间没有重要邮件。" if only_important
                     else "这段时间没有新邮件。")
         head = f"共 {len(rows)} 封重要邮件：" if only_important else f"共 {len(rows)} 封邮件："
-        parts = [head]
+        parts = []
         for row in rows[:10]:
             when = _short_time(row.get("received_at") or "")
             who = row.get("sender_name") or row.get("sender") or "未知发件人"
             what = row.get("one_line") or row.get("subject") or "（无主题）"
             flag = "，需要回复" if row.get("needs_reply") else ""
             parts.append(f"{when}{who}：{what}{flag}")
-        return "".join(p + "；" for p in parts).rstrip("；") + "。"
+        return head + "；".join(parts) + "。"
 
     # ---------------------------------------------------------------- 发信
     def draft(self, *, to: str | list[str], subject: str, body: str,
@@ -336,10 +336,27 @@ class MailService:
         self.store.close()
 
 
+def _to_local(iso: str) -> datetime | None:
+    """Graph 给的时间都是 UTC（``2026-11-20T06:12:00Z``）→ 换成本机时区。"""
+    text = str(iso or "").strip()
+    if not text:
+        return None
+    try:
+        moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone()
+
+
+def local_stamp(iso: str) -> str:
+    """``2026-11-20T06:12:00Z`` → ``11-20 14:12``（本机时区，列表用）。"""
+    moment = _to_local(iso)
+    return moment.strftime("%m-%d %H:%M") if moment else ""
+
+
 def _short_time(iso: str) -> str:
-    """``2026-11-20T06:12:00Z`` → ``06:12``（本地时区不好念，就报 UTC+0 的小时分钟）。"""
-    text = str(iso or "")
-    match = re.search(r"T(\d{2}):(\d{2})", text)
-    if not match:
-        return ""
-    return f"{match.group(1)}:{match.group(2)} "
+    """``2026-11-20T06:12:00Z`` → ``14:12 ``（本机时区；念出来时不用管日期）。"""
+    moment = _to_local(iso)
+    return moment.strftime("%H:%M ") if moment else ""

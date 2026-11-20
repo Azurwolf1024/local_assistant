@@ -22,6 +22,7 @@ import logging
 from typing import Any, Callable
 
 from ...mail import MailService
+from ...mail.service import local_stamp
 from ...settings import Settings, load_settings
 from ..server import MCPServer
 
@@ -45,7 +46,7 @@ def _fmt_rows(rows: list[dict]) -> str:
         flag = {"high": "★重要", "medium": "·", "low": " "}.get(
             str(row.get("level") or ""), " ")
         unread = "未读" if row.get("unread") else "已读"
-        when = str(row.get("received_at") or "")[5:16].replace("T", " ")
+        when = local_stamp(row.get("received_at") or "")
         who = row.get("sender_name") or row.get("sender") or "未知"
         line = f"{flag} {when} {who}：{row.get('subject') or '（无主题）'}（{unread}）"
         if row.get("one_line"):
@@ -80,7 +81,7 @@ def make_read(service: MailService):
         if not got.get("ok"):
             return {"text": str(got.get("error") or "读不到这封邮件"), "is_error": True}
         head = (f"主题：{got['subject']}\n发件人：{got['sender']}\n"
-                f"时间：{got['received_at']}\n分级：{got.get('level') or '未分级'}\n---\n")
+                f"时间：{local_stamp(got['received_at'])}\n分级：{got.get('level') or '未分级'}\n---\n")
         tail = "\n（正文被截断）" if got.get("truncated") else ""
         return {"text": head + str(got.get("body") or "") + tail, "is_error": False}
 
@@ -173,7 +174,8 @@ def build_server(
 
     server.add_tool(
         "mail_search",
-        "搜邮件（本地索引，中文友好）。参数 query 放关键词（发件人/主题/正文都能搜）。",
+        "在邮箱里按关键词搜邮件（本地索引，中文友好）；用户说「学校发的通知」「谁给我发过…」"
+        "「找一下那封关于…的邮件」时用它。参数 query 放关键词（发件人/主题/正文都能搜）。",
         {
             "type": "object",
             "properties": {
@@ -202,7 +204,8 @@ def build_server(
     )
     server.add_tool(
         "mail_summary",
-        "一句话清单：这段时间有哪些重要邮件（谁发的、要不要回复）。",
+        "用户问「有没有重要邮件 / 邮箱里有什么 / 有没有要回的 / 最近的通知」时用这个："
+        "一句话清单（谁发的、什么事、要不要回复）。",
         since,
         make_summary(svc),
     )

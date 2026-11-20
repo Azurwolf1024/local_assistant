@@ -490,6 +490,22 @@ def test_split_layout() -> None:
               str([e["id"] for e in DEFAULT_INDEX["characters"]]))
 
 
+def test_cli_character_flag() -> None:
+    print("\n[11] 命令行 --character：写在子命令前后都生效")
+    import main as cli  # noqa: PLC0415
+
+    ap = cli.build_parser()
+    front = ap.parse_args(["--character", "bluefish", "ask", "喂"])
+    back = ap.parse_args(["ask", "喂", "--character", "bluefish"])
+    none = ap.parse_args(["ask", "喂"])
+    # ★踩过的坑★：子解析器里同名参数带 default=None 时，解析子命令那一步会把
+    # 全局值覆盖成 None —— `python main.py --character X ask ...` 就静默不切角色。
+    check("写在子命令前面也认", getattr(front, "character", None) == "bluefish",
+          f"拿到 {getattr(front, 'character', '<缺失>')!r}")
+    check("写在子命令后面也认", getattr(back, "character", None) == "bluefish")
+    check("没写就是不指定（用角色文件里的默认）", getattr(none, "character", None) is None)
+
+
 def main() -> int:
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -510,6 +526,7 @@ def main() -> int:
         test_default_file()
         test_split_layout()
         test_original_default(tmp)
+        test_cli_character_flag()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

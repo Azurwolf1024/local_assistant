@@ -22,16 +22,15 @@
   "engine": "api",
   "api_model": "deepseek-chat",
   "api_tools": [
+    "mail",
     "web",
-    "files",
-    "weather",
-    "mail"
+    "weather"
   ],
   "temperature": 0.8,
   "default": false,
   "enabled": true,
   "knowledge_all": false,
-  "notes": "★原生 API 角色（2026-11-18 加）★：engine=api，默认模型 deepseek-chat（DeepSeek）；backend=api 走 DeepSeek 官方 TTS（音色 stella），失败自动退回本地 Piper（voice 那一栏就是退路）。api_tools=[\"web\",\"files\",\"weather\",\"mail\"] 额外开放 harness 工具：web_search / web_fetch / weather / read_file / list_dir / glob / grep / mail_search / mail_read / mail_summary / mail_draft，外加内置的 ask_user（会反过来问你问题）和 update_plan（写步骤计划）；写文件、执行命令要 [agent] 里显式开启。★发信必须人工批准★：mail_draft 只建草稿，右下角审批卡上点「发送」才会真发出去，模型没有绕过路径（见 docs/guide/mail.md）。本地角色看不到这些工具（但本地角色自己也有 weather 工具）。没有 API key 时流水线会自动退回本地模型，不会把嘴弄哑。",
+  "notes": "★原生 API 角色（2026-11-18 加）★：engine=api，默认模型 deepseek-chat（DeepSeek）；backend=api 走 DeepSeek 官方 TTS（音色 stella），失败自动退回本地 Piper（voice 那一栏就是退路）。api_tools=[\"mail\",\"web\",\"weather\"] 额外开放 harness 工具：mail_search / mail_read / mail_summary / mail_draft、web_search / web_fetch、weather，外加内置的 ask_user（会反过来问你问题）和 update_plan（写步骤计划）。★为什么没有 files★：实测工具数到 22 个时 deepseek-chat 会把「看邮件」错选成 list_memos；18 个以内选得准。要读工作区文件就往 api_tools 里加 \"files\"，要写文件/执行命令再加 \"write\" / \"shell\"（需 [agent] 里显式开启）。★发信必须人工批准★：mail_draft 只建草稿，右下角审批卡上点「发送」才会真发出去，模型没有绕过路径（见 docs/guide/mail.md）。本地角色看不到这些工具（但本地角色自己也有 weather 工具）。没有 API key 时流水线会自动退回本地模型，不会把嘴弄哑。",
   "style": [
     "“傲娇”与“天然呆”：她性格软萌温顺，爱撒娇，但被调侃时会“炸毛”反驳（比如被叫“大肥鱼”）。同时她也有点“天然呆”，会敬业地满足各种奇怪要求。她干活时爱偷个小懒、爱吃白饭（token）。"
   ],

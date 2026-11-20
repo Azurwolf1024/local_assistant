@@ -221,6 +221,7 @@ class Auth:
         end = time.monotonic() + min(float(deadline or pending.expires_in), pending.expires_in)
         interval = max(1.0, pending.interval)
         last = ""
+        next_report = 0.0
         while time.monotonic() < end:
             code, payload = self._post(
                 self._url("token"),
@@ -250,9 +251,18 @@ class Auth:
                     needs_login=True,
                 )
             if on_wait is not None:
-                on_wait(last)
+                # 每 30 秒报一次（每 5 秒一行会把终端刷满，反而看不见关键信息）
+                now = time.monotonic()
+                if now >= next_report:
+                    left = int(max(0, end - now))
+                    on_wait(f"{last}（还剩 {left // 60} 分 {left % 60} 秒）")
+                    next_report = now + 30.0
             sleep(interval)
-        raise AuthError(f"登录超时（{last or '用户没在时限内完成'}）", needs_login=True)
+        raise AuthError(
+            "登录窗口过期了（这串码 15 分钟内没用上）——重新跑一次 "
+            "`python main.py mail login` 拿新码",
+            needs_login=True,
+        )
 
     def _store(self, payload: dict) -> Token:
         token = Token(
