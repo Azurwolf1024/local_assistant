@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import attachments as attachments_kit
+from .contacts import Contacts
 from .auth import Auth, AuthError, DeviceCode
 from .delta import Syncer
 from .graph import Graph, GraphError
@@ -120,6 +121,13 @@ class MailService:
         #: 建完「日程提议」后的回调（同上一张卡，只是文案不同）
         self.on_proposal: Callable[[str], None] | None = None
         self.proposer = EventProposer(self.cfg, log=self.log, llm=llm)
+        #: 收件人匹配（从邮件索引现算；别名表来自 [mail.contacts]）
+        self.contacts = Contacts(
+            self.store,
+            aliases=dict(getattr(self.cfg, "contacts", {}) or {}),
+            log=self.log,
+        )
+        self._owner_name = ""
         #: 日程提议队列（``add_event`` 由流水线注入；没接就只提示「接口没接上」）
         self.queue_event = EventQueue(self.store, log=self.log)
         self.triage = Triage(self.cfg, self.store, log=self.log, llm=llm, me=self._me)
@@ -160,6 +168,41 @@ class MailService:
         if tok is None or not tok.access_token:
             return False, "还没登录（python main.py mail login）"
         return True, ""
+
+    def refresh_identity(self) -> str:
+        """取一次「我是谁」（Graph 的 displayName + 邮箱），用来排除自己和默认落款。"""
+        if self._owner_name:
+            return self._owner_name
+        try:
+            me = self.graph.me() or {}
+        except Exception as exc:  # noqa: BLE001 - 取不到不影响收发
+            self.log.info(f"[mail] 读不到自己的账号信息（忽略）：{exc}")
+            return ""
+        address = str(me.get("mail") or me.get("userPrincipalName") or "").strip().lower()
+        if address:
+            self.contacts.self_addresses.add(address)
+        self._owner_name = str(me.get("name") or me.get("displayName") or "").strip()
+        if address:
+            self.store.meta_set("owner_address", address)
+        return self._owner_name
+
+    @property
+    def signature(self) -> str:
+        """落款用谁：配置写了就用配置，否则用你自己的显示名（读不到就空着）。"""
+        configured = str(getattr(self.cfg, "signature", "") or "").strip()
+        return configured or self._owner_name or self.store.meta_get("owner_name", "")
+
+    def resolve_recipient(self, query: str) -> dict[str, Any]:
+        """「给 AIAA3102 的老师发」→ 具体地址。分不清就返回候选、不硬猜。"""
+        if self._owner_name == "":
+            name = self.refresh_identity()
+            if name:
+                self.store.meta_set("owner_name", name)
+        self._owner_name = self._owner_name or self.store.meta_get("owner_name", "")
+        owner = self.store.meta_get("owner_address", "")
+        if owner:
+            self.contacts.self_addresses.add(owner)
+        return self.contacts.resolve(query)
 
     def status(self) -> dict[str, Any]:
         ok, why = self.ready()
@@ -383,6 +426,23 @@ class MailService:
             return {"ok": False, "error": why}
         to_list = [to] if isinstance(to, str) else list(to or [])
         cc_list = [cc] if isinstance(cc, str) else list(cc or [])
+        # ★收件人匹配★：没有 @ 的一律按「名字/机构/别名」解析（绝不瞎编地址）；
+        # 分不清就把候选抛回去，让模型去问用户，而不是赌一个
+        resolved: list[str] = []
+        for item in to_list:
+            text = str(item or "").strip()
+            if not text:
+                continue
+            if "@" in text:
+                resolved.append(text)
+                continue
+            got = self.resolve_recipient(text)
+            if not got.get("ok"):
+                return {"ok": False, "error": str(got.get("reason") or "认不出收件人"),
+                        "candidates": got.get("candidates") or [],
+                        "hint": "问用户是哪一个（把候选念出来），不要自己编地址"}
+            resolved.append(str(got.get("address") or ""))
+        to_list = resolved
         try:
             draft = self.outbox.create(
                 to=[a for a in (x.strip() for x in to_list) if a],

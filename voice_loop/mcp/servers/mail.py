@@ -199,7 +199,14 @@ def build_server(
     if callable(service):
         service = service()
     svc = service or MailService(settings, log=log)
-    server = MCPServer(name=NAME, version="1.0.0", instructions=INSTRUCTIONS)
+    # ★落款用谁★：优先 [mail] signature，其次你自己在 Outlook 里的显示名（第一次读一次）
+    try:
+        signer = svc.signature or svc.refresh_identity() or ""
+    except Exception:  # noqa: BLE001 - 读不到就留空，让模型问用户
+        signer = ""
+    sign_hint = (f"落款默认用「{signer}」" if signer else "落款用你自己的名字（不知道就问用户）")
+    server = MCPServer(name=NAME, version="1.0.0",
+                       instructions=f"{INSTRUCTIONS}\n{sign_hint}。")
 
     empty: dict = {"type": "object", "properties": {}}
     since = {
@@ -254,9 +261,28 @@ def build_server(
         {
             "type": "object",
             "properties": {
-                "to": {"type": "string", "description": "收件人，多个用逗号分隔"},
+                "to": {
+                    "type": "string",
+                    "description": (
+                        "收件人。可以直接说人话：课程代码/机构/称呼都行"
+                        "（例「AIAA3102 的老师」「教务处」「私人邮箱」「itdid」）——"
+                        "系统会从你自己的邮件往来里匹配到具体地址；分不清会返回候选，"
+                        "★这时要用 ask_user 问用户，绝对不要自己编地址★。"
+                        "多个收件人用逗号分隔；也可以直接写完整地址。"
+                    ),
+                },
                 "subject": {"type": "string"},
-                "body": {"type": "string", "description": "正文（口语化、别写客套模板）"},
+                "body": {
+                    "type": "string",
+                    "description": (
+                        "正文。用户口语说个大概就行，你要负责补全成**可以直接发出去**的信："
+                        "开头称呼、把事情说清楚（时间/事由/请求）、结尾礼貌收束、末尾加落款"
+                        "（" + sign_hint + "）。"
+                        "用户说「礼貌一点/正式一点」→ 加敬语、少用省略号和感叹号；"
+                        "说「用英文」→ 整封英文（Dear / Best regards，称呼和落款一起换）；"
+                        "说「简短点」→ 三行以内。★不要写「（此处补充）」这类占位符★。"
+                    ),
+                },
                 "cc": {"type": "string", "description": "抄送（可空）"},
                 "reply_to": {"type": "string", "description": "要回复的邮件 id（可空）"},
             },

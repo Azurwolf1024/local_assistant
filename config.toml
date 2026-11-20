@@ -703,6 +703,12 @@ link_events = true             # 允许 mail_to_event 从邮件里提事件
 auto_propose = false           # 重要邮件自动生成待批提议（默认关，免得老弹卡）
 
 # —— 发信（三道闸门）——
+# —— 收件人匹配（放 config.local.toml；这里只写格式示例）——
+# 说法 → 地址。没有 @ 的收件人会先查这张表，再查「你和谁有往来」。
+# [mail.contacts]
+# "私人邮箱" = "whoever@163.com"
+# "导师" = "prof@school.edu"
+
 allow_send = false             # ★改 true 才能发★
 send_allowlist = []            # ★空表 = 谁都发不出去★ 例：["@example.com", "a@b.com"]
 approval_ttl = 300             # 批准后多少秒内必须点发送，过期作废

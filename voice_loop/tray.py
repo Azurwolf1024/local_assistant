@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -159,6 +160,7 @@ class ServiceTray:
         stop: Callable[[], tuple[bool, str]] | None = None,
         start: Callable[[], tuple[bool, str]] | None = None,
         open_url: Callable[[str], Any] | None = None,
+        start_console: Callable[..., tuple[bool, str]] | None = None,
         open_file: Callable[[Path], Any] | None = None,
         on_exit: Callable[[], None] | None = None,
         poll_seconds: float = POLL_SECONDS,
@@ -173,6 +175,8 @@ class ServiceTray:
         self._stop_fn = stop or self._default_stop
         self._start_fn = start or self._default_start
         self._open_url = open_url or _open_url
+        self._start_console = start_console or (
+            lambda settings, log=None: start_console(settings, log))
         self._open_file = open_file or _open_file
         self._on_exit = on_exit
         self._poll = max(1.0, float(poll_seconds))
@@ -287,8 +291,9 @@ class ServiceTray:
             return False, "上一个动作还没做完"
         try:
             if entry_id == "console":
-                self._open_url(self.url)
-                return True, "已在浏览器打开控制台"
+                ok, msg = self._open_console()
+                self._announce(msg, ok)
+                return ok, msg
             if entry_id == "log":
                 self._open_file(self.settings.resolve(self.settings.wake.log_file))
                 return True, "已打开服务日志"
@@ -312,6 +317,14 @@ class ServiceTray:
             return False, f"动作失败：{exc}"
         finally:
             self._busy.release()
+
+    def _open_console(self) -> tuple[bool, str]:
+        """「打开控制台」：没起就先拉起来，再开浏览器。"""
+        ok, msg = self._start_console(self.settings, self.log)
+        if ok:
+            self._open_url(self.url)
+            return True, msg
+        return False, msg
 
     def _announce(self, message: str, ok: bool) -> None:
         """把结果写到托盘气泡 + 日志（气泡失败就算了）。"""
@@ -498,6 +511,60 @@ def _release_lock(path: Path | None) -> None:
         path.unlink(missing_ok=True)
     except OSError:
         pass
+
+
+def _port_open(port: int, timeout: float = 0.25) -> bool:
+    import socket  # noqa: PLC0415
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        return sock.connect_ex(("127.0.0.1", int(port))) == 0
+
+
+def console_url(settings: Any) -> str:
+    port = int(getattr(getattr(settings, "app", None), "console_port", 8765) or 8765)
+    return f"http://127.0.0.1:{port}/"
+
+
+def start_console(settings: Any, log: logging.Logger | None = None,
+                  wait_seconds: float = 8.0,
+                  popen: Callable[..., Any] | None = None,
+                  port_open: Callable[[int], bool] | None = None) -> tuple[bool, str]:
+    """确保控制台在跑；没跑就拉一个独立进程。返回 ``(ok, 人话)``。
+
+    ★这是「托盘点『打开控制台』打不开」的正解★：控制台是**另一个进程**
+    （不占麦克风、不加载模型），服务起来时不会顺手带它。以前托盘点一下只是
+    `webbrowser.open(...)` —— 浏览器老老实实打开一个「无法访问此网站」，
+    看起来就像按钮坏了。现在先探端口，没起就自己拉起来再开浏览器。
+    """
+    import subprocess  # noqa: PLC0415
+    import time  # noqa: PLC0415
+
+    log = log or logging.getLogger("voice_loop.tray")
+    port = int(getattr(getattr(settings, "app", None), "console_port", 8765) or 8765)
+    probe = port_open or _port_open
+    if probe(port):
+        return True, f"控制台已经在跑（端口 {port}）"
+    root = getattr(settings, "project_root", None) or Path(__file__).resolve().parents[1]
+    cmd = [sys.executable, "main.py", "ui", "--port", str(port), "--no-browser"]
+    flags = 0
+    if os.name == "nt":
+        flags = (getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                 | getattr(subprocess, "DETACHED_PROCESS", 0))
+    spawn = popen or subprocess.Popen
+    try:
+        spawn(cmd, cwd=str(root), close_fds=True,
+              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+              creationflags=flags)
+    except OSError as exc:
+        return False, f"控制台起不来：{exc}"
+    deadline = time.monotonic() + max(1.0, float(wait_seconds))
+    while time.monotonic() < deadline:
+        if probe(port):
+            log.info(f"[托盘] 控制台已就绪：{console_url(settings)}")
+            return True, f"控制台已启动（端口 {port}）"
+        time.sleep(0.2)
+    return False, f"控制台没起来（端口 {port} 一直没响应，多半是缺 fastapi/uvicorn）"
 
 
 def _open_url(url: str) -> None:

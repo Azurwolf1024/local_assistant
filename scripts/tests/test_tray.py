@@ -159,13 +159,57 @@ def test_open_actions(tmp: Path) -> None:
     print("\n[3] 打开控制台 / 看日志（注入的回调，不真开窗口）")
     opened: list[str] = []
     files: list[Path] = []
+    started: list[str] = []
+
+    def fake_start(settings, log=None):
+        started.append("start")
+        return True, "控制台已启动（端口 8765）"
+
     tray = tr.ServiceTray(make_settings(tmp / "e"), mode="standalone",
                           status=lambda: tr.Snapshot(False),
-                          open_url=opened.append, open_file=files.append)
-    ok, _ = tray.act("console")
-    check("打开控制台给了个 http 地址", (ok, opened[0].startswith("http://")), (True, True))
+                          open_url=opened.append, open_file=files.append,
+                          start_console=fake_start)
+    ok, msg = tray.act("console")
+    check("★打开控制台会先把控制台拉起来★", (ok, started), (True, ["start"]), detail=msg)
+    check("打开控制台给了个 http 地址", opened[0].startswith("http://"), True, detail=opened[0])
     ok, _ = tray.act("log")
     check("看日志打开的是配置里的日志文件", (ok, files[0].name), (True, "listen.log"))
+
+    # 控制台起不来时：不开浏览器、如实报错（以前这里只是"打开了打不开的网页"）
+    tray2 = tr.ServiceTray(make_settings(tmp / "e2"), mode="standalone",
+                           status=lambda: tr.Snapshot(False),
+                           open_url=opened.append,
+                           start_console=lambda settings, log=None: (False, "缺 fastapi"))
+    ok, msg = tray2.act("console")
+    check("起不来就报错、不假装成功", (ok, "缺 fastapi" in msg), (False, True), detail=msg)
+    check("起不来就不开浏览器", len(opened), 1)
+
+
+def test_console_boot(tmp: Path) -> None:
+    print("\n[3.1] start_console：端口探活 / 不重复起 / 起不来要说清")
+    settings = make_settings(tmp / "c")
+
+    spawned: list[list[str]] = []
+    check("已经跑着就不再拉一个",
+          tr.start_console(settings, port_open=lambda p: True, popen=spawned.append)[0], True)
+    check("没重复 spawn", len(spawned), 0)
+
+    state = {"open": False}
+
+    def fake_popen(cmd, **kw):
+        spawned.append(list(cmd))
+        state["open"] = True            # 一起就"通了"
+
+    ok, msg = tr.start_console(settings, port_open=lambda p: state["open"],
+                               popen=fake_popen, wait_seconds=2)
+    check("没跑就拉一个", (ok, len(spawned)), (True, 1), detail=msg)
+    check("拉的是 main.py ui 且指定端口",
+          ("main.py" in spawned[0], "ui" in spawned[0], "--port" in spawned[0]), (True, True, True),
+          detail=" ".join(spawned[0]))
+
+    ok, msg = tr.start_console(settings, port_open=lambda p: False,
+                               popen=lambda *a, **k: None, wait_seconds=0.3)
+    check("一直没通就如实说（不再假装打开成功）", (ok, "没起来" in msg), (False, True), detail=msg)
 
 
 def test_icon() -> None:
@@ -224,6 +268,7 @@ def main() -> int:
         test_menu(tmp)
         test_stop_action(tmp)
         test_open_actions(tmp)
+        test_console_boot(tmp)
         test_icon()
         test_fallbacks(tmp)
         test_single_instance(tmp)

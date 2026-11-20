@@ -691,6 +691,13 @@ class MailConfig:
     link_events: bool = True          # 允许「从邮件提取事件」这个能力（★写入仍要人点确认★）
     auto_propose: bool = False        # 重要邮件自动生成待批日程提议（默认关，免得老弹卡）
 
+    # —— 收件人匹配 ——
+    # 别名表「你说的话 → 地址」：没有 @ 的收件人一律按别名/联系人解析（不猜、不瞎编）
+    contacts: dict[str, str] = field(default_factory=dict)
+    # —— 落款 ——
+    # 空 = 用 Graph 读到的你自己的显示名（第一次发信时取一次）；也可以写死
+    signature: str = ""
+
     allow_send: bool = False          # ★默认关★：开了也还要白名单 + 人工点一次
     send_allowlist: list[str] = field(default_factory=list)   # 空表 = 谁都发不出去
     approval_ttl: int = 300           # 审批通过后多久内必须点发送（秒）

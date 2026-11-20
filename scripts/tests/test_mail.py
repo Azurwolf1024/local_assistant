@@ -795,6 +795,162 @@ def test_token_budget(tmp: Path) -> None:
     store.close()
 
 
+def test_contacts(tmp: Path) -> None:
+    """收件人匹配：说人话 → 具体地址；分不清就问，绝不瞎编。"""
+    print("\n[15] 收件人匹配：课程代码 / 机构 / 别名 / 分不清就问")
+    settings, cfg = make_cfg(tmp / "ct", send_allowlist=["@163.com"])
+    graph = FakeGraph()
+    svc = MailService(settings, graph=graph)
+    svc.auth.save(auth_mod.Token(access_token="t-ct", refresh_token="r-ct",
+                                 expires_at=time.time() + 3600))
+    def with_name(mid: str, subject: str, address: str, name: str) -> dict:
+        raw = raw_msg(mid, subject=subject, sender=address)
+        raw["from"]["emailAddress"]["name"] = name
+        return normalize_message(raw)
+
+    svc.store.upsert_messages([
+        with_name("c1", "AIAA3102 期末项目评分标准", "zhang.li@hkust-gz.edu.cn", "李章 Li"),
+        with_name("c2", "关于选课的通知", "registrar@hkust-gz.edu.cn", "教务处"),
+        with_name("c3", "HPC 领奖", "itdid@hkust-gz.edu.cn", "ITDID"),
+        with_name("c4", "我的私人邮件", "me@school.edu", "我自己"),
+    ])
+    svc.contacts.self_addresses.add("me@school.edu")
+    svc.contacts.aliases["私人邮箱"] = "whoever@163.com"
+    svc.contacts._cache = None                          # noqa: SLF001 - 重建索引
+
+    got = svc.resolve_recipient("给 AIAA3102 的老师发邮件")
+    check("★课程代码 → 老师那封的地址★", got["address"], "zhang.li@hkust-gz.edu.cn",
+          detail=str(got.get("reason")))
+    check("机构名也能对上", svc.resolve_recipient("教务处")["address"],
+          "registrar@hkust-gz.edu.cn")
+    check("★别名：说「私人邮箱」就发到那个地址★",
+          svc.resolve_recipient("发到私人邮箱")["address"], "whoever@163.com")
+    check("认不出来就问（不给地址）", svc.resolve_recipient("随便谁")["ok"], False)
+    check("★不会把自己匹配进去★",
+          svc.resolve_recipient("给 AIAA3102 的老师发邮件")["address"] != "me@school.edu", True)
+
+    # 草稿：给名字就能建；分不清的不许建、把候选抛回去
+    ok = svc.draft(to="教务处", subject="咨询", body="请问选课什么时候截止？")
+    check("按机构名建草稿成功", ok.get("ok"), True, detail=str(ok)[:100])
+    check("草稿收件人已解析成地址",
+          (ok.get("preview") or {}).get("to"), "registrar@hkust-gz.edu.cn")
+    bad = svc.draft(to="随便谁", subject="x", body="y")
+    check("★认不出就不建草稿（不许瞎编地址）★", bad.get("ok"), False, detail=str(bad)[:80])
+    check("把候选/提示一起给模型", "不要自己编地址" in str(bad.get("hint") or ""), True)
+    svc.close()
+
+
+class _FakeCanvas:
+    """够用的 Canvas 替身：只记调用，不画东西（卡片逻辑能在无图形环境里跑）。"""
+
+    def __init__(self) -> None:
+        self.items: dict[str, dict] = {}
+        self._n = 0
+
+    def _add(self, **kw) -> str:
+        self._n += 1
+        name = f"i{self._n}"
+        self.items[name] = dict(kw, _type="text")
+        return name
+
+    def create_text(self, *a, **kw): return self._add(**kw)
+    def create_oval(self, *a, **kw): return self._add(**kw)
+    def create_polygon(self, *a, **kw): return self._add(**kw)
+    def create_line(self, *a, **kw): return self._add(**kw)
+    def create_rectangle(self, *a, **kw): return self._add(**kw)
+    def delete(self, _tag=None): self.items.clear()
+    def itemconfigure(self, item, **kw): self.items.setdefault(item, {}).update(kw)
+    def configure(self, **kw): pass
+    def bind_all(self, *a, **kw): pass
+    def bind(self, *a, **kw): pass
+    def find_all(self): return list(self.items)
+    def type(self, _item): return "text"
+    def itemcget(self, item, key): return self.items.get(item, {}).get(key, "")
+    def bbox(self, _item): return (0, 0, 10, 10)
+
+
+class _FakeQueue:
+    """审批队列替身：记录 decide 被调了什么。"""
+
+    def __init__(self, draft: dict) -> None:
+        self.draft = draft
+        self.calls: list[tuple[str, str]] = []
+        self.kind = "mail"
+
+    def submit(self, _i): pass
+    def head(self): return self.draft
+    def preview(self, _d): return {"id": "d1", "to": "cx@x.edu.cn", "cc": "",
+                                   "subject": "很长的一封邮件", "body": "正文行。\n" * 20}
+    def decide(self, draft_id, action):
+        self.calls.append((draft_id, action))
+        return True, "ok"
+
+
+def test_approval_card(tmp: Path) -> None:
+    """审批卡：正文能滚 / 发送要二次确认 / 取消真的能取消。
+
+    打的是真机上踩过的两个坑：
+      - 正文溢出到页脚（以前按「字数/13.5px」估行数，200% 缩放时压住按钮）；
+      - `_decide` 被改丢 → 点按钮抛 AttributeError，看着像「点了没反应」。
+    """
+    print("\n[16] 审批卡：滚动 / 二次确认 / 取消")
+    from voice_loop.mail.approve import ApprovalCard
+
+    queue = _FakeQueue({"id": "d1"})
+    card = ApprovalCard(queue, timeout=60)
+    card._canvas = _FakeCanvas()               # noqa: SLF001 - 用替身，不建真窗口
+    card._draft = {"id": "d1"}                 # noqa: SLF001
+    card._lines = ["行%d" % i for i in range(20)]   # noqa: SLF001
+    card._viewport = 6                         # noqa: SLF001
+    card._line_h = 22                          # noqa: SLF001
+    card._height = 320                         # noqa: SLF001
+    card._deadline = time.monotonic() + 60     # noqa: SLF001
+    card._refresh()                            # noqa: SLF001
+
+    check("长正文分成多行、视口只放 6 行",
+          (len(card._lines), card._viewport), (20, 6))
+    class _Wheel:
+        delta = -120
+    card._on_wheel(_Wheel())                   # noqa: SLF001
+    check("★滚轮能翻正文★", card._scroll > 0, True, detail=f"scroll={card._scroll}")
+    before = card._scroll                      # noqa: SLF001
+    card._on_wheel(_Wheel())                   # noqa: SLF001
+    check("再滚还在往下走", card._scroll >= before, True)
+
+    send_box = next(b for b in card._buttons if b[4] == "send")   # noqa: SLF001
+    cancel_box = next(b for b in card._buttons if b[4] == "cancel")  # noqa: SLF001
+
+    class _Click:
+        def __init__(self, box):
+            self.x = int((box[0] + box[2]) / 2)
+            self.y = int((box[1] + box[3]) / 2)
+
+    card._on_click(_Click(send_box))           # noqa: SLF001
+    check("★第一次点「发送」只进入确认态（不真发）★",
+          (queue.calls, time.monotonic() < card._confirm_until), ([], True))
+    card._on_click(_Click(send_box))           # noqa: SLF001
+    time.sleep(0.3)
+    check("★第二次点才真的发送★", [c[1] for c in queue.calls], ["send"])
+    card._busy = False                         # noqa: SLF001 - 等后台线程收尾
+
+    # 取消：单独一张卡
+    queue2 = _FakeQueue({"id": "d2"})
+    card2 = ApprovalCard(queue2, timeout=60)
+    card2._canvas = _FakeCanvas()              # noqa: SLF001
+    card2._draft = {"id": "d2"}                # noqa: SLF001
+    card2._lines = ["行"] * 3                  # noqa: SLF001
+    card2._viewport = 6                        # noqa: SLF001
+    card2._line_h = 22                         # noqa: SLF001
+    card2._height = 320                        # noqa: SLF001
+    card2._deadline = time.monotonic() + 60    # noqa: SLF001
+    card2._refresh()                           # noqa: SLF001
+    box = next(b for b in card2._buttons if b[4] == "cancel")     # noqa: SLF001
+    card2._on_click(_Click(box))               # noqa: SLF001
+    time.sleep(0.3)
+    check("★「取消」真的能取消（不再 AttributeError）★",
+          [c[1] for c in queue2.calls], ["cancel"])
+
+
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="mail_"))
     try:
@@ -812,6 +968,8 @@ def main() -> int:
         test_event_link(tmp)
         test_add_event_real_path(tmp)
         test_token_budget(tmp)
+        test_contacts(tmp)
+        test_approval_card(tmp)
     finally:
         import shutil
 
