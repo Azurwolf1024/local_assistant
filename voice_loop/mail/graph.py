@@ -201,13 +201,38 @@ class Graph:
         items = [normalize_message(x) for x in (raw.get("value") or []) if isinstance(x, dict)]
         return items, str(raw.get("@odata.nextLink") or ""), str(raw.get("@odata.deltaLink") or "")
 
-    def delta_cursor_from_now(self, *, folder: str = "inbox") -> str:
-        """「从现在开始」的游标（不想回拉历史时用）。"""
+    def delta_cursor_from_now(self, *, folder: str = "inbox", max_pages: int = 30,
+                             page_size: int = 200) -> str:
+        """拿到「此刻」的游标（= 最后一页的 ``@odata.deltaLink``）。
+
+        ★别再试 ``$deltatoken=latest`` 了★：那是旧版 Outlook 的写法，Graph 的
+        ``/messages/delta`` 现在不认 —— 实机上它返回的对象里没有 ``@odata.deltaLink``，
+        于是游标一直是空串，**每轮巡检都退化成全量重拉**（276 封 × 6 页，每 3 分钟一次）。
+        正确做法只能是把 delta 从头翻到最后一页（``$select=id``，不要正文），
+        最后一页才带 ``@odata.deltaLink``。翻不动（超过 ``max_pages``）就返回空串，
+        下一轮继续按时间窗口同步，功能不受影响。
+        """
         folder = (folder or "inbox").strip()
-        base = (f"/me/mailFolders/{folder}/messages/delta"
-                if folder and folder.lower() != "all" else "/me/messages/delta")
-        raw = self.call("GET", base, params={"$select": "id", "$deltatoken": "latest"}) or {}
-        return str(raw.get("@odata.deltaLink") or "")
+        if folder and folder.lower() != "all":
+            fid = self.folder_id(folder)
+            base = (f"/me/mailFolders/{fid}/messages/delta" if fid
+                    else "/me/messages/delta")
+        else:
+            base = "/me/messages/delta"
+        url = f"{base}?$select=id&$top={int(page_size)}"
+        absolute = False
+        for page in range(1, max(1, int(max_pages)) + 1):
+            raw = self.call("GET", url, absolute=absolute) or {}
+            cursor = str(raw.get("@odata.deltaLink") or "")
+            if cursor:
+                self.log.info(f"[mail] 取到增量游标（翻了 {page} 页）")
+                return cursor
+            nxt = str(raw.get("@odata.nextLink") or "")
+            if not nxt:
+                return ""
+            url, absolute = nxt, True
+        self.log.info(f"[mail] 信箱太大，{max_pages} 页还没翻到末尾：这轮先按时间窗口同步")
+        return ""
 
     # ------------------------------------------------------------------ 读
     def list_recent(

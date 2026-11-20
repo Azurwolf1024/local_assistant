@@ -538,6 +538,32 @@ def test_graph_http(tmp: Path) -> None:
     out = g3.call("GET", "/me")
     check("401 → 续期一次后成功", out, {"ok": True})
 
+    # ★游标引导：必须翻到最后一页才有 @odata.deltaLink★
+    # （踩过的坑：以前用 $deltatoken=latest，Graph 早不认了 → 游标永远空 → 每轮全量重拉）
+    pages = [
+        (200, {}, {"value": [{"id": "1"}],
+                   "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/messages/delta?$skiptoken=a"}),
+        (200, {}, {"value": [{"id": "2"}], "@odata.deltaLink": "https://graph.microsoft.com/v1.0/delta?$deltatoken=FINAL"}),
+    ]
+    seen: list[str] = []
+
+    def transport_delta(method, url, *, headers, params, payload, timeout):
+        seen.append(url)
+        return pages.pop(0)
+
+    g4 = Graph(a, request=transport_delta)
+    cursor = g4.delta_cursor_from_now(folder="all")
+    check("★游标翻到最后一页才拿得到★", cursor.endswith("$deltatoken=FINAL"), True,
+          detail=cursor[-40:])
+    check("跟着 nextLink 翻页（没有停在第一页）", len(seen), 2)
+
+    def transport_nocursor(method, url, *, headers, params, payload, timeout):
+        return 200, {}, {"value": []}          # 没有 nextLink 也没有 deltaLink
+
+    g5 = Graph(a, request=transport_nocursor)
+    check("翻不到就返回空串（上层继续按窗口同步，不炸）",
+          g5.delta_cursor_from_now(folder="all"), "")
+
 
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="mail_"))
