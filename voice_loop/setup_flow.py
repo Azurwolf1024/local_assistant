@@ -61,7 +61,7 @@ def child_env() -> dict:
 MIN_PYTHON = (3, 11)
 """tomllib 是 3.11 进标准库的，而 `voice_loop/settings.py` 直接用了它。"""
 
-MODEL_GROUPS = ("sensevoice", "vad", "piper", "zipvoice", "speaker")
+MODEL_GROUPS = ("sensevoice", "vad", "piper", "zipvoice", "speaker", "kws")
 """`scripts/download_models.py --only` 认的组（自测会去解析那个脚本，防两边跑偏）。"""
 
 DEFAULT_MODEL_GROUPS = ("sensevoice", "vad", "piper")

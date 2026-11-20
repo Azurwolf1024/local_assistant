@@ -187,7 +187,7 @@ class ZipVoiceTts:
             print(
                 f"[tts] 这个角色目录里没有 {PRECISION_FILES[self._precision][0]}，"
                 f"按 {DEFAULT_PRECISION} 加载（想用 fp32："
-                f"python scripts/finetune_zipvoice.py --stage 8 --precision both --prefix <角色>）",
+                f"python scripts/tools/finetune_zipvoice.py --stage 8 --precision both --prefix <角色>）",
                 file=sys.stderr,
             )
 
@@ -461,33 +461,27 @@ class ZipVoiceTts:
         return text
 
     def _transcribe(self, path: Path, samples: np.ndarray, rate: int, quiet: bool = False) -> str:
-        """用本机识别引擎转写参考音频（★走 asr 门面，不再直连某个引擎★）。
+        """转写参考音频——★能力由外面注入，TTS 不认识 ASR★。
 
-        以前这里是 ``from ..asr.sensevoice import SenseVoiceEngine`` + 读一个
-        **不存在的** ``asr.sensevoice_threads`` 字段（永远回落成 4，静默的 bug）。
-        现在只用 ``Hearing.transcribe(prefer="fast")``：换常驻引擎时这段代码不用动。
+        以前这里是 ``from ..asr.sensevoice import SenseVoiceEngine``（还读一个
+        **不存在的** ``asr.sensevoice_threads`` 字段，线程数永远 4），后来又改成
+        ``from ..asr import Hearing`` —— 两种写法都让 TTS 反向依赖识别模块，
+        两边就没法单独拿走、单独优化了。
+
+        现在走 :mod:`voice_loop.tts.hooks`：管线启动时把 ``Hearing.transcribe`` 放进来。
+        没人注入 = 没有这个能力（参考文本留空，让用户手填 ``.txt`` 更准）。
         """
+        from .hooks import transcribe as ask  # noqa: PLC0415
+
         try:
-            from ..asr import Hearing  # noqa: PLC0415
-        except Exception as exc:  # pragma: no cover
-            if not quiet:
-                print(f"[tts] 自动转写不可用（{exc}）", file=sys.stderr)
-            return ""
-        hearing = None
-        try:
-            hearing = Hearing(self.settings, None, preload=False, lexicon=None)
-            result = hearing.transcribe(_resample(samples, rate, 16000), 16000, prefer="fast")
-        except Exception as exc:  # noqa: BLE001
+            text = ask(_resample(samples, rate, 16000), 16000)
+        except Exception as exc:  # noqa: BLE001 - 转写失败不该影响出声
             if not quiet:
                 print(f"[tts] 自动转写失败（{exc}）", file=sys.stderr)
             return ""
-        finally:
-            if hearing is not None:
-                try:
-                    hearing.close()
-                except Exception:  # noqa: BLE001
-                    pass
-        text = str(getattr(result, "text", "") or "").strip()
+        if not text and not quiet:
+            print("[tts] 自动转写不可用（没有注入转写能力）——参考文本请手填 .txt",
+                  file=sys.stderr)
         if text and not quiet:
             print(f"[tts] 自动转写“{path.name}”：{text}", flush=True)
         return text

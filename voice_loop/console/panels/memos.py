@@ -7,7 +7,7 @@
 ★关于下面那个触发词正则的重复★：``voice_loop/skills.py`` 里有一份一模一样的
 （``TRIGGER_MEMO_ADD``），但 skills 会连带 import ``vision``（Pillow / OpenCV），
 控制台不该为了剥两个词就把图像库拉起来。所以这里自带一份，并且用
-``scripts/test_console.py`` 拿真实 skills 的正则对样本句逐条比对——
+``scripts/tests/test_console.py`` 拿真实 skills 的正则对样本句逐条比对——
 **两边一旦跑偏，测试会失败**，不会静静发展成「网页认识的词和语音不一样」。
 """
 

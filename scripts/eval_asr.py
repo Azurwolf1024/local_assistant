@@ -96,15 +96,28 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.synth:
         from voice_loop.asr.eval import synthesize as _synth
+        from voice_loop.tts import create_tts
+
+        # ★TTS 在这里接进来★：asr 模块本身不认识 TTS（这样它能单独拿走、单独评测）
+        tts = create_tts(settings, log)
+
+        def speak(text: str):
+            return list(tts.synth(text))
 
         print("=" * 96)
         print(" 合成评测素材（本地 TTS）")
         print("=" * 96)
         made = 0
-        for set_name, texts in _synthesis_texts().items():
-            cases = _synth(settings, texts, root, set_name=f"synth/{set_name}", logger=log)
-            made += len(cases)
-            print(f"  · {set_name:<10}{len(cases)} 条")
+        try:
+            for set_name, texts in _synthesis_texts().items():
+                cases = _synth(settings, texts, root, set_name=f"synth/{set_name}",
+                               logger=log, speak=speak)
+                made += len(cases)
+                print(f"  · {set_name:<10}{len(cases)} 条")
+        finally:
+            close = getattr(tts, "close", None)
+            if callable(close):
+                close()
         print(f"  合成完成：{made} 条 → {root / 'synth'}")
         if not (args.set or args.matrix):
             print("\n  （加 --set wake 或者 --matrix 开始评测）")

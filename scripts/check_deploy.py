@@ -169,15 +169,25 @@ def check_deps(rep: Report) -> None:
 # --------------------------------------------------------------------------- #
 # 3 配置
 # --------------------------------------------------------------------------- #
-def _walk_paths(obj, prefix: str = "") -> list[tuple[str, str]]:
-    """把配置里所有「看起来是路径」的字符串值摊平成 (键, 值)。"""
+def _walk_paths(obj, prefix: str = "",
+                skipped: list[str] | None = None) -> list[tuple[str, str]]:
+    """把配置里所有「看起来是路径」的字符串值摊平成 (键, 值)。
+
+    ★`enabled = false` 的段落整个跳过★：可选功能没开，就不该为它的模型路径报错
+    （没下 KWS / 关掉语音打断的人，不该被一条「模型不存在」拦在安装门外）。
+    """
     out: list[tuple[str, str]] = []
     if isinstance(obj, dict):
         for key, value in obj.items():
-            out.extend(_walk_paths(value, f"{prefix}.{key}" if prefix else str(key)))
+            name = f"{prefix}.{key}" if prefix else str(key)
+            if isinstance(value, dict) and value.get("enabled") is False:
+                if skipped is not None:
+                    skipped.append(name)
+                continue
+            out.extend(_walk_paths(value, name, skipped))
     elif isinstance(obj, list):
         for i, value in enumerate(obj):
-            out.extend(_walk_paths(value, f"{prefix}[{i}]"))
+            out.extend(_walk_paths(value, f"{prefix}[{i}]", skipped))
     elif isinstance(obj, str):
         value = obj.strip()
         if not value or "://" in value:  # 空串和 URL 不是路径
@@ -210,7 +220,8 @@ def check_config(rep: Report) -> None:
 
     missing_models: list[str] = []
     absolute: list[str] = []
-    for key, value in _walk_paths(raw):
+    skipped: list[str] = []
+    for key, value in _walk_paths(raw, skipped=skipped):
         p = Path(value).expanduser()
         if p.is_absolute():
             absolute.append(f"{key}={value}")
@@ -226,6 +237,9 @@ def check_config(rep: Report) -> None:
         else:
             rep.add("3 配置", WARN, f"{key} 指向的文件不在", value)
 
+    if skipped:
+        rep.add("3 配置", INFO, f"{len(skipped)} 个可选功能没启用",
+                "跳过它们的路径检查：" + "、".join(skipped[:4]))
     if absolute:
         rep.add(
             "3 配置",

@@ -6,11 +6,11 @@
 numpy 和 sherpa 那一堆东西；放这儿则谁都能用，而且**只有一份定义**——
 「查文件全不全」和「真正加载哪个文件」用的是同一个函数，不会各说各话。
 
-两份可以共存：训练脚本 ``scripts/finetune_zipvoice.py --precision both``
+两份可以共存：训练脚本 ``scripts/tools/finetune_zipvoice.py --precision both``
 会把 int8 和 fp32 都装进同一个角色目录，运行时按 config.toml 的
 ``[tts] clone_precision`` 选一套，方便直接 A/B 听。
 
-    python scripts/ab_clone_model.py      # 精度 × 步数 的客观指标 + wav 试听
+    python scripts/tools/ab_clone_model.py      # 精度 × 步数 的客观指标 + wav 试听
 """
 
 from __future__ import annotations

@@ -203,7 +203,7 @@
   ],
   "knowledge": [],
   "temperature": 0,
-  "notes": "★由 scripts/import_persona.py 导入素材★：lines 来自 data/personas/clementia/clementia.txt（38 条），知识库来自 profile.txt → data/knowledge/clementia/档案.md。voice_ref 与 voice_refs 是 scripts/pick_voice_ref.py --who clementia 的实测推荐（任命队长.wav 安静帧高频 0.48% 最干净、像她 0.875）。别名的生僻说法还要拿 scripts/test_wake.py 实测补。",
+  "notes": "★由 scripts/import_persona.py 导入素材★：lines 来自 data/personas/clementia/clementia.txt（38 条），知识库来自 profile.txt → data/knowledge/clementia/档案.md。voice_ref 与 voice_refs 是 scripts/tools/pick_voice_ref.py --who clementia 的实测推荐（任命队长.wav 安静帧高频 0.48% 最干净、像她 0.875）。别名的生僻说法还要拿 scripts/tests/test_wake.py 实测补。",
   "tts": {
     "provider": "zipvoice",
     "ref_audio": "data/personas/clementia/任命队长.wav",

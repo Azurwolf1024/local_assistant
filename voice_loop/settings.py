@@ -362,7 +362,7 @@ class TtsConfig:
     trim_shrink_over_ms: int = 450     # 超过它才开始按比例压
     # ---- 音质：沙沙声与语气连贯（见 voice_loop/tts/refclean.py）----
     # ★先听后改★：这几个默认都是「不处理」，量出来的数字只能筛掉明显差的，
-    #   最终好不好听要耳朵定（工具：scripts/ab_voice.py）。
+    #   最终好不好听要耳朵定（工具：scripts/tools/ab_voice.py）。
     ref_clean: str = "off"            # 参考音频净化：off | gate | gate+tilt
                                       #   推理时那条参考是噪声的「载体」（交叉实验：×1.8~2.5）
     ref_clean_strength: float = 0.7    # 谱门强度 0~1（越大越干净，过大可能削气声）

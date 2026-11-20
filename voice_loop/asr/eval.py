@@ -168,51 +168,48 @@ def load_cases(root: str | Path, *, sets: list[str] | None = None) -> list[Case]
 
 
 def synthesize(settings: Any, texts: list[str], out_dir: str | Path, *,
-               set_name: str = "synth", logger=None, prefix: str = "") -> list[Case]:
-    """用本地 TTS 把一串文本合成成评测素材（零人工，覆盖广）。
+               set_name: str = "synth", logger=None, prefix: str = "",
+               speak: Any = None) -> list[Case]:
+    """把一串文本合成成评测素材（零人工，覆盖广）。
+
+    ★TTS 由外面传进来★（``speak=`` 是一个 ``Callable[[str], list[(rate, pcm)]]``）：
+    `voice_loop/asr/` 不认识 TTS —— 否则"识别模块"就没法单独拿走、单独评测了。
+    ``scripts/eval_asr.py`` 会把「本地 TTS 的 synth」接进来。
 
     ★注意★：合成音没有口音/噪声/麦克风频响，所以它只能证明"词库和模型对得上"，
     不能替代真机录音 —— 指标要两套分开看（脚本里会标 `synth/` 前缀）。
     """
     from ..audio import save_wav  # noqa: PLC0415
-    from ..tts import create_tts  # noqa: PLC0415
 
     room = Path(out_dir) / set_name
     room.mkdir(parents=True, exist_ok=True)
-    tts = create_tts(settings, logger)
     out: list[Case] = []
-    try:
-        for index, text in enumerate(texts, 1):
-            clean = str(text or "").strip()
-            if not clean:
-                continue
-            name = f"{prefix}{index:03d}_{clean[:10]}"
-            wav = room / f"{name}.wav"
-            if wav.is_file() and wav.with_suffix(".txt").is_file():
-                out.append(Case(name=name, wav=wav,
-                                ref=wav.with_suffix(".txt").read_text(encoding="utf-8").strip(),
-                                set_name=set_name))
-                continue
-            try:
-                chunks = list(tts.synth(clean))
-            except Exception as exc:  # noqa: BLE001 - 一条合成失败不该中断整批
-                if logger is not None:
-                    logger.warning(f"[评测] 合成失败（{clean[:12]}）：{exc}")
-                continue
-            if not chunks:
-                continue
-            rate = int(chunks[0][0])
-            pcm = np.concatenate([np.asarray(data) for _, data in chunks])
-            save_wav(wav, pcm, rate)
-            wav.with_suffix(".txt").write_text(clean + "\n", encoding="utf-8")
-            out.append(Case(name=name, wav=wav, ref=clean, set_name=set_name))
-    finally:
-        close = getattr(tts, "close", None)
-        if callable(close):
-            try:
-                close()
-            except Exception:  # noqa: BLE001
-                pass
+    if speak is None:
+        raise ValueError("synthesize() 需要 speak=（转写素材的合成函数），asr 模块不提供 TTS")
+    for index, text in enumerate(texts, 1):
+        clean = str(text or "").strip()
+        if not clean:
+            continue
+        name = f"{prefix}{index:03d}_{clean[:10]}"
+        wav = room / f"{name}.wav"
+        if wav.is_file() and wav.with_suffix(".txt").is_file():
+            out.append(Case(name=name, wav=wav,
+                            ref=wav.with_suffix(".txt").read_text(encoding="utf-8").strip(),
+                            set_name=set_name))
+            continue
+        try:
+            chunks = list(speak(clean))
+        except Exception as exc:  # noqa: BLE001 - 一条合成失败不该中断整批
+            if logger is not None:
+                logger.warning(f"[评测] 合成失败（{clean[:12]}）：{exc}")
+            continue
+        if not chunks:
+            continue
+        rate = int(chunks[0][0])
+        pcm = np.concatenate([np.asarray(data) for _, data in chunks])
+        save_wav(wav, pcm, rate)
+        wav.with_suffix(".txt").write_text(clean + "\n", encoding="utf-8")
+        out.append(Case(name=name, wav=wav, ref=clean, set_name=set_name))
     return out
 
 

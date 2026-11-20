@@ -2,8 +2,8 @@
 
 ★它不是合成模型★：不参与出声，只在工具里出现 ——
 
-- ``scripts/spk_check.py``：一批 wav 的「两两相似度 / 对参考的相似度」；
-- ``scripts/pick_voice_ref.py``：给每条素材加一列「像不像这个角色的整体音色」。
+- ``scripts/tools/spk_check.py``：一批 wav 的「两两相似度 / 对参考的相似度」；
+- ``scripts/tools/pick_voice_ref.py``：给每条素材加一列「像不像这个角色的整体音色」。
 
 为什么需要它（2026-09-30）：本项目已有的尺子能量**音区**（``pitch.py``）、
 **停顿/节奏**（``pacing.py``）、**沙沙声**（``ab_clone_model.py`` 的频段表），

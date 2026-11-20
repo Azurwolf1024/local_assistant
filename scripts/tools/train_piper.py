@@ -1,0 +1,260 @@
+"""Piper/VITS 微调启动器（绕开厂商入口与新版 Lightning 的不兼容）。
+
+为什么需要它：``python -m piper_train`` 用的是 ``Trainer.add_argparse_args``
+（Lightning 1.x API，2.x 已删除），而这个环境里只有 lightning 2.6。
+另外它的 ``--resume_from_checkpoint`` 走的是 Lightning 的「恢复整段训练」：
+会把**别人训练时的超参和 dataloader** 一起恢复回来（路径在我们机器上不存在），
+对「拿别人的 ckpt 微调」是错的做法。
+
+这个启动器改成显式做两件事：
+1. 用**我们自己的**数据集配置造 ``VitsModel``（采样率/符号表都从 preprocess 的 config.json 读）；
+2. **只把权重**从底模 ckpt 里搬过来（``load_state_dict(strict=False)``），
+   优化器状态不要（微调本来就要新的学习率）——
+   ★并且会断言「生成器的编码器权重真的匹配上了」★，避免「以为在微调、其实从零训」。
+
+用法：
+
+    python scripts/tools/train_piper.py --dataset-dir data/piper/kaltsit/training ^
+        --checkpoint models/tts/piper/_train/zh_CN-huayan-medium.ckpt ^
+        --out data/piper/kaltsit/exp --epochs 200 --batch-size 8 --lr 2e-4
+"""
+
+from __future__ import annotations
+
+import argparse
+import statistics
+import sys
+import time
+from pathlib import Path
+
+import soundfile as sf
+import torch
+
+# ★「梅尔帧 / 音素 id」的健康下限（经验值，来自两份实测数据）★
+#   A `kaltsit_long`  24 条：中位 **1.91** → 29 epoch 的模型 ASR 回听 0.79/1.00/1.00（能用）
+#   B `kaltsit_split` 69 条：中位 **1.02** → 29 与 49 epoch 的模型都是**胡话**（0.04~0.38）
+# 两者用的是同一份脚本、同一个底模、同样的 lr，只有数据形状不同。
+# 所以「中位低于这个值」不是硬错误，而是**强烈预警**：先回去查切分与标签对齐，别急着训。
+RATIO_HEALTHY_LOW = 1.5
+
+ROOT = Path(__file__).resolve().parents[2]
+PIPER_SRC = ROOT / ".piper-src" / "src" / "python"
+if str(PIPER_SRC) not in sys.path:
+    sys.path.insert(0, str(PIPER_SRC))
+
+
+def load_weights(model, ckpt_path: Path) -> tuple[int, int]:
+    """把底模 ckpt 里的**权重**搬进 model（不恢复优化器/超参）。"""
+    # ★这个 ckpt 是在 Linux 上存的，pickle 里带着 PosixPath★：直接 load 会报
+    #   "cannot instantiate 'PosixPath' on your system"。把 PosixPath 顶成 WindowsPath
+    #   就能解开（里面那些路径是别人的超参，我们不用；真要用的只有 state_dict）。
+    import pathlib
+
+    if pathlib.PosixPath is not pathlib.WindowsPath:  # pragma: no branch
+        pathlib.PosixPath = pathlib.WindowsPath  # type: ignore[assignment,misc]
+    blob = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+    state = None
+    if isinstance(blob, dict):
+        state = blob.get("state_dict")
+        if not isinstance(state, dict) and blob and all(hasattr(v, "shape") for v in blob.values()):
+            # `save_weights_only=True` 存的 checkpoint **本身就是 state_dict**（外面没那层壳）。
+            # ★续跑要认这种★：看门狗重启时喂进来的就是我们自己存的权重文件。
+            state = blob
+    if not isinstance(state, dict):
+        raise SystemExit(f"{ckpt_path.name} 里没有 state_dict（不是 Lightning 的 ckpt？）")
+    # lightning 的 key 可能带 'model_g.' 前缀，也可能不带；两种都试
+    stripped = {k[len("model."):] if k.startswith("model.") else k: v for k, v in state.items()}
+    missing, unexpected = model.load_state_dict(stripped, strict=False)
+    gen_keys = [k for k in stripped if k.startswith("model_g.")]
+    print(f"底模权重：共 {len(stripped)} 个张量，其中生成器 {len(gen_keys)} 个；"
+          f"未匹配（missing）{len(missing)} 个，多余（unexpected）{len(unexpected)} 个")
+    if missing[:3]:
+        print("  missing 例：", missing[:3])
+    if unexpected[:3]:
+        print("  unexpected 例：", unexpected[:3])
+    # ★断言：编码器/解码器的核心权重必须在位★
+    emb = model.model_g.enc_p.emb.weight.detach()
+    if float(emb.abs().max()) == 0.0:
+        raise SystemExit("生成器 embedding 还是全 0 = 权重没搬进来，别开了")
+    if missing and len(missing) > len(stripped) * 0.2:
+        raise SystemExit(f"太多权重没匹配上（{len(missing)}/{len(stripped)}），结构可能不一致")
+    return len(missing), len(unexpected)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Piper 微调（显式版，绕开厂商入口）")
+    ap.add_argument("--dataset-dir", required=True, help="preprocess 的输出目录（含 config.json/dataset.jsonl）")
+    ap.add_argument("--checkpoint", default="", help="底模 ckpt（留空 = 从零训，别这么干）")
+    ap.add_argument("--out", required=True, help="训练产物目录（default_root_dir）")
+    ap.add_argument("--epochs", type=int, default=200)
+    ap.add_argument("--checkpoint-epochs", type=int, default=25, help="每多少 epoch 存一次")
+    ap.add_argument("--batch-size", type=int, default=8)
+    ap.add_argument("--lr", type=float, default=2e-4, help="学习率（微调可以用 1e-4 更保守）")
+    ap.add_argument("--num-workers", type=int, default=0, help="Windows 上用 0（spawn 有额外开销）")
+    ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument("--threads", type=int, default=0, help="torch 线程数（0 = 不设）")
+    ap.add_argument("--min-frames-per-id", type=float, default=0.7,
+                    help="护栏：梅尔帧数 / 音素 id 数的下限，低于它的样本直接剔除"
+                         "（0 = 不过滤）。不设会硬崩 0xC0000005，见 main() 里的说明")
+    args = ap.parse_args()
+
+    import json
+
+    try:  # 这个环境里装的是 pytorch_lightning（没有 lightning 元包）
+        from lightning.pytorch import Trainer
+        from lightning.pytorch.callbacks import ModelCheckpoint
+    except ImportError:  # pragma: no cover
+        from pytorch_lightning import Trainer
+        from pytorch_lightning.callbacks import ModelCheckpoint
+
+    from piper_train.vits.lightning import VitsModel
+
+    dataset_dir = Path(args.dataset_dir)
+    config_path = dataset_dir / "config.json"
+    dataset_path = dataset_dir / "dataset.jsonl"
+    if not config_path.is_file() or not dataset_path.is_file():
+        raise SystemExit(f"{dataset_dir} 里缺 config.json / dataset.jsonl（先跑 preprocess）")
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+
+    # ★护栏：梅尔帧数必须 ≥ 文本 token 数★
+    # 崩点做过定位（2026-09-25）：退码 `0xC0000005`（硬崩、没有 traceback）。
+    # 崩的地方是 `vits/models.py` 的 `monotonic_align.maximum_path`（Cython 单调对齐）：
+    # 它按「音频帧 × 文本 token」分配内存并找一条单调路径，
+    # **音频比文本短时它会写到界外**（Cython 不抛异常，直接踩内存）。
+    # 用 trace 探针（sessions/probe_train_trace.py）定位到具体样本：
+    # `行动开始_01.wav` 1.11s ≈ 95 帧却有 137 个音素 id（比值 0.70）—— 全数据集最极端的一条。
+    # 这类样本来自「把长独白切短」时切出了「话多音频短」的碎片，纯手工核对很难发现，
+    # 所以在这里自动剔除并打印，而不是让训练崩在半夜。
+    if args.min_frames_per_id > 0:
+        rows = [
+            json.loads(line)
+            for line in dataset_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        hop = int(config.get("hop_length") or 256)
+        rate = int(config["audio"]["sample_rate"])
+        kept_rows, dropped = [], []
+        ratios: list[float] = []          # ★全部样本的比值★（不只是被剔的那几条）
+        for row in rows:
+            audio = Path(str(row["audio_path"]))
+            audio = audio if audio.is_absolute() else ROOT / audio
+            try:
+                info = sf.info(str(audio))
+                frames = info.frames * rate / info.samplerate / hop   # 换采样率也算对
+            except Exception as exc:  # noqa: BLE001 - 读不出来就当不合格
+                dropped.append((audio.name, float("nan"), f"读不出音频：{exc}"))
+                continue
+            ratio = frames / max(1, len(row["phoneme_ids"]))
+            ratios.append(ratio)
+            if ratio < args.min_frames_per_id:
+                dropped.append((audio.name, ratio, f"{frames:.0f} 帧 / {len(row['phoneme_ids'])} id"))
+            else:
+                kept_rows.append(row)
+        # ★无论剔没剔，都要报一句比值分布★（2026-09-27 补）：
+        # 实测有一份数据**一条都没被剔**（阈值 0.7），但比值中位只有 1.02（正常区间 ~1.5~2.0），
+        # 训出来是**胡话**（本地 ASR 回听相似度 0.04~0.38，而出厂模型是 0.958~1.000），
+        # 而且高频抬到 −16 dB（出厂 −74）。静默通过比崩掉难查一百倍。
+        if ratios:
+            kept_ratios = sorted(r for r in ratios if r >= args.min_frames_per_id)
+            median = statistics.median(kept_ratios) if kept_ratios else 0.0
+            # ★最小/最大要自己算★：ratios 这个列表**没排序**（按数据集原序追加），
+            # 直接取 [0]/[-1] 会打出「最大 0.96 < 中位 1.02」这种自相矛盾的行
+            # —— 第一次跑就被自己的输出抓到了（教训：验证要**读**输出，不能只看退出码）。
+            print(f"[护栏] 「梅尔帧 / 音素 id」比值：最小 {min(ratios):.2f} / "
+                  f"中位 {median:.2f} / 最大 {max(ratios):.2f}"
+                  f"（全 {len(ratios)} 条，正常区间 ~{RATIO_HEALTHY_LOW}~2.0）")
+            if 0 < median < RATIO_HEALTHY_LOW:
+                print(f"★警告★ 比值中位只有 {median:.2f}（低于 {RATIO_HEALTHY_LOW}）："
+                      "文本相对音频偏长 —— 这份数据训出来的声音会「吐字不清、像在说胡话」，"
+                      "而且**训练过程不会报任何错**。先回去查切分与标签对齐"
+                      "（prepare_piper_segments.py 那种「按比例把全文分给各段」最容易出这个问题），"
+                      "别急着拿它训。")
+        if dropped:
+            print(f"剔除 {len(dropped)} 条「文本比音频长」的样本（比值 < {args.min_frames_per_id}）：")
+            for name, ratio, why in sorted(dropped, key=lambda x: x[1]):
+                print(f"  - {name:<24}{ratio:5.2f}  {why}")
+            # ★阈值定高了就是「静默地把数据扔掉」★：实测把阈值写成 0.9 时，
+            # 切短那个数据集从 38 条剔到只剩 **8 条**，训练 5 分钟就说“完成”——
+            # 比崩掉更难发现。所以剔掉太多必须大声报警。
+            share = len(dropped) / max(1, len(rows))
+            if share > 0.25:
+                print(f"★警告★ 剔掉了 {share * 100:.0f}% 的样本（{len(dropped)}/{len(rows)}）—— "
+                      f"要么阈值偏高，要么**标签和音频本来就不匹配**（回去查切分/对齐）")
+        if not kept_rows:
+            raise SystemExit("所有样本都被剔除了，检查 --min-frames-per-id")
+        filtered = dataset_dir / "dataset.filtered.jsonl"
+        filtered.write_text(
+            "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in kept_rows), encoding="utf-8"
+        )
+        print(f"用过滤后的数据集训练：{len(kept_rows)} 条（{filtered.name}）")
+        dataset_path = filtered
+
+    if args.threads > 0:
+        torch.set_num_threads(args.threads)
+    torch.manual_seed(args.seed)
+
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+
+    # ★这些超参跟厂商 train.sh 一致；quality 默认 medium（底模就是 medium）★
+    model = VitsModel(
+        num_symbols=int(config["num_symbols"]),
+        num_speakers=int(config["num_speakers"]),
+        sample_rate=int(config["audio"]["sample_rate"]),
+        dataset=[str(dataset_path)],
+        learning_rate=args.lr,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        validation_split=0.0,
+        num_test_examples=0,
+        seed=args.seed,
+    )
+    if args.checkpoint:
+        ckpt = Path(args.checkpoint)
+        if not ckpt.is_file():
+            raise SystemExit(f"底模 ckpt 不存在：{ckpt}")
+        print(f"从 {ckpt.name}（{ckpt.stat().st_size / 1e6:.0f} MB）搬权重…")
+        t0 = time.perf_counter()
+        load_weights(model, ckpt)
+        print(f"  用时 {time.perf_counter() - t0:.1f}s")
+    else:
+        print("⚠️ 没有给 --checkpoint：从零训。5 分钟数据训不出可用声线，只适合验证流程")
+
+    n_train = len(model._train_dataset) if model._train_dataset is not None else -1
+    steps_per_epoch = max(1, (n_train + args.batch_size - 1) // args.batch_size)
+    print(f"训练样本 {n_train} 条 → 每 epoch {steps_per_epoch} 步；共 {args.epochs} epoch "
+          f"≈ {steps_per_epoch * args.epochs} 步")
+
+    trainer = Trainer(
+        accelerator="cpu",
+        devices=1,
+        precision=32,
+        max_epochs=args.epochs,
+        default_root_dir=str(out),
+        callbacks=[
+            # ★`save_weights_only=True` 是必须的★：Lightning 的 `_atomic_save` 会把**整个
+            # checkpoint 先序列化进内存缓冲区**，默认连优化器状态一起存 —— 内存紧的时候
+            # `torch.save` 会抛 `MemoryError`（或者更糟：在 C++ 里分配失败 → `0xC0000005`
+            # 访问违例，没 traceback）。实测这台机器只剩 3.9 GB 可用时就成这样了。
+            # 只存权重既能减半内存峰值，又是我们续跑时唯一需要的东西。
+            ModelCheckpoint(
+                every_n_epochs=max(1, args.checkpoint_epochs),
+                save_top_k=-1,
+                save_weights_only=True,
+            )
+        ],
+        num_sanity_val_steps=0,
+        log_every_n_steps=1,
+        enable_progress_bar=False,
+    )
+    t0 = time.perf_counter()
+    trainer.fit(model)
+    dt = time.perf_counter() - t0
+    print(f"\n训练结束：{dt / 60:.1f} 分钟（{dt / max(1, args.epochs):.1f} 秒/epoch）")
+    print(f"权重在 {out}（找 *.ckpt）。下一步导出 ONNX：")
+    print(f"  python -m piper_train.export_onnx <ckpt> {out}/voice.onnx")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

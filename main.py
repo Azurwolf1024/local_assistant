@@ -571,7 +571,7 @@ def cmd_gpu(settings: Settings, args: argparse.Namespace) -> int:
             continue
         if str(device).upper() == "NPU":
             # 为什么直接跳过：这份导出是动态形状，NPU 连编译都过不了；
-            # 就算改成静态形状，核显也比它快约 8 倍（scripts/probe_npu.py 有实测表）
+            # 就算改成静态形状，核显也比它快约 8 倍（scripts/tools/probe_npu.py 有实测表）
             print("  [NPU] 已跳过：动态形状编译不过，而且核显比它快 8 倍（实测）")
             continue
         try:

@@ -1129,7 +1129,7 @@ PERSONA_KALTSIT: dict = {
             "temperature": 0.0,
             "default": True,
             "enabled": True,
-            "notes": "默认角色。别名是拿 scripts/test_wake.py 一条条实测攒的，别删。",
+            "notes": "默认角色。别名是拿 scripts/tests/test_wake.py 一条条实测攒的，别删。",
 }
 
 PERSONA_AMIYA: dict = {

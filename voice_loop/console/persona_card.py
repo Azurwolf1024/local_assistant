@@ -66,7 +66,7 @@ SPEC: list[dict] = [
              "hint": "一行一个；至少写一个，否则只能手动切换，喊不出来"},
             {"key": "aliases", "label": "别名（喊错也认）", "kind": "json",
              "placeholder": "{\"凯尔希\": [\"开尔信\", \"凯尔西\"]}",
-             "hint": "键是唤醒词，值是「听错的说法」列表；实测工具：python scripts/test_wake.py"},
+             "hint": "键是唤醒词，值是「听错的说法」列表；实测工具：python scripts/tests/test_wake.py"},
             {"key": "ack", "label": "应答语", "kind": "text",
              "placeholder": "在的", "hint": "被唤醒时先说的那一句（留空则不出声）"},
         ],

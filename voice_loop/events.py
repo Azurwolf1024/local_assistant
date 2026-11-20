@@ -648,7 +648,7 @@ class EventStore:
 def migrate_legacy(alarm_file: Path, schedule_file: Path) -> tuple[list[dict], dict[str, int]]:
     """把旧的两个文件读成一套事件。返回 (items, 统计)。
 
-    想迁完再去重、而且带备份：落在哪、怎么写由调用方决定（见 scripts/migrate_events.py）。
+    想迁完再去重、而且带备份：落在哪、怎么写由调用方决定（见 scripts/tools/migrate_events.py）。
     ★旧文件里的 ``kind`` 不再带过来★——新 schema 不区分闹钟/日程，
     只把日程的 ``kind: course/meeting/task`` 转成**标签** ``category``：
 

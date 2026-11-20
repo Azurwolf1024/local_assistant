@@ -108,7 +108,7 @@ provider = "cpu"
 [llm]
 host = "http://127.0.0.1:11434"
 # qwen3.5 是多模态模型（自带 vision + tools），一个模型同时管文本和看图。
-# 实测（Arc 核显，见 README 第 7 节与 scripts/bench_llm.py）：
+# 实测（Arc 核显，见 README 第 7 节与 scripts/tools/bench_llm.py）：
 #   3.4 GB / 生成 17.6 tok/s / 热首字 0.5s     ← 现在这个
 #   4.7 GB / 生成 12.3 tok/s / 热首字 0.1s     ← 老的 qwen2.5:7b（还要另装 3.2 GB 的视觉模型）
 # 想要更强：ollama pull qwen3.5:9b（6.6 GB，质量更好但慢一半左右）。
@@ -347,7 +347,7 @@ first_chunk_max_chars = 0     # 首块最多字数（0 = 不限）
 # 用一小段「参考音频 + 它的逐字文本」把角色音色搬到中文输出上。
 # 实测（Core Ultra 5 / CPU）：RTF 1.1~1.4、首段 1.4~2.7s；Piper 是 RTF 0.05、首段 0.13s。
 # 就是「说多久、等多久」——想快就改回 backend = "piper"，只改这一行。
-#   试听：python scripts/tts_clone_probe.py --ref <wav> --compare
+#   试听：python scripts/tools/tts_clone_probe.py --ref <wav> --compare
 #   模型：python scripts/download_models.py --only zipvoice（156 MB）
 clone_dir = "models/tts/zipvoice/sherpa-onnx-zipvoice-distill-int8-zh-en-emilia"
 clone_vocoder = "models/tts/zipvoice/vocos_24khz.onnx"
@@ -359,13 +359,13 @@ clone_max_seconds = 15.0     # 仅当文本靠自动转写时才截；文本来�
 clone_steps = 4              # 流匹配步数：4 最快；8 慢一倍，输出时长完全一样（实测）
                              #   ★注意：这个 4 是给出厂**蒸馏**模型调的。本项目角色是从
                              #   非蒸馏基座微调来的，步数与精度的取舍见第 15 节与
-                             #   python scripts/ab_clone_model.py★
+                             #   python scripts/tools/ab_clone_model.py★
 clone_precision = "int8"     # 角色声线用哪一份 onnx：
                              #   int8 = 125 MB / 快（当前默认，实测过的那一套）
                              #   fp32 = 600 MB / 慢一倍，但没有动态量化的精度损失
                              #   两份可以共存：训练脚本装模型时加 --precision both；
                              #   目录里没有配置的这一份会自动退回另一份（不会哑）。
-                             #   ★换它之前先听：python scripts/ab_clone_model.py★
+                             #   ★换它之前先听：python scripts/tools/ab_clone_model.py★
 clone_min_chars = 16         # 段内最短切句字数（越小出声越快）
 clone_threads = 2            # onnxruntime 线程数
 clone_speed = 1.0            # 语速：1.0=模型节奏；★两边都不安全★——>1 实测 1.15 就含糊，
@@ -402,7 +402,7 @@ trim_shrink_over_ms = 450    # 超过它才开始按比例压（实测模型逗�
 
 # ---- 音质：沙沙声与语气连贯（2026-09-25；见 voice_loop/tts/refclean.py）----
 # ★先听后改★：下面默认全是「不处理」。量出来的数字只能筛掉明显差的，好不好听要耳朵定；
-#   对比工具：python scripts/ab_voice.py（会写 wav 到 sessions/voice_ab2/ 并打客观指标表）。
+#   对比工具：python scripts/tools/ab_voice.py（会写 wav 到 sessions/voice_ab2/ 并打客观指标表）。
 ref_clean = "off"            # 参考音频净化：off | gate | gate+tilt
                              #   ★实测无效，保持 off★：5 遍配对下开净化反而让输出高频
                              #   变高（凯尔希 +8~+12 点），方向不对；见日志 18.2
@@ -421,7 +421,7 @@ out_tilt_db = 0.0            # ★当前 0 = 关：因为已经改回出厂模�
                              #   对出厂模型更是雪上加霜 → 所以：
                              #     · 用微调模型（voice_model 填上前）：-9 ~ -12
                              #     · 用出厂模型（当前默认）：**0（关掉）**
-                             #   量法：python scripts\ab_clone_model.py --profile <wav...>
+                             #   量法：python scripts/tools/ab_clone_model.py --profile <wav...>
 chunk_level_db = 1.5         # 块间电平对齐上限 dB（0 = 关；1.5 = 只修明显的忽大忽小）
 join_pause_comma_ms = 160    # 逗号接缝补白（0 = 用 sentence_silence 的老行为）
 join_pause_period_ms = 320   # 句号接缝补白（同一句话被切块时，句号后不该只停 80ms）
@@ -438,7 +438,7 @@ join_pause_period_ms = 320   # 句号接缝补白（同一句话被切块时，�
 #   ★只重采，不变调★：变调 DSP 会毁音色。实测引擎那边一句话本来就是整块产出
 #   （42 字的长句也是 1 块），所以判定不用额外攒延迟，量一次只花 ~0.1 秒（6 秒音频实测 87ms）。
 # ★代价★：触发的那一遍要多花一次合成时间（实测样本里阿米娅约 1/6 的句子触发、凯尔希 0/6）。
-#   嫌慢就调大阈值或设 pitch_guard_st = 0 关掉。工具：python scripts/pitch_report.py <wav...>
+#   嫌慢就调大阈值或设 pitch_guard_st = 0 关掉。工具：python scripts/tools/pitch_report.py <wav...>
 pitch_guard_st = 1.5         # 允许偏离多少半音（0 = 关；1.5≈全音；2.0 更松）
 pitch_guard_tries = 2        # 最多采几遍（含第一遍）；2 = 最坏情况多花一遍的时间
 
@@ -533,10 +533,10 @@ data_dir = "data"
 #   · 闹钟 = kind="reminder" + 没有 repeat + remind_before=[0]
 #   · 事件链 = 条目里的 "chain": {"after": <上游 id>, "on": "done"|"start"}
 #     完成判定按上游的结束时间**自动算**（start + duration_minutes），不用你说「做完了」
-#   迁移：python scripts/migrate_events.py（默认试运行）→ 详见工程日志第 17 节
+#   迁移：python scripts/tools/migrate_events.py（默认试运行）→ 详见工程日志第 17 节
 #   ★代码还没切过去，运行期仍读下面两个旧文件★
 event_file = "data/events.json"
-alarm_file = "data/alarms.json"        # 迁移数据源（已迁完，只剩 scripts/migrate_events.py 读它）
+alarm_file = "data/alarms.json"        # 迁移数据源（已迁完，只剩 scripts/tools/migrate_events.py 读它）
 memo_file = "data/memos.json"
 schedule_file = "data/schedule.json"   # 迁移数据源
 check_interval = 5            # 后台检查提醒的间隔（秒）
@@ -579,7 +579,7 @@ base_track = 0.3              # 基准跟随速度（越小越稳）
 # 播放开头先取峰值当回声基准，之后只从「低于门槛」的帧里慢慢跟，
 # 连续超过基准 margin 倍 0.25 秒才算你在插话。
 # 戴耳机时基准会跟到底噪附近，任何说话都能立刻打断；外放时确实不如耳机灵敏。
-# 想验证这台机器会不会被自己的回声骗到：python scripts/test_bargein.py --echo
+# 想验证这台机器会不会被自己的回声骗到：python scripts/tests/test_bargein.py --echo
 
 # ── 看图（摄像头 / 屏幕 / 剪贴板 / 文件）──────────────────────────────────
 # 注意：下面这些值才是真正生效的；settings.py 里的 dataclass 只是缺少配置项时的兜底。

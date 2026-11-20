@@ -38,7 +38,7 @@ PIPER_REPO = "rhasspy/piper-voices"
 
 # 说话人向量（声纹）：★不是合成用的★，是量「像不像」用的尺子。
 # 3D-Speaker CAM++ 中文版，16 kHz 单声道输入，输出 192 维向量，27 MB。
-# 用途：scripts/spk_check.py、pick_voice_ref.py 的「音色相似度」列。
+# 用途：scripts/tools/spk_check.py、pick_voice_ref.py 的「音色相似度」列。
 SPEAKER_REPO = "csukuangfj/speaker-embedding-models"
 SPEAKER_MODEL = "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx"
 
@@ -191,7 +191,7 @@ def fetch_zipvoice(force: bool = False) -> None:
     download_with_fallback(
         ZIPVOICE_VOCODER_URLS, out / "vocos_24khz.onnx", force=force
     )
-    print("      完成。用法见 README 第 14 节，试听：python scripts/tts_clone_probe.py --help")
+    print("      完成。用法见 README 第 14 节，试听：python scripts/tools/tts_clone_probe.py --help")
 
 
 def fetch_speaker(force: bool = False) -> None:
@@ -204,7 +204,7 @@ def fetch_speaker(force: bool = False) -> None:
     out = MODELS / "speaker"
     out.mkdir(parents=True, exist_ok=True)
     download_with_fallback(hf_urls(SPEAKER_REPO, SPEAKER_MODEL), out / SPEAKER_MODEL, force=force)
-    print("      用法：python scripts/spk_check.py <wav...> [--ref <wav|目录>]")
+    print("      用法：python scripts/tools/spk_check.py <wav...> [--ref <wav|目录>]")
 
 
 def main() -> int:

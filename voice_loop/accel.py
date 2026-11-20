@@ -7,7 +7,7 @@
         GPU   热态 1.05s   RTF 0.109   ← 3.6 倍
         NPU   **用不了**（详见下）
 
-关于 NPU（Intel(R) AI Boost，2026-09-24 用 `scripts/probe_npu.py` 重测）：
+关于 NPU（Intel(R) AI Boost，2026-09-24 用 `scripts/tools/probe_npu.py` 重测）：
 
     | 同一份静态 [1,128,3000] encoder | CPU | Arc 核显 | NPU |
     |---|---|---|---|
@@ -263,7 +263,7 @@ def pick_whisper_devices(want: str) -> list[str]:
 
     ``auto`` -> GPU（有的话）然后 CPU；显式写 NPU 也允许，但一定会带 CPU 兜底，
     因为这份导出（动态形状）在 NPU 上连编译都过不了，而就算改成静态形状，
-    核显仍比 NPU 快约 8 倍（实测见 `scripts/probe_npu.py`）。
+    核显仍比 NPU 快约 8 倍（实测见 `scripts/tools/probe_npu.py`）。
     """
     want = (want or "auto").strip()
     devs = detect().openvino
@@ -323,7 +323,7 @@ def report(settings: Settings, logger: logging.Logger | None = None) -> list[str
     lines.append(
         "  显卡加速："
         + ("Intel Arc 核显（GPU）√" if acc.has_intel_gpu else "× 没有 Intel 核显")
-        + ("；NPU √（硬件在、能跑，但比核显慢 8 倍，别选——scripts/probe_npu.py 有实测表）"
+        + ("；NPU √（硬件在、能跑，但比核显慢 8 倍，别选——scripts/tools/probe_npu.py 有实测表）"
            if acc.has_npu else "")
     )
     lines.append(

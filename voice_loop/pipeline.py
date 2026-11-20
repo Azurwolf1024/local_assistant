@@ -173,6 +173,9 @@ class VoiceLoop:
             settings.llm, getattr(settings, "api", None), self.log
         )
         self.tts = create_tts(settings, self.log, lazy=self.lazy)
+        # ★把「转写参考音频」的能力注入给 TTS★（见 voice_loop/tts/hooks.py）：
+        # 这样 tts/ 里一个 asr 的 import 都没有，两个模块可以各自拿走单独优化。
+        self._wire_tts_transcriber()
         # ★合成回听★：有 ASR 就把「说的是不是这句」的校验器接上去（见 textcheck.py）
         self._wire_text_guard()
         # 注：以前这里还存了 6 个「全局声线快照」（_base_voice / _base_backend /
@@ -1038,6 +1041,26 @@ class VoiceLoop:
         self._style = want
         self._apply_voice(char, reason or f"风格 {want or '默认'}")
         return want
+
+    def _wire_tts_transcriber(self) -> None:
+        """把识别能力注入给 TTS（克隆声线时自动转写参考文本要用）。
+
+        ★方向只有一个★：ts → 不认识 asr；是管线把 `Hearing.transcribe` 塞进
+        `voice_loop.tts.hooks`。想做「只装 TTS 不装识别」时，这里什么都不注入，
+        TTS 只会说一句「参考文本请手填 .txt」，照样能跑（`self.asr is None`）。
+        """
+        try:
+            from .tts.hooks import set_transcriber  # noqa: PLC0415
+
+            if self.asr is None:
+                set_transcriber(None)
+                return
+            set_transcriber(
+                lambda audio, rate: self.asr.transcribe(audio, int(rate), prefer="fast").text,
+                source="pipeline/Hearing",
+            )
+        except Exception as exc:  # noqa: BLE001 - 注入失败只影响"自动转写"
+            self.log.debug(f"[tts] 注入转写能力失败（忽略）：{exc}")
 
     def _wire_text_guard(self) -> None:
         """把「合成回听」的校验器接给 TTS（见 voice_loop/tts/textcheck.py）。

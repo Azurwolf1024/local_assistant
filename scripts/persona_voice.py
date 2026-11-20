@@ -7,7 +7,7 @@
     python scripts/persona_voice.py --persona kaltsit --stage 3 --stop-stage 5
     python scripts/persona_voice.py --persona kaltsit --verify      # 只校验装好的模型
 
-它背后用的是官方 ZipVoice 微调配方（见 scripts/finetune_zipvoice.py 里的对照表），
+它背后用的是官方 ZipVoice 微调配方（见 scripts/tools/finetune_zipvoice.py 里的对照表），
 角色相关的东西都按约定推出来，不用记一堆路径：
 
     data/personas/<id>.json          人格文件（读 voice_dir / voice_ref）
@@ -43,7 +43,7 @@ from voice_loop.voice_data import (  # noqa: E402
     render_report,
 )
 
-TRAINER = ROOT / "scripts" / "finetune_zipvoice.py"
+TRAINER = ROOT / "scripts" / "tools" / "finetune_zipvoice.py"
 
 
 def persona_paths(item: VoiceData) -> dict[str, str]:
@@ -133,7 +133,7 @@ def do_train(item: VoiceData, args) -> int:
         trainer_args.append("--force")
     if args.dry_run:
         print("（--dry-run：不执行，只显示会跑什么）")
-        print(f"$ python scripts/finetune_zipvoice.py {' '.join(trainer_args)}")
+        print(f"$ python scripts/tools/finetune_zipvoice.py {' '.join(trainer_args)}")
         return 0
     code = run_trainer(trainer_args)
     if code != 0:

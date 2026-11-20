@@ -13,7 +13,7 @@
    否则会出现「原始对话删了、事件也没提出来」的信息黑洞。
 
 这些函数都是**纯函数**（输入输出都是 dataclass/字典，不碰文件、不看全局），
-所以 `scripts/test_memory.py` 能拿假数据把每条规则钉住。
+所以 `scripts/tests/test_memory.py` 能拿假数据把每条规则钉住。
 """
 
 from __future__ import annotations

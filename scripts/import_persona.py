@@ -144,7 +144,7 @@ def main() -> int:
         print(" 这是试运行 —— 确认无误后加 --apply")
     elif ok:
         print(" 下一步：")
-        print("   · 想听声音：python scripts/pick_voice_ref.py --who <id>（挑参考音频）")
+        print("   · 想听声音：python scripts/tools/pick_voice_ref.py --who <id>（挑参考音频）")
         print("   · 改人设：python main.py ui --window auto（控制台「角色」标签页，点卡片就能改）")
         print("   · 试一句：python main.py ask \"你好\" --character <id>")
     for result in bad:
