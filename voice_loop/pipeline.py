@@ -227,6 +227,8 @@ class VoiceLoop:
                     # ★邮件服务器要的就是流水线里这一个 MailService★：
                     # 巡检线程、审批卡、MCP 工具读写同一份索引，不会各开一个 SQLite
                     "service": lambda: self.mail,
+                    # ★让模型能主动「结束这次聆听」★（API 角色才有这个工具）
+                    "end_listening": self.end_listening,
                 },
             )
             if self.skills and getattr(settings, "mcp", None) is not None
@@ -352,6 +354,8 @@ class VoiceLoop:
 
         self._stop = threading.Event()
         self._interrupt = threading.Event()
+        #: 模型调 end_listening 后置真：主循环下一轮就不再收音（见 service/chat）
+        self._end_listen_requested = False
         self._hotkey = None            # 按键打断（默认 Esc）的监听线程
         # 字幕同步用：这一轮念到第几个字、已经排了多少秒音频
         self._spoken_chars = 0
@@ -1353,6 +1357,16 @@ class VoiceLoop:
             stats.extra["asr_score"] = round(asr.score, 4)
         stats.asr_seconds = asr_seconds
 
+        # ★「别听了」先判掉★：这类收尾话模型常常只回一句「好的」而不调 end_listening，
+        # 结果服务还在傻等下一句。这里用确定性规则兜底（和 standby 短语一个思路）。
+        if self._wants_end_listening(user_text):
+            self.end_listening(f"用户说「{user_text[:20]}」")
+            reply = str(getattr(self.settings.wake, "standby_reply", "") or "好，那我先退下。")
+            stats.answer = reply
+            stats.extra["end_listening"] = True
+            self._speak_brief(reply)
+            return stats
+
         # 字幕：先清掉上一轮的内容（否则流式 append 会越滚越长），
         # 再把「你说：…」放上去——听错了一眼就能看出来
         if self.subtitle is not None:
@@ -2289,6 +2303,29 @@ class VoiceLoop:
             if callable(unload):
                 unload()
 
+    #: ★这些是在说「别听了」★：模型对收尾话经常只回一句「好的」而不调工具，
+    #: 所以再兜一条确定性规则（宁可多结束一次，也别一直傻等）。
+    _END_LISTEN_HINTS = (
+        "不用听了", "别听了", "不要听了", "先不用听", "先别听", "停止聆听", "结束聆听",
+        "我说完了", "就这样吧", "先这样", "先这样吧", "退下吧", "先退下", "你可以休息了",
+    )
+
+    def _wants_end_listening(self, text: str) -> bool:
+        raw = re.sub(r"\s+", "", str(text or ""))
+        return any(word in raw for word in VoiceLoop._END_LISTEN_HINTS)
+
+    def end_listening(self, note: str = "") -> tuple[bool, str]:
+        """工具实现：结束这次聆听（关会话、置一个标记，让主循环立刻停止收音）。
+
+        ★为什么用标记而不是当场关麦克风★：工具是在**回答这一轮里**被调用的，
+        当场关麦克风会把还没念完的回答掐掉。主循环看到标记后：
+        先停止继续听、再回待唤醒（见 ``service``/``chat`` 里的判断）。
+        """
+        self._end_listen_requested = True
+        self.session.close()
+        self.log.info(f"[聆听] 模型请求结束聆听{f'（{note}）' if note else ''}")
+        return True, "已结束聆听，麦克风停止收音（回到待唤醒）"
+
     def _standby_now(self, text: str) -> None:
         """收回这次唤醒：关会话 + 说一句话；重型模型由主循环下一轮释放。"""
         self.session.close()
@@ -2444,6 +2481,11 @@ class VoiceLoop:
         try:
             while not self._stop.is_set():
                 try:
+                    if self._end_listen_requested:
+                        # 模型请求结束聆听：chat 模式没有唤醒词，直接收工
+                        self._end_listen_requested = False
+                        print("\n[已结束聆听] 这次对话到此为止。\n", flush=True)
+                        return
                     audio = self.listen_once() if mode == "vad" else self.record_ptt()
                 except KeyboardInterrupt:
                     raise
@@ -2566,6 +2608,11 @@ class VoiceLoop:
                     break
                 # 控制台（网页 UI）的命令：最多 5 秒内被响应（本循环每轮也会被 listen_once 上限带走）
                 self._serve_console()
+                if self._end_listen_requested:
+                    # ★模型在上一轮里调了 end_listening★：这一轮起不再收音，回待唤醒
+                    self._end_listen_requested = False
+                    self.session.close()
+                    print(f"\n[已结束聆听] 请说「{self._wake_hint()}」再叫我。\n", flush=True)
                 try:
                     if self.wake.maybe_reload():
                         self._idle_timeout = float(

@@ -542,6 +542,8 @@ def make_run_command(settings: Settings, log: logging.Logger):
 def build_server(
     settings: Settings | None = None,
     logger: logging.Logger | None = None,
+    *,
+    end_listening: Any = None,      # ★宿主注入★：真的把这次聆听结束掉
     **_ignored: Any,
 ) -> MCPServer:
     log = logger or logging.getLogger("voice_loop")
@@ -553,6 +555,30 @@ def build_server(
     def add(name: str, description: str, schema: dict, handler) -> None:
         server.add_tool(name, description, schema, handler)
 
+    def make_end_listening():
+        def handler(args: dict) -> dict:
+            if not callable(end_listening):
+                return {"text": "这个入口不能结束聆听（只有常驻服务里可用）", "is_error": True}
+            note = str((args or {}).get("note") or "").strip()
+            ok, message = end_listening(note)
+            return {"text": message, "is_error": not ok}
+
+        return handler
+
+    add(
+        "end_listening",
+        "结束**这一次**语音聆听：用户说「不用听了」「就这样」「先到这」「我说完了」或者明显不打算"
+        "继续说的时候调用。调用后麦克风立刻停止收音、回到待唤醒，不会立刻再听你说话。"
+        "★不要用它代替回答★：只有用户明确不想继续时才调。",
+        {
+            "type": "object",
+            "properties": {
+                "note": {"type": "string",
+                         "description": "为什么结束（可选，写进日志给人看）"},
+            },
+        },
+        make_end_listening(),
+    )
     add(
         "web_search",
         "联网搜索（DeepSeek Search API）：返回标题、URL、来源、摘要。"

@@ -119,6 +119,18 @@ Stop-Process -Id <PID> -Force
 > 注意：在 VS Code 里直接关掉终端面板**不保证**会把子进程一起杀掉，
 > 残留的进程会一直占着麦克风。用 `main.py stop` 最稳。
 
+### 让它自己结束聆听（API 角色）
+
+说「**不用听了 / 先这样 / 就这样吧 / 我说完了 / 你可以休息了**」→ 立刻停止收音、回待唤醒。
+两条路都通：
+
+- 模型侧有 `end_listening` 工具（API 角色在 `api_tools` 里加 `"voice"` 就能用）；
+- 再加一条**确定性规则**兜底（这类收尾话模型常常只回「好的」而不调工具）。
+
+```powershell
+python main.py --character bluefish ask "先不用听了" --no-tts
+```
+
 ### 外观（弹窗 / 字幕 / 审批卡）
 
 三者共用一套设计件（[`voice_loop/ui_kit.py`](../../voice_loop/ui_kit.py)），语言参照

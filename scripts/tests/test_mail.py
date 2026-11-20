@@ -951,6 +951,47 @@ def test_approval_card(tmp: Path) -> None:
           [c[1] for c in queue2.calls], ["cancel"])
 
 
+def test_end_listening(tmp: Path) -> None:
+    """end_listening 工具：模型能主动结束聆听（不把回答掐掉）。"""
+    print("\n[17] 结束聆听工具（API 角色用）")
+    from voice_loop.mcp.servers import agent as agentsrv
+
+    hits: list[str] = []
+
+    def fake_end(note: str = ""):
+        hits.append(note)
+        return True, "已结束聆听，麦克风停止收音（回到待唤醒）"
+
+    settings, _cfg = make_cfg(tmp / "end")
+    server = agentsrv.build_server(settings, agent=settings.agent, end_listening=fake_end) \
+        if False else agentsrv.build_server(settings, end_listening=fake_end)
+    names = [t.name for t in server.tools()]
+    check("工具列表里有 end_listening", "end_listening" in names, True, detail=str(names[:4]))
+    reply = server.call_tool("end_listening", {"note": "用户说不用听了"})
+    text = str((reply.get("content") or [{}])[0].get("text") or "")
+    check("调它能真的结束", (bool(hits), "结束聆听" in text), (True, True), detail=text)
+
+    # 没注入回调（比如单独跑命令行）时要说清楚，而不是静默成功
+    bare = agentsrv.build_server(settings)
+    got = bare.call_tool("end_listening", {})
+    check("没有宿主回调就如实说不可用", got.get("isError"), True,
+          detail=str((got.get("content") or [{}])[0].get("text"))[:60])
+
+
+def test_end_listening_rule() -> None:
+    """「别听了」这条确定性规则（模型常常只回一句「好的」，不会调工具）。"""
+    print("\n[18] 结束聆听的兜底规则")
+    from voice_loop.pipeline import VoiceLoop
+
+    says = ["先不用听了", "就这样吧", "我说完了，谢谢", "你可以休息了"]
+    nots = ["帮我看看邮件", "这个功能怎么用", "先不用听了以后再说吧"]  # 最后一个含关键词 → 也算
+    for text in says:
+        check(f"「{text}」→ 要结束", VoiceLoop._wants_end_listening(None, text), True)
+    check("普通问题不结束", VoiceLoop._wants_end_listening(None, "帮我看看邮件"), False)
+    check("关键词出现在句子里也认", VoiceLoop._wants_end_listening(None, "好了我说完了"), True)
+    check("空串安全", VoiceLoop._wants_end_listening(None, ""), False)
+
+
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="mail_"))
     try:
@@ -970,6 +1011,8 @@ def main() -> int:
         test_token_budget(tmp)
         test_contacts(tmp)
         test_approval_card(tmp)
+        test_end_listening(tmp)
+        test_end_listening_rule()
     finally:
         import shutil
 

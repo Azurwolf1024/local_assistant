@@ -199,14 +199,27 @@ def build_server(
     if callable(service):
         service = service()
     svc = service or MailService(settings, log=log)
+    # ★别名表：★必须写进**工具说明**（MCP 的 instructions 我们自己的宿主不会转给模型，
+    # 只有 schema / description 会）—— 真机就是栽在这里：模型看不到别名，
+    # 于是反问「你的私人邮箱是哪个」。
+    table = dict(getattr(settings.mail, "contacts", {}) or {})
+    alias_hint = ""
+    if table:
+        pairs = "、".join(f"「{k}」= {v}" for k, v in table.items())
+        alias_hint = f"（已配置：{pairs}）"
+
     # ★落款用谁★：优先 [mail] signature，其次你自己在 Outlook 里的显示名（第一次读一次）
     try:
         signer = svc.signature or svc.refresh_identity() or ""
     except Exception:  # noqa: BLE001 - 读不到就留空，让模型问用户
         signer = ""
     sign_hint = (f"落款默认用「{signer}」" if signer else "落款用你自己的名字（不知道就问用户）")
-    server = MCPServer(name=NAME, version="1.0.0",
-                       instructions=f"{INSTRUCTIONS}\n{sign_hint}。")
+    # ★把「说法的别名」告诉模型★：真机上它不知道存在「私人邮箱」这种别名，
+    # 于是回了一句"我这边没有你私人邮箱的地址呢" —— 其实配置里就有，只是它看不见。
+    server = MCPServer(
+        name=NAME, version="1.0.0",
+        instructions=f"{INSTRUCTIONS}\n{sign_hint}。{alias_hint}",
+    )
 
     empty: dict = {"type": "object", "properties": {}}
     since = {
@@ -268,7 +281,9 @@ def build_server(
                         "（例「AIAA3102 的老师」「教务处」「私人邮箱」「itdid」）——"
                         "系统会从你自己的邮件往来里匹配到具体地址；分不清会返回候选，"
                         "★这时要用 ask_user 问用户，绝对不要自己编地址★。"
+                        "★把用户的原话照抄进来即可，不要自己改写、不要问他要地址★。"
                         "多个收件人用逗号分隔；也可以直接写完整地址。"
+                        + alias_hint
                     ),
                 },
                 "subject": {"type": "string"},

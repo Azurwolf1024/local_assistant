@@ -248,12 +248,13 @@ def test_hidden_and_preset() -> None:
     check("files 预设", expand(["files"]),
           {"read_file", "list_dir", "glob", "grep"})
     check("write 预设", expand(["write"]), {"write_file", "edit_file"})
+    check("voice 预设（结束聆听）", expand(["voice"]), {"end_listening"})
     check("mail 预设", expand(["mail"]),
           {"mail_search", "mail_read", "mail_summary", "mail_draft", "mail_send",
            "mail_to_event"})
     check("harness 预设", expand(["harness"]),
           {"web_search", "web_fetch", "weather", "read_file", "list_dir", "glob", "grep",
-           "write_file", "edit_file", "run_command",
+           "write_file", "edit_file", "run_command", "end_listening",
            "mail_search", "mail_read", "mail_summary", "mail_draft", "mail_to_event"})
 
 
