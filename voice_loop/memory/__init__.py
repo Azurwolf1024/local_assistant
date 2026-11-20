@@ -425,6 +425,9 @@ class Memory:
             try:
                 path.unlink()
                 removed.append(name)
+            except FileNotFoundError:
+                # 文件已经被手动删了（清理磁盘 / 换机器搬家）：状态照样清掉，不刷警告
+                removed.append(name)
             except OSError as exc:
                 self.log.warning(f"[记忆] 删不掉 {name}：{exc}")
         for name in removed:

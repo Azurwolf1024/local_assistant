@@ -276,6 +276,14 @@ def test_session_archive(tmp: Path) -> None:
     old.write_text("{}", encoding="utf-8")
     removed = mem.prune_raw_sessions(sessions, now=NOW, dry_run=False)
     check("dry_run=False 真的删文件", not old.exists() and "session-old-extracted.jsonl" in removed)
+    # ★文件已被手动删掉（清理磁盘 / 换机器）时不该刷警告、也不该把状态留着★
+    states = dict(mem.session_states())
+    states["session-gone.jsonl"] = {"extracted": True, "last_ts": "2026-01-01 10:00"}
+    write_json(mem.paths.sessions, states)
+    gone = mem.prune_raw_sessions(sessions, now=NOW, dry_run=False)
+    check("文件已经不在 → 不算失败，状态照样清掉",
+          ("session-gone.jsonl" in gone, "session-gone.jsonl" in mem.session_states()),
+          (True, False))
 
 
 def test_extract_rules() -> None:
