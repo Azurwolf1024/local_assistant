@@ -107,3 +107,5 @@ data/asr_eval/
 data/lexicon/_gen/
 data/lexicon/*.txt
 
+# 邮件子系统：token / 本地索引 / 草稿 / 审计（含隐私，绝不进 git）
+data/mail/

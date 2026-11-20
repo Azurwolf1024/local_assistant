@@ -1,4 +1,4 @@
-"""模块边界自测：asr / tts / memory 三个「可单独拿走」的子系统不许互相缠住。
+"""模块边界自测：asr / tts / memory / mail 四个「可单独拿走」的子系统不许互相缠住。
 
 为什么要有这条
     解耦最容易悄悄回退：某天为了省事在图省事在 `tts/` 里 `from ..asr import Hearing`，
@@ -8,11 +8,13 @@
 
 规则（允许的依赖都是"叶子工具"）
     允许：settings / paths / store / text / audio / phonetic / names / accel / persona
-          （memory 另外允许 events、llm、harness —— 它就是干"整理对话"这件事的）
+          （memory 另外允许 events、llm、harness —— 它就是干"整理对话"这件事的；
+            mail 允许 llm、ui —— 分类模型和审批卡都是注入式的惰性 import）
     禁止：
-        tts   ✗ asr / memory / skills / pipeline / tools / vision / wake
-        asr   ✗ tts / memory / skills / pipeline / tools / vision / wake
-        memory✗ tts / asr / skills / pipeline / tools / vision / wake
+        tts   ✗ asr / memory / mail / skills / pipeline / tools / vision / wake
+        asr   ✗ tts / memory / mail / skills / pipeline / tools / vision / wake
+        memory✗ tts / asr / mail / skills / pipeline / tools / vision / wake
+        mail  ✗ tts / asr / memory / skills / pipeline / tools / vision / wake
 
     python scripts\\tests\\test_module_boundaries.py
 """
@@ -31,9 +33,10 @@ _failures: list[str] = []
 
 #: 每个子系统**不许**出现的依赖
 FORBIDDEN = {
-    "tts": {"asr", "memory", "skills", "pipeline", "tools", "vision", "wake", "mcp"},
-    "asr": {"tts", "memory", "skills", "pipeline", "tools", "vision", "wake", "mcp"},
-    "memory": {"tts", "asr", "skills", "pipeline", "tools", "vision", "wake", "mcp"},
+    "tts": {"asr", "memory", "mail", "skills", "pipeline", "tools", "vision", "wake", "mcp"},
+    "asr": {"tts", "memory", "mail", "skills", "pipeline", "tools", "vision", "wake", "mcp"},
+    "memory": {"tts", "asr", "mail", "skills", "pipeline", "tools", "vision", "wake", "mcp"},
+    "mail": {"tts", "asr", "memory", "skills", "pipeline", "tools", "vision", "wake", "mcp"},
 }
 
 
@@ -75,8 +78,8 @@ def scan(module: str) -> list[str]:
 
 
 def test_boundaries() -> None:
-    print("\n[1] 三个子系统的 import 边界")
-    for module in ("tts", "asr", "memory"):
+    print("\n[1] 四个子系统的 import 边界")
+    for module in ("tts", "asr", "memory", "mail"):
         bad = scan(module)
         check(f"{module}/ 没有越界依赖", not bad,
               "；".join(bad[:4]) + (f" 等 {len(bad)} 处" if len(bad) > 4 else ""))
@@ -87,7 +90,7 @@ def test_leaf_contracts() -> None:
     import subprocess
 
     # ★用子进程★：主进程早就 import 过 pipeline 了，量不出来"能不能单独装"
-    for stmt in ("import voice_loop.tts", "import voice_loop.asr"):
+    for stmt in ("import voice_loop.tts", "import voice_loop.asr", "import voice_loop.mail"):
         got = subprocess.run([sys.executable, "-c",
                               f"import sys; sys.path.insert(0, r'{ROOT}'); {stmt}"],
                              capture_output=True, text=True, encoding="utf-8",
@@ -121,7 +124,7 @@ def test_tts_hooks() -> None:
 
 def main() -> int:
     print("=" * 72)
-    print(" 模块边界自测：asr / tts / memory 能各自独立")
+    print(" 模块边界自测：asr / tts / memory / mail 能各自独立")
     print("=" * 72)
     test_boundaries()
     test_leaf_contracts()

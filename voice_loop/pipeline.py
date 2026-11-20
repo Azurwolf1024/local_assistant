@@ -19,6 +19,7 @@ from collections import deque
 from dataclasses import asdict, dataclass, field, replace as _dc_replace
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -29,6 +30,11 @@ from .audio import BaseSegmenter, MicReader, MicRecorder, Speaker, make_segmente
 from .bargein import BargeInDetector
 from .control import ControlChannel, reap as reap_control, serve_once as serve_control_once
 from .llm import ChatClient, LlmError
+from .mail import MailService
+from .mail.adapters import api_classifier, ollama_classifier
+from .mail.approve import ApprovalCard, ApprovalQueue
+from .mail.notify import Notifier
+from .mail.watcher import MailWatcher
 from .mcp import MCPHost
 from .names import NameCorrector
 from .persona import (Character, CharacterRegistry, TRUTH_HINT, knowledge_spec_for,
@@ -218,6 +224,9 @@ class VoiceLoop:
                         if self.persona is not None and self.persona.get(cid) is not None else cid
                     ),
                     "can_read_all": lambda: bool(self.character and self.character.memory_all),
+                    # ★邮件服务器要的就是流水线里这一个 MailService★：
+                    # 巡检线程、审批卡、MCP 工具读写同一份索引，不会各开一个 SQLite
+                    "service": lambda: self.mail,
                 },
             )
             if self.skills and getattr(settings, "mcp", None) is not None
@@ -387,6 +396,66 @@ class VoiceLoop:
                 self._start_dream_scheduler(dcfg)
             except Exception as exc:  # noqa: BLE001 - 调度器起不来不该影响说话
                 self.log.warning(f"[记忆] 做梦调度器没起来（不影响对话）：{exc}")
+
+        # ★邮件子系统★（见 voice_loop/mail/ 与 docs/guide/mail.md）：
+        # 索引库 + 巡检线程 + 右下角审批卡。关掉就完全没有这一摊东西。
+        self.mail: MailService | None = None
+        self.mail_watcher: MailWatcher | None = None
+        self.mail_approval: ApprovalCard | None = None
+        self._init_mail(settings)
+
+    def _init_mail(self, settings: Settings) -> None:
+        cfg = getattr(settings, "mail", None)
+        if cfg is None or not getattr(cfg, "enabled", False):
+            return
+        try:
+            self.mail = MailService(settings, log=self.log, llm=self._mail_llm(cfg))
+        except Exception as exc:  # noqa: BLE001 - 邮件起不来不该影响说话
+            self.log.warning(f"[mail] 初始化失败（不影响对话）：{exc}")
+            self.mail = None
+            return
+        notifier = Notifier(
+            cfg, self.mail.store,
+            toast=self.toast,
+            speak=lambda text: self.speak_text(text, wait=False),
+            log=self.log,
+        )
+        # 审批卡按「批准时限」倒计时：卡片消失 = token 也过期，不会出现
+        # 「看着还在，其实已经批不了」的错位。
+        approval = ApprovalCard(
+            ApprovalQueue(self.mail.outbox, log=self.log, on_result=self._on_mail_result),
+            timeout=float(getattr(cfg, "approval_ttl", 300) or 300),
+            log=self.log,
+        )
+        self.mail_approval = approval
+        self.mail.on_draft = approval.submit
+        # ★巡检只在常驻服务里跑★：一次性命令（mail search 之类）自己会 sync，
+        # 多开一个线程白耗电，还会和命令行抢 SQLite。
+        self.mail_watcher = MailWatcher(
+            self.mail, notifier,
+            interval=float(getattr(cfg, "sync_minutes", 3) or 3) * 60.0,
+            log=self.log,
+        )
+
+    def _mail_llm(self, cfg) -> Any:
+        """分级用哪个模型：``ollama:xxx`` 走本地，否则用 ``[api]`` 那套。"""
+        want = str(getattr(cfg, "classify_model", "") or "").strip()
+        try:
+            if want.startswith("ollama:"):
+                return ollama_classifier(getattr(self.settings, "llm", None),
+                                         model=want.split(":", 1)[1], log=self.log)
+            return api_classifier(getattr(self.settings, "api", None), model=want, log=self.log)
+        except Exception as exc:  # noqa: BLE001 - 没有云端就只用规则分
+            self.log.warning(f"[mail] 分级模型没接上（只用规则）：{exc}")
+            return None
+
+    def _on_mail_result(self, ok: bool, message: str) -> None:
+        """审批卡按完按钮后的一句话回执（不念出来，免得打断当前这轮）。"""
+        if self.toast is not None:
+            try:
+                self.toast.show("邮件", message)
+            except Exception:  # noqa: BLE001
+                pass
 
     # ======================================================================
     # 预热
@@ -2435,6 +2504,12 @@ class VoiceLoop:
             self.log.warning(f"清理控制台信箱失败（忽略）：{exc}")
         if self.scheduler:
             self.scheduler.start()
+        # 邮件：审批卡先起（它要占用 Tk 宿主），再开巡检线程
+        if self.mail_approval is not None and not self.mail_approval.start():
+            self.log.warning("[mail] 审批卡起不来（没有图形环境？）——草稿只能用 "
+                             "python main.py mail approve <id> 批")
+        if self.mail_watcher is not None:
+            self.mail_watcher.start()
         if not self.lazy:
             # 不分级时模型已经加载好了，直接算活跃
             self._active = True
@@ -2922,12 +2997,33 @@ class VoiceLoop:
             self._hotkey = None
         if self.scheduler:
             self.scheduler.stop()
+        # 邮件：先停巡检（它可能在发 HTTP），再把审批卡从 Tk 宿主上摘下来
+        if self.mail_watcher is not None:
+            try:
+                self.mail_watcher.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self.mail_watcher = None
+        if self.mail_approval is not None:
+            try:
+                self.mail_approval.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self.mail_approval = None
         if self.mcp is not None:
             # 关掉 MCP 服务器（stdio 的那些要收子进程，不然会留下孤儿）
             try:
                 self.mcp.close()
             except Exception as exc:  # noqa: BLE001
                 self.log.debug(f"关闭 MCP 出错（已忽略）：{exc}")
+        if self.mail is not None:
+            # 关掉索引库（此时 MCP 里的邮件工具已经不再被调用）
+            self.mail.on_draft = None
+            try:
+                self.mail.close()
+            except Exception as exc:  # noqa: BLE001
+                self.log.debug(f"关闭邮件索引出错（已忽略）：{exc}")
+            self.mail = None
         if self.toast is not None:
             try:
                 self.toast.stop()

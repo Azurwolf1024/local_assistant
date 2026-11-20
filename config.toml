@@ -648,6 +648,47 @@ cache_seconds = 600           # 同一地点的预报缓存多久（省流量，
 unit = "c"                    # c = 摄氏度，f = 华氏度
 geocode_language = "zh"       # 地名返回中文
 
+# ── 邮件（Outlook / Microsoft Graph）───────────────────────────────────────────
+# 「今天有什么重要邮件」「帮我把这封回一下」都走这里。★发信永远不会自动发生★：
+# 必须同时满足 allow_send = true、收件人在 send_allowlist、并且你在弹窗里点了「发送」。
+#
+# 一次性准备（3 分钟，只需做一次）：
+#   1. https://entra.microsoft.com → Identity → Applications → App registrations
+#      → New registration；Supported account types 选「个人 Microsoft 账户」
+#   2. Manifest 里两行：requestedAccessTokenVersion = 2、isFallbackPublicClient = true
+#   3. 把 Application (client) ID 写进 config.local.toml 的 [mail] client_id（不要写这儿）
+#   4. python main.py mail login   → 浏览器输一串短码，token 会存在 data/mail/
+[mail]
+enabled = true
+client_id = ""                 # ★放在 config.local.toml★（这是应用标识，不是密钥）
+tenant = "consumers"           # 个人账号；工作/学校账号填 organizations
+
+folder = "inbox"               # 同步哪个文件夹（all = 全部）
+first_sync_days = 30           # 第一次往回拉多少天
+page_size = 50
+max_pages = 10                 # 单轮最多翻几页
+sync_minutes = 3               # 巡检间隔（服务在跑时每 3 分钟问一次 Graph）
+max_body_chars = 6000          # 读正文时最多给模型多少字
+
+# —— 重要度分级 ——
+# 只把「主题 + 发件人 + 前 classify_chars 字」发给模型，正文不会整封出去。
+classify_chars = 400
+classify_model = ""            # 空 = 用 [api] 的模型；填 ollama:qwen3.5:4b 就走本地
+classify_per_sync = 10         # 每轮最多分级几封
+high_score = 60                # ≥ 60 立刻弹窗提醒
+medium_score = 30              # ≥ 30 进摘要（每天 digest_hours 两个时间点）
+vip_senders = []               # 例：["boss@company.com", "@hku.hk"]
+priority_domains = []          # 例：["hkust-gz.edu.cn"]
+
+notify_high = true
+digest_hours = [9, 20]
+
+# —— 发信（三道闸门）——
+allow_send = false             # ★改 true 才能发★
+send_allowlist = []            # ★空表 = 谁都发不出去★ 例：["@example.com", "a@b.com"]
+approval_ttl = 300             # 批准后多少秒内必须点发送，过期作废
+timeout = 20
+
 # ── MCP：自己搭的工具协议层（见 voice_loop/mcp/）────────────────────────────
 # 把能力域拆成独立的 MCP 服务器：宿主（MCPHost）聚合工具清单，再把调用路由回去。
 # 同一个服务器既能被助手进程内用（inproc，零进程开销），
@@ -688,6 +729,16 @@ module = "voice_loop.mcp.servers.agent"
 hidden = true
 namespace = false
 timeout = 120
+
+# 邮件：查 / 读 / 摘要 / 起草（+ 审批后才能发送）。
+# 和 agent 一样 hidden —— 只有 api_tools 里点名 mail 的 API 角色看得到。
+[[mcp.servers]]
+name = "mail"
+transport = "inproc"
+module = "voice_loop.mcp.servers.mail"
+hidden = true
+namespace = false
+timeout = 60
 
 # 想更隔离就把它挪到子进程（每次调用多几毫秒，但服务器崩了不影响助手）：
 # [[mcp.servers]]

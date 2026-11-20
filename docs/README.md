@@ -13,6 +13,7 @@
 | [guide/persona.md](guide/persona.md) | 角色设定：多角色、声线、唤醒词、素材导入、只用 API 的角色 |
 | [guide/memory.md](guide/memory.md) | 记忆：四级分层、会自己整理、怎么查旧事、上云 |
 | [guide/asr.md](guide/asr.md) | 语音识别：怎么听、词库、评测台 |
+| [guide/mail.md](guide/mail.md) | 邮件：看/读/摘要/起草，发送要人工审批（Outlook Graph） |
 | [guide/mcp.md](guide/mcp.md) | MCP：自己搭的工具协议层 |
 | [guide/faq.md](guide/faq.md) | 常见问题 |
 | [guide/privacy.md](guide/privacy.md) | 隐私说明与协议 |
@@ -38,8 +39,9 @@
 | 语音识别 | `voice_loop/asr/` | [asr/README.md](../voice_loop/asr/README.md) |
 | 语音合成 | `voice_loop/tts/` | [tts/README.md](../voice_loop/tts/README.md) |
 | 记忆 | `voice_loop/memory/` | [memory/README.md](../voice_loop/memory/README.md) |
+| 邮件 | `voice_loop/mail/` | [mail/README.md](../voice_loop/mail/README.md) |
 
-三个包的边界由自测盯着（AST 扫 import，docstring 提到不算违规）：
+这几个包的边界由自测盯着（AST 扫 import，docstring 提到不算违规）：
 
 ```powershell
 python scripts\tests\test_module_boundaries.py

@@ -14,14 +14,15 @@
 | [04-console-ui.md](04-console-ui.md) | 控制台：网页 UI、启停服务、角色资料卡、克隆声线、exe 化、改角色卡把嗓子改没 | §25 §27 §28 §48 §51 §54 §56 §59 |
 | [05-persona-llm.md](05-persona-llm.md) | 人格：素材导入、人设卡 vs 文档（出戏与幻觉） | §57 §58 |
 | [06-data-events.md](06-data-events.md) | 数据层：事件统一与事件链 | §17 |
-| [07-ops-release.md](07-ops-release.md) | 运维与交付：清理、隐私事故复盘、训练误判、文档对齐、可交付化、删熄屏加天气、托盘图标 | §30 §31 §37 §42 §45 §55 §64 §65 |
+| [07-ops-release.md](07-ops-release.md) | 运维与交付：清理、隐私事故复盘、训练误判、文档对齐、可交付化、删熄屏加天气、托盘图标、邮件子系统 | §30 §31 §37 §42 §45 §55 §64 §65 §66 |
 
 ## 怎么用这份日志
 
 - **改代码前**：先搜相关册子里的"踩过什么坑" —— 很多看着简单的改动都试过并失败过。
 - **想优化某个子系统**：模块自己的文档（[`voice_loop/asr/README.md`](../../voice_loop/asr/README.md)、
   [`voice_loop/tts/README.md`](../../voice_loop/tts/README.md)、
-  [`voice_loop/memory/README.md`](../../voice_loop/memory/README.md)）讲**怎么改**，
+  [`voice_loop/memory/README.md`](../../voice_loop/memory/README.md)、
+  [`voice_loop/mail/README.md`](../../voice_loop/mail/README.md)）讲**怎么改**，
   日志讲**为什么当初这么定、试过什么不行**。
 - **新增一节**：直接加到对应册子的末尾（编号接着全局最大号往后排），再更新上面的表。
 

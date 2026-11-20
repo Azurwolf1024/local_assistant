@@ -650,6 +650,43 @@ class WeatherConfig:
 
 
 @dataclass
+class MailConfig:
+    """邮件子系统（Outlook / Microsoft Graph）。★发信默认是关着的★
+
+    发信要同时满足三道：``allow_send = true`` + 收件人在 ``send_allowlist`` +
+    人工在弹窗里点「发送」（见 ``voice_loop/mail/outbox.py``）。
+    """
+
+    enabled: bool = True
+    dir: str = "data/mail"            # token / 索引 / 草稿 / 审计都在这儿（已进 .gitignore）
+    client_id: str = ""               # Azure 应用的 Application (client) ID（public client，不是密钥）
+    tenant: str = "consumers"         # 个人账号 = consumers；工作/学校 = organizations；两者都可 = common
+
+    folder: str = "inbox"             # 同步哪个文件夹（inbox / all）
+    first_sync_days: int = 30         # 第一次同步往回拉几天
+    page_size: int = 50
+    max_pages: int = 10               # 单轮最多翻几页（防止一次拉爆）
+    sync_minutes: float = 3.0         # 巡检间隔（秒级也行，服务里跑）
+    max_body_chars: int = 6000        # 读正文时最多给模型多少字
+
+    classify_chars: int = 400         # ★分类时只把「主题 + 前 N 字」发给模型★
+    classify_model: str = ""          # 空 = 用 [api] 里的模型；填 ollama:<名字> 走本地
+    classify_per_sync: int = 10       # 每轮最多分级几封（省 token、也防止卡住）
+    high_score: int = 60              # ≥ 这个分 → 立刻提醒
+    medium_score: int = 30            # ≥ 这个分 → 进摘要
+    vip_senders: list[str] = field(default_factory=list)      # 地址或 @域名
+    priority_domains: list[str] = field(default_factory=list)  # 学校/公司域名
+
+    notify_high: bool = True          # 重要邮件立刻弹窗
+    digest_hours: list[int] = field(default_factory=lambda: [9, 20])
+
+    allow_send: bool = False          # ★默认关★：开了也还要白名单 + 人工点一次
+    send_allowlist: list[str] = field(default_factory=list)   # 空表 = 谁都发不出去
+    approval_ttl: int = 300           # 审批通过后多久内必须点发送（秒）
+    timeout: float = 20.0
+
+
+@dataclass
 class SubtitleConfig:
     """屏幕底部居中的半透明字幕（关掉声音时靠它沟通）。"""
 
@@ -683,6 +720,7 @@ class Settings:
     bargein: BargeInConfig = field(default_factory=BargeInConfig)
     vision: VisionConfig = field(default_factory=VisionConfig)
     weather: WeatherConfig = field(default_factory=WeatherConfig)
+    mail: MailConfig = field(default_factory=MailConfig)
     mcp: McpConfig = field(default_factory=McpConfig)
     path: Path = PROJECT_ROOT / "config.toml"
 
@@ -788,6 +826,7 @@ def load_settings(path: str | Path | None = None) -> Settings:
         bargein=_build(BargeInConfig, raw.get("bargein", {}), "bargein"),
         vision=_build(VisionConfig, raw.get("vision", {}), "vision"),
         weather=_build(WeatherConfig, raw.get("weather", {}), "weather"),
+        mail=_build(MailConfig, raw.get("mail", {}), "mail"),
         tts=_build(TtsConfig, raw.get("tts", {}), "tts"),
         chat=_build(ChatConfig, raw.get("chat", {}), "chat"),
         persona=_build(PersonaConfig, raw.get("persona", {}), "persona"),

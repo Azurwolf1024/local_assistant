@@ -26,15 +26,16 @@
 | 隐私 / 协议 | [docs/guide/privacy.md](docs/guide/privacy.md) |
 | **为什么这么设计、实测多少、踩过什么坑** | [docs/log/](docs/log/)（工程日志，按主题分册） |
 
-### 三个可以直接拿走 / 单独优化的子系统
+### 可以直接拿走 / 单独优化的子系统
 
 | 子系统 | 目录 | 它自己的文档 |
 | --- | --- | --- |
 | 语音识别 | `voice_loop/asr/` | [asr/README.md](voice_loop/asr/README.md) |
 | 语音合成 | `voice_loop/tts/` | [tts/README.md](voice_loop/tts/README.md) |
 | 记忆 | `voice_loop/memory/` | [memory/README.md](voice_loop/memory/README.md) |
+| 邮件 | `voice_loop/mail/` | [mail/README.md](voice_loop/mail/README.md)（用法见 [docs/guide/mail.md](docs/guide/mail.md)） |
 
-三个包**互不 import**（`asr` 与 `tts` 之间靠注入，有自测盯着：
+这几个包**互不 import**（`asr` 与 `tts` 之间靠注入，有自测盯着：
 `python scripts\tests\test_module_boundaries.py`），所以可以各自换代、各自评测。
 
 ### 章节号 → 文件对照（老链接仍然有效）
@@ -150,6 +151,7 @@ flowchart LR
 > 可选：某个角色可以在人格文件里改用**云端 API**（`"engine": "api"`，见第 14 节）。
 > 默认工具还是这 11 个；API 角色在 `api_tools` 里按预设多开 harness 工具
 > （`web` = 联网搜索/读取，`weather` = 天气，`files` = 工作区读/列/glob/grep，
+> `mail` = 邮件查/读/摘要/起草（发送要人工审批，见 [docs/guide/mail.md](docs/guide/mail.md)），
 > `harness` = 全部；另外 `ask_user` / `update_plan` 是 harness 内置的，不用点名；
 > 见 `voice_loop/tool_presets.py`）。
 
@@ -205,6 +207,7 @@ flowchart LR
 │  ├─ knowledge/               #   ★知识库（L4）★：顶层=所有角色 / <角色id>/=专属 /
 │  │                           #     _worlds/<世界观>/*=挂了它的共享；详见第 15 节
 │  ├─ memory/                  #   ★记忆（L1~L3）★：一个角色一个目录（不进 git，是隐私）
+│  ├─ mail/                    #   邮件索引 / 令牌 / 发信审计（不进 git，是隐私）
 │  ├─ backup/                  #   ★升级前自动备份到这里★（带 MANIFEST.txt 与 RESTORE.txt）
 │  ├─ wakewords.json           #   唤醒词调参（唤醒词本身在人格文件里）
 │  ├─ events.json              #   ★全部事件★：提醒 / 闹钟 / 课 / 会议 / 约会都是一条
@@ -238,7 +241,20 @@ flowchart LR
 │  │  ├─ serve.py              #   python -m voice_loop.mcp.serve <服务器>
 │  │  ├─ servers/skills.py     #   技能服务器（见第 13 节）
 │  │  ├─ servers/memory.py     #   ★记忆服务器★：recall / remember / memory_stats
-│  │  └─ servers/agent.py      #   ★harness agent★：联网 / 文件 / 可选命令（默认 hidden）
+│  │  ├─ servers/agent.py      #   ★harness agent★：联网 / 文件 / 可选命令（默认 hidden）
+│  │  └─ servers/mail.py       #   ★邮件服务器★：查 / 读 / 摘要 / 起草（默认 hidden）
+│  ├─ mail/                    # ★ 邮件子系统（Outlook Graph，见 docs/guide/mail.md）
+│  │  ├─ auth.py               #   设备码登录 + 令牌缓存/续期（data/mail/token.json）
+│  │  ├─ graph.py              #   Graph 封装：delta 查询 / 草稿 / 发送（429 退避）
+│  │  ├─ store.py              #   本地索引（SQLite）：检索 / 未读 / 未分级 / 未提醒
+│  │  ├─ delta.py              #   同步：首次拉窗口 → 游标接力 → 410 自动重来
+│  │  ├─ triage.py             #   重要度分级：规则分 + 模型分（只发主题+前 N 字）
+│  │  ├─ outbox.py             #   ★发信四道闸门★：白名单 / 状态 / HMAC token / 审计
+│  │  ├─ notify.py             #   重要立刻弹窗、同封只提醒一次、早/晚报摘要
+│  │  ├─ approve.py            #   ★右下角审批卡★：点「发送」才发，超时=取消
+│  │  ├─ watcher.py            #   服务里的巡检线程（每 3 分钟一轮）
+│  │  ├─ adapters.py           #   唯一知道外面世界的文件：[api] / Ollama → 分类器
+│  │  └─ service.py            #   MailService 门面（外层只该用这一个）
 │  ├─ scheduler.py             # 后台提醒调度器
 │  ├─ weather.py              # 天气：原话→(哪天,哪座城)，Open-Meteo 两级取数，翻成能念的中文
 │  ├─ bargein.py               # 语音自动打断（实验性、默认关）：分清「自己的回声」和「你在插话」
@@ -312,10 +328,11 @@ flowchart LR
 ## 现状（一眼）
 
 - **全离线**：识别、思考、出声都在本机；只有你显式配置的 API 角色才联网。
-- **可换零件**：识别 / 合成 / 记忆都是可插拔子系统（见上面三份模块文档）。
+- **可换零件**：识别 / 合成 / 记忆 / 邮件都是可插拔子系统（见上面四份模块文档）。
 - **会自己整理**：记忆按四级分层，夜里"做梦"压缩上下文，改动可 `--undo` 回滚。
 - **有尺子**：`scripts\tests\` 是离线自测，`scripts\eval_asr.py` 量识别准确率与唤醒，
   `scripts\tools\ab_voice.py` 量音质 —— 改完靠数说话，不靠感觉。
+- **对外动作要过人**：发邮件只有「草稿」是自动的，真发送必须在右下角卡片点一下。
 
 ```powershell
 python main.py setup          # 一键把机器准备好

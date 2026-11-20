@@ -32,6 +32,10 @@ python main.py gpu                           # 看加速器（核显/NPU/CUDA）
 python main.py gpu --bench                   # 实测 Whisper CPU vs 核显
 python main.py mcp                           # 看工具层：有哪些工具、来自哪个 MCP 服务器（第 13 节）
 python main.py persona                       # 看角色设定：名字、称呼、各自的唤醒词（第 14 节）
+python main.py mail status                   # 邮件：登录状态 + 索引统计（docs/guide/mail.md）
+python main.py mail login                    # 邮件：设备码登录（浏览器输一串短码）
+python main.py mail search 选课 --limit 5     # 邮件：搜本地索引
+python main.py mail drafts                   # 邮件：看待批草稿（发送必须在弹窗里点）
 ```
 
 `listen` 模式下：
@@ -48,6 +52,8 @@ python main.py persona                       # 看角色设定：名字、称呼
 - 回答过程中**按 Esc** 立刻打断（后台无终端时自动跳过）
 - 想让它「你一开口就停」也能办：把 `[bargein] enabled` 改成 `true`（实验性，详见下面「打断」一节）
 - 屏幕底部居中同时有一条**半透明字幕**：助手说的每一句话都显示在上面，关掉声音也能沟通
+- `[mail] enabled = true` 时还会每 3 分钟看一次邮件：重要的立刻弹窗念一句，
+  要发信则在右下角弹审批卡（**点「发送」才真发**，详见 [mail.md](mail.md)）
 - 回答过程中**按 Esc** 立刻打断（后台无终端时自动跳过）
 - `[bargein] enabled = true` 时还会「你一开口就停」
 

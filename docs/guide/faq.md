@@ -159,6 +159,19 @@ Piper 的 `zh_CN-huayan-medium` 是官方唯一的中文女声。调 `noise_w_sc
 `voice_loop/text.py` 已经过滤 Markdown / 表情 / 链接 / LaTeX。若还有漏网，
 把样例加进 `[llm] system_prompt` 的约束，或在 `text.py` 里补一条正则。
 
+**Q：邮件功能怎么开？登录一直提示「需要管理员批准」**
+三步：①在 Entra 注册一个应用（不开密钥，走设备码）；②把 `client_id` / `tenant` 写进
+`config.local.toml` 的 `[mail]`；③`python main.py mail login`。
+学校 / 公司账号常见卡在「需要管理员同意」，而且你的账号不是管理员（门户上那个按钮是灰的）——
+这不是配置错，是租户策略。三条绕路（转发到个人邮箱 / 让 IT 批一次 / 装经典 Outlook 走本机）
+详见 [mail.md](mail.md#学校--公司租户重要邮件被挡在这里)。
+
+**Q：它会不会自己把我的邮件发出去？**
+不会。`mail_draft` 只建草稿；真发送要走四道闸门：`[mail] allow_send = true`（默认 false）、
+收件人在 `send_allowlist`（默认空 = 谁都发不出去）、状态是「你点过发送」、
+`confirm_token` 对得上正文 hash（5 分钟过期）。token 只在弹窗点「发送」时由本进程签发，
+模型拿不到也伪造不了 —— 这不是提示词约束，是代码路径。
+
 **Q：Ollama 连不上**
 `ollama list` 能列出模型但程序报错时，多半是没起服务：另开终端跑 `ollama serve`。
 

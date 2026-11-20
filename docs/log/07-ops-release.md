@@ -696,3 +696,90 @@ Wayland 还永远做不到、只能回一句「请用桌面快捷键」；外加
   写停止文件 → 服务 7~8 秒内退出并打印收尾耗时；`_kill_pid` 单独在一次性进程上验过。
 
 ---
+
+## 66. 邮件子系统：读可以自动，写必须过人（2026-11-20，用户要求「让 agent 帮我管理邮件，区分重要程度，收到重要邮件时提醒我」）
+
+### 66.1 是「一个工具」还是「一个子系统」
+
+用户自己也拿不准，所以先按成熟做法查了一遍再定：MCP 官方 email server 是"allowlist-first"（默认
+只能读白名单里的地址）、Exchange Online 已经**彻底关掉 basic auth**、Graph 的增量同步要走
+`delta query`（否则每轮只能全量拉）。三件事都说明这不是「包一层 HTTP」的量级。
+
+于是定成**子系统**（`voice_loop/mail/`）+ **5 个 MCP 工具**，但不拆成独立仓库：
+
+| 拆出去的好处 | 留在这里的好处 |
+|---|---|
+| 可以脱离语音单独跑 | 提醒要弹窗 + 念一句、发信要弹审批卡 —— 这些能力本项目已经有了 |
+| 依赖更干净 | 已经分好的 `asr/` `tts/` `memory/` 就是"包内子系统"的先例 |
+
+它现在也进边界自测：`mail/` 里不许 import `tts/asr/memory/skills/pipeline/...`，
+**弹窗、朗读、审批卡全部是注入的**（`toast=` / `speak=` / `on_draft=`）。
+
+### 66.2 发信为什么非得点按钮
+
+发信是**不可逆的外部动作**。把「批准」写成提示词里的一句"发送前先问我"是不可靠的：
+模型完全可以在同一轮里自己"问"自己再"答"。
+
+所以闸门写在代码路径上（`outbox.Outbox.send`）：
+
+| # | 闸门 | 默认 |
+|---|---|---|
+| 1 | `[mail] allow_send` = true | **false** |
+| 2 | 收件人在 `[mail] send_allowlist` 里 | **空表 = 谁都发不出去** |
+| 3 | 状态必须是 `approved`（用户点过按钮） | — |
+| 4 | `confirm_token` = HMAC(草稿 id + 正文 hash + 过期时间) | 5 分钟过期 |
+
+第 4 条是针对"批了 A 版本、偷偷改 B 版本再发"的：正文变一个字，hash 就对不上。
+token 只在用户点「发送」那一刻由**本进程**签发 —— 模型这条路径上根本拿不到。
+
+顺带把「网络断在半路」单独出来：状态标 `unknown`，**不自动重试**（可能已经发出去了），
+由人去看 Outlook 的「已发送」。这是唯一一处宁可"人工兜底"也不"智能重试"的地方。
+
+### 66.3 重要度：规则先算，模型只补充
+
+`[mail] high_score / medium_score` 两档阈值 + 规则分（VIP、优先域名、只发给你、
+会议/截止/缴费类词）+ 模型返回的 JSON（一句话概括 / 要不要回 / 截止时间）。
+模型判定"像群发"会**降权**，所以促销邮件不会因为写了"紧急"就弹窗。
+
+隐私边界：**只把「主题 + 发件人 + 前 `classify_chars`（默认 400）字」发给模型**，
+整封正文不出本机；想零外发就 `classify_model = "ollama:qwen3.5:4b"`。
+
+### 66.4 同步：别用 delta 做第一次
+
+第一次就 `delta` 会从"邮箱创建那天"开始翻页（几千封、几十页）。所以：
+先 `$filter=receivedDateTime ge <N天前>` 拉一个窗口（`first_sync_days` 默认 30），
+再取 `$deltatoken=latest` 当游标接力；之后每轮只问"变了什么"。
+游标过期 Graph 返回 **410** → 自动按窗口全量重来一次（不丢信，也不重复入库）。
+
+### 66.5 Azure 应用注册：踩了一路坑（留给下一次）
+
+| 坑 | 现象 | 真相 |
+|---|---|---|
+| 找不到 App registrations | 门户首页没有这个入口 | 它在 **Entra ID**（`entra.microsoft.com`）里，不在 Azure 门户首页 |
+| 保存 manifest 失败 | 改 `signInAudience` 就报错 | 个人账号受众要求 `api.requestedAccessTokenVersion = 2` |
+| 设备码报 `AADSTS7000218` | 说没开公共客户端 | 清单字段叫 **`isFallbackPublicClient`**（Graph API 才叫 `allowPublicClient`） |
+| `AADSTS9002346` / `9002332` | 一会儿说只支持个人、一会儿说只支持组织 | `signInAudience` 与 `[mail] tenant` 必须**成对**改（见 guide/mail.md 的对照表） |
+| 学校账号登录被挡 | 「需要管理员批准」，门户上「授予管理员同意」是灰的 | 租户不允许用户自同意，非管理员无解 → 三条绕路：转发到个人邮箱 / 让 IT 批一次 / 装经典 Outlook 走本机 COM |
+
+最后一条是当前的**阻塞点**：学校账号（`@connect.hkust-gz.edu.cn`）需要管理员同意，
+用户不是管理员。代码这一侧已经和"数据源"解耦（`adapters.py` 是唯一知道外面世界的文件），
+以后加 IMAP / 本机 MAPI 后端只动 `graph.py` 那一层，上层零改动。
+
+### 66.6 验证
+
+- `scripts/tests/test_mail.py`（9 组、全打桩，不联网/不登录/不弹窗）：
+  token 续期与失效提示重新登录、首次拉窗口 + 翻页 + 存游标 + 增量 + 410 重来、
+  规则与模型合并（含"只把主题+前 N 字发出去"这条断言）、四道闸门逐道拦、
+  幂等（再点一次不发第二封）、批准后改正文拒发、`failed` 可用同一 token 重试、
+  `unknown` 不再自动重试、审批队列"点取消就不发"、提醒去重与摘要时段、MCP 工具形状。
+- 真机：`python main.py mail status` 读出索引统计；`python main.py mcp` 显示
+  `mail(inproc,0/5)`（hidden，等 API 角色点名）；`make_transport` 走 inproc 能建起来。
+- 顺手修的两个真 bug：
+  - `Notifier.notify_high` **属性和方法同名**，属性被后定义的方法覆盖 →
+    `[mail] notify_high = false` 形同失效（改名 `high_enabled`）；
+  - `Outbox.send` 在 `failed` 状态下直接判"还没批准" → 明确失败后同一个 token 永远重试不了
+    （现在 `approved` / `failed` 都允许进 send）。
+- 顺带给 MCP 协议层补了 `structuredContent`：草稿 id 这种"给程序读"的字段不再混进
+  给人看的 `text` 里（`mail_draft` 是第一个用它的工具）。
+
+---

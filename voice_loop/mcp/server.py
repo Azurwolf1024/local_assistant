@@ -87,6 +87,10 @@ class MCPServer:
     def tools(self) -> list[ToolSpec]:
         return list(self._specs.values())
 
+    def call_tool(self, name: str, arguments: dict | None = None) -> dict:
+        """直接调一个工具（跳过 JSON-RPC 编解码），返回 {"content": [...], "is_error": bool}。"""
+        return self._on_call({"name": name, "arguments": arguments or {}})
+
     def __repr__(self) -> str:  # pragma: no cover - 只为调试好看
         return f"<MCPServer {self.name} tools={len(self._specs)}>"
 
@@ -143,10 +147,14 @@ class MCPServer:
             if "content" in out:
                 return out                              # handler 自己给了完整结果
             if "text" in out:                           # 简写：{"text": ..., "is_error": bool}
-                return tool_result(
+                result = tool_result(
                     [text_content(str(out.get("text") or ""))],
                     is_error=bool(out.get("is_error")),
                 )
+                extra = {k: v for k, v in out.items() if k not in ("text", "is_error")}
+                if extra:
+                    result["structuredContent"] = extra  # 给程序读的数据，不混进给人看的 text
+                return result
         return tool_result([text_content(str(out))])
 
     # ------------------------------------------------------------ stdio 循环

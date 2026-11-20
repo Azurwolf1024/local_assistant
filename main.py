@@ -407,6 +407,121 @@ def cmd_tray(settings: Settings, args: argparse.Namespace) -> int:
     )
 
 
+def cmd_mail(settings: Settings, args: argparse.Namespace) -> int:
+    """邮件子系统：登录 / 状态 / 同步 / 搜索 / 摘要 / 草稿审批。
+
+    ★发信只在 approve 里发生★，而且 `approve` 就是「用户本人点了发送」——
+    语音/模型没有任何路径能绕过它（见 voice_loop/mail/outbox.py）。
+    """
+    from voice_loop.mail import MailService  # noqa: PLC0415
+
+    what = str(getattr(args, "mail_cmd", "") or "status")
+    svc = MailService(settings, log=logging.getLogger("voice_loop.mail"))
+    try:
+        if what == "login":
+            pending = svc.start_login()
+            print(f"  打开 {pending.verification_uri} 并输入：{pending.user_code}")
+            print(f"  （{int(pending.expires_in)} 秒内有效；用你要连的那个邮箱账号登录）")
+            info = svc.finish_login(
+                pending, printer=lambda m: print(f"  {m}", flush=True))
+            print(f"√ 登录成功：{info.get('account') or '（没读到邮箱地址）'}")
+            return 0
+        if what == "status":
+            st = svc.status()
+            print(f"  功能   : {'开' if st['enabled'] else '关'}")
+            print(f"  可工作 : {'是' if st['ready'] else '否 —— ' + str(st['reason'])}")
+            auth = st["auth"]
+            print(f"  账号   : {st['account'] or auth.get('account') or '（未登录）'}")
+            print(f"  有效期 : {auth.get('expires_in')} 秒")
+            print(f"  索引   : {st['total']} 封（未读 {st['unread']}）"
+                  f" 分级 {st['by_level']} 待批草稿 {st['pending_drafts']}")
+            print(f"  数据   : {st['db']}")
+            return 0
+        if what == "sync":
+            got = svc.sync(force_full=bool(getattr(args, "full", False)))
+            if not got.get("ok"):
+                print(f"× 同步失败：{got.get('error')}")
+                return 1
+            print(f"√ 同步完成：新增 {got['added']}、更新 {got['updated']}"
+                  f"（{'全量' if got.get('full') else '增量'} {got.get('pages')} 页）")
+            return 0
+        if what == "search":
+            rows = svc.search(str(args.query or ""), limit=int(args.limit or 10),
+                              unread_only=bool(getattr(args, "unread", False)),
+                              level=str(getattr(args, "level", "") or ""),
+                              since_hours=float(getattr(args, "hours", 0) or 0))
+            if not rows:
+                print("  （没有符合条件的邮件）")
+                return 0
+            for row in rows:
+                mark = {"high": "★", "medium": "·", "low": " "}.get(row.get("level") or "", " ")
+                when = str(row.get("received_at") or "")[5:16].replace("T", " ")
+                who = row.get("sender_name") or row.get("sender")
+                unread = "未读" if row.get("unread") else "已读"
+                print(f"  {mark} {when} {who}：{row.get('subject') or '（无主题）'}（{unread}）")
+                if row.get("one_line"):
+                    print(f"      {row['one_line']}")
+                print(f"      id={row['id']}")
+            return 0
+        if what == "read":
+            got = svc.read(str(args.id))
+            if not got.get("ok"):
+                print(f"× {got.get('error')}")
+                return 1
+            print(f"  主题：{got['subject']}")
+            print(f"  发件人：{got['sender']}")
+            print(f"  时间：{got['received_at']}  分级：{got.get('level') or '未分级'}")
+            print("-" * 70)
+            print(got.get("body") or "（正文是空的）")
+            return 0
+        if what == "digest":
+            text = svc.summary(since_hours=float(getattr(args, "hours", 24) or 24),
+                               only_important=not bool(getattr(args, "all", False)))
+            print(text)
+            return 0
+        if what == "drafts":
+            rows = svc.drafts()
+            if not rows:
+                print("  （没有待批草稿）")
+                return 0
+            for row in rows:
+                print(f"  {row['id']} → {row['to']}")
+                print(f"      主题：{row['subject']}")
+                print(f"      正文：{row['body'][:100]}")
+            return 0
+        if what == "approve":
+            draft_id = str(args.id)
+            draft = svc.outbox.get(draft_id)
+            if draft is None:
+                print("× 找不到这封草稿")
+                return 1
+            preview = svc.outbox.preview(draft)
+            print(f"  收件人：{preview['to']}")
+            print(f"  主题：{preview['subject']}")
+            print("-" * 70)
+            print(preview["body"])
+            print("-" * 70)
+            if not getattr(args, "yes", False):
+                print("  确认要发就说：python main.py mail approve "
+                      f"{draft_id} --yes")
+                return 1
+            ok, token, msg = svc.approve(draft_id)
+            if not ok:
+                print(f"× {msg}")
+                return 1
+            ok2, info = svc.send(draft_id, token)
+            print(("√ " if ok2 else "× ") + ("邮件已发出" if ok2 else str(info.get("error"))))
+            return 0 if ok2 else 1
+        if what == "send":
+            ok, info = svc.send(str(args.id), str(getattr(args, "token", "") or ""))
+            print(("√ 已发送" if ok else f"× {info.get('error')}"))
+            return 0 if ok else 1
+        print(f"× 不认识的子命令：{what}")
+        return 2
+    finally:
+        svc.close()
+
+
 def cmd_text(settings: Settings, args: argparse.Namespace) -> int:
     """打字调试：完整的技能 + LLM + TTS 链路，不用麦克风。"""
     require_models(settings, need_asr=False)
@@ -1687,6 +1802,41 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("tray", help="系统托盘图标：右键启停服务 / 打开控制台 / 看日志")
     p.set_defaults(func=cmd_tray)
+
+    p = sub.add_parser("mail", help="邮件：登录 / 同步 / 搜索 / 摘要 / 审批发送")
+    mail_sub = p.add_subparsers(dest="mail_cmd")
+    p_mail = mail_sub.add_parser("status", help="登录状态与索引统计")
+    p_mail.set_defaults(mail_cmd="status")
+    p_mail = mail_sub.add_parser("login", help="设备码登录（浏览器输一串短码）")
+    p_mail.set_defaults(mail_cmd="login")
+    p_mail = mail_sub.add_parser("sync", help="立刻同步一次")
+    p_mail.add_argument("--full", action="store_true", help="丢掉游标、按窗口全量重来")
+    p_mail.set_defaults(mail_cmd="sync")
+    p_mail = mail_sub.add_parser("search", help="搜邮件（本地索引）")
+    p_mail.add_argument("query", nargs="?", default="", help="关键词（可空 = 最近）")
+    p_mail.add_argument("--limit", type=int, default=10)
+    p_mail.add_argument("--unread", action="store_true", help="只看未读")
+    p_mail.add_argument("--level", default="", choices=["", "high", "medium", "low"])
+    p_mail.add_argument("--hours", type=float, default=0, help="只看最近多少小时")
+    p_mail.set_defaults(mail_cmd="search")
+    p_mail = mail_sub.add_parser("read", help="读一封（正文去引用）")
+    p_mail.add_argument("id")
+    p_mail.set_defaults(mail_cmd="read")
+    p_mail = mail_sub.add_parser("digest", help="摘要（默认只要重要的）")
+    p_mail.add_argument("--hours", type=float, default=24)
+    p_mail.add_argument("--all", action="store_true", help="连一般邮件也算上")
+    p_mail.set_defaults(mail_cmd="digest")
+    p_mail = mail_sub.add_parser("drafts", help="看待批草稿")
+    p_mail.set_defaults(mail_cmd="drafts")
+    p_mail = mail_sub.add_parser("approve", help="批准并发送（★这一步才会真发★）")
+    p_mail.add_argument("id")
+    p_mail.add_argument("--yes", action="store_true", help="真的要发（不带就是只看预览）")
+    p_mail.set_defaults(mail_cmd="approve")
+    p_mail = mail_sub.add_parser("send", help="用 confirm_token 发送（脚本/自测用）")
+    p_mail.add_argument("id")
+    p_mail.add_argument("--token", default="")
+    p_mail.set_defaults(mail_cmd="send")
+    p.set_defaults(func=cmd_mail, mail_cmd="status")
 
     p = sub.add_parser("text", help="打字调试（完整技能 + LLM + 语音播报）")
     p.add_argument("--no-tts", action="store_true", help="只输出文字")
