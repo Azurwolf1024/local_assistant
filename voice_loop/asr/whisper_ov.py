@@ -28,6 +28,7 @@ class WhisperOpenVinoEngine:
         language: str = "zh",
         num_threads: int = 0,
         word_timestamps: bool = False,
+        initial_prompt: str = "",
     ) -> None:
         import logging
 
@@ -42,6 +43,10 @@ class WhisperOpenVinoEngine:
         self.device = device
         self.language = language if language not in ("auto", "") else None
         self.word_timestamps = word_timestamps
+        # ★提示词偏置（initial_prompt）当前不可用★：这个 OpenVINO 导出 + transformers 5.x
+        # 的 generate() 没有 prompt/prompt_ids 入口（传了会被当未知参数丢掉，还刷一条警告）。
+        # 所以 Whisper 的词库走"事后纠正"（provider 里 hotwords = post）。
+        self.initial_prompt = str(initial_prompt or "").strip()
         self._processor = AutoProcessor.from_pretrained(str(model_dir))
         ov_config: dict = {"PERFORMANCE_HINT": "LATENCY"}
         # INFERENCE_NUM_THREADS 是 **CPU 专属**属性：一起塞给 GPU/NPU 会让 compile_model 直接抛

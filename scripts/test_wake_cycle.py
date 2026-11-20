@@ -43,40 +43,53 @@ def check(name: str, ok: bool, detail: str = "") -> None:
         _failures.append(name)
 
 
-# --------------------------------------------------------------------------- #
 def test_router_standby() -> None:
-    print("\n[1] 待唤醒时绝不能跑 Whisper（含加载竞态）")
-    from voice_loop.asr.router import AsrRouter
+    print("\n[1] 待唤醒时绝不能跑重引擎（含加载竞态）")
+    from voice_loop.asr import Hearing
+    from voice_loop.asr.base import AsrResult
 
     settings = load_settings()
-    router = AsrRouter(settings, None, preload=False, whisper_enabled=True)
+    # 这一节只钉"两级加载"的契约：主引擎常驻、复核引擎按需
+    settings.asr.provider = "sensevoice"
+    settings.asr.verify = "whisper"
+    settings.asr.verify_when = ["long:6.0"]
+    hearing = Hearing(settings, None, preload=False, heavy_enabled=True)
 
-    # 用假引擎替换真的 Whisper：加载要 0.6 秒，方便制造「加载中」的时刻
-    fake_loaded = []
+    built: list[str] = []
+    loaded: set[str] = set()
 
-    class _FakeWhisper:
-        pass
+    class FakeEngine:
+        def __init__(self, pid: str) -> None:
+            self.name = pid
 
-    class _Real(dict):
-        pass
+        def transcribe(self, samples, sample_rate: int = 16000) -> AsrResult:
+            return AsrResult(text=f"{self.name}说的", engine=self.name, latency=0.01,
+                             audio_seconds=len(samples) / float(sample_rate or 16000))
 
-    def fake_engine(name):
-        if name == "whisper":
-            time.sleep(0.6)
-            fake_loaded.append(1)
-            return _FakeWhisper()
-        time.sleep(0.05)
-        return _FakeWhisper()
+    def fake_engine(pid, spec=None, *, allow_heavy=True):
+        # 复核引擎（whisper）故意慢 0.6 秒，好制造「正在加载」的那一刻
+        time.sleep(0.6 if pid == "whisper" else 0.0)
+        built.append(pid)
+        loaded.add(pid)
+        return FakeEngine(pid)
 
-    router._engine = fake_engine  # type: ignore[method-assign]
-    router._sv = _FakeWhisper()
+    def fake_unload(pid):
+        key = hearing.registry.normalize(pid)
+        if key in loaded:
+            loaded.discard(key)
+            return True
+        return False
 
-    # ---- 竞态：后台正在加载 Whisper 时回到待唤醒 ----
+    hearing.registry.engine = fake_engine        # type: ignore[method-assign]
+    hearing.registry.is_loaded = lambda pid: hearing.registry.normalize(pid) in loaded  # type: ignore[method-assign]
+    hearing.registry.unload = fake_unload        # type: ignore[method-assign]
+
+    # ---- 竞态：后台正在加载重引擎时回到待唤醒 ----
     started = threading.Event()
 
     def loader():
         started.set()
-        router.load_whisper()
+        hearing.load_heavy()
 
     t = threading.Thread(target=loader, daemon=True)
     t.start()
@@ -84,37 +97,38 @@ def test_router_standby() -> None:
     time.sleep(0.15)  # 确保已经进到加载里
 
     t0 = time.perf_counter()
-    freed = router.set_whisper_enabled(False)
+    freed = hearing.set_heavy_enabled(False)
     elapsed = time.perf_counter() - t0
-    check("关闭 Whisper 不阻塞（不会卡住服务）", elapsed < 0.3, f"耗时 {elapsed:.3f}s")
+    check("关闭重引擎不阻塞（不会卡住服务）", elapsed < 0.3, f"耗时 {elapsed:.3f}s")
     check("加载中关不掉时返回 False（交给加载线程收尾）", freed is False)
 
     t.join(timeout=5.0)
-    check("加载线程结束后 Whisper 已自己卸载", router.whisper_loaded is False)
-    check("whisper_enabled 保持关闭", router.whisper_enabled is False)
-    check("确实加载过一次（证明确实存在这个竞态窗口）", len(fake_loaded) == 1)
+    check("加载线程结束后重引擎已自己卸载", hearing.heavy_loaded is False)
+    check("heavy_enabled 保持关闭", hearing.heavy_enabled is False)
+    check("确实加载过一次（证明确实存在这个竞态窗口）", built.count("whisper") == 1,
+          str(built))
 
-    # ---- 待唤醒时 transcribe 不该用 Whisper ----
-    print("  · 待唤醒状态转写一段音频（只该跑 SenseVoice）")
+    # ---- 待唤醒时 transcribe 不该用重引擎 ----
+    print("  · 待唤醒状态转写一段音频（只该跑常驻引擎）")
     calls: list[str] = []
 
-    def fake_engine2(name):
-        calls.append(name)
-        return _FakeWhisper()
+    def fake_engine2(pid, spec=None, *, allow_heavy=True):
+        calls.append(pid)
+        return FakeEngine(pid)
 
-    router._engine = fake_engine2  # type: ignore[method-assign]
-    router._wh = None
-    router._wh_enabled = False
-    router.transcribe(np.zeros(16000, dtype=np.float32), 16000)
-    check("只调用了 SenseVoice", calls == ["sensevoice"], str(calls))
+    hearing.registry.engine = fake_engine2       # type: ignore[method-assign]
+    hearing.registry.is_loaded = lambda pid: False   # type: ignore[method-assign]
+    hearing.registry.unload = lambda pid: False   # type: ignore[method-assign]
+    hearing.transcribe(np.zeros(16000, dtype=np.float32), 16000)
+    check("只调用了常驻引擎", calls == ["sensevoice"], str(calls))
 
-    # ---- 对照：唤醒后（开启 Whisper）长音频会走 Whisper 复核 ----
-    router._wh = _FakeWhisper()
-    router._wh_enabled = True
+    # ---- 对照：唤醒后（重引擎可用）长音频会走复核 ----
+    hearing.set_heavy_enabled(True)
     calls.clear()
-    router.transcribe(np.zeros(int(16000 * 8), dtype=np.float32), 16000)
+    hearing.transcribe(np.zeros(int(16000 * 8), dtype=np.float32), 16000)
     check("唤醒后长音频会复核（调用链正常）", "whisper" in calls, str(calls))
-    router.close()
+    hearing.close()
+
 
 
 # --------------------------------------------------------------------------- #
@@ -308,7 +322,10 @@ def test_state_machine(idle_seconds: float = 4.0) -> None:
         deadline = time.time() + 20.0
         while time.time() < deadline and loop._active:  # noqa: SLF001
             time.sleep(0.1)
-        while time.time() < deadline and "[待唤醒] 已释放" not in buf.getvalue():
+        # ★要等"这次"的回收行出现，不能只等"有任何一行"★：前面阶段也打过同一句，
+        # 一看到它就把 out_now 抓下来的话，会抢在应答打印之前（偶发失败过）。
+        while (time.time() < deadline
+               and buf.getvalue().count("[待唤醒] 已释放") <= released_before):
             time.sleep(0.1)
         out_now = buf.getvalue()
         check(
@@ -331,7 +348,7 @@ def test_state_machine(idle_seconds: float = 4.0) -> None:
         sys.stdout = real_stdout
 
     for line in buf.getvalue().splitlines():
-        if "[已唤醒]" in line or "[待唤醒] 已释放" in line:
+        if any(mark in line for mark in ("[已唤醒]", "[待唤醒] 已释放", "助手：")):
             print(f"      {line.strip()[:90]}")
     loop.close()
     try:

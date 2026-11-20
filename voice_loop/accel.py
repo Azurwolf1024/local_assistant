@@ -303,7 +303,15 @@ def llm_options(cfg: LlmConfig) -> dict:
 def report(settings: Settings, logger: logging.Logger | None = None) -> list[str]:
     """给人看的一份报告（`python main.py gpu` 用它）。"""
     acc = detect(settings.llm)
-    asr_plan = pick_whisper_devices(settings.asr.whisper_device)
+    # ★别硬编码 whisper_device★：`[asr.providers.whisper] device` 是新的写法，
+    # 老字段仍然认（谁指到谁由 provider 自己决定，见 providers/whisper.py）。
+    try:
+        from .asr.providers.whisper import device_of as _device_of
+
+        want = _device_of(settings)
+    except Exception:  # noqa: BLE001 - 拿不到就按 auto 显示
+        want = str(getattr(settings.asr, "whisper_device", "auto") or "auto")
+    asr_plan = pick_whisper_devices(want)
     lines: list[str] = []
 
     if acc.openvino:
@@ -326,7 +334,7 @@ def report(settings: Settings, logger: logging.Logger | None = None) -> list[str
     if bool(getattr(settings.tts, "use_cuda", False)) and not acc.has_cuda:
         lines.append("  ! [tts] use_cuda = true，但本机没有 CUDA 的 onnxruntime：Piper 仍在 CPU 跑")
 
-    dev = str(settings.asr.whisper_device)
+    dev = want
     lines.append(f"Whisper 设备配置 = {dev}  →  实际尝试顺序：{' → '.join(asr_plan)}")
     if dev.strip().upper() in ("NPU",):
         lines.append("  ! 你把 NPU 写死了：这个 Whisper 导出在 NPU 上会崩进程，崩溃就回不到 CPU 了")

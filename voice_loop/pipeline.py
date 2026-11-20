@@ -22,7 +22,9 @@ from pathlib import Path
 
 import numpy as np
 
-from .asr import AsrResult, AsrRouter
+from .asr import AsrResult, Hearing
+from .asr.kws import build_kws
+from .asr.lexicon import build_lexicon
 from .audio import BaseSegmenter, MicReader, MicRecorder, Speaker, make_segmenter, save_wav
 from .bargein import BargeInDetector
 from .control import ControlChannel, reap as reap_control, serve_once as serve_control_once
@@ -111,9 +113,12 @@ def _turn_stamp(stats: TurnStats, *, first: bool) -> str:
 class VoiceLoop:
     """把各个组件串成一条可交互的语音链路。
 
-    ``lazy_whisper=True`` 时进入「两级加载」模式（唤醒服务用）：
-    待唤醒状态只保留 SenseVoice 与 VAD，Whisper / TTS / Ollama 模型
+    ``lazy_heavy=True`` 时进入「两级加载」模式（唤醒服务用）：
+    待唤醒状态只保留快引擎（SenseVoice）与 VAD，重引擎（Whisper）/ TTS / Ollama
     都在被唤醒后才加载，空闲超时后再释放。
+
+    ``lazy_whisper`` 是老名字，等价（``lazy_heavy`` 之前专指 Whisper，
+    现在由后端的 ``heavy`` 能力决定谁需要两级加载）。
     """
 
     def __init__(
@@ -123,11 +128,14 @@ class VoiceLoop:
         preload: bool = True,
         enable_skills: bool = True,
         enable_listening: bool = True,
-        lazy_whisper: bool = False,
+        lazy_heavy: bool = False,
         auto_sync: bool = False,
+        lazy_whisper: bool | None = None,
     ) -> None:
         import logging
 
+        if lazy_whisper is not None:      # 老参数名
+            lazy_heavy = bool(lazy_whisper)
         self.settings = settings
         # ★退出时要不要同步记忆到云端★：只由 main 的「真的在聊天」那两个入口打开
         # （见 build_loop 的说明）。默认关，自测就算 close() 也不会碰网络。
@@ -135,8 +143,8 @@ class VoiceLoop:
         self.log = logger or logging.getLogger("voice_loop")
         self.cfg = settings
 
-        # 两级加载：待唤醒时只跑 SenseVoice
-        self.lazy = bool(lazy_whisper)
+        # 两级加载：待唤醒时只跑快引擎
+        self.lazy = bool(lazy_heavy)
 
         # 纯文本模式（调试技能 / 调音色）不需要麦克风与 ASR，也就不加载它们
         self.enable_listening = bool(enable_listening)
@@ -145,9 +153,17 @@ class VoiceLoop:
             make_segmenter(settings, self.log) if self.enable_listening else None
         )
         self._seg_key: bool | None = False
-        self.asr: AsrRouter | None = (
-            AsrRouter(
-                settings, self.log, preload=preload, whisper_enabled=not self.lazy
+        # ★识别门面★：管线从此只说「怎么听」（策略），不再认引擎名字
+        # （以前这里是 `AsrRouter(settings, ..., whisper_enabled=...)`）
+        self.lexicon = build_lexicon(settings, self.log) if self.enable_listening else None
+        # ★可选的两阶段唤醒★：待唤醒先用 30 MB 的流式关键词检测筛一遍，
+        # 命中才值得跑完整识别（[asr.kws] enabled，默认关：没模型/没量过就别开）
+        self.kws = (build_kws(settings, self.log, self.lexicon)
+                    if self.enable_listening else None)
+        self.asr: Hearing | None = (
+            Hearing(
+                settings, self.log, preload=preload,
+                heavy_enabled=not self.lazy, lexicon=self.lexicon,
             )
             if self.enable_listening
             else None
@@ -764,7 +780,7 @@ class VoiceLoop:
         self._active = True
         t0 = time.perf_counter()
         if self.asr is not None:
-            self.asr.set_whisper_enabled(True)
+            self.asr.set_heavy_enabled(True)
         if self.lazy:
             # 要马上应答，TTS 前台加载；Whisper / LLM 放后台，不阻塞回复
             try:
@@ -780,19 +796,19 @@ class VoiceLoop:
         self.log.info(f"[{reason}] 进入活跃状态（{time.perf_counter() - t0:.2f}s）")
 
     def _warm_heavy(self) -> None:
-        """后台预热 Whisper 与 Ollama 模型，让第一句话更快得到回答。"""
-        if self.asr is not None and self.lazy and not self.asr.whisper_loaded:
+        """后台预热重引擎（Whisper）与 Ollama 模型，让第一句话更快得到回答。"""
+        if self.asr is not None and self.lazy and not self.asr.heavy_loaded:
             t0 = time.perf_counter()
             try:
-                if self.asr.load_whisper():
+                if self.asr.load_heavy():
                     if self._active:
                         self.asr.warmup()
                         self.log.info(
-                            f"Whisper 已就绪（后台加载 {time.perf_counter() - t0:.1f}s）"
+                            f"重引擎已就绪（后台加载 {time.perf_counter() - t0:.1f}s）"
                         )
                     else:
-                        # 加载过程中已经回到待唤醒，load_whisper 会自己收拾，这里不再预热
-                        self.log.info("Whisper 加载完成前已回到待唤醒，跳过预热")
+                        # 加载过程中已经回到待唤醒，load_heavy 会自己收拾，这里不再预热
+                        self.log.info("重引擎加载完成前已回到待唤醒，跳过预热")
             except Exception as exc:  # noqa: BLE001
                 self.log.warning(f"Whisper 后台加载失败：{exc}")
         try:
@@ -814,11 +830,11 @@ class VoiceLoop:
             # 加锁：确保没有正在进行的播报被中途抽掉
             with self._speak_lock:
                 if self.asr is not None:
-                    # 无条件关（不是「已加载才关」）：后台预热线程可能正在加载 Whisper，
-                    # 那样 `whisper_loaded` 还是 False；不关的话它加载完就留在内存里，
-                    # 待唤醒状态会变成每句都跑几秒的 Whisper，再次唤醒又慢又不准。
-                    if self.asr.set_whisper_enabled(False):
-                        freed.append("Whisper")
+                    # 无条件关（不是「已加载才关」）：后台预热线程可能正在加载重引擎，
+                    # 那样 `heavy_loaded` 还是 False；不关的话它加载完就留在内存里，
+                    # 待唤醒状态会变成每句都跑几秒的重引擎，再次唤醒又慢又不准。
+                    if self.asr.set_heavy_enabled(False):
+                        freed.extend(self.asr.heavy_ids or ["重引擎"])
                 unload = getattr(self.tts, "unload", None)
                 if callable(unload) and getattr(self.tts, "loaded", False):
                     unload()
@@ -1027,8 +1043,10 @@ class VoiceLoop:
         """把「合成回听」的校验器接给 TTS（见 voice_loop/tts/textcheck.py）。
 
         为什么放在管线里：ASR 是管线的资源，TTS 不该依赖它（有人只想用 TTS）。
-        ★只走 SenseVoice 快路径★（``prefer="sensevoice"``）：hybrid 策略会再跑一遍
-        Whisper，那是给「没听清的用户语音」用的，不是给回听自己合成音的。
+        ★只走快路径★（``prefer="fast"``，按 ``fast`` 能力选）：策略里的复核引擎
+        是给「没听清的用户语音」用的，不是给回听自己合成音的。
+        ★说能力不说引擎名★：以前这里写死 ``prefer="sensevoice"``，
+        换掉常驻引擎就得改管线。
         """
         cfg = self.settings.tts
         min_ratio = float(getattr(cfg, "text_guard_min", 0.0) or 0.0)
@@ -1045,7 +1063,7 @@ class VoiceLoop:
                     audio = audio.astype(np.float32) / 32768.0
                 if int(rate) != 16000:
                     audio = _resample(audio, int(rate), 16000)
-                heard = self.asr.transcribe(audio, 16000, prefer="sensevoice").text
+                heard = self.asr.transcribe(audio, 16000, prefer="fast").text
                 if not heard.strip():
                     return None      # 没听出东西 = 判不了，别因此重采
                 return similarity(text, heard)
@@ -2261,7 +2279,8 @@ class VoiceLoop:
         mode = (mode or self.settings.chat.mode or "vad").lower()
         print(
             f"\n=== 本地语音助手已启动 ===\n"
-            f"  ASR : {self.settings.asr.strategy} / {'+'.join(self.asr.available) or '未加载'}\n"
+            f"  ASR : {self.asr.describe() if self.asr else '关'}"
+            f"（{'+'.join(self.asr.available) or '未加载'}）\n"
             f"  LLM : {self.settings.llm.model} @ {self.settings.llm.host}\n"
             f"  TTS : {self._tts_label()}\n"
             f"  模式: {'自动断句（直接说话，停顿即发送）' if mode == 'vad' else '回车录制'}"
@@ -2332,9 +2351,12 @@ class VoiceLoop:
             wake_where = f"各角色的 data/personas/<id>.json（{self.persona.path.name} 里指到的人格文件）"
         else:
             wake_where = str(self._wake_path)
-        asr_desc = f"{self.settings.asr.strategy} / SenseVoice" + (
-            " 常驻 + Whisper 按需" if self.lazy else " + Whisper"
-        )
+        asr_desc = self.asr.describe() if self.asr else "关"
+        if self.lazy:
+            asr_desc += "（重引擎随唤醒加载）"
+        if self.lexicon is not None:
+            stats = self.lexicon.stats()
+            asr_desc += f" · 词库 {stats['total']} 条"
         print(
             f"\n=== 本地语音助手 · 常驻服务 ===\n"
             f"  ASR : {asr_desc}\n"
@@ -2429,6 +2451,14 @@ class VoiceLoop:
 
                 self._turn += 1
                 try:
+                    if not in_session and self.kws is not None and self.kws.ready:
+                        # ★两阶段唤醒★：待唤醒先用流式关键词检测筛一遍（毫秒级），
+                        # 没被叫就**不跑完整识别**。命中了才往下走正常的 ASR + 文本匹配
+                        # （还要拿整句文本去剥离唤醒词、换角色）。
+                        hits = self.kws.detect(audio, int(self.settings.audio.sample_rate))
+                        if not hits:
+                            continue
+                        self.log.info(f"[kws] 命中：{'、'.join(hits)}")
                     text, result, asr_seconds = self._transcribe(audio)
                     if not text:
                         continue
@@ -2891,6 +2921,8 @@ class VoiceLoop:
                 self.mic.close()
             if self.asr is not None:
                 self.asr.close()
+            if self.kws is not None:
+                self.kws.close()
             if self.lazy:
                 unload = getattr(self.tts, "unload", None)
                 if callable(unload):

@@ -30,6 +30,8 @@ class SenseVoiceEngine:
         num_threads: int = 4,
         use_itn: bool = True,
         language: str = "zh",
+        hr_lexicon: str = "",
+        hr_dict_dir: str = "",
     ) -> None:
         import sherpa_onnx
 
@@ -44,11 +46,17 @@ class SenseVoiceEngine:
         )
         if self.language:
             kwargs["language"] = self.language
+        # ★同音字替换（引擎侧词库）★：sherpa-onnx 的 hr_* 参数。配了就能把
+        # 「白泽/白则」这类同音错字在**解码后立刻**改回来，比纯事后纠正准。
+        if hr_lexicon:
+            kwargs["hr_lexicon"] = str(hr_lexicon)
+        if hr_dict_dir:
+            kwargs["hr_dict_dir"] = str(hr_dict_dir)
         try:
             self._rec = sherpa_onnx.OfflineRecognizer.from_sense_voice(**kwargs)
         except TypeError:
-            # 兼容较老的 sherpa-onnx：不支持 language / debug 参数
-            for key in ("language", "debug"):
+            # 兼容较老的 sherpa-onnx：不支持 language / debug（/ hr_*）参数
+            for key in ("language", "debug", "hr_lexicon", "hr_dict_dir"):
                 kwargs.pop(key, None)
             self._rec = sherpa_onnx.OfflineRecognizer.from_sense_voice(**kwargs)
         self._last_meta: dict = {}

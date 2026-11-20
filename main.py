@@ -95,11 +95,11 @@ def setup_logging(level: str, log_file: str | Path | None = None) -> None:
 
 def apply_overrides(settings: Settings, args: argparse.Namespace) -> Settings:
     if getattr(args, "strategy", None):
-        settings.asr.strategy = args.strategy
+        settings.asr.strategy = args.strategy       # 老参数：映射成同一份 spec（见 registry）
     if getattr(args, "mode", None):
         settings.chat.mode = args.mode
     if getattr(args, "device", None):
-        settings.asr.whisper_device = args.device
+        settings.asr.device = args.device           # 通用设备字段（空则回落到 whisper_device）
     if getattr(args, "llm", None):
         settings.llm.model = args.llm
     if getattr(args, "character", None):
@@ -110,15 +110,14 @@ def apply_overrides(settings: Settings, args: argparse.Namespace) -> Settings:
 
 
 def require_models(settings: Settings, need_tts: bool = True, need_asr: bool = True) -> None:
+    """缺哪些模型文件。★识别那部分问注册表★（换后端/将来的云端后端不需要本地文件）。"""
     missing: list[str] = []
     if need_asr:
-        strategy = settings.asr.strategy
-        if strategy in ("sensevoice", "hybrid"):
-            if not settings.resolve(settings.asr.sensevoice_model).exists():
-                missing.append(f"SenseVoice: {settings.asr.sensevoice_model}")
-        if strategy in ("whisper", "hybrid"):
-            if not settings.resolve(settings.asr.whisper_model).exists():
-                missing.append(f"Whisper: {settings.asr.whisper_model}")
+        from voice_loop.asr.registry import AsrRegistry
+
+        registry = AsrRegistry(settings)
+        registry.discover()
+        missing.extend(registry.missing())
     if need_tts and not settings.resolve(settings.tts.model).exists():
         missing.append(f"Piper 语音: {settings.tts.model}")
     if missing:
@@ -133,17 +132,20 @@ def build_loop(
     settings: Settings,
     preload: bool = True,
     enable_listening: bool = True,
-    lazy_whisper: bool = False,
+    lazy_heavy: bool = False,
     auto_sync: bool = False,
+    lazy_whisper: bool | None = None,
 ):
     from voice_loop.pipeline import VoiceLoop
 
+    if lazy_whisper is not None:      # 老参数名（以前只指 Whisper）
+        lazy_heavy = bool(lazy_whisper)
     return VoiceLoop(
         settings,
         logging.getLogger("voice_loop"),
         preload=preload,
         enable_listening=enable_listening,
-        lazy_whisper=lazy_whisper,
+        lazy_heavy=lazy_heavy,
         # ★只有「真的在跟人聊」的入口才在退出时同步记忆★：底下的 run_* 一次性命令
         # 也走 build_loop，让它们去推云端既没道理、又容易把自测的记忆推上去
         auto_sync=auto_sync,
@@ -518,11 +520,15 @@ def cmd_gpu(settings: Settings, args: argparse.Namespace) -> int:
     acc = detect(settings.llm)
     state = ollama_gpu_state()
     print("\n  建议：")
-    dev = str(settings.asr.whisper_device)
+    from voice_loop.asr.providers.whisper import device_of as _whisper_device
+    from voice_loop.asr.providers.whisper import model_path as _whisper_model
+
+    dev = _whisper_device(settings)
     plan = pick_whisper_devices(dev)
     if acc.has_intel_gpu and plan and plan[0] != "GPU":
         print("    · Whisper 可以改成 GPU：实测 CPU 3.31s → GPU 0.49s（同一段 5.6s 音频）")
-        print('      改 config.toml 里的 [asr] whisper_device = "GPU"（或写 "auto"，它也会选 GPU）')
+        print('      改 config.toml 里的 [asr.providers.whisper] device = "GPU"'
+              '（或写 "auto"，它也会选 GPU）')
     elif acc.has_intel_gpu:
         print(f"    · Whisper 已经在用 GPU √（{dev} → {' → '.join(plan)}）")
     if not acc.has_intel_gpu and not acc.has_cuda:
@@ -559,7 +565,7 @@ def cmd_gpu(settings: Settings, args: argparse.Namespace) -> int:
 
     from voice_loop.accel import detect as _detect
 
-    for device in (args.devices or pick_whisper_devices(settings.asr.whisper_device)):
+    for device in (args.devices or pick_whisper_devices(dev)):
         if device not in _detect().openvino and device != "CPU":
             print(f"  [{device}] 不可用，跳过")
             continue
@@ -571,7 +577,7 @@ def cmd_gpu(settings: Settings, args: argparse.Namespace) -> int:
         try:
             t0 = time.perf_counter()
             engine = WhisperOpenVinoEngine(
-                settings.resolve(settings.asr.whisper_model), device=device, language="zh"
+                settings.resolve(_whisper_model(settings)), device=device, language="zh"
             )
             load_s = time.perf_counter() - t0
             times = []
@@ -651,7 +657,8 @@ def cmd_skills(settings: Settings, args: argparse.Namespace) -> int:
 
 def cmd_asr(settings: Settings, args: argparse.Namespace) -> int:
     require_models(settings, need_tts=False)
-    from voice_loop.asr import AsrRouter
+    from voice_loop.asr import Hearing
+    from voice_loop.asr.lexicon import build_lexicon
 
     path = Path(args.audio)
     if not path.exists():
@@ -663,7 +670,10 @@ def cmd_asr(settings: Settings, args: argparse.Namespace) -> int:
     chunks = segment_audio(audio, settings)
     print(f"VAD 切成 {len(chunks)} 段\n")
 
-    router = AsrRouter(settings, logging.getLogger("voice_loop"))
+    lexicon = build_lexicon(settings, logging.getLogger("voice_loop"))
+    router = Hearing(settings, logging.getLogger("voice_loop"), lexicon=lexicon)
+    print(f"识别策略：{router.describe()}"
+          + (f" · 词库 {lexicon.stats()['total']} 条" if lexicon else "") + "\n")
     try:
         if args.engine == "both":
             for i, chunk in enumerate(chunks, 1):
@@ -675,7 +685,8 @@ def cmd_asr(settings: Settings, args: argparse.Namespace) -> int:
         else:
             lines: list[str] = []
             for i, chunk in enumerate(chunks, 1):
-                r = router.transcribe(chunk, rate, prefer=None if args.engine == "auto" else args.engine)
+                r = router.transcribe(chunk, rate,
+                                      prefer="" if args.engine == "auto" else args.engine)
                 print(f"  [{i:02d}] ({r.engine}, {r.latency:.2f}s, RTF {r.rtf:.2f}) {r.text}")
                 lines.append(r.text)
             print("\n全文：\n" + "".join(lines))
@@ -945,10 +956,13 @@ def cmd_selftest(settings: Settings, args: argparse.Namespace) -> int:
 
     # 2. 模型
     print("\n[2] 模型文件")
+    from voice_loop.asr.providers import sensevoice as _sv_provider
+    from voice_loop.asr.providers import whisper as _wh_provider
+
     checks = [
-        ("SenseVoiceSmall", settings.asr.sensevoice_model),
-        ("SenseVoice tokens", settings.asr.sensevoice_tokens),
-        ("Whisper OV", settings.asr.whisper_model),
+        ("SenseVoiceSmall", _sv_provider.model_path(settings)),
+        ("SenseVoice tokens", _sv_provider.tokens_path(settings)),
+        ("Whisper OV", _wh_provider.model_path(settings)),
         ("Piper 语音", settings.tts.model),
         ("Silero VAD（可选）", settings.vad.model),
     ]
@@ -1024,9 +1038,9 @@ def cmd_selftest(settings: Settings, args: argparse.Namespace) -> int:
     print("\n[5] 语音识别")
     try:
         require_models(settings, need_tts=False)
-        from voice_loop.asr import AsrRouter
+        from voice_loop.asr import Hearing
 
-        router = AsrRouter(settings, logging.getLogger("voice_loop"))
+        router = Hearing(settings, logging.getLogger("voice_loop"))
         print(f"   已加载引擎: {', '.join(router.available) or '(无)'}")
 
         # 找一个测试音频：示例音频 -> 自行用 Piper 合成一段

@@ -100,3 +100,10 @@ data/knowledge/*
 # ★本地私有覆盖：密钥路径、个人设备名、自己的 API 地址都写这里★
 #   主 config.toml 只留空值；这个文件被 git 忽略，永远不会被提交。
 config.local.toml
+
+# ── 识别评测素材 + 词库（本地数据，含你自己的录音/领域词）──────────────────────
+# 注意：.gitignore 不支持行尾注释，注释必须单独一行（写成 data/x/  # 说明 是不生效的）
+data/asr_eval/
+data/lexicon/_gen/
+data/lexicon/*.txt
+

@@ -55,10 +55,84 @@ class VadConfig:
 
 
 @dataclass
+class AsrLexiconConfig:
+    """识别词库（见 voice_loop/asr/lexicon.py）。
+
+    一份词库，四种消费方式：喂给引擎的热词表 / 塞进解码提示词 / 事后纠正 /
+    唤醒词匹配。★怎么用由后端能力决定★（`ProviderSpec.hotwords`），
+    所以换引擎不会丢词库。
+    """
+
+    enabled: bool = True
+    files: list[str] = field(default_factory=lambda: ["data/lexicon/*.txt"])
+    from_personas: bool = True      # 名字 / 称呼 / 唤醒词 / aliases 自动并入
+    weight: float = 1.5             # 写进热词表时的默认权重
+    fix: bool = True                # 事后纠正（pinyin / 编辑距离）
+    fix_min_score: float = 0.78     # 相似度低于它就改（越低越激进）
+    max_words: int = 2000           # 词库上限（热词表太大反而拖慢解码）
+
+
+@dataclass
+class AsrKwsConfig:
+    """流式关键词检测（两阶段唤醒，见 voice_loop/asr/kws.py）。
+
+    ★默认关★：它改变唤路路径（待唤醒时不再跑完整 ASR），要先量过再开。
+    开了之后：待唤醒只跑 30 MB 的关键词检测，命中才加载 ASR —— 唤醒快、还省电。
+    """
+
+    enabled: bool = False
+    model_dir: str = "models/asr/kws-zipformer"
+    # 关键词表：留空就用词库生成（需要模型 tokens.txt 对得上，生成不了会明说）
+    keywords_file: str = ""
+    num_threads: int = 2
+    keywords_score: float = 1.0
+    keywords_threshold: float = 0.25
+    provider: str = "cpu"
+
+
+@dataclass
 class AsrConfig:
-    strategy: str = "hybrid"
+    """语音识别。★怎么听 = 主引擎 + 复核引擎 + 复核条件★（见 asr/spec.py）。
+
+    老写法 ``strategy = "hybrid"`` 仍然有效（映射成同样的 spec，见
+    `asr/registry.py::LEGACY_STRATEGY`）；新配置建议直接写 ``provider/verify``。
+    """
+
+    # ---- 「怎么听」的四个字段（核心）----
+    provider: str = "sensevoice"      # 主引擎（快）；空 = 用注册表的默认
+    verify: str = "whisper"           # 复核引擎（准）；空 = 不复核
+    verify_when: list[str] = field(default_factory=lambda: ["empty", "long:6.0", "score<0.45"])
+    fallback: list[str] = field(default_factory=list)   # 主引擎起不来时的兜底顺序
+    strategy: str = ""                # ★老字段★：非空时以它为准（sensevoice/whisper/hybrid）
+    allow_cloud: bool = False         # 允许把音频发到网上（本版本没有云端后端，留闸门）
+    max_loaded: int = 2               # 同时常驻几个引擎（主 + 复核 = 2）
+    providers: dict = field(default_factory=dict)   # [asr.providers.<id>] 覆盖
+    lexicon: AsrLexiconConfig = field(default_factory=AsrLexiconConfig)
+    kws: AsrKwsConfig = field(default_factory=AsrKwsConfig)
+
+    # ---- 引擎参数（provider 们共用这几个名字；老配置名继续认）----
     language: str = "zh"
     num_threads: int = 6
+    model: str = ""                   # 通用模型路径（不填就看各自的 legacy 字段）
+    tokens: str = ""
+    device: str = ""                  # auto / CPU / GPU / NPU（空 = 用 whisper_device）
+    initial_prompt: str = ""          # whisper 的词库提示词（词库会自动填）
+    hr_lexicon: str = ""              # sensevoice 的同音字替换词表（引擎侧词库）
+    hr_dict_dir: str = ""             # 同音字替换要用的拼音字典目录
+    provider_device: str = "cpu"      # sherpa 的推理设备（cpu / cuda）
+    sherpa_kind: str = "paraformer"   # paraformer / transducer / ctc
+    sherpa_model: str = ""
+    sherpa_tokens: str = ""
+    sherpa_encoder: str = ""
+    sherpa_decoder: str = ""
+    sherpa_joiner: str = ""
+    hotwords_file: str = ""           # transducer 的热词表（留空用词库生成的）
+    hotwords_score: float = 1.5
+    modeling_unit: str = "cjkchar"
+    bpe_vocab: str = ""
+    rule_fsts: str = ""
+
+    # ---- legacy（仍然认，但只在没写新字段时生效）----
     sensevoice_model: str = "models/asr/sensevoice-small/model.int8.onnx"
     sensevoice_tokens: str = "models/asr/sensevoice-small/tokens.txt"
     sensevoice_use_itn: bool = True

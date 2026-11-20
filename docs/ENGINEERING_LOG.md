@@ -5119,3 +5119,117 @@ pending = context.new_turns()        # 上次做梦之后新长出来的
 | 真机 | `python main.py dream --dry-run` → `python main.py dream --date ...` 写了 digest + 封段 + episodes；再 `--undo` → episodes/facts/`last_dream_seq` 全退回原值 | 通过 |
 | 控制台 | `/api/overview` 带 `memory_dream`（各角色段数/上次整理/命中率）；`/api/overview/dream` 手动整理返回摘要 | 通过 |
 | 回归 | `test_memory` / `test_memory_mcp`（工具数改 4）/ `test_memory_sync` / `test_agent_tools` / `test_tts_registry` / `test_console` / `test_offline` / `test_persona` / `test_mcp` / `test_tools` / `test_route` / `test_store_lock` | 全 EXIT=0 |
+
+---
+## 63. ASR 解耦：把「怎么听」从引擎名字里拆出来（2026-11-20）
+
+### 63.1 为什么光"换引擎"没用
+
+这次的目标不是"支持更多识别模型"，而是三件具体的事：**提升准确率**、**提升唤醒速度**、
+**让词库真的能起作用**。先看清楚它们各自卡在哪：
+
+| 目标 | 原来卡在哪 | 现在靠什么 |
+| --- | --- | --- |
+| 准确率 | 一点词库都没有：人名/术语全靠 ASR 自由解码，再靠 `names.py` **事后猜**；两个引擎只能整句二选一 | `Lexicon` 一等公民 + 按后端能力自动选"喂法"（native / prompt / post） |
+| 唤醒速度 | 唤醒也必须**跑完整识别**：VAD 等静音 → SenseVoice → 再拿文本匹配关键词 | 可选的两阶段唤醒（流式 KWS 先筛，命中才跑完整识别） |
+| 词库匹配 | 只有拼音近似纠错，引擎拿不到任何提示 | 同上：transducer 有 `hotwords_file`，SenseVoice 有 `hr_lexicon`，都没有就事后纠 |
+| 架构自由 | `pipeline` 直接调 `set_whisper_enabled / whisper_loaded / prefer="sensevoice"` —— 四个 API 全带引擎名 | 只剩 `Hearing`：`set_heavy_enabled / heavy_loaded / prefer="fast"`，**按能力**不按名字 |
+
+### 63.2 旧结构的四个病灶
+
+| 病灶 | 具体长相 | 位置 |
+| --- | --- | --- |
+| 按名字分支 | `_engine(name)` 里 `if name == "sensevoice" / "whisper"`；`_wanted_engines()` 又是一份 if | `asr/router.py` |
+| 策略和引擎名焊死 | `strategy ∈ {sensevoice, whisper, hybrid}` 本身就是引擎名；hybrid 硬编码"先 SV 再 WH" | 同上 |
+| `prefer=` 传引擎名 | TTS 回听校验写死 `prefer="sensevoice"` | `pipeline._wire_text_guard` |
+| 重引擎写死 Whisper | `whisper_enabled / load_whisper / whisper_loaded` 四件套 + `VoiceLoop(lazy_whisper=)` | `router` / `pipeline` |
+
+顺带发现一个**静默 bug**：`tts/zipvoice_tts.py` 直连 `SenseVoiceEngine` 并读
+`getattr(asr, "sensevoice_threads", 4)` —— 这个字段**根本不存在**，所以线程数永远是 4。
+现在它走 `Hearing.transcribe(prefer="fast")`，TTS 也不再反向依赖 ASR 的内部实现。
+
+### 63.3 新结构：spec / registry / providers / session
+
+```python
+AsrSpec(provider, language, model, verify, verify_when, fallback, params, note)
+ProviderSpec(id, label, capabilities, hotwords, fields, defaults, ready, create, missing)
+Hearing: transcribe(prefer=) / set_heavy_enabled / load_heavy / warmup / close
+```
+
+| 能力 | 意思 | 谁有 |
+| --- | --- | --- |
+| `local` | 在本机算 | 三个内置后端 |
+| `cloud` | 会把音频发上网（本版本没有实现者，闸门先留着） | — |
+| `heavy` | 走两级加载（待唤醒绝不常驻） | whisper |
+| `fast` | 能当"合成回听"这类内部校验的快路径 | sensevoice |
+| `hotwords` | 热词怎么喂：`native / prompt / post / none` | transducer / (暂缺) / sensevoice、whisper |
+
+★策略也是数据★：`verify` + `verify_when`（`empty` / `long:6.0` / `score<0.45` / `always`）。
+老 `strategy` 在 `registry.LEGACY_STRATEGY` 里映射成同一份 spec，所以
+`config.toml` 和 `main.py --strategy` 都不用改。
+
+### 63.4 词库：一份数据，四种用法
+
+`asr/lexicon.py` 把「名字 / 唤醒词 / 领域词」合成一张表，然后**按后端能力选喂法**：
+
+- `native` → 生成 `data/lexicon/_gen/hotwords.txt`（`词 :权重`）交给 transducer
+- `prompt` → 生成一句 `initial_prompt`（Whisper 这条路当前导出不支持，见坑 3）
+- `post` → 句首名字走 `names.NameCorrector`（严规则），领域词走"同长度 + 只差一个音节 +
+  相似度 ≥ fix_min_score"
+- 唤醒匹配 → 同一份词（名字 + aliases）
+
+★保守是刻意的★：把人名纠正放开到全句会立刻出事（实测「海尔洗衣机」→「凯尔希」、
+「米亚的论文」被改坏）。自测里专门钉了三条负样本，`fix` 一条都不许动。
+
+### 63.5 五个坑（都是真跑才暴露的）
+
+1. **Whisper 在短音上会整句幻觉**：把「阿米娅」听成 `MING PAO CANADA MING PAO TORONTO`，
+   而且质量分（0.5）比"空结果"（0.0）**高**，于是被混合策略选中 —— CER 直接 9.0。
+   修法：主引擎"没听出字"（只有一个「。」也算没听出）而复核结果"不像话"（中文场景下
+   一个汉字都没有）时，**按没听清处理**，宁可空着也不编。
+   实测同一批素材 CER 1.499 → 0.499、RTF 0.669 → 0.052。
+2. **`prefer="fast"` 不能只在"想要的那两个"里找**：一开始只在主/复核引擎里挑，
+   结果配上"慢主引擎 + 快兜底"时永远选不到快的。改成从**降级链**里挑第一个 `fast` 且真能起来的。
+3. **Whisper 的提示词偏置在这台机器上不存在**：transformers 5.5 的 `generate()` 没有
+   `prompt/prompt_ids`，传 `prompt=` 只会被当未知参数丢掉（还刷一条警告）。所以
+   whisper 的 `hotwords` 标成 `post`，字段留着但注明"当前不生效"。
+4. **`dataclasses.replace()` 在测试壳子上会炸**：`registry.effective()` 原来直接
+   `replace(settings, ...)`，自测用 `SimpleNamespace` 当配置就 TypeError。改成
+   `_with()`：真是 dataclass 就 replace，否则 `copy.copy` + 赋值。
+5. **`test_wake_cycle` 的等待条件写错了**（老问题，这次才暴露）：它等"日志里出现
+   `[待唤醒] 已释放`"，但前面阶段已经打过同一句，于是可能抢在应答打印之前抓快照。
+   改成等"这次"的计数**超过**之前的值。
+
+### 63.6 两级加载的契约没变（只是换了名字）
+
+`test_wake_cycle.py` 钉的四条语义一字未改：关闭**不阻塞**（< 0.3 s）、
+加载中关不掉要返回 `False`（交给加载线程收尾）、加载线程结束后**自己卸掉**、
+待唤醒时转写**只跑常驻引擎**。为了兼容老代码，`set_whisper_enabled / load_whisper /
+whisper_loaded` 都还在，内部转发到通用实现。
+
+### 63.7 验证
+
+| 验的东西 | 怎么验 | 结果 |
+| --- | --- | --- |
+| 注册表 / 能力 / 别名 | `scripts/test_asr_registry.py` [1] | 3 个后端，`sherpa` 原生热词，无 cloud |
+| `[asr]` → spec（含老 strategy） | 同上 [2] | hybrid 三条条件在；`whisper_min_duration` 跟着走 |
+| 配置副本不改全局 | 同上 [3] | 全局一个字段都没动 |
+| 降级链 | 同上 [4] | 自己 → fallback → 快引擎，无重复 |
+| 策略（空/长/低分/不复核/prefer） | 同上 [5] | 全过；★复核只在条件命中时才构造引擎★ |
+| 两级加载 + 竞态 | 同上 [6] + `test_wake_cycle.py` [1] | 全过 |
+| 词库四种用法 + 误伤为 0 | 同上 [7] | 「白则」→「白泽」；三条负样本原样不动 |
+| KWS 默认关 / 缺模型退回 | 同上 [8] | `ready=False` 且原因说清；检测失败当没命中 |
+| 评测指标 | 同上 [9] | CER / 归一（「３点」→「3点」）/ 唤醒 / 误唤醒 |
+| 真机转写 | `python main.py asr models/asr/sensevoice-small/zh.wav` | 5.59 s 音频 0.09 s 出结果（RTF 0.02），走了新门面 |
+| 真机评测 | `python scripts/eval_asr.py --synth --set wake` | 8 条唤醒词：CER 0.499 / 命中 25% / 误唤醒 0% / RTF 0.052 |
+| 回归 | `test_wake_cycle` / `test_offline` / `test_persona` / `test_tts_registry` / `test_agent_tools` / `test_route` / `test_mcp` / `test_accel` / `test_wake` | 全 EXIT=0 |
+
+### 63.8 这次**没有**做的事（说清楚，免得以为是 bug）
+
+- **没有云端 ASR**：`CAP_CLOUD` 只是闸门占位（`[asr] allow_cloud = false`）。
+  本机使用场景里"把声音传出去"需要单独讨论，不该顺手做掉。
+- **KWS 默认关**：它改变的是唤路路径，必须先量过命中率/误唤醒。模型 30 MB，
+  `download_models.py --only kws` 一条命令就有。
+- **流式识别（边说边出字）**：`CAP_PARTIAL` 占位，暂不实现。
+- **唤醒命中率还只有 25%**（合成素材）：这是**下一步的工作清单**，不是这次的目标 ——
+  评测台就是为了让「加 aliases / 调 fix_min_score / 换 transducer」这三个选择有数可依。

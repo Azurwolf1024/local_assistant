@@ -28,6 +28,12 @@ MODELS = ROOT / "models"
 HF_MIRRORS = ["https://hf-mirror.com", "https://huggingface.co"]
 
 SENSEVOICE_REPO = "csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
+#: 关键词检测（KWS）：30 MB 的流式 zipformer，双语（中文按拼音切词）
+KWS_REPO = "csukuangfj/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01"
+KWS_FILES = ("encoder-epoch-12-avg-2-chunk-16-left-64.onnx",
+             "decoder-epoch-12-avg-2-chunk-16-left-64.onnx",
+             "joiner-epoch-12-avg-2-chunk-16-left-64.onnx",
+             "tokens.txt")
 PIPER_REPO = "rhasspy/piper-voices"
 
 # 说话人向量（声纹）：★不是合成用的★，是量「像不像」用的尺子。
@@ -134,6 +140,20 @@ def fetch_sensevoice(force: bool = False) -> None:
         download_with_fallback(hf_urls(SENSEVOICE_REPO, name), dest, force=force, optional=not required)
 
 
+def fetch_kws(force: bool = False) -> None:
+    """流式关键词检测（两阶段唤醒用）：30 MB 的 zipformer transducer。
+
+    ★可选★：只有 ``[asr.kws] enabled = true`` 才用得上；不下也能正常跑
+    （待唤醒退回"整句识别 + 文本匹配"）。
+    """
+    print("[kws] 关键词检测模型（可选，约 30 MB）")
+    out = MODELS / "asr" / "kws-zipformer"
+    out.mkdir(parents=True, exist_ok=True)
+    for name in KWS_FILES:
+        dest = out / Path(name).name
+        download_with_fallback(hf_urls(KWS_REPO, name), dest, force=force, optional=True)
+
+
 def fetch_silero_vad(force: bool = False) -> None:
     print("[2/3] Silero VAD")
     out = MODELS / "vad" / "silero_vad.onnx"
@@ -192,8 +212,8 @@ def main() -> int:
     ap.add_argument(
         "--only",
         nargs="*",
-        choices=["sensevoice", "vad", "piper", "zipvoice", "speaker"],
-        help="只下载指定模型",
+        choices=["sensevoice", "vad", "piper", "zipvoice", "speaker", "kws"],
+        help="只下载指定模型（kws = 两阶段唤醒的关键词检测，可选）",
     )
     ap.add_argument("--force", action="store_true", help="强制重新下载")
     args = ap.parse_args()
@@ -209,6 +229,8 @@ def main() -> int:
         fetch_zipvoice(force=args.force)
     if "speaker" in targets:
         fetch_speaker(force=args.force)
+    if "kws" in targets:
+        fetch_kws(force=args.force)
 
     print("\n完成。模型目录：")
     for p in sorted(MODELS.rglob("*")):

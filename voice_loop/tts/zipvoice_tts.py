@@ -461,33 +461,32 @@ class ZipVoiceTts:
         return text
 
     def _transcribe(self, path: Path, samples: np.ndarray, rate: int, quiet: bool = False) -> str:
-        """用本机已有的 SenseVoice 转写参考音频（中/英/日/韩/粤都支持）。"""
+        """用本机识别引擎转写参考音频（★走 asr 门面，不再直连某个引擎★）。
+
+        以前这里是 ``from ..asr.sensevoice import SenseVoiceEngine`` + 读一个
+        **不存在的** ``asr.sensevoice_threads`` 字段（永远回落成 4，静默的 bug）。
+        现在只用 ``Hearing.transcribe(prefer="fast")``：换常驻引擎时这段代码不用动。
+        """
         try:
-            from ..asr.sensevoice import SenseVoiceEngine  # noqa: PLC0415
+            from ..asr import Hearing  # noqa: PLC0415
         except Exception as exc:  # pragma: no cover
             if not quiet:
                 print(f"[tts] 自动转写不可用（{exc}）", file=sys.stderr)
             return ""
-        asr = self.settings.asr
+        hearing = None
         try:
-            engine = SenseVoiceEngine(
-                self.settings.resolve(asr.sensevoice_model),
-                self.settings.resolve(asr.sensevoice_tokens),
-                num_threads=int(getattr(asr, "sensevoice_threads", 4) or 4),
-                use_itn=False,
-                language="auto",
-            )
-        except Exception as exc:
+            hearing = Hearing(self.settings, None, preload=False, lexicon=None)
+            result = hearing.transcribe(_resample(samples, rate, 16000), 16000, prefer="fast")
+        except Exception as exc:  # noqa: BLE001
             if not quiet:
                 print(f"[tts] 自动转写失败（{exc}）", file=sys.stderr)
             return ""
-        audio16 = _resample(samples, rate, 16000)
-        try:
-            result = engine.transcribe(audio16, 16000)
-        except Exception as exc:
-            if not quiet:
-                print(f"[tts] 自动转写失败（{exc}）", file=sys.stderr)
-            return ""
+        finally:
+            if hearing is not None:
+                try:
+                    hearing.close()
+                except Exception:  # noqa: BLE001
+                    pass
         text = str(getattr(result, "text", "") or "").strip()
         if text and not quiet:
             print(f"[tts] 自动转写“{path.name}”：{text}", flush=True)

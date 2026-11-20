@@ -37,25 +37,72 @@ energy_threshold = 0.012      # energy 后端的 RMS 阈值
 
 # ── 语音识别 ────────────────────────────────────────────────────────────────
 [asr]
-# sensevoice = 最快（中文首选）
-# whisper    = 最准，中英混说/长句更稳
-# hybrid     = 默认，SenseVoice 快路径 + Whisper 按需校验
-strategy = "hybrid"
+# ★「怎么听」= 主引擎（快）+ 复核引擎（准）+ 复核条件★（见 voice_loop/asr/spec.py）
+# provider 常驻、verify 按需：待唤醒时只留 provider，唤醒后才后台加载 verify。
+# 加引擎不用改代码：往 voice_loop/asr/providers/ 丢一个文件就是一个后端。
+provider = "sensevoice"
+verify = "whisper"
+# 什么时候让 verify 复核一遍：empty = 主引擎没听出东西；long:6.0 = 超过 6 秒；
+# score<0.45 = 质量分偏低。★这三个是默认值，和以前的 hybrid 完全一致★
+verify_when = ["empty", "long:6.0", "score<0.45"]
+fallback = []                 # 主引擎起不来时按序兜底（空 = 只用 provider 自己）
+max_loaded = 2                # 同时常驻几个引擎（主 + 复核 = 2）
+allow_cloud = false           # 允许把音频发到网上（本版本没有云端后端，闸门先留着）
 language = "zh"               # zh / en / auto
 num_threads = 6
+# ★老写法仍然认★：strategy = "sensevoice" / "whisper" / "hybrid"（写了就以它为准）
 
-# SenseVoiceSmall（sherpa-onnx）
-sensevoice_model = "models/asr/sensevoice-small/model.int8.onnx"
-sensevoice_tokens = "models/asr/sensevoice-small/tokens.txt"
+# ── 每个后端的私有参数（不写就用下面的默认值）────────────────────────────────
+[asr.providers.sensevoice]
+model = "models/asr/sensevoice-small/model.int8.onnx"
+tokens = "models/asr/sensevoice-small/tokens.txt"
 sensevoice_use_itn = true     # 逆文本正则化：数字/日期更自然
+# hr_lexicon / hr_dict_dir：sherpa-onnx 的同音字替换（引擎侧词库）。
+# 配了它，「白泽/白则」这种同音错字在解码后立刻改回来；不配就走事后纠正。
+hr_lexicon = ""
+hr_dict_dir = ""
 
-# Whisper large-v3-turbo（OpenVINO int8）
-whisper_model = "models/asr/whisper-large-v3-turbo-int8-ov"
+[asr.providers.whisper]
+model = "models/asr/whisper-large-v3-turbo-int8-ov"
 # auto = 有 Intel 核显就用 GPU，否则 CPU（本机 Arc 130T：实测 3.79s -> 1.05s，3.6 倍）
 # 也可写 CPU / GPU / NPU，但 NPU 跑这个导出会**崩进程**，所以 auto 绝不选它
-whisper_device = "auto"
-whisper_min_duration = 6.0    # 音频超过该秒数时，hybrid 模式会追加 Whisper 校验
+device = "auto"
 whisper_word_timestamps = false
+# 词库走这条（Whisper 没有热词表）：[asr.lexicon] 里有词就会自动填进来
+initial_prompt = ""
+
+[asr.providers.sherpa]
+# 想认真提准确率就换它：paraformer / zipformer（transducer，★原生热词★）/ CTC
+# 换法：把上面 provider 改成 "sherpa"，再填这里的三五个路径。
+kind = "paraformer"
+model = ""
+tokens = ""
+encoder = ""
+decoder = ""
+joiner = ""
+hotwords_score = 1.5          # 热词权重（只有 transducer 用；词表由词库自动生成）
+
+# ── 词库：一份数据，四种用法（见 voice_loop/asr/lexicon.py）──────────────────────
+# 引擎有热词表就喂热词表（transducer）；只能塞提示词就塞提示词（whisper）；
+# 都不行就事后纠正（sensevoice）；唤醒词匹配也用这一份。
+[asr.lexicon]
+enabled = true
+files = ["data/lexicon/*.txt"]     # 一行一个词；支持 "词 权重"，以及 "词|拼音变体"
+from_personas = true               # 名字 / 称呼 / 唤醒词 / aliases 自动并入
+weight = 1.5
+fix = true                         # 事后纠正（拼音 + 编辑距离）
+fix_min_score = 0.78               # 相似度低于它就改（越低越激进、误改越多）
+max_words = 2000
+
+# ── 两阶段唤醒（可选，默认关）：待唤醒只跑 30 MB 流式关键词检测 ────────────────
+# 开了之后唤醒更快更省电，但换了一条唤路路径 —— 先量过再开（python scripts\eval_asr.py）。
+[asr.kws]
+enabled = false
+model_dir = "models/asr/kws-zipformer"
+num_threads = 2
+keywords_score = 1.0
+keywords_threshold = 0.25
+provider = "cpu"
 
 # ── 大语言模型 (Ollama) ─────────────────────────────────────────────────────
 [llm]

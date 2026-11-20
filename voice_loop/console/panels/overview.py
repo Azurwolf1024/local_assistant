@@ -77,11 +77,7 @@ def register(app, ctx) -> None:
                 "text_guard": settings.tts.text_guard_min,
                 "trim_min_gap_ms": settings.tts.trim_min_gap_ms,
             },
-            "asr": {
-                "strategy": settings.asr.strategy,
-                "sensevoice": settings.asr.sensevoice_model,
-                "whisper": settings.asr.whisper_model,
-            },
+            "asr": _asr_state(settings),
             "llm": {
                 "model": settings.llm.model,
                 "host": settings.llm.host,
@@ -237,6 +233,33 @@ def _memory_sync_state(settings) -> dict:
     out["updated_at"] = str(data.get("updated_at") or "")
     out["counts"] = dict(data.get("counts") or {})
     out["characters"] = int(out["counts"].get("characters") or 0)
+    return out
+
+
+def _asr_state(settings) -> dict:
+    """识别现状（★从注册表来★，不写死引擎名）：策略一行 + 每个后端的就绪情况 + 词库条数。"""
+    out: dict = {"summary": "", "providers": [], "lexicon": {}, "kws": False, "cloud": False}
+    try:
+        from ...asr.lexicon import build_lexicon  # noqa: PLC0415
+        from ...asr.registry import AsrRegistry  # noqa: PLC0415
+
+        registry = AsrRegistry(settings)
+        registry.discover()
+        out["summary"] = registry.summary()
+        out["spec"] = registry.default_spec().display()
+        out["providers"] = [
+            {"id": item["id"], "label": item["label"], "ready": item["ready"],
+             "why": item["why"], "heavy": item["heavy"], "hotwords": item["hotwords"],
+             "primary": item["primary"], "verify": item["verify"]}
+            for item in registry.describe()
+        ]
+        out["missing"] = registry.missing()
+        lex = build_lexicon(settings)
+        out["lexicon"] = lex.stats() if lex is not None else {"total": 0}
+        out["cloud"] = bool(getattr(settings.asr, "allow_cloud", False))
+        out["kws"] = bool(getattr(getattr(settings.asr, "kws", None), "enabled", False))
+    except Exception as exc:  # noqa: BLE001 - 概览页读不到也不该 500
+        out["error"] = f"{type(exc).__name__}: {exc}"
     return out
 
 

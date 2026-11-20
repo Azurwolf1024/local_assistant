@@ -191,8 +191,13 @@
         body.appendChild(card("技术配置一览（要改去 config.toml）", table(
           [{ key: "k", label: "项", cls: "num" }, { key: "v", label: "值" }],
           [
-            { k: "ASR", v: data.asr.strategy + "（SenseVoice: " + data.asr.sensevoice + "）" },
-            { k: "Whisper", v: data.asr.whisper },
+            { k: "ASR", v: (data.asr.summary || "—")
+                + (data.asr.missing && data.asr.missing.length
+                  ? "  × 缺模型：" + data.asr.missing.join("、") : "") },
+            { k: "识别策略", v: (data.asr.spec || "—")
+                + " · 词库 " + ((data.asr.lexicon || {}).total || 0) + " 条"
+                + (data.asr.kws ? " · KWS 唤醒已开" : "")
+                + (data.asr.cloud ? " · ★允许云端识别（音频会上传）★" : "") },
             { k: "LLM", v: data.llm.model + " @ " + data.llm.host },
             { k: "LLM 路由", v: (data.llm.router || data.llm.route || "—") + " · temperature " + data.llm.temperature },
             { k: "API 引擎", v: (data.api.enabled ? (data.api.engine === "api" ? "全局默认 API" : "全局默认本地") : "已关闭")
