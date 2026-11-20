@@ -35,6 +35,7 @@ from .skills import (
     Skills,
     has_clock_expr,
 )
+from .weather import WeatherService
 
 # 给模型的额外说明（跟人设 system_prompt 分开放，人设仍然由用户自己改）
 # 写法上刻意「机械」：第 1 条给的是关键词白名单，而不是「相关就问」这种要靠理解的
@@ -50,23 +51,27 @@ TOOL_HINT = (
     "不要自己换算日期、不要改写时间说法（「下周三下午三点半」就照抄）。\n"
     "4. 要**改 / 挪 / 取消 / 删掉**什么，也走工具（change_event），"
     "text 同样是原话——你不需要知道库里现在有什么，也不需要算时间。\n"
-    "5. 上面这些词都没出现、也不涉及安排/提醒/备忘时，直接回答，不要调工具。"
+    "5. 问**天气**（天气、气温、多少度、下雨、下雪、带不带伞）就先调 weather，"
+    "text 也照抄原话（地名和时间说法都在里面）。你不可能知道外面的天气，别猜。\n"
+    "6. 上面这些词都没出现、也不涉及安排/提醒/备忘/天气时，直接回答，不要调工具。"
     "闲聊、问知识、让你写代码、问你的看法（「你觉得我中午吃什么好」「要不要继续写」）"
     "都属于这种——不要拿这些去查日程。\n"
-    "6. 工具返回的 reply 就是最终答复，不要改数字和时间的说法。\n"
-    "7. 要调工具就**直接用工具接口**，不要用文字写出 {'name': ..., 'arguments': ...} 这种 JSON。"
+    "7. 工具返回的 reply 就是最终答复，不要改数字和时间的说法。\n"
+    "8. 要调工具就**直接用工具接口**，不要用文字写出 {'name': ..., 'arguments': ...} 这种 JSON。"
 )
 
 HARNESS_TOOL_HINT = (
     "你是一个能使用工具的助手。规则：\n"
-    "1. 需要真实数据（日程、记忆、网页、文件）时先调用工具，不要编造。\n"
+    "1. 需要真实数据（日程、记忆、网页、文件、天气）时先调用工具，不要编造。\n"
     "2. 工具结果是给你看的资料，不是最终答复；请自己归纳成简短、口语化的中文回答。\n"
     "3. 日程/备忘：把用户原话放进 text，不要自己换算日期或改时间说法。\n"
     "4. 联网：先 web_search；需要细节再 web_fetch。回答时不要念 URL。\n"
-    "5. 文件只能看工作区里的；写文件/执行命令是否可用取决于配置。\n"
-    "6. 信息够了就直接回答，不要为了用工具而用工具。\n"
-    "7. 要调工具就用接口，不要用文字写出 {'name': ..., 'arguments': ...} 这种 JSON。\n"
-    "8. 缺关键信息或需要用户拍板时用 ask_user 提问，不要自己猜；多步骤任务可以先用 "
+    "5. 天气用 weather（它会查真实预报）；用户没说地名时用配置里的默认城市，"
+    "没有默认就问他一句，别猜城市。\n"
+    "6. 文件只能看工作区里的；写文件/执行命令是否可用取决于配置。\n"
+    "7. 信息够了就直接回答，不要为了用工具而用工具。\n"
+    "8. 要调工具就用接口，不要用文字写出 {'name': ..., 'arguments': ...} 这种 JSON。\n"
+    "9. 缺关键信息或需要用户拍板时用 ask_user 提问，不要自己猜；多步骤任务可以先用 "
     "update_plan 写下计划（计划不用念给用户听）。"
 )
 
@@ -256,6 +261,7 @@ class ToolRegistry:
         self.log = logger or logging.getLogger("voice_loop")
         self.calls = 0
         self.errors = 0
+        self._weather_svc: WeatherService | None = None
 
     # ------------------------------------------------------------ 给模型看的
     def specs(self) -> list[dict]:
@@ -355,6 +361,19 @@ class ToolRegistry:
             {
                 "type": "function",
                 "function": {
+                    "name": "weather",
+                    "description": (
+                        "查真实天气（现在实况 + 逐日预报，数据来自 Open-Meteo）。"
+                        "问「今天天气怎么样」「明天要带伞吗」「上海多少度」「这周会下雨吗」时用。"
+                        "text 照抄用户原话——地名和时间说法由本地代码解析，你不要自己换成经纬度，"
+                        "也不要编温度。用户没说地名时会用配置的默认城市。"
+                    ),
+                    "parameters": text_only,
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "fix_last",
                     "description": (
                         "用户纠正**刚刚**记下的那一条的时间：「我说今天晚上8点45」「不对，"
@@ -394,6 +413,7 @@ class ToolRegistry:
             "add_memo": self._add_memo,
             "change_event": self._change_event,
             "now": self._now,
+            "weather": self._weather,
             "fix_last": self._fix_last,
         }.get(name)
         if handler is None:
@@ -558,6 +578,19 @@ class ToolRegistry:
                 False, action="clock_miss", error="这不是问时间的说法", reply="（没听懂问的是几点）"
             )
         return ToolResult(True, action=result.action, reply=result.reply, data=result.data)
+
+    def _weather(self, args: dict) -> ToolResult:
+        """查天气：解析和取数都在 :mod:`voice_loop.weather`，这里只做接口适配。"""
+        text = self._text_arg(args) or "今天天气怎么样"
+        cfg = getattr(self.settings, "weather", None)
+        if cfg is None or not bool(getattr(cfg, "enabled", False)):
+            return ToolResult(False, action="weather", error="天气查询关着",
+                              reply="天气查询现在是关着的（config.toml 的 [weather] enabled）。")
+        if self._weather_svc is None:
+            self._weather_svc = WeatherService(cfg, self.log)
+        answer = self._weather_svc.ask(text)
+        return ToolResult(answer.ok, action="weather", reply=answer.reply,
+                          data=answer.data, error=answer.error)
 
     def _fix_last(self, args: dict) -> ToolResult:
         """「我说是今晚8点45」——改刚记下的那一条（而不是新建一条）。"""

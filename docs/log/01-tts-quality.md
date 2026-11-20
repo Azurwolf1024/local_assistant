@@ -634,7 +634,7 @@ git clone --depth 1 https://github.com/k2-fsa/ZipVoice.git .zipvoice-src
 
 | 位置 | 之前 | 现在 |
 |---|---|---|
-| `voice_loop/system_ops.py` | 只有 Windows 实现，其它系统一律「暂不支持关屏」 | Windows（`SC_MONITORPOWER`）/ Linux-X11（`xset dpms`）/ macOS（`pmset`、`caffeinate`）三套；**Wayland 明确说「做不到」并给出该按什么**，不假装成功 |
+| `voice_loop/system_ops.py`（★2026-11-20 已删，见 §64.1★） | 只有 Windows 实现，其它系统一律「暂不支持关屏」 | Windows（`SC_MONITORPOWER`）/ Linux-X11（`xset dpms`）/ macOS（`pmset`、`caffeinate`）三套；**Wayland 明确说「做不到」并给出该按什么**，不假装成功 |
 | `main.py listen -B` 后台服务 | POSIX 上传 `creationflags=0`，终端一关就被 SIGHUP 带走 | POSIX 用 `start_new_session`；日志查看提示按平台给 `tail -f` / `Get-Content` |
 | `vision.py` 截屏 | `ImageGrab.grab()` 不传 `xdisplay` → Linux 上必失败（它不读 `$DISPLAY`） | Linux 自动带上 `$DISPLAY`；剪贴板读图在非 Windows/macOS 上回一句人话（Pillow 没实现） |
 | `accel.py` | Ollama 日志路径写死 `~/AppData/Local/…`，iGPU 开关没判平台 | 路径按平台推（Linux `~/.ollama/logs`、macOS `~/Library/Logs`）；iGPU 开关在非 Windows 上说明「不适用」而不是报错 |
@@ -656,7 +656,7 @@ git clone --depth 1 https://github.com/k2-fsa/ZipVoice.git .zipvoice-src
 | 3 配置 | `config.toml` 里每个路径是否存在、是否写了绝对路径 | **绝对路径换机器必失效**；模型路径缺失可以直接指到 `download_models.py` |
 | 4 模型 | 体积下限 + 每个角色目录里有哪些 onnx | 「下了一半」的文件比缺文件更难查 |
 | 5 服务 | Ollama 可达 + 模型是否拉过；麦克风/扬声器能否枚举 | 这两样是「程序能跑但用不了」的最常见原因 |
-| 6 平台能力 | 关屏 / 字幕点穿 / 后台服务 / iGPU 开关 / 剪贴板，逐项说当前系统会怎样 | 换系统后功能会静默降级，先说清楚 |
+| 6 平台能力 | 字幕点穿 / 后台服务 / iGPU 开关 / 剪贴板，逐项说当前系统会怎样（关屏那两条 2026-11-20 随功能一起删了，见 §64.1） | 换系统后功能会静默降级，先说清楚 |
 | 7 磁盘 | 三个目录可写 + 可用空间（模型 + checkpoint 动辄几个 GB） | 微调一个角色要留 1.9 GB × 保留数 |
 
 > ★踩的坑★：**OpenVINO 模型的体积要看 `.bin`，不是 `.xml`**。
@@ -1615,7 +1615,7 @@ epoch 59  loss_gen=39.2   ┘
   （`exp_probe`/`exp_steptrace`/`exp_sub_2`…），全列出来是噪音。
 - `sessions/train_status.py`（旧的一次性脚本）改成**转发入口**（`os.execv` 调新脚本），
   **一行实现都不复制** —— 两份实现必然漂移（这个项目在 `precision.py` 上已经吃过一次亏）。
-- 测试 `scripts/tests/test_train_watch.py`（10 节 40 条断言，已进 `sessions/run_tests.cmd`，
+- 测试 `scripts/tests/test_train_watch.py`（10 节 40 条断言，已进 `scripts/tests/run_all.cmd`，
   全套 **28** 个脚本全 0）。它挡的正是上面四个坑：版本排序、速率（含除零与「时间没前进」）、
   **进程归属挑内存大的**、以及**降级渲染不许冒充进度**。
 - 曲线图：`.venv-piper\Scripts\tensorboard.exe --logdir data\piper` → http://localhost:6006 。
@@ -1655,7 +1655,7 @@ cmd.exe →  5844(启动器) → 46256(真看门狗，持有锁) → 32232(启�
   **直接 TerminateProcess**：想「查一下对方还在不在」反而把它杀了。Windows 走
   `OpenProcess` + `GetExitCodeProcess == STILL_ACTIVE`。
 - 收工只删**自己那把**锁（万一被 `--force` 抢过，别把新锁删掉）。
-- 测试 `scripts/tests/test_train_forever.py`（15 条，已进 `sessions/run_tests.cmd`，现 **29** 个脚本）。
+- 测试 `scripts/tests/test_train_forever.py`（15 条，已进 `scripts/tests/run_all.cmd`，现 **29** 个脚本）。
 
 **三条教训（按价值排）**：
 
@@ -1963,7 +1963,7 @@ B 中位 1.02，一条都没被剔 → **一声不呢地放行**（正好撞上 
   `test_trim_pacing`/`test_control`）。
 - ★**全量 35 个脚本这次没跑成**★：`preflight_heavy.py` 拦下了 —— 空闲内存 3.78 GB < 4 GB
   （当时**没有**训练在跑，是机器上别的程序占着）。护栏干了它该干的事，就不硬闯；
-  等内存松了补跑（`cmd /c sessions\run_tests.cmd`）。
+  等内存松了补跑（`scripts\tests\run_all.cmd`）。
 - **没测**：让真模型（qwen3.5:4b）真吐一个 `<style=…>` 标签的端到端那一遍。
   机制层（剥除/提示/换档）都有自测，但「4b 会不会照做」只能真跑一轮才知道 ——
   所以这个开关默认关着。

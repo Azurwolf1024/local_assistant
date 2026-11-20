@@ -517,7 +517,6 @@ class SkillsConfig:
     speak_duplicate: bool = False    # 提醒重复播报
     visual_alert: bool = True        # 提醒时同时弹出右下角可视窗（怕没开扬声器）
     visual_timeout: float = 25.0     # 可视窗自动关闭秒数
-    allow_system_commands: bool = True  # 允许「关屏幕」这类系统级操作
 
 
 @dataclass
@@ -628,6 +627,22 @@ class MemoryConfig:
 
 
 @dataclass
+class WeatherConfig:
+    """天气：Open-Meteo（免 key）。查不到就说查不到，绝不编数字。"""
+
+    enabled: bool = True
+    default_city: str = ""        # 「今天天气怎么样」没说地名时用它；留空 = 让用户说清楚
+    latitude: float = 0.0         # ★填了经纬度就跳过地名解析（最稳）★
+    longitude: float = 0.0
+    days_max: int = 7             # 最多查几天（1~16）
+    timeout: float = 8.0          # 单次 HTTP 超时（秒）
+    cache_seconds: int = 600      # 同一个地点的预报缓存多久（秒）
+    unit: str = "c"               # c = 摄氏度，f = 华氏度
+    geocode_language: str = "zh"  # 地名的返回语言
+    auto_ip: bool = False         # ★默认关★：按出口 IP 猜城市（会告诉第三方你的 IP）
+
+
+@dataclass
 class SubtitleConfig:
     """屏幕底部居中的半透明字幕（关掉声音时靠它沟通）。"""
 
@@ -660,6 +675,7 @@ class Settings:
     subtitle: SubtitleConfig = field(default_factory=SubtitleConfig)
     bargein: BargeInConfig = field(default_factory=BargeInConfig)
     vision: VisionConfig = field(default_factory=VisionConfig)
+    weather: WeatherConfig = field(default_factory=WeatherConfig)
     mcp: McpConfig = field(default_factory=McpConfig)
     path: Path = PROJECT_ROOT / "config.toml"
 
@@ -764,6 +780,7 @@ def load_settings(path: str | Path | None = None) -> Settings:
         subtitle=_build(SubtitleConfig, raw.get("subtitle", {}), "subtitle"),
         bargein=_build(BargeInConfig, raw.get("bargein", {}), "bargein"),
         vision=_build(VisionConfig, raw.get("vision", {}), "vision"),
+        weather=_build(WeatherConfig, raw.get("weather", {}), "weather"),
         tts=_build(TtsConfig, raw.get("tts", {}), "tts"),
         chat=_build(ChatConfig, raw.get("chat", {}), "chat"),
         persona=_build(PersonaConfig, raw.get("persona", {}), "persona"),

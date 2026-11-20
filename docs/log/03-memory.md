@@ -73,7 +73,7 @@ python main.py memory --knowledge "白泽"           # 只搜知识库
 
 ### 36.5 验收
 
-- `scripts/tests/test_memory.py`：11 节 **90 条断言全过**（EXIT=0），已加入 `sessions/run_tests.cmd`；
+- `scripts/tests/test_memory.py`：11 节 **90 条断言全过**（EXIT=0），已加入 `scripts/tests/run_all.cmd`；
 - 全套 **30 个脚本 ALLDONE**，且跑完后 `data/memory/` **不存在**（测试完全隔离）；
 - 命令行实测：`--remember` 写入 → `--recall "导师"` 命中（score 1.62）；
 - 默认角色已修正：命令行与助手都落到索引里的默认角色（白泽），不再分家。
@@ -139,7 +139,7 @@ stdio 那边自己读一次角色索引就行（`mcp/servers/memory.py` 里的 `
 
 - 新增 `scripts/tests/test_memory_mcp.py`（7 节，无需模型）：共享库不被污染、专属目录隔离、
   人格字段解析、显式路径 + 内联世界观、检索层隔离、三个工具的写入/时间检索/角色隔离、
-  以及「独立进程没注入 hub 也要能用」；已并入 `sessions/run_tests.cmd`。
+  以及「独立进程没注入 hub 也要能用」；已并入 `scripts/tests/run_all.cmd`。
 - `test_mcp.py` 的期望从「8 个工具」改为「10 个」，并断言两个记忆工具确实露出
   （带 `mcp__memory__` 前缀）→ 实测 EXIT=0，说明从 pipeline 到宿主到服务器整条路是通的。
 - `test_memory.py` / `test_persona.py` EXIT=0（新增字段没破坏老行为）。
@@ -411,7 +411,7 @@ grep 整个 `voice_loop/memory/`：`image / shot / vision / jpg / base64` **零�
   褪色后不再保护、以及技能认「上次那张截图」「之前那张照片」但**不**把「看看我的屏幕」当回顾。
 - ★顺手改掉一个一直没人管的问题★：`scripts/tests/test_vision.py` 有 **3 处过期期望**
   （还写着 `schedule_query`，而 §17 事件统一之后动作叫 `event_query`）——
-  它**从来没进过自测清单**，所以红了也没人知道。已修好并**加进 `sessions/run_tests.cmd`**。
+  它**从来没进过自测清单**，所以红了也没人知道。已修好并**加进 `scripts/tests/run_all.cmd`**。
   遇到这种事不装看不见：不是“顺手提一下”，是把它修到能进清单为止。
 
 ### 47.4 没做的

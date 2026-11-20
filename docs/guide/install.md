@@ -161,7 +161,6 @@ python scripts/make_console_exe.py --check           # 只打印计划与要补�
 | --- | --- | --- | --- |
 | 语音主流程（VAD→ASR→LLM→TTS） | √ | √ | √ |
 | 唤醒词常驻服务 `listen` | √（`-B` 用 pythonw，无窗口） | √（`-B` 用 `start_new_session`，关终端不会被带走） | √ |
-| 「关屏幕 / 开屏幕」 | √（`SC_MONITORPOWER`） | √ X11（`xset dpms`）；**Wayland 会直说做不到** | √（`pmset` / `caffeinate`） |
 | 底部字幕 | √ 点得穿 + 自动避开任务栏 | 显示正常，但**不会点穿**、位置按屏幕高度估算 | 同 Linux |
 | 截屏看屏幕 | √ | √（自动带 `xdisplay`）；**Wayland 可能全黑** | √ |
 | 读剪贴板图片 | √ | ×（Pillow 没实现，会回一句人话） | √ |
@@ -177,8 +176,8 @@ python scripts/make_console_exe.py --check           # 只打印计划与要补�
    `onnxruntime`、`openvino`、`sherpa-onnx` 的轮子发布节奏会先卡住你——
    `scripts/check_deploy.py` 的第 2 项会直接把缺的包名和 pip 命令列出来。
 
-一套判断只在 `voice_loop/tts/precision.py` 和 `voice_loop/system_ops.py` 里，
-所以加新平台只需改这两个地方（离线测试 `scripts/tests/test_precision.py` 会守着接口不变）。
+一套判断只在 `voice_loop/tts/precision.py` 里，所以加新平台只需改那一个地方
+（离线测试 `scripts/tests/test_precision.py` 会守着接口不变）。
 
 ---
 

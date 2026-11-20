@@ -5,8 +5,8 @@
 | 位置 | 放什么 | 例子 |
 | --- | --- | --- |
 | `scripts/`（根） | **文档里会让人照抄的命令**、被代码调用/解析的脚本 | `download_models.py` `eval_asr.py` `preflight_heavy.py` `lint_persona.py` `check_deploy.py` `make_release.py` `make_console_exe.py` `import_persona.py` `import_lines.py` `persona_voice.py` `say.py` `clean_junk_data.py` |
-| `scripts/tests/` | **离线自测**（`python scripts/tests/xxx.py`，退出码 0 = 通过） | `test_offline.py` `test_asr_registry.py` `test_memory_dream.py` |
-| `scripts/tools/` | **一次性 / 实验性**：训练、探针、A/B、数据准备、迁移 | `train_piper.py` `probe_npu.py` `ab_voice.py` `migrate_tts_format.py` `split_docs.py` |
+| `scripts/tests/` | **离线自测**（`python scripts/tests/xxx.py`，退出码 0 = 通过）+ 跑全套的 `run_all.cmd` | `test_offline.py` `test_asr_registry.py` `test_memory_dream.py` |
+| `scripts/tools/` | **一次性 / 实验性**：训练、探针、A/B、数据准备、迁移 | `train_piper.py` `probe_npu.py` `ab_voice.py` `migrate_tts_format.py` |
 
 为什么根目录不全搬家：`setup_flow.py` **真的会执行** `scripts/check_deploy.py`、
 还会**解析** `scripts/download_models.py` 取模型组名；文档里几十处写着
@@ -27,7 +27,7 @@ python scripts\tests\test_asr_registry.py             # 单个自测
 ## 跑全套自测
 
 ```powershell
-python sessions\run_tests.cmd      # 57 个脚本 + lint_persona，日志落 sessions\testlogs\
+scripts\tests\run_all.cmd      # 49 个脚本 + lint_persona，日志落 sessions\testlogs\
 ```
 
 ## 找某个自测

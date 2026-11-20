@@ -110,7 +110,7 @@ flowchart LR
 一句话：**模型**负责「听懂要干什么、该用哪个工具」，**确定性代码**负责「算时间、查数据、做守卫」。
 
 ```
-你说 ──▶ ① 模型（带着 10 个工具，流式：8 个生活技能 + 2 个记忆工具）
+你说 ──▶ ① 模型（带着 11 个工具，流式：9 个自家工具 + 2 个记忆工具）
            ├ tool_call  → ② MCP 工具层（宿主 → 服务器）
            │               └ 算日期、去重、反问确认全在服务器后面的确定性代码里
            │               → 工具产出的话直接播报（不再多跑一轮模型）
@@ -141,15 +141,16 @@ flowchart LR
 > 想完全不调工具：`[llm] router = "chat"`（这时自动走 `rules`）。
 > 想自己量一遍选工具准不准：`python scripts/tools/eval_router.py --builtin`（带预期标注，会算选对率）。
 
-工具一共 10 个：**8 个生活技能**都只收一句原话（`text`）——
+工具一共 11 个：**8 个生活技能**都只收一句原话（`text`）——
 `list_events`（事件列表，也接「有哪些提醒」）`next_event` `add_event` `change_event`
 `list_memos` `add_memo`、`now`（报时）、`fix_last`（「我说是…」改刚记下那条）；
-再加 **2 个记忆工具**（第 15 节）：`mcp__memory__recall`、`mcp__memory__remember`。
+再加 **2 个记忆工具**（第 15 节）：`mcp__memory__recall`、`mcp__memory__remember`；
+以及 **`weather`**（真实天气，Open-Meteo 免 key，见 [`docs/guide/usage.md`](docs/guide/usage.md#能用语音做的事)）。
 
 > 可选：某个角色可以在人格文件里改用**云端 API**（`"engine": "api"`，见第 14 节）。
-> 默认工具还是这 10 个；API 角色在 `api_tools` 里按预设多开 harness 工具
-> （`web` = 联网搜索/读取，`files` = 工作区读/列/glob/grep，`harness` = 全部；
-> 另外 `ask_user` / `update_plan` 是 harness 内置的，不用点名；
+> 默认工具还是这 11 个；API 角色在 `api_tools` 里按预设多开 harness 工具
+> （`web` = 联网搜索/读取，`weather` = 天气，`files` = 工作区读/列/glob/grep，
+> `harness` = 全部；另外 `ask_user` / `update_plan` 是 harness 内置的，不用点名；
 > 见 `voice_loop/tool_presets.py`）。
 
 > ★合并前是 11 个★：`add_schedule`/`add_alarm` 是一回事，`change_schedule`/`cancel_alarm`
@@ -239,7 +240,7 @@ flowchart LR
 │  │  ├─ servers/memory.py     #   ★记忆服务器★：recall / remember / memory_stats
 │  │  └─ servers/agent.py      #   ★harness agent★：联网 / 文件 / 可选命令（默认 hidden）
 │  ├─ scheduler.py             # 后台提醒调度器
-│  ├─ system_ops.py            # 系统操作：关/开显示器（只关屏，不休眠）
+│  ├─ weather.py              # 天气：原话→(哪天,哪座城)，Open-Meteo 两级取数，翻成能念的中文
 │  ├─ bargein.py               # 语音自动打断（实验性、默认关）：分清「自己的回声」和「你在插话」
 │  ├─ hotkey.py                # ★ 按 Esc 打断：裸按键监听，只在说话时读键盘
 │  ├─ subtitle.py              # 底部半透明字幕（帮手里说的话都显示出来，跟声音同步）
@@ -280,7 +281,7 @@ flowchart LR
 │  ├─ check_deploy.py          # ★ 搬家/换系统前的只读自检（setup / doctor 复用它）
 │  ├─ make_release.py / make_console_exe.py / persona_voice.py / import_persona.py
 │  ├─ import_lines.py / say.py / clean_junk_data.py
-│  ├─ tests/                   # 58 个离线自测，退出码 0 = 通过
+│  ├─ tests/                   # 59 个离线自测（49 个进全套）+ run_all.cmd，退出码 0 = 通过
 │  │  ├─ test_asr_registry.py  # ★ 识别解耦：注册表 / 能力协商 / 降级链 / 词库 / 幻觉守卫
 │  │  ├─ test_tts_registry.py  # ★ 合成解耦：注册表 / 声音描述 / 云端能力 / http 端到端
 │  │  ├─ test_module_boundaries.py # ★ 模块边界：asr/tts/memory 互不 import，只依赖叶子工具
@@ -319,7 +320,7 @@ flowchart LR
 python main.py setup          # 一键把机器准备好
 python main.py doctor         # 只读体检
 python main.py ui             # 可视化控制台（日程/日志/声线/对话）
-python sessions\run_tests.cmd # 跑全部离线自测
+scripts\tests\run_all.cmd # 跑全部离线自测
 ```
 
 ## 许可与隐私

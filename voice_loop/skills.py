@@ -61,6 +61,7 @@ from .nlp_time import (
 from .settings import Settings
 from .store import JsonStore
 from .vision import Vision, VisionError, norm_name
+from .weather import WeatherService
 
 WEEKDAY_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 WEEKDAY_FULL = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
@@ -270,6 +271,8 @@ class Skills:
         # ★去长期记忆找「上次那张图」的回调★（由 pipeline 接上记忆层；没接就只认进程内那一张）：
         # 技能层不认记忆（分层），但「刚才那张」重启后会丢 —— 得有人能从记忆里把路径拿回来。
         self.last_image: Callable[[], str] | None = None
+        # 天气（第一次问才建，省得每次启动都去碰网络配置）
+        self.weather: WeatherService | None = None
 
     # ======================================================================
     # 入口
@@ -295,7 +298,7 @@ class Skills:
             self._handle_vision_reply,   # 先接「是 / 第一个」这种确认，别被别的技能抢走
             self._handle_event_confirm,  # 「确定」——上一轮问过「要取消吗」
             self._handle_help,
-            self._handle_screen,
+            self._handle_weather,        # 天气要走在地名前：否则「看看天气」会被看图抢走
             self._handle_clock,
             self._handle_vision,         # 看图（带时间词的会让给事件）
             self._handle_correction,     # 「我说是今晚8点45」——改刚才那一条，别新建
@@ -740,6 +743,7 @@ class Skills:
         r"日程|安排|课程|课|会议|开会|例会|组会|行程|讲座|答辩|面试|体检"
         r"|提醒|闹钟|叫我|喊我|备忘|记一下|记住|记下"
         r"|几点|几号|星期几|周几|报时|什么日子"
+        r"|天气|气温|温度|多少度|下雨|下雪|带伞|紫外|空气质量|湿度"
         r"|看看|看一下|瞧一眼|拍一张|拍个照|摄像头|屏幕上|屏幕里|剪贴板|桌面上的|文件"
     )
 
@@ -1934,40 +1938,26 @@ class Skills:
             action="event_next",
         )
     # ======================================================================
-    # 显示开关
+    # 天气
     # ======================================================================
-    _SCREEN_OFF_WORDS = (
-        "关屏幕", "关闭屏幕", "关掉屏幕", "关一下屏幕", "把屏幕关", "屏幕关掉", "屏幕关了",
-        "关显示器", "关闭显示器", "关掉显示器", "显示器关", "屏幕熄灭", "屏幕黑",
-        "息屏", "黑屏", "关显示", "屏幕灭",
-    )
-    _SCREEN_ON_WORDS = (
-        "开屏幕", "打开屏幕", "点亮屏幕", "亮屏", "把屏幕打开", "屏幕亮",
-        "开显示器", "打开显示器", "点亮显示器", "显示器亮",
+    # 「天气」这类词必须成对出现才认：只出现「多少度」可能是问别的（水温、体温、角 45 度）
+    _WEATHER_Q = re.compile(
+        r"天气|天气预报|气温|温度多少|多少度|几度|下雨|下雪|带伞|要不要伞|紫外|空气质量|湿度"
+        r"|冷不冷|热不热|穿什么|穿多少"
     )
 
-    def _handle_screen(self, text: str, now: datetime) -> SkillResult | None:
-        compact = re.sub(r"[\s，。、,.!！?？]", "", text)
-        if any(w in compact for w in self._SCREEN_OFF_WORDS):
-            if not self.settings.skills.allow_system_commands:
-                return SkillResult(reply="系统级操作已被禁用（config.toml 的 allow_system_commands）。", action="screen_off")
-            from .system_ops import monitor_off
-
-            ok, info = monitor_off()
-            if not ok:
-                return SkillResult(reply=info, action="screen_off")
-            return SkillResult(
-                reply="已关闭显示。系统仍在运行，只是屏幕灭了；敲一下键盘或叫我都能回来。",
-                action="screen_off",
-            )
-        if any(w in compact for w in self._SCREEN_ON_WORDS):
-            if not self.settings.skills.allow_system_commands:
-                return SkillResult(reply="系统级操作已被禁用（config.toml 的 allow_system_commands）。", action="screen_on")
-            from .system_ops import monitor_on
-
-            ok, info = monitor_on()
-            return SkillResult(reply="屏幕已点亮。" if ok else info, action="screen_on")
-        return None
+    def _handle_weather(self, text: str, now: datetime) -> SkillResult | None:
+        cfg = getattr(self.settings, "weather", None)
+        if cfg is None or not bool(getattr(cfg, "enabled", False)):
+            return None
+        if not self._WEATHER_Q.search(text):
+            return None
+        if self.weather is None:
+            self.weather = WeatherService(cfg, self.log)
+        answer = self.weather.ask(text)
+        if not answer.ok:
+            return SkillResult(reply=answer.reply, action="weather", data=answer.data)
+        return SkillResult(reply=answer.reply, action="weather", data=answer.data)
 
     # ======================================================================
     # 能力咨询
@@ -1993,7 +1983,7 @@ class Skills:
                 "「有哪些课程」「所有会议」看全部的安排，「取消所有会议」"
                 "「所有课程提前半小时提醒」一次改一片；"
                 "「看看这是什么」「看看我的屏幕上是什么」「读一下那个报告」我还能看图看文件；"
-                "「关屏幕」把显示器关掉（只是关屏，不睡眠）。"
+                "「今天天气怎么样」「明天要带伞吗」「上海多少度」我查得到天气。"
                 "其余的，直接问我就好。"
             ),
             action="help",

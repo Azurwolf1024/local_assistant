@@ -1,9 +1,9 @@
 """技能路由 + 数据持久化 + 提醒文案自测。
 
-覆盖用户实测日志里暴露出来的四个问题，以及新加的「关屏幕」技能：
+覆盖用户实测日志里暴露出来的四个问题：
     python scripts/tests/test_skills_route.py
 
-不依赖麦克风/ASR/Ollama，也不会真的关掉你的屏幕（monitor_off 被打桩）。
+不依赖麦克风/ASR/Ollama。
 """
 
 from __future__ import annotations
@@ -17,7 +17,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from voice_loop import system_ops  # noqa: E402
 from voice_loop import event_text as et  # noqa: E402
 from voice_loop import events as ev  # noqa: E402
 from voice_loop.scheduler import ReminderScheduler  # noqa: E402
@@ -32,25 +31,6 @@ def check(name: str, ok: bool, detail: str = "") -> None:
     print(f"  {PASS if ok else FAIL} {name}" + (f"   {detail}" if detail else ""))
     if not ok:
         _failures.append(name)
-
-
-# --------------------------------------------------------------------------- #
-# 打桩，避免测试真的把屏幕关掉
-_calls: list[str] = []
-
-
-def _fake_off():
-    _calls.append("off")
-    return True, ""
-
-
-def _fake_on():
-    _calls.append("on")
-    return True, ""
-
-
-system_ops.monitor_off = _fake_off  # type: ignore[assignment]
-system_ops.monitor_on = _fake_on  # type: ignore[assignment]
 
 
 def make_skills(tmp: Path, **overrides) -> Skills:
@@ -109,40 +89,6 @@ def test_regressions() -> None:
     check("闹钟内容不是命令本身", "定一个" not in text2 and "闹钟" not in text2.replace('"kind"', ""), text2[:120])
     memo = json.dumps(skills.memos.load(), ensure_ascii=False)
     check("备忘只写进了「买牛奶」", "录吗" not in memo, memo[:120])
-
-
-# --------------------------------------------------------------------------- #
-def test_screen_skill() -> None:
-    print("\n[2] 关屏幕技能（只是关屏，不是休眠）")
-    tmp = Path(tempfile.mkdtemp(prefix="screen_"))
-    skills = make_skills(tmp)
-
-    for q in ("关屏幕", "把屏幕关掉", "关闭显示器", "黑屏", "息屏", "帮我关掉屏幕"):
-        r = skills.handle(q)
-        ok = r is not None and r.action == "screen_off"
-        check(f"{q:<12} → {r.action if r else '未命中'}", ok)
-    check("确实调用了 monitor_off", _calls.count("off") == 6, str(_calls))
-
-    for q in ("开屏幕", "打开显示器", "亮屏"):
-        r = skills.handle(q)
-        ok = r is not None and r.action == "screen_on"
-        check(f"{q:<12} → {r.action if r else '未命中'}", ok)
-
-    # 不能把普通句子误判成关屏
-    for q in ("这个办法屏幕道了", "我看了一下屏幕时间", "关闭闹钟"):
-        r = skills.handle(q)
-        ok = r is None or r.action != "screen_off"
-        check(f"不误判：{q:<16} → {r.action if r else '未命中'}", ok)
-
-    # 开关
-    off = make_skills(Path(tempfile.mkdtemp(prefix="screen_off_")), allow_system_commands=False)
-    r = off.handle("关屏幕")
-    ok = r is not None and "禁用" in r.reply
-    check("allow_system_commands=false 时拒绝执行", ok, r.reply if r else "")
-
-    # 系统层实现是否可用（不真的执行）
-    check("system_ops.supported()", system_ops.supported() is True)
-    print(f"    电源信息：{system_ops.power_info()}")
 
 
 # --------------------------------------------------------------------------- #
@@ -268,7 +214,6 @@ def test_persistence() -> None:
 # --------------------------------------------------------------------------- #
 def main() -> int:
     test_regressions()
-    test_screen_skill()
     test_weekly_course()
     test_reminder_content()
     test_persistence()

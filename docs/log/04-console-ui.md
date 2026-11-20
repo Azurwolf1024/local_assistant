@@ -143,7 +143,7 @@
 * `scripts/tests/test_control.py`（信箱协议：原子认领 / 旧请求不执行 / 崩半路判失败 / 命令表 / 超时）
 * `scripts/tests/test_console.py`（**真起一个 HTTP 服务**：六个面板、静态文件、日程增删改查与
   「重复事件先确认」、备忘清洗、周视图、概览、日志、**SSE 全链路**、面板容错、触发词一致性）
-* 全套 24 个离线测试脚本 EXIT=0（新增的三个都进了 `sessions/run_tests.cmd`）
+* 全套 24 个离线测试脚本 EXIT=0（新增的三个都进了 `scripts/tests/run_all.cmd`）
 * 真浏览器目视 + 交互一遍（六个标签、补 id、一句话添加、编辑保存、试听快速失败、hashchange）
 
 ---
@@ -368,7 +368,8 @@ SSE 是「永不结束的响应」，② 会一直等；而我把 `bus.close()`�
   体检（太短 / 坏文件 / 不存在）、候选排序、写人格文件（只动那几个键 + `.bak` + 幂等）、
   上传落点、FastAPI 接口（GET 候选 / POST `dry_run` / 坏输入 400 / 无此角色 404）、
   以及第 [6] 节那道闸门。
-- 全量：本机的 `sessions\run_tests.cmd`（**没入库**：整个 `sessions/` 都在 `.gitignore` 里，它是本地脚手架）
+- 全量：`scripts\tests\run_all.cmd`（★2026-11-20 起入库★：以前放在被忽略的 `sessions/` 里，
+  等于新克隆的仓库根本没有「跑全套」这个入口，见 §64.1）
   → **33 个脚本 EXIT=0 / ALLDONE**（新脚本已挂进清单）。
 - **没测**：在网页上真点按钮走一遍（要真起服务 + 真合成一次，十几秒）。
   接口层已被自测覆盖，剩下的是「浏览器里点得动吗」—— 这层目前靠人看。
@@ -776,7 +777,7 @@ main.py:265                    [pythonw, __file__]              ← 后台服务
 | 更新核心 | `scripts/tests/test_update.py`（9 节，★不联网★：下载与取清单都是假函数） | 全过 |
 | 路径/冻结/解释器 | `scripts/tests/test_paths.py`（8 节，假装的 `sys.frozen` + 真子进程） | 全过 |
 | 控制台接口 | `scripts/tests/test_console.py` 第 8 节（把 `update.check` 换成假的，不联网） | 全过 |
-| 回归 | 全量 `sessions\run_tests.cmd`（**40 个脚本**） | 全 EXIT=0 |
+| 回归 | 全量 `scripts\tests\run_all.cmd`（**40 个脚本**） | 全 EXIT=0 |
 
 ### 56.9 诚实清单：没做的、以及一个偶发
 

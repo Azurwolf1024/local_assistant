@@ -312,7 +312,7 @@ chain_blocked(item, start, all_items, now)
 
 #### 测试
 
-    18 个离线脚本全绿（cmd /c sessions\run_tests.cmd）
+    18 个离线脚本全绿（scripts\tests\run_all.cmd）
     test_events.py        107 条
     test_event_text.py     78 条
     test_offline.py       173 处断言（含上面那张坑表里的每一条）

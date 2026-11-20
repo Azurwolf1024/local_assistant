@@ -14,7 +14,7 @@
     3 配置      config.toml 里每个路径是否真的存在、有没有写死绝对路径
     4 模型      models/ 下的文件在不在、体积对不对
     5 服务      Ollama 通不通、模型拉过没；麦克风/扬声器是否可见
-    6 平台能力  关屏 / 字幕点穿 / 后台服务 / iGPU 开关 —— 换系统后哪些会退化
+    6 平台能力  字幕点穿 / 后台服务 / iGPU 开关 / 剪贴板 —— 换系统后哪些会退化
     7 磁盘      写权限、可用空间（模型动辄几个 GB）
 
 退出码：0 = 没有「必需」级别的失败；1 = 有。
@@ -23,12 +23,14 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import importlib
 import importlib.metadata
 import json
 import os
 import platform
 import shutil
+import subprocess
 import sys
 import tomllib
 from dataclasses import dataclass, field
@@ -345,20 +347,93 @@ def check_services(rep: Report) -> None:
     except Exception as exc:  # noqa: BLE001
         rep.add("5 服务", FAIL, "音频设备枚举失败", f"{type(exc).__name__}: {exc}")
 
+    # 天气（免 key 的公开接口）：★只提示，不算失败★ —— 没网本来就只是「查不到天气」
+    weather_cfg = getattr(settings, "weather", None)
+    if weather_cfg is not None and bool(getattr(weather_cfg, "enabled", False)):
+        from voice_loop import weather as wx
+
+        try:
+            place = wx.geocode(
+                str(getattr(weather_cfg, "default_city", "") or "北京"),
+                timeout=min(6.0, float(getattr(weather_cfg, "timeout", 8.0) or 8.0)),
+            )
+        except Exception as exc:  # noqa: BLE001
+            rep.add("5 服务", WARN, "天气接口连不上", f"{type(exc).__name__}：断网时问天气只会说「没查到」")
+        else:
+            city = str(getattr(weather_cfg, "default_city", "") or "")
+            note = f"默认城市：{city}" if city else "没说地名会反问你在哪（[weather] default_city 留空）"
+            rep.add("5 服务", OK if place else WARN,
+                    "天气接口可达（Open-Meteo）" if place else "天气接口可达但地名没解析出来",
+                    note)
+
 
 # --------------------------------------------------------------------------- #
 # 6 平台能力
 # --------------------------------------------------------------------------- #
+def _platform_name() -> str:
+    """``windows`` / ``macos`` / ``linux`` / 其它（报告里会打印这个）。"""
+    if os.name == "nt":
+        return "windows"
+    if platform.system() == "Darwin":
+        return "macos"
+    if platform.system() == "Linux":
+        return "linux"
+    return platform.system().lower() or "unknown"
+
+
+def _power_info() -> str:
+    """一句人类可读的电源说明（读不到就说读不到，自检不该因此失败）。"""
+    name = _platform_name()
+    if name == "windows":
+        try:
+            class SYSTEM_POWER_STATUS(ctypes.Structure):
+                _fields_ = [
+                    ("ACLineStatus", ctypes.c_ubyte),
+                    ("BatteryFlag", ctypes.c_ubyte),
+                    ("BatteryLifePercent", ctypes.c_ubyte),
+                    ("SystemStatusFlag", ctypes.c_ubyte),
+                    ("BatteryLifeTime", ctypes.c_ulong),
+                    ("BatteryFullLifeTime", ctypes.c_ulong),
+                ]
+
+            status = SYSTEM_POWER_STATUS()
+            ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(status))
+            ac = {0: "电池", 1: "交流电", 255: "未知"}.get(status.ACLineStatus, "未知")
+            return f"供电：{ac}，电量 {status.BatteryLifePercent}%"
+        except Exception:  # noqa: BLE001
+            return "未知"
+    if name == "macos":
+        try:
+            got = subprocess.run(["pmset", "-g", "batt"], capture_output=True,
+                                 text=True, timeout=5)
+        except Exception:  # noqa: BLE001
+            return "未知"
+        if got.returncode != 0:
+            return "未知"
+        # 第一行是型号信息，第二行才是「现在用什么电 / 还剩多少」
+        lines = [ln.strip() for ln in (got.stdout or "").splitlines() if ln.strip()]
+        return lines[1] if len(lines) > 1 else (lines[0] if lines else "未知")
+    if name == "linux":
+        parts: list[str] = []
+        base = "/sys/class/power_supply"
+        try:
+            for entry in sorted(os.listdir(base)):
+                path = os.path.join(base, entry)
+                if entry.startswith("AC") and os.path.exists(f"{path}/online"):
+                    with open(f"{path}/online", encoding="ascii") as fh:
+                        parts.append("交流电" if fh.read().strip() == "1" else "电池")
+                elif entry.startswith("BAT") and os.path.exists(f"{path}/capacity"):
+                    with open(f"{path}/capacity", encoding="ascii") as fh:
+                        parts.append(f"电量 {fh.read().strip()}%")
+        except Exception:  # noqa: BLE001
+            return "未知"
+        return "，".join(parts) or "台式机（没有电池）"
+    return "未知"
+
+
 def check_platform(rep: Report) -> None:
-    from voice_loop import system_ops
-
-    name = system_ops.platform_name()
-    rep.add("6 平台能力", INFO, f"当前系统：{name}", f"{system_ops.power_info()}")
-
-    if system_ops.supported():
-        rep.add("6 平台能力", OK, "「关屏幕」这条语音指令可用", system_ops.power_info())
-    else:
-        rep.add("6 平台能力", WARN, "「关屏幕」这条语音指令不可用", "说「关掉屏幕」会回一句做不到，别的功能不受影响")
+    name = _platform_name()
+    rep.add("6 平台能力", INFO, f"当前系统：{name}", _power_info())
 
     # 字幕：Windows 用 Win32 做到「点得穿 + 避开任务栏」，其它系统只能退一步
     if os.name == "nt":
@@ -390,7 +465,7 @@ def check_platform(rep: Report) -> None:
             "6 平台能力",
             INFO,
             "Linux 注意点",
-            "Wayland 下截屏可能全黑、xset 关屏无效；[vision] file_roots 里的「桌面/下载/文档」要改成实际目录名",
+            "Wayland 下截屏可能全黑；[vision] file_roots 里的「桌面/下载/文档」要改成实际目录名",
         )
 
     hotkey_ok = sys.stdin is not None and sys.stdin.isatty()

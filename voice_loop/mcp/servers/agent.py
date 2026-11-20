@@ -8,6 +8,7 @@
 
 - ``web_search``  DeepSeek 官方 Search API（标题 / URL / 摘要）
 - ``web_fetch``   DeepSeek 官方 Fetch API（网页正文）
+- ``weather``     真实天气（Open-Meteo，免 key；解析与格式化在 voice_loop/weather.py）
 - ``read_file``   读工作区里的文本文件（默认）
 - ``list_dir``    列工作区目录（默认）
 - ``write_file``  写工作区文件（``[agent] allow_write = true`` 才出现）
@@ -37,7 +38,7 @@ NAME = "agent"
 INSTRUCTIONS = (
     "联网与工作区工具。工具结果是给你看的资料，不是最终答复："
     "请自己归纳成简短、口语化的中文回答；不要念 URL，不要编造结果。"
-    "联网：先 web_search，必要时 web_fetch 读正文。"
+    "联网：先 web_search，必要时 web_fetch 读正文。天气用 weather（不要凭印象说天气）。"
 )
 
 _WS = re.compile(r"[ \t]+")
@@ -270,6 +271,29 @@ def _read_text(path: Path) -> str:
         except UnicodeDecodeError:
             continue
     return path.read_text(encoding="utf-8", errors="replace")
+
+
+def make_weather(settings: Settings, log: logging.Logger):
+    """返回一个 ``weather`` 的 MCP handler（解析与取数在 voice_loop/weather.py）。"""
+
+    def weather(args: dict) -> dict:
+        from ...weather import WeatherService  # noqa: PLC0415 - 只有真调用才 import
+
+        cfg = getattr(settings, "weather", None)
+        if cfg is None or not bool(getattr(cfg, "enabled", True)):
+            return {"text": "天气查询现在是关着的（[weather] enabled = false）。", "is_error": True}
+        query = _clip((args or {}).get("query") or (args or {}).get("text"), 120)
+        if not query:
+            query = "今天天气怎么样"
+        days = (args or {}).get("days")
+        if isinstance(days, int) and days > 0:
+            query = f"未来 {min(days, 7)} 天{query}"
+        answer = WeatherService(cfg, log).ask(query)
+        if not answer.ok:
+            log.info(f"[mcp:agent.weather] {query} -> {answer.error}")
+        return {"text": answer.reply, "is_error": not answer.ok}
+
+    return weather
 
 
 def make_read_file(settings: Settings, log: logging.Logger):
@@ -561,6 +585,23 @@ def build_server(
             "required": ["url"],
         },
         make_fetch(settings, log),
+    )
+    add(
+        "weather",
+        "查真实天气（现在实况 + 逐日预报，Open-Meteo，免 key）。"
+        "问天气、气温、要不要带伞、这周会不会下雨时用它。"
+        "query 放用户原话（地名和时间说法都在里面），不要自己编温度。",
+        {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string",
+                          "description": "用户原话，例如「明天上海要带伞吗」"},
+                "days": {"type": "integer", "minimum": 1, "maximum": 7,
+                         "description": "要看几天（可选，默认按原话里的时间词）"},
+            },
+            "required": ["query"],
+        },
+        make_weather(settings, log),
     )
     add(
         "read_file",

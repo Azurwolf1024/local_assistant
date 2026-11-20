@@ -545,7 +545,6 @@ default_remind_before = 10    # 只有「手写进 json、又没写 remind_befor
 speak_duplicate = false
 visual_alert = true           # 提醒时同时弹出右下角可视窗（没开扬声器也不会错过）
 visual_timeout = 25           # 可视窗多少秒后自动关闭（可随时点「知道了」或按 Esc 关掉）
-allow_system_commands = true  # 允许「关屏幕」这类系统级操作；关掉后语音指令无效
 
 # ── 屏幕字幕（底部居中半透明，关掉声音也能沟通）──────────────────────────────
 [subtitle]
@@ -617,6 +616,27 @@ file_num_ctx = 8192           # 读文件那一轮单独放大上下文
 confirm_expire = 120          # 「是这个文件吗？」多少秒没回答就作废
 
 say_first = "我看一眼。"       # 看图前先说的那句话（留空则不说）
+
+# ── 天气（Open-Meteo，免 API key，无需注册）──────────────────────────────────
+# 「今天天气怎么样」「明天上海要带伞吗」「这周会下雨吗」都走这里。
+# 数据源是公开接口：geocoding-api.open-meteo.com（地名→经纬度）+ api.open-meteo.com（预报）。
+# ★断网就说查不到，绝不编一个温度出来★。
+[weather]
+enabled = true
+# 没说地名时查哪里（「今天天气怎么样」这种）。
+# 留空 = 会反问你说清楚（★想直接问就别留空★）；填了就写你常待的城市名，例如 "杭州"。
+default_city = ""
+# 更稳的做法：直接写经纬度（填了就不走地名解析）。0 / 0 = 没填。
+latitude = 0.0
+longitude = 0.0
+# 按出口 IP 猜城市：★关着★。打开就会去问 ipapi.co「这台机器的 IP 在哪」，
+# 等于把一个第三方能看到你的 IP——要不要开你自己决定。
+auto_ip = false
+days_max = 7                  # 最多查几天（接口上限 16）
+timeout = 8                   # 单次请求超时（秒）
+cache_seconds = 600           # 同一地点的预报缓存多久（省流量，天气也不会 10 分钟内变）
+unit = "c"                    # c = 摄氏度，f = 华氏度
+geocode_language = "zh"       # 地名返回中文
 
 # ── MCP：自己搭的工具协议层（见 voice_loop/mcp/）────────────────────────────
 # 把能力域拆成独立的 MCP 服务器：宿主（MCPHost）聚合工具清单，再把调用路由回去。

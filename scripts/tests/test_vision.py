@@ -295,8 +295,6 @@ def test_routing() -> None:
     # 不是看图的句子要原样交给别的技能 / LLM
     check("「看看今天的日程」还是日程查询",
           getattr(skills.handle("看看今天的日程"), "action", "").startswith("event"), True)
-    check("「关屏幕」还是关屏而不是看图",
-          getattr(skills.handle("关屏幕"), "action", ""), "screen_off")
     check("「看看新闻」不该去拍照", skills.handle("看看新闻"), None)
     check("「今天有什么课」不受影响",
           getattr(skills.handle("今天有什么课"), "action", ""), "event_query")

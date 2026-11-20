@@ -62,9 +62,9 @@ def test_specs() -> None:
     _settings, _skills, reg = build(tmp)
     specs = reg.specs()
     names = [s["function"]["name"] for s in specs]
-    check("八个工具都在", sorted(names),
+    check("八个生活技能 + weather 都在", sorted(names),
           ["add_event", "add_memo", "change_event", "fix_last",
-           "list_events", "list_memos", "next_event", "now"])
+           "list_events", "list_memos", "next_event", "now", "weather"])
     check("每个都有 description", all(s["function"].get("description") for s in specs), True)
     check("每个都有 parameters", all(s["function"].get("parameters") for s in specs), True)
     add = next(s for s in specs if s["function"]["name"] == "add_event")

@@ -30,7 +30,7 @@ pipeline（会话编排）
 | `mcp/host.py` | 聚合工具清单、白名单、路由、服务器崩了自动重启 |
 | `mcp/servers/skills.py` | 第一个服务器：把现成的 `ToolRegistry`（事件/提醒/备忘）挂到协议后面 |
 | `mcp/servers/memory.py` | ★ 记忆服务器（第 15 节）：`recall` / `remember` / `memory_stats`，默认只露前两个 |
-| `mcp/servers/agent.py` | ★ harness agent：`web_search` / `web_fetch` / `read_file` / `list_dir` / `glob` / `grep`（+ 可选 `write_file` / `edit_file` / `run_command`），默认 `hidden` |
+| `mcp/servers/agent.py` | ★ harness agent：`web_search` / `web_fetch` / `weather` / `read_file` / `list_dir` / `glob` / `grep`（+ 可选 `write_file` / `edit_file` / `run_command`），默认 `hidden` |
 | `harness.py` | ★ harness 运行时：多轮工具循环 + 内置 `ask_user` / `update_plan`（进程内，不是 MCP 工具） |
 
 第一条命令：
@@ -86,7 +86,7 @@ claude mcp add voice-assistant -- python -m voice_loop.mcp.serve skills
 ```python
 # voice_loop/mcp/servers/louder.py
 from ..server import MCPServer
-from ...system_ops import set_volume          # 假设有这么一个函数
+from ...my_new_module import set_volume          # 假设有这么一个函数
 
 def build_server(settings=None, skills=None, logger=None, **_) -> MCPServer:
     srv = MCPServer("louder", instructions="音量控制")

@@ -36,6 +36,10 @@ PRESETS: dict[str, dict] = {
         "title": "联网搜索 / 网页读取（DeepSeek Search / Fetch）",
         "tools": ["web_search", "web_fetch"],
     },
+    "weather": {
+        "title": "天气（Open-Meteo，免 key）",
+        "tools": ["weather"],
+    },
     "files": {
         "title": "工作区文件（读 / 列目录 / 找文件 / 搜索）",
         "tools": ["read_file", "list_dir", "glob", "grep"],
@@ -50,7 +54,7 @@ PRESETS: dict[str, dict] = {
     },
     "harness": {
         "title": "完整 harness 工具集（不可用的会自动跳过）",
-        "tools": ["web_search", "web_fetch", "read_file", "list_dir",
+        "tools": ["web_search", "web_fetch", "weather", "read_file", "list_dir",
                   "glob", "grep", "write_file", "edit_file", "run_command"],
     },
     # ★下一步讨论好的额外工具加在这里★，例如：

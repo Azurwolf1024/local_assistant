@@ -356,7 +356,7 @@ Whisper / SenseVoice / ZipVoice / Ollama 陆续加载一遍，几个 GB 就这�
 
 ### 37.4 修法：起飞前检查
 
-新增 `scripts/preflight_heavy.py`，并在 `sessions/run_tests.cmd` 开头调用它：
+新增 `scripts/preflight_heavy.py`，并在 `scripts/tests/run_all.cmd` 开头调用它：
 
 - **有训练在跑** 且空闲 < 8 GB → 拦；
 - 空闲 < 4 GB（没训练也拦，这么点内存跑什么都会崩）；
@@ -522,7 +522,7 @@ Whisper / SenseVoice / ZipVoice / Ollama 陆续加载一遍，几个 GB 就这�
    修法：`child_env()` 统一给子进程 `PYTHONIOENCODING=utf-8` + `PYTHONUTF8=1`。
 2. ★`git tag --list <不存在的 tag>` 退出码是 0★：第一版发布脚本拿退出码判断「tag 打没打过」，
    于是它对新 tag 说「**这个 tag 已经存在**」——反了。改成看输出，并写进自测。
-3. `Set-Content -Encoding utf8` 给 `sessions\run_tests.cmd` 加了个 BOM：`.cmd` 第一行会因此解析
+3. `Set-Content -Encoding utf8` 给 `scripts\tests\run_all.cmd` 加了个 BOM：`.cmd` 第一行会因此解析
    失败（这条也在记忆里）。已去掉 —— 动 `.cmd` 之后**必须**检查一遍头三个字节。
 4. `load_settings` 缺 `config.toml` 直接抛：而「还没装好」正是 `setup` 要处理的状态，
    所以给 bootstrap 命令单独开了一条「读不到就用默认值」的路。
@@ -530,7 +530,7 @@ Whisper / SenseVoice / ZipVoice / Ollama 陆续加载一遍，几个 GB 就这�
 ### 55.4 没做的，以及为什么不（诚实清单）
 
 - **Docker / Compose / Helm**：这个项目要**麦克风 + 声卡**、要 3~4 GB 本地模型、要 Ollama、
-  要 Windows 的关屏/字幕点穿；容器化收益小、坑多（`/dev/snd` 透传、镜像体积、
+  要 Windows 的关屏/字幕点穿（关屏 2026-11-20 已删，见 §64.1）；容器化收益小、坑多（`/dev/snd` 透传、镜像体积、
   模型挂载）。**只有控制台是天然可容器化的**（纯网页 + 读写 json）—— 想做的话那是最值得的一步。
 - **内置自动更新**：自托管工具不该偷偷换自己的代码。现在是「默认只检查、`--apply` 才升、
   升级前先备份」，把决定权留给人。真要做也应该是「通知 + 一键」，不是静默。
@@ -555,3 +555,83 @@ Whisper / SenseVoice / ZipVoice / Ollama 陆续加载一遍，几个 GB 就这�
 | L5 自动更新通道 | 有意**不做**（见 55.4）；`latest.json` 已经是将来做它的地基 |
 
 ---
+## 64. 删掉「熄屏」、加上「天气」（2026-11-20，用户要求「清除熄屏功能，然后增加天气工具，参考成熟实现」）
+
+### 64.1 为什么删熄屏
+
+它是个**成本全在维护面、收益在键盘旁边**的功能：三个平台各一套
+（Windows `SC_MONITORPOWER` 广播、Linux `xset dpms`、macOS `pmset`），
+Wayland 还永远做不到、只能回一句「请用桌面快捷键」；外加 `[skills] allow_system_commands`
+一个开关挡着它。删掉的东西一次说清：
+
+| 位置 | 删了什么 |
+|---|---|
+| `voice_loop/system_ops.py` | 整个文件（`monitor_off` / `monitor_on` / `supported`）；`platform_name` 与 `power_info` 挪进 `scripts/check_deploy.py`（唯一真正的使用者是体检报告） |
+| `voice_loop/skills.py` | `_handle_screen` + 两张词表 + `handle()` 里的一行 + 「帮助」里的那句介绍 |
+| `voice_loop/settings.py` / `config.toml` | `[skills] allow_system_commands` |
+| `scripts/check_deploy.py` | 「6 平台能力」里那两条「关屏幕可用 / 不可用」 |
+| 自测 | `test_skills_route` 的关屏段、`test_vision` 的「关屏幕不会被看图抢走」、`test_precision` 的 `system_ops` 段 |
+
+★保留的判断★：`platform_name()` / `power_info()` 还在体检里（换系统前想知道「现在什么供电、
+什么系统」是有用的），但它们现在**只读**，不再有「动一下显示器」的能力。
+
+### 64.2 天气：为什么选 Open-Meteo，怎么分层
+
+成熟 harness agent 的 `get_weather` 都是同一个形状：**地名 → 经纬度 → 预报**，两跳。
+数据源选 **Open-Meteo**：免 key、免注册、家用频率随便用，Geocoding 与 Forecast
+两个公开接口就够。没用收费 API 的原因不是钱，是**没网就该说没网**——
+多一个 key 只会让「查不到」多一种原因。
+
+新文件 `voice_loop/weather.py` 分三层，和 `asr/`、`tts/` 一样可以单独拿走：
+
+| 层 | 函数 | 为什么单独一层 |
+|---|---|---|
+| 解析 | `parse_scope` / `parse_place` | 纯字符串、纯确定性，一张表就能改；「明天上海要带伞吗」→（明天，上海）不依赖模型 |
+| 取数 | `geocode` / `forecast` | 直接对应两个 HTTP 跳；返回原样保留，不在这里加工 |
+| 说话 | `describe` / `code_text` | 数值 → 能念的中文（`12 到 21 度`、`降水概率 80%，记得带伞`），不念 `°C`、不念 WMO 编号 |
+
+门面 `WeatherService` 管三件事：**缓存**（同一地点 10 分钟）、**地点优先级**
+（原话里的地名 → 配置经纬度 → `default_city` → `auto_ip`）、**把失败说人话**
+（断网 / 地名查不到 / 功能关着，三种话术不同）。
+
+接了三处，共用同一份解析：
+
+1. **技能层**（本地角色也能用，零延迟）：`_handle_weather`，词表命中就走。
+2. **工具层**（模型先路由那条路）：`weather` 工具，参数仍然只有 `text`（原话）。
+3. **MCP harness**（API 角色）：`agent` 服务器加 `weather`，预设里加 `weather` 并进 `harness`；
+   大肥鱼的 `api_tools` 因此多了 `weather`。
+
+### 64.3 踩到的两个坑
+
+- ★`看看天气` 会被「看图」抢走★：`_handle_vision` 认 `看看` 开头的句子，所以
+  `_handle_weather` 必须排在它**前面**（`handle()` 的顺序就是优先级，注释里也写了原因）。
+- ★「火星」真的查得到★：Open-Meteo 的 geocoding 会返回广东的「火星」村 ——
+  这不是 bug，是地名库的真实行为。所以工具描述里写明「地名由本地代码解析，不要自己换经纬度」，
+  而不是让模型去猜。
+
+### 64.4 隐私与默认值
+
+- `[weather] auto_ip` **默认 false**：打开就等于告诉 `ipapi.co`「这台机器在哪」。
+- `default_city` 在仓库里留空（不把用户常住城市提交上去），本地要就直接写
+  `config.local.toml`（已在 `.gitignore`）。
+- 断网时**只说查不到**，绝不编温度 —— 和记忆层「宁可查到空也不要凭印象说」是同一条规矩。
+
+### 64.5 验证
+
+- `scripts/tests/test_weather.py`（离线，`weather._get` 打桩）：解析 7 组原话、
+  代码映射、给定预报的固定文案（含「记得带伞」）、缓存不重复请求、
+  经纬度优先于地名、断网/无地名/关闭三种退路、工具层与技能层路由、MCP 注册与预设展开。
+- 真机实测（2026-11-20 上午）：
+  `杭州明天要带伞吗` → 「杭州明天晴，3 到 15 度，降水概率 0%」；
+  `上海现在多少度` → 「上海现在 10 度，体感 6 度，晴，湿度 45%，风速 10 米每秒」；
+  `未来三天北京天气` → 三天逐条，最低 -2 度。
+- 全套自测 `scripts\tests\run_all.cmd` 通过（`lint_persona` 也干净了：大肥鱼角色卡里
+  「摸鱼」这种会被模型当成「待办话题」的词已换掉）。
+
+---
+## 64.6 顺手补的：跑全套自测的入口以前根本没入库
+
+`run_tests.cmd` 一直躺在 `sessions/` 里，而整个 `sessions/` 都在 `.gitignore` 里 ——
+也就是说**新克隆的仓库没有「跑全套」这个入口**，每次加测试都加在一个不进版本库的文件里。
+现在它搬到 `scripts/tests/run_all.cmd`（入库、路径自解析 `%~dp0..\..`，不再硬编码 `d:\local_AI`），
+文档里所有旧路径一起改掉。

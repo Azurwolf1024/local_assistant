@@ -165,9 +165,14 @@ python main.py ui                 # 老行为：浏览器开一个标签页
 | 批量 | 有哪些课程 / 我的所有会议 / 取消所有会议 / 所有课程提前半小时提醒 |
 | 只取消这一次 | 下周三的课不上了（课表留着，下周照常） |
 | 彻底删除 | 以后不上这门课了 / 删掉组会 |
-| 关/开显示器 | 关屏幕 / 黑屏 / 息屏（只是关屏，不是休眠；服务照常跑） |
+| 天气 | 今天天气怎么样 / 明天上海要带伞吗 / 这周会下雨吗（真实预报，见下） |
 | 看图 | 看看这是什么 / 用摄像头看看 / 看看我的屏幕上是什么 / 刚才那张图是什么 |
 | 看文件 | 读一下那个报告 / 念一下会议纪要（先报完整路径，你说「是」才读） |
+
+天气走的是公开接口 **Open-Meteo**（免 key、不用注册）：地名先转成经纬度，再取
+「现在实况 + 逐日预报」，最后翻成能念的中文（`18 度`、`12 到 21 度`，不念 `18°C`）。
+断网只会说「没查到」，**绝不编一个温度**。没说地名时用 `[weather] default_city`；
+那里留空就会反问你一句（或者直接在 `[weather]` 里写 `latitude` / `longitude`）。
 
 技能命中就本地直接回答，零延迟也不会胡说；没命中才交给 Ollama。
 所有技能返回 `None` 时不会抢话，所以闲聊不受影响。
@@ -288,7 +293,7 @@ python scripts/tests/test_api_tts.py         # 官方 TTS：PCM/WAV / 失败回 
 python scripts/tests/test_agent_tools.py     # harness agent：多轮工具循环 / 文件边界 / 预设 / 默认隐藏（不联网）
 python scripts/tests/test_vision.py          # 看图：找文件/确认流程/编码/路由（不用视觉模型）
 python scripts/tools/eval_router.py --builtin  # 评估「模型选工具」准不准（29 句带预期，算选对率/误报/漏调）
-python scripts/tests/test_skills_route.py    # 技能路由 + 关屏幕 + 课表 + 提醒文案 + 重启不丢数据
+python scripts/tests/test_skills_route.py    # 技能路由 + 课表 + 提醒文案 + 重启不丢数据
 python scripts/tests/test_bargein.py         # 打断：合成回声/插话对照（--echo 真机回声自测）
 python scripts/tests/test_hotkey.py          # 按 Esc 打断：假键盘驱动，验按键与护栏逻辑
 python scripts/tests/test_wake_cycle.py      # 待机 → 唤醒 → 空闲回收 → 再次唤醒

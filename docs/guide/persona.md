@@ -157,12 +157,12 @@ api_key_file = "D:/你的路径/assistant.txt"
 
 **额外工具**：本地 4B 能稳定驾驭的工具就那十个，所以默认所有角色一样。
 API 角色可以在 `api_tools`（或 `[api] extra_tools`）里按 **预设名** 或 **具体工具名**
-点名多开。现在有的预设是 `memory`（recall / remember）和 `skills`（八个生活技能）；
+点名多开。现在有的预设是 `memory`（recall / remember）、`skills`（八个生活技能）、
+`web`（搜索 / 读网页）、`weather`（真实天气）和 `files`（读工作区）；
 也可以直接点名一个被白名单挡住的工具，例如
 `"api_tools": ["mcp__memory__memory_stats"]`。预设表在
 [`voice_loop/tool_presets.py`](../../voice_loop/tool_presets.py)：加一个预设 = 加一行，
 流水线不用改；名字找不到只打警告，不会让这一轮失败。
-（具体还要加哪些工具，等下一步讨论。）
 
 ### 声音（TTS）：换成任何模型 / 任何 API 都不用改代码
 
@@ -299,6 +299,7 @@ max_tool_chars = 6000     # 单个工具结果喂回模型的上限
 | --- | --- | --- |
 | `web_search` | DeepSeek `POST /v1/tools/search` | `api_tools` 含 `web` |
 | `web_fetch` | DeepSeek `POST /v1/tools/fetch` | `api_tools` 含 `web` |
+| `weather` | Open-Meteo（免 key；解析在 `voice_loop/weather.py`） | `api_tools` 含 `weather` |
 | `read_file` | 工作区文本文件（带行号） | `api_tools` 含 `files` |
 | `list_dir` | 工作区目录 | `api_tools` 含 `files` |
 | `glob` | 按通配符找文件（`**/*.py`） | `api_tools` 含 `files` |
@@ -322,10 +323,11 @@ max_tool_chars = 6000     # 单个工具结果喂回模型的上限
 
 ```jsonc
 // data/personas/bluefish.json
-{ "api_tools": ["web", "files"] }
+{ "api_tools": ["web", "files", "weather"] }
 ```
 
 - `web` → `web_search` + `web_fetch`
+- `weather` → `weather`（真实天气，免 API key）
 - `files` → `read_file` + `list_dir` + `glob` + `grep`
 - `write` → `write_file` + `edit_file`（需要先在 `[agent]` 里显式开启）
 - `shell` → `run_command`（需要先在 `[agent]` 里显式开启）

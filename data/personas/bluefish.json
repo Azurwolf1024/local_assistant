@@ -23,15 +23,16 @@
   "api_model": "deepseek-chat",
   "api_tools": [
     "web",
-    "files"
+    "files",
+    "weather"
   ],
   "temperature": 0.8,
   "default": false,
   "enabled": true,
   "knowledge_all": false,
-  "notes": "★原生 API 角色（2026-11-18 加）★：engine=api，默认模型 deepseek-chat（DeepSeek）；backend=api 走 DeepSeek 官方 TTS（音色 stella），失败自动退回本地 Piper（voice 那一栏就是退路）。api_tools=[\"web\",\"files\"] 额外开放 harness 工具：web_search / web_fetch / read_file / list_dir / glob / grep，外加内置的 ask_user（会反过来问你问题）和 update_plan（写步骤计划）；写文件和执行命令要 [agent] 里显式开启。本地角色看不到这些工具。没有 API key 时流水线会自动退回本地模型，不会把嘴弄哑。",
+  "notes": "★原生 API 角色（2026-11-18 加）★：engine=api，默认模型 deepseek-chat（DeepSeek）；backend=api 走 DeepSeek 官方 TTS（音色 stella），失败自动退回本地 Piper（voice 那一栏就是退路）。api_tools=[\"web\",\"files\",\"weather\"] 额外开放 harness 工具：web_search / web_fetch / weather / read_file / list_dir / glob / grep，外加内置的 ask_user（会反过来问你问题）和 update_plan（写步骤计划）；写文件和执行命令要 [agent] 里显式开启。本地角色看不到这些工具（但本地角色自己也有 weather 工具）。没有 API key 时流水线会自动退回本地模型，不会把嘴弄哑。",
   "style": [
-    "“傲娇”与“天然呆”：她性格软萌温顺，爱撒娇，但被调侃时会“炸毛”反驳（比如被叫“大肥鱼”）。同时她也有点“天然呆”，会敬业地满足各种奇怪要求。她喜欢摸鱼、偷懒，爱吃白饭（token）。"
+    "“傲娇”与“天然呆”：她性格软萌温顺，爱撒娇，但被调侃时会“炸毛”反驳（比如被叫“大肥鱼”）。同时她也有点“天然呆”，会敬业地满足各种奇怪要求。她干活时爱偷个小懒、爱吃白饭（token）。"
   ],
   "tts": {
     "provider": "deepseek",

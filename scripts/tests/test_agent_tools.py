@@ -244,11 +244,12 @@ def test_hidden_and_preset() -> None:
     finally:
         host.close()
     check("web 预设", expand(["web"]), {"web_search", "web_fetch"})
+    check("weather 预设", expand(["weather"]), {"weather"})
     check("files 预设", expand(["files"]),
           {"read_file", "list_dir", "glob", "grep"})
     check("write 预设", expand(["write"]), {"write_file", "edit_file"})
     check("harness 预设", expand(["harness"]),
-          {"web_search", "web_fetch", "read_file", "list_dir", "glob", "grep",
+          {"web_search", "web_fetch", "weather", "read_file", "list_dir", "glob", "grep",
            "write_file", "edit_file", "run_command"})
 
 

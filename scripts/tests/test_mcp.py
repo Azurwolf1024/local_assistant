@@ -236,7 +236,7 @@ def test_host(tmp: Path) -> None:
         check("外来/第二个服务器带 mcp__ 前缀", "mcp__ro__list_memos" in names)
         check("★白名单挡掉了写操作★", "mcp__ro__add_memo" not in names
               and "mcp__ro__add_event" not in names, str(sorted(names))[:90])
-        check("模型看到的工具数 = 8 + 2", len(host.specs()) == 10, f"{len(host.specs())} 个")
+        check("模型看到的工具数 = 9 + 2", len(host.specs()) == 11, f"{len(host.specs())} 个")
         check("specs 是 Ollama 形状", host.specs()[0]["type"] == "function"
               and "parameters" in host.specs()[0]["function"])
 
@@ -282,9 +282,10 @@ def test_pipeline(tmp: Path) -> None:
         check("pipeline 里挂了 MCP 宿主", loop.mcp is not None)
         specs = loop._tool_specs() or []  # noqa: SLF001
         names = {s["function"]["name"] for s in specs}
-        # 8 个技能 + 2 个记忆工具（recall / remember，白名单控制；见 config.toml）
-        check("工具清单来自宿主", {"list_events", "add_memo", "add_event"} <= names
-              and len(names) == 10, f"{len(names)} 个")
+        # 9 个自家工具（8 个生活技能 + weather）+ 2 个记忆工具
+        # （recall / remember，白名单控制；见 config.toml）
+        check("工具清单来自宿主", {"list_events", "add_memo", "add_event", "weather"} <= names
+              and len(names) == 11, f"{len(names)} 个")
         check("记忆工具也露出来了（带 mcp__memory__ 前缀）",
               {"mcp__memory__recall", "mcp__memory__remember"} <= names,
               str(sorted(names))[:80])

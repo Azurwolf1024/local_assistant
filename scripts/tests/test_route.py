@@ -159,8 +159,9 @@ def test_model_first() -> None:
         check("工具名记进了统计", "list_events" in str(stats.extra.get("tool")), True)
         check("没有落在技能路径上", stats.extra.get("skill"), None)
         check("只问了一次模型（没有多余往返）", loop.llm.turns, 1)
-        # 10 = 8 个生活技能 + 2 个记忆工具（mcp__memory__recall / remember，见 config.toml 白名单）
-        check("模型确实拿到了工具清单", len(loop.llm.last_tools or []), 10)
+        # 11 = 9 个自家工具（8 个生活技能 + weather）+ 2 个记忆工具
+        # （mcp__memory__recall / remember，见 config.toml 白名单）
+        check("模型确实拿到了工具清单", len(loop.llm.last_tools or []), 11)
         check("记忆工具也在清单里（名字带前缀，不会和技能撞）",
               {t["function"]["name"] for t in (loop.llm.last_tools or [])}
               >= {"mcp__memory__recall", "mcp__memory__remember"}, True)
@@ -265,7 +266,7 @@ def test_new_tools() -> None:
         loop = make_loop(tmp)
         reg = loop.tools
         assert reg is not None
-        check("工具总数", len(reg.specs()), 8)
+        check("工具总数（8 个生活技能 + weather）", len(reg.specs()), 9)
 
         got = reg.call(call("now", text="现在几点"))
         check("now → 报时", got.ok and "点" in got.reply, True)

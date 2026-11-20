@@ -151,7 +151,7 @@ python scripts/import_persona.py --only clementia --add-index --apply
 | 界面路径 | `scripts/tests/test_console.py` 第 [9] 节走真 HTTP：扫描 → 试运行（不写）→ 导入（写入 lines + 知识库）→ 进索引后角色列表立刻出现她 | 全过 |
 | 真浏览器 | 沙盒控制台 + Playwright：卡片渲染 → 扫描（**台词 3 条 / 档案 3 个章节**）→ 试运行 → 导入（confirm 文案如实说清会改什么）→ 角色卡片「示例台词 2 → 5 条」当场刷新 | 通过 |
 | 落盘 | 沙盒里数文件：`probe.json` lines=5、`data/knowledge/probe/档案.md` 17 行、`.bak` 在 | 通过 |
-| 回归 | 全量 `sessions\run_tests.cmd`（**41 个脚本**） | 全 EXIT=0 |
+| 回归 | 全量 `scripts\tests\run_all.cmd`（**41 个脚本**） | 全 EXIT=0 |
 
 ### 57.10 诚实清单
 
@@ -246,7 +246,7 @@ python scripts/import_persona.py --only clementia --add-index --apply
 顺手清掉的数据问题：`baize` / `exusiai` 的 `rules` 里有 `★用第一人称说话，不要自我介绍★`
 （这是渲染器早就统一处理的事，写在数据里只会被模型念出来），`clementia` 的 `style` 里有 `★`。
 
-`scripts/lint_persona.py` 现在是这套规则的守门员，并**进了 `sessions\run_tests.cmd`**
+`scripts/lint_persona.py` 现在是这套规则的守门员，并**进了 `scripts\tests\run_all.cmd`**
 （它不是单元测试，而是对**真实**人格文件做体检，有告警就 EXIT=1）：
 
 | 检查项 | 会出什么事 |
@@ -305,7 +305,7 @@ python scripts/import_persona.py --only clementia --add-index --apply
 | 兜底重答 | `scripts/tests/test_persona_guard.py`：假模型两段回答，断言只念第二段、第二遍换了极简人设 | 全过 |
 | 真模型行为 | `sessions/probe_final.py`：五个角色 × 三问，固定 15:00（所以「又熬夜了」一定是编的），判「元话语 / 凭空关心 / 编造日程」 | 见下面的诚实清单 |
 | 人格文件体检 | `scripts/lint_persona.py`：五个角色 | EXIT=0（干净） |
-| 回归 | 全量 `sessions\run_tests.cmd`（**42 个脚本 + lint**） | 全 EXIT=0 |
+| 回归 | 全量 `scripts\tests\run_all.cmd`（**42 个脚本 + lint**） | 全 EXIT=0 |
 
 ### 58.6 诚实清单
 

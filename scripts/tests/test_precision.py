@@ -20,7 +20,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from voice_loop import system_ops  # noqa: E402
 from voice_loop.settings import load_settings  # noqa: E402
 from voice_loop.tts import precision as prec  # noqa: E402
 from voice_loop.tts import zipvoice_tts as zv  # noqa: E402
@@ -170,29 +169,6 @@ def test_pipeline_missing() -> None:
         check_true(bool(zipvoice_provider._missing_model(settings, half)), "文件都在但没有 onnx → 算缺")
 
 
-def test_platform_names() -> None:
-    print("\n[6] 平台判断与降级（不能抛异常）")
-    name = system_ops.platform_name()
-    check_true(name in ("windows", "macos", "linux") or sys.platform in name, f"platform_name() = {name!r}")
-    check_true(isinstance(system_ops.supported(), bool), "supported() 返回 bool")
-    ok, why = system_ops.monitor_off()
-    check_true(isinstance(ok, bool) and isinstance(why, str), f"monitor_off() 返回 (bool, str) —— {why}")
-    ok, why = system_ops.monitor_on()
-    check_true(isinstance(ok, bool) and isinstance(why, str), f"monitor_on() 返回 (bool, str) —— {why}")
-    check_true(isinstance(system_ops.power_info(), str), f"power_info() 返回 строку —— {system_ops.power_info()}")
-
-    # 非 Windows 上「关屏」应该老实说不支持，而不是假装成功
-    saved = system_ops.platform_name
-    try:
-        system_ops.platform_name = lambda: "plan9"  # type: ignore[assignment]
-        ok, why = system_ops.monitor_off()
-        check(ok, False, "未知平台 → monitor_off 明确返回失败")
-        check_true("暂不支持" in why, f"说明里说清了原因：{why}")
-        check(system_ops.supported(), False, "未知平台 → supported() 为假")
-    finally:
-        system_ops.platform_name = saved  # type: ignore[assignment]
-
-
 def test_single_source() -> None:
     print("\n[7] 精度定义只有一份（四个调用方共用）")
     check_true(zv.PRECISION_FILES is prec.PRECISION_FILES, "zipvoice_tts 转发的是 precision 里那一份")
@@ -214,7 +190,6 @@ def main() -> int:
     test_fallback()
     test_missing_files()
     test_pipeline_missing()
-    test_platform_names()
     test_single_source()
     print(f"\n{'=' * 60}\n通过 {PASS}，失败 {FAIL}")
     return 1 if FAIL else 0
