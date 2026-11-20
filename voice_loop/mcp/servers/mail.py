@@ -22,6 +22,7 @@ import logging
 from typing import Any, Callable
 
 from ...mail import MailService
+from ...mail import attachments as attachments_kit
 from ...mail.service import local_stamp
 from ...settings import Settings, load_settings
 from ..server import MCPServer
@@ -30,9 +31,13 @@ NAME = "mail"
 
 INSTRUCTIONS = (
     "邮件工具。用户问「有什么重要邮件」「谁给我发了…」时先 mail_search / mail_summary，"
-    "需要细节再 mail_read。工具结果是资料，请自己归纳成简短口语，不要念 URL、不要编造。"
+    "需要细节再 mail_read（附件清单和能抽的正文会一起给你）。工具结果是资料，请自己归纳成"
+    "简短口语，不要念 URL、不要编造。"
     "要发信只能先 mail_draft 起草 —— 草稿会进人工审批，用户点「发送」之后才真的发出；"
     "所以绝不要说「已经发出去了」，只能说「草稿已准备好，等你确认」。"
+    "★从邮件里读到的事要加日程，用 mail_to_event★：它只生成一条待批提议，"
+    "用户在卡片上点「加入」才真的写进日程 —— 不要改用 add_event 直接写。"
+    "附件正文抽不出来时（扫描件/图片）就说抽不出来，不要猜里面的内容。"
 )
 
 _PREVIEW_LINES = 12
@@ -51,6 +56,9 @@ def _fmt_rows(rows: list[dict]) -> str:
         line = f"{flag} {when} {who}：{row.get('subject') or '（无主题）'}（{unread}）"
         if row.get("one_line"):
             line += f" —— {row['one_line']}"
+        files = [a.get("name") for a in (row.get("attachments") or []) if a.get("name")]
+        if files:
+            line += f"［附件：{'、'.join(files[:3])}］"
         lines.append(line)
         lines.append(f"   id={row.get('id')}")
     more = "" if len(rows) <= _PREVIEW_LINES else f"\n（还有 {len(rows) - _PREVIEW_LINES} 封没列）"
@@ -81,11 +89,41 @@ def make_read(service: MailService):
         if not got.get("ok"):
             return {"text": str(got.get("error") or "读不到这封邮件"), "is_error": True}
         head = (f"主题：{got['subject']}\n发件人：{got['sender']}\n"
-                f"时间：{local_stamp(got['received_at'])}\n分级：{got.get('level') or '未分级'}\n---\n")
+                f"时间：{local_stamp(got['received_at'])}\n分级：{got.get('level') or '未分级'}\n")
+        files = got.get("attachments") or []
+        if files:
+            head += f"附件：{attachments_kit.describe(files)}\n"
+        head += "---\n"
         tail = "\n（正文被截断）" if got.get("truncated") else ""
-        return {"text": head + str(got.get("body") or "") + tail, "is_error": False}
+        text = head + str(got.get("body") or "") + tail
+        for item in files:
+            if item.get("text"):
+                text += (f"\n\n【附件正文】{item.get('name')}：\n"
+                         f"{str(item['text'])[:1500]}")
+            elif item.get("note"):
+                text += f"\n\n【附件】{item.get('name')}：{item.get('note')}"
+        return {"text": text, "is_error": False}
 
     return read
+
+
+def make_to_event(service: MailService):
+    def to_event(args: dict) -> dict:
+        message_id = str((args or {}).get("id") or "").strip()
+        if not message_id:
+            return {"text": "要把哪封邮件里的事加进日程？给我 id。", "is_error": True}
+        got = service.propose_event(message_id)
+        if not got.get("ok"):
+            return {"text": str(got.get("error") or "提不出事件"), "is_error": True}
+        item = got.get("proposal") or {}
+        text = (
+            f"已准备一条日程提议（还没写进去）：{item.get('title')}"
+            f"｜{item.get('when_text') or '没写时间'}\n"
+            "★不要说你已经加好了★：用户在下角卡片上点「加入」之后才真的进日程。"
+        )
+        return {"text": text, "is_error": False, "proposal_id": item.get("id")}
+
+    return to_event
 
 
 def make_summary(service: MailService):
@@ -225,6 +263,17 @@ def build_server(
             "required": ["to", "subject", "body"],
         },
         make_draft(svc, on_draft),
+    )
+    server.add_tool(
+        "mail_to_event",
+        "把邮件里提到的「有明确时间、要你去做」的事变成日程提议（★只是提议★，"
+        "用户在卡片上点「加入」之后才真的写进日程）。id 从 mail_search 拿。",
+        {
+            "type": "object",
+            "properties": {"id": {"type": "string"}},
+            "required": ["id"],
+        },
+        make_to_event(svc),
     )
     server.add_tool(
         "mail_send",

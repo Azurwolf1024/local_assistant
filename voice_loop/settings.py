@@ -679,6 +679,15 @@ class MailConfig:
 
     notify_high: bool = True          # 重要邮件立刻弹窗
     digest_hours: list[int] = field(default_factory=lambda: [9, 20])
+    demote_expired: bool = True       # 截止时间已过的通知降一档（别再弹窗打扰）
+
+    # —— 附件 ——
+    attachment_chars: int = 4000      # 抽附件正文时最多给多少字（按需抽，不跟同步一起拉）
+    max_attachment_mb: float = 8.0    # 超过这个大小就不下载（只留清单）
+
+    # —— 邮件 → 日程 ——
+    link_events: bool = True          # 允许「从邮件提取事件」这个能力（★写入仍要人点确认★）
+    auto_propose: bool = False        # 重要邮件自动生成待批日程提议（默认关，免得老弹卡）
 
     allow_send: bool = False          # ★默认关★：开了也还要白名单 + 人工点一次
     send_allowlist: list[str] = field(default_factory=list)   # 空表 = 谁都发不出去

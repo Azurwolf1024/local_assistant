@@ -429,6 +429,16 @@ class VoiceLoop:
         )
         self.mail_approval = approval
         self.mail.on_draft = approval.submit
+        # 日程提议用同一张卡片（文案自动换成「加入 / 忽略」）
+        proposal_card = ApprovalCard(
+            self.mail.queue_event,
+            timeout=float(getattr(cfg, "approval_ttl", 300) or 300),
+            log=self.log,
+        )
+        self.mail_proposal = proposal_card
+        self.mail.on_proposal = proposal_card.submit
+        # ★真正写日程的是这里★：提交人在卡片上点「加入」之后才会被调用
+        self.mail.queue_event.add_event = self._add_event_from_mail
         # ★巡检只在常驻服务里跑★：一次性命令（mail search 之类）自己会 sync，
         # 多开一个线程白耗电，还会和命令行抢 SQLite。
         self.mail_watcher = MailWatcher(
@@ -456,6 +466,33 @@ class VoiceLoop:
                 self.toast.show("邮件", message)
             except Exception:  # noqa: BLE001
                 pass
+
+    def _add_event_from_mail(self, item: dict) -> int:
+        """把一条「已批准的日程提议」写进 events.json，返回事件 id。
+
+        ★复用技能层现成的写入路径★：``event_text`` 负责一句话 ↔ 一条事件，
+        ``EventStore`` 负责跨进程锁与原子写。邮件子系统不认识事件层（边界自测守着），
+        这根线就搭在流水线里。
+        """
+        if self.skills is None:
+            raise RuntimeError("技能层没开（[skills] enabled = false），加不了日程")
+        from .event_text import parse_datetime  # noqa: PLC0415
+
+        when_text = str(item.get("when_text") or "").strip()
+        when = parse_datetime(when_text) if when_text else None
+        if when is None:
+            raise RuntimeError(f"听不懂这个时间：{when_text or '（空）'}")
+        fields = {
+            "title": str(item.get("title") or "邮件提到的事")[:60],
+            "start": when,
+            "location": str(item.get("place") or ""),
+            "note": str(item.get("reason") or "")[:200],
+            "category": "mail",
+        }
+        event = self.skills.store.append(et.to_item(fields))
+        event_id = int(event.get("id") or 0)
+        self.log.info(f"[mail] 已加入日程 #{event_id}：{fields['title']}（{when_text}）")
+        return event_id
 
     # ======================================================================
     # 预热

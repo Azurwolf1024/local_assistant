@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from datetime import datetime
 from typing import Any, Callable
 
 #: 类别 → 中文（也用来判断「群发/促销」这类可以压分的类别）
@@ -58,6 +59,30 @@ _NOISE = re.compile(
     r"|秒杀|抽奖|积分|会员日",
     re.IGNORECASE,
 )
+
+
+def _parse_deadline(text: str, now: datetime | None = None) -> datetime | None:
+    """把 ``deadline`` 解析成日期：认 ``2026-11-24`` / ``2026/11/24`` / ``11月24日``。
+
+    只认**日期**（时间部分忽略）—— 降权只需要判断「这一天过去了没有」。
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    match = re.search(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})", raw)
+    if match:
+        try:
+            return datetime(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        except ValueError:
+            return None
+    match = re.search(r"(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]?", raw)
+    if match:
+        moment = now or datetime.now()
+        try:
+            return datetime(moment.year, int(match.group(1)), int(match.group(2)))
+        except ValueError:
+            return None
+    return None
 
 
 def _addr_set(items: Any) -> set[str]:
@@ -267,6 +292,7 @@ class Triage:
             "reasons": reasons,
             "model": model_used,
         }
+        info = self.demote_if_expired(info)
         if self.store is not None and message_id:
             # 只缓存「模型真实跑过」的结果；纯规则结果每次都现算（改配置能立刻生效）
             if model_used:
@@ -301,6 +327,39 @@ class Triage:
         if score >= self.medium_score:
             return "medium"
         return "low"
+
+    # ---------------------------------------------------------------- 过期降权
+    @property
+    def demote_expired(self) -> bool:
+        return bool(getattr(self.cfg, "demote_expired", True))
+
+    def demote_if_expired(self, info: dict, now: datetime | None = None) -> dict:
+        """截止时间**已经过去**的通知降一档（「11月17日的课调到下午」这种别再弹窗）。
+
+        为什么放在分级末尾而不是规则里：截止时间多半是**模型**读出来的（``deadline``），
+        规则层看不到；而这件事本身很简单 —— 只要那个日期在今天之前，就把 level 降一档，
+        并在理由里说清楚（可解释，不是黑盒）。
+        """
+        if not self.demote_expired:
+            return info
+        when = _parse_deadline(str(info.get("deadline") or ""))
+        if when is None:
+            return info
+        moment = now or datetime.now()
+        if when.date() >= moment.date():
+            return info
+        order = ["low", "medium", "high"]
+        level = str(info.get("level") or "low")
+        idx = order.index(level) if level in order else 0
+        new_level = order[max(0, idx - 1)]
+        if new_level == level:
+            return info
+        out = dict(info)
+        out["level"] = new_level
+        out["expired"] = True
+        out["reasons"] = [*list(info.get("reasons") or []),
+                          f"截止时间已过（{when.strftime('%m-%d')}）→ 降一档"]
+        return out
 
     def classify_many(self, rows: list[dict], *, limit: int = 20) -> list[dict]:
         """给一批新邮件打标（巡检每轮用；``limit`` 限制模型调用次数）。"""

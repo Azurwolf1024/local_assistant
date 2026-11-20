@@ -35,8 +35,10 @@ MCP 工具（5 个）                  ../mcp/servers/mail.py
 | `graph.py` | Microsoft Graph 封装：`/me/messages`、delta、草稿、发送；429 按 `Retry-After` 退避 | 换数据源（IMAP / 本机 Outlook COM） |
 | `store.py` | SQLite 索引（messages / drafts / meta），中文多词 AND 检索 | 加字段、加索引 |
 | `delta.py` | `Syncer`：首次按时间窗口拉 → 取 `delta` 游标接力 → 之后只问变化 | 改同步策略 |
-| `triage.py` | 规则（VIP / 关键词 / 群发降权）+ 模型 JSON 合并，按 model 缓存 | 调整「什么叫重要」 |
+| `triage.py` | 规则（VIP / 关键词 / 群发降权）+ 模型 JSON 合并 + **过期降权**，按 model 缓存 | 调整「什么叫重要」 |
 | `outbox.py` | ★发信闸门★：白名单、状态机、HMAC token、幂等、审计 | 加闸门（几乎只加不减） |
+| `attachments.py` | 附件：类型识别 / 清单描述 / **按需抽正文**（pdf/docx/文本） | 加 OCR 或新格式 |
+| `link.py` | 邮件 → 日程：`EventProposer`（提议）+ `EventQueue`（待批队列，同卡片协议） | 改"什么样的事值得记" |
 | `notify.py` | 重要立刻弹窗+念一句、同封只提醒一次、早/晚报摘要 | 改提醒节奏 |
 | `watcher.py` | 服务里的巡检线程（一个 `Event` + 守护线程，`tick()` 可离线调） | 改周期 / 加动作 |
 | `approve.py` | `ApprovalQueue`（纯逻辑）+ `ApprovalCard`（右下角 Tk 卡片） | 换审批界面（控制台 / 手机） |
@@ -78,6 +80,9 @@ watcher  = MailWatcher(svc, notifier, interval=180)
 
 第 4 条专治「你批准了 A 版本，agent 偷偷改成 B 版本再发」：正文一变 hash 就对不上。
 token 只在用户点「发送」的那一刻由本进程签发，模型拿不到、也伪造不了。
+
+写日程同理：`mail_to_event` 只落一条 `proposals` 记录（`pending`），**卡片上点「加入」才
+调用注入的 `add_event`**（`EventQueue.decide(id, "send")`）；点「忽略」记 `skipped`，什么都不写。
 
 状态机：`pending → approved → sent`；`failed`（明确失败，可用同一 token 重试）；
 `unknown`（网络断在半路，★不自动重试★，由人确认「已发送」里到底有没有）。

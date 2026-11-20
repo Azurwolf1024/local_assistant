@@ -41,8 +41,9 @@ PRESETS: dict[str, dict] = {
         "tools": ["weather"],
     },
     "mail": {
-        "title": "邮件（查 / 读 / 摘要 / 起草；发送要人工审批）",
-        "tools": ["mail_search", "mail_read", "mail_summary", "mail_draft", "mail_send"],
+        "title": "邮件（查 / 读 / 摘要 / 起草 / 提日程；发送与写日程都要人工审批）",
+        "tools": ["mail_search", "mail_read", "mail_summary", "mail_draft", "mail_send",
+                  "mail_to_event"],
     },
     "files": {
         "title": "工作区文件（读 / 列目录 / 找文件 / 搜索）",
@@ -59,7 +60,7 @@ PRESETS: dict[str, dict] = {
     "harness": {
         "title": "完整 harness 工具集（不可用的会自动跳过）",
         "tools": ["web_search", "web_fetch", "weather", "mail_search", "mail_read",
-                  "mail_summary", "mail_draft", "read_file", "list_dir",
+                  "mail_summary", "mail_draft", "mail_to_event", "read_file", "list_dir",
                   "glob", "grep", "write_file", "edit_file", "run_command"],
     },
     # ★下一步讨论好的额外工具加在这里★，例如：

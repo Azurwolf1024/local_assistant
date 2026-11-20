@@ -682,6 +682,15 @@ priority_domains = []          # 例：["hkust-gz.edu.cn"]
 
 notify_high = true
 digest_hours = [9, 20]
+demote_expired = true          # 截止时间已过的通知降一档（「11月17日的课调了」别再弹窗）
+
+# —— 附件（按需抽，不跟同步一起拉）——
+attachment_chars = 4000        # 抽附件正文时最多给模型多少字
+max_attachment_mb = 8          # 超过这个大小只记清单、不下载
+
+# —— 邮件 → 日程（★写入仍然要人在卡片上点「加入」★）——
+link_events = true             # 允许 mail_to_event 从邮件里提事件
+auto_propose = false           # 重要邮件自动生成待批提议（默认关，免得老弹卡）
 
 # —— 发信（三道闸门）——
 allow_send = false             # ★改 true 才能发★

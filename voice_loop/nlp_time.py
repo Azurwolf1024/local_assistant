@@ -54,6 +54,11 @@ _PERIOD_FIX = {
     "今日晚": "今天晚上",
 }
 
+#: 机器时间写法：``2026-11-24 23:59`` / ``2026/11/24 23:59:00`` / ``2026-11-24``
+_ISO_DATETIME = re.compile(
+    r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?:[T\s]+(\d{1,2}):(\d{2})(?::\d{2})?)?"
+)
+
 
 def cn2num(text: str) -> int | None:
     """把「十五 / 23 / 两」这类写法转成整数；失败返回 None。"""
@@ -249,6 +254,17 @@ def parse_datetime(text: str, now: datetime | None = None, roll_forward: bool = 
     t = (text or "").strip()
     if not t:
         return None
+    # ★ISO 写法先认★：模型/邮件里给的常常是「2026-11-24 23:59」这种机器时间，
+    # 中文解析器只把它当成「23:59」→ 日期落回今天（实测过：24 号的截止变成今天）。
+    iso = _ISO_DATETIME.match(t)
+    if iso:
+        try:
+            found = datetime(int(iso.group(1)), int(iso.group(2)), int(iso.group(3)),
+                             int(iso.group(4) or 0), int(iso.group(5) or 0))
+        except ValueError:
+            found = None
+        if found is not None:
+            return found
     for src, dst in _PERIOD_FIX.items():
         t = t.replace(src, dst)
 

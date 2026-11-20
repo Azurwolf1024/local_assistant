@@ -18,9 +18,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from . import attachments as attachments_kit
 from .auth import Auth, AuthError, DeviceCode
 from .delta import Syncer
 from .graph import Graph, GraphError
+from .link import STATE_PENDING, EventProposer, EventQueue
 from .outbox import Outbox, STATE_SENT
 from .store import MailStore
 from .triage import Triage
@@ -115,6 +117,11 @@ class MailService:
         self._me: set[str] = set()
         #: 建完草稿后的回调（流水线接上「右下角审批卡」；没接就只留在库里）
         self.on_draft: Callable[[str], None] | None = None
+        #: 建完「日程提议」后的回调（同上一张卡，只是文案不同）
+        self.on_proposal: Callable[[str], None] | None = None
+        self.proposer = EventProposer(self.cfg, log=self.log, llm=llm)
+        #: 日程提议队列（``add_event`` 由流水线注入；没接就只提示「接口没接上」）
+        self.queue_event = EventQueue(self.store, log=self.log)
         self.triage = Triage(self.cfg, self.store, log=self.log, llm=llm, me=self._me)
         self.outbox = Outbox(
             self.store, self.cfg, graph=self.graph, log=self.log,
@@ -220,7 +227,22 @@ class MailService:
             since = moment.strftime("%Y-%m-%dT%H:%M:%SZ")
         rows = self.store.search(query, limit=limit, unread_only=unread_only,
                                  level=level, sender=sender, since_iso=since)
-        return [self._brief(r) for r in rows]
+        out = []
+        for row in rows:
+            brief = self._brief(row)
+            if brief["attachments"] is None:
+                brief["attachments"] = []
+            if row.get("has_attachments") and not brief["attachments"]:
+                # 索引里存过清单就直接用（同步时不拉，第一次问到时才拉）
+                brief["attachments"] = [
+                    {"name": a.get("name"), "size": a.get("size"),
+                     "kind": attachments_kit.kind_of(a.get("name") or "",
+                                                     a.get("content_type") or "")}
+                    for a in self.store.attachments_of(str(row.get("id") or ""))
+                    if not a.get("is_inline")
+                ]
+            out.append(brief)
+        return out
 
     def read(self, message_id: str, *, max_chars: int = 0) -> dict[str, Any]:
         row = self.store.get(message_id)
@@ -241,6 +263,7 @@ class MailService:
             except GraphError as exc:
                 self.log.warning(f"[mail] 拉正文失败（用摘要代替）：{exc.reason}")
                 body = str(row.get("preview") or "")
+        attachments = self.attachments(message_id, with_text=True)
         return {
             "ok": True,
             "id": message_id,
@@ -251,8 +274,64 @@ class MailService:
             "one_line": row.get("one_line") or "",
             "body": body[:limit] + ("…" if len(body) > limit else ""),
             "truncated": len(body) > limit,
+            "attachments": attachments,
             "web_link": row.get("web_link") or "",
         }
+
+    # ---------------------------------------------------------------- 附件
+    def attachments(self, message_id: str, *, with_text: bool = False) -> list[dict]:
+        """这封邮件的附件清单；``with_text`` 时顺便按需抽正文（有硬上限）。
+
+        ★只在真的要看这封邮件时才下载★：同步阶段只记 ``has_attachments``，
+        正文一个字节都不拉。
+        """
+        row = self.store.get(message_id)
+        if row is None:
+            return []
+        cached = self.store.attachments_of(message_id)
+        if not cached and row.get("has_attachments"):
+            cached = self._fetch_attachment_list(message_id)
+        if not with_text:
+            return cached
+        budget = int(getattr(self.cfg, "attachment_chars", 4000) or 4000)
+        max_mb = float(getattr(self.cfg, "max_attachment_mb", 8) or 8)
+        out = []
+        left = budget
+        for item in cached:
+            got = dict(item)
+            if left > 0 and not got.get("text") and attachments_kit.can_extract(
+                    got.get("name") or "", got.get("content_type") or ""):
+                if int(got.get("size") or 0) > max_mb * 1024 * 1024:
+                    got["note"] = f"太大（超过 {max_mb:.0f} MB），没有下载"
+                else:
+                    text = self._download_attachment_text(
+                        message_id, got, min(left, budget))
+                    if text:
+                        got["text"] = text
+                        self.store.set_attachment_text(message_id, str(got.get("att_id") or ""), text)
+                        left -= len(text)
+            out.append(got)
+        return out
+
+    def _fetch_attachment_list(self, message_id: str) -> list[dict]:
+        try:
+            items = self.graph.attachments(message_id)
+        except GraphError as exc:
+            self.log.info(f"[mail] 拉附件列表失败（忽略）：{exc.reason}")
+            return []
+        self.store.set_attachments(message_id, items)
+        return self.store.attachments_of(message_id)
+
+    def _download_attachment_text(self, message_id: str, item: dict, max_chars: int) -> str:
+        try:
+            data = self.graph.attachment_bytes(message_id, str(item.get("att_id") or ""))
+        except GraphError as exc:
+            self.log.info(f"[mail] 下载附件失败（{item.get('name')}）：{exc.reason}")
+            return ""
+        return attachments_kit.extract_text(
+            data, str(item.get("name") or ""), str(item.get("content_type") or ""),
+            max_chars=max_chars, log=self.log,
+        )
 
     def summary(self, *, since_hours: float = 24, only_important: bool = True) -> str:
         """一句话清单：给人念，也给模型做二次归纳。"""
@@ -270,6 +349,31 @@ class MailService:
             flag = "，需要回复" if row.get("needs_reply") else ""
             parts.append(f"{when}{who}：{what}{flag}")
         return head + "；".join(parts) + "。"
+
+    # ---------------------------------------------------------------- 事件联动
+    def propose_event(self, message_id: str, *, body: str = "") -> dict[str, Any]:
+        """把一封邮件读成一条「日程提议」（★不写日程★，等人点「加入」）。"""
+        row = self.store.get(message_id)
+        if row is None:
+            return {"ok": False, "error": "本地索引里没有这封邮件（先同步一下）"}
+        text = body
+        if not text:
+            got = self.read(message_id)
+            text = str(got.get("body") or "") if got.get("ok") else ""
+        proposal = self.proposer.propose(row, body=text)
+        if proposal is None:
+            return {"ok": False,
+                    "error": "这封邮件里没看出「有明确时间、要你去做」的事"}
+        item = self.queue_event.create(row, proposal)
+        if self.on_proposal is not None:
+            try:
+                self.on_proposal(str(item["id"]))
+            except Exception as exc:  # noqa: BLE001 - 弹卡片失败不影响提议落库
+                self.log.warning(f"[mail] 通知日程卡失败（忽略）：{exc}")
+        return {"ok": True, "proposal": item, "note": "等你确认后才会加进日程"}
+
+    def proposals(self) -> list[dict]:
+        return self.store.proposals(states=(STATE_PENDING,))
 
     # ---------------------------------------------------------------- 发信
     def draft(self, *, to: str | list[str], subject: str, body: str,
@@ -328,8 +432,10 @@ class MailService:
             "score": int(row.get("score") or 0),
             "category": row.get("category") or "",
             "needs_reply": bool(row.get("needs_reply")),
+            "deadline": row.get("deadline") or "",
             "one_line": row.get("one_line") or "",
             "preview": (row.get("preview") or "")[:120],
+            "attachments": list(row.get("attachments") or []),
         }
 
     def close(self) -> None:

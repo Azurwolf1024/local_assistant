@@ -121,15 +121,26 @@ class ApprovalCard:
 
     def __init__(
         self,
-        queue: ApprovalQueue,
+        queue: Any,
         *,
         host: Any = None,
         timeout: float = DEFAULT_TIMEOUT,
         width: int = 460,
         log: logging.Logger | None = None,
         on_empty: Callable[[], None] | None = None,
+        title: str = "",
+        ok_text: str = "",
+        no_text: str = "",
+        hint: str = "",
     ) -> None:
         self.queue = queue
+        # 邮件草稿 / 日程提议共用这一张卡：只换文案，不换交互（``kind`` 由队列自己声明）
+        is_event = str(getattr(queue, "kind", "mail")) == "event"
+        self.title = title or ("要不要加进日程？" if is_event else "要发一封邮件")
+        self.ok_text = ok_text or ("加入" if is_event else "发送")
+        self.no_text = no_text or ("忽略" if is_event else "取消")
+        self.hint = hint or ("想改时间就说「改成…」" if is_event else "要改就说「把这封改成…」")
+        self.who_label = "时间" if is_event else "收件人"
         self._host = host
         self.timeout = max(10.0, float(timeout))
         self.width = max(280, int(width))
@@ -226,18 +237,19 @@ class ApprovalCard:
     def _build(self, root, draft: dict) -> Any:  # pragma: no cover - 需要图形环境
         import tkinter as tk
 
-        preview = self.queue.outbox.preview(draft)
+        previewer = getattr(self.queue, "preview", None)
+        preview = previewer(draft) if callable(previewer) else self.queue.outbox.preview(draft)
         win = tk.Toplevel(root)
-        win.title("要发一封邮件")
+        win.title(self.title)
         win.attributes("-topmost", True)
         win.resizable(False, False)
         win.configure(bg="#1b1f2a")
 
-        tk.Label(win, text="要发一封邮件", bg="#1b1f2a", fg="#8fd3ff",
+        tk.Label(win, text=self.title, bg="#1b1f2a", fg="#8fd3ff",
                  font=("Microsoft YaHei UI", 11, "bold"), anchor="w").pack(
             fill="x", padx=14, pady=(10, 2))
         to_line = preview["to"] + (f"（抄送 {preview['cc']}）" if preview["cc"] else "")
-        tk.Label(win, text=f"收件人：{to_line}", bg="#1b1f2a", fg="#f2f4f8",
+        tk.Label(win, text=f"{self.who_label}：{to_line}", bg="#1b1f2a", fg="#f2f4f8",
                  font=("Microsoft YaHei UI", 10), anchor="w",
                  wraplength=self.width - 28, justify="left").pack(fill="x", padx=14)
         tk.Label(win, text=f"主题：{preview['subject']}", bg="#1b1f2a", fg="#f2f4f8",
@@ -250,7 +262,7 @@ class ApprovalCard:
         self._countdown = tk.Label(win, text="", bg="#1b1f2a", fg="#8b93a7",
                                    font=("Microsoft YaHei UI", 9), anchor="w")
         self._countdown.pack(fill="x", padx=14)
-        tk.Label(win, text="要改就说「把这封改成…」", bg="#1b1f2a", fg="#8b93a7",
+        tk.Label(win, text=self.hint, bg="#1b1f2a", fg="#8b93a7",
                  font=("Microsoft YaHei UI", 9), anchor="w").pack(fill="x", padx=14)
 
         row = tk.Frame(win, bg="#1b1f2a")
@@ -262,11 +274,11 @@ class ApprovalCard:
         def cancel() -> None:
             self._decide("cancel")
 
-        tk.Button(row, text="发送", command=send, relief="flat", bg="#2f6feb", fg="white",
+        tk.Button(row, text=self.ok_text, command=send, relief="flat", bg="#2f6feb", fg="white",
                   activebackground="#1d5ad4", activeforeground="white",
                   font=("Microsoft YaHei UI", 10), padx=18, pady=2,
                   cursor="hand2").pack(side="right")
-        tk.Button(row, text="取消", command=cancel, relief="flat", bg="#39404f", fg="#e6eaf2",
+        tk.Button(row, text=self.no_text, command=cancel, relief="flat", bg="#39404f", fg="#e6eaf2",
                   activebackground="#2b3240", activeforeground="white",
                   font=("Microsoft YaHei UI", 10), padx=16, pady=2,
                   cursor="hand2").pack(side="right", padx=(0, 8))

@@ -59,6 +59,15 @@ def _requests_transport(method: str, url: str, *, headers: dict, params: dict | 
     return resp.status_code, dict(resp.headers or {}), body
 
 
+def _requests_binary(method: str, url: str, *, headers: dict,
+                     timeout: float) -> tuple[int, dict, bytes]:
+    """附件 ``/$value`` 用：返回原始字节（不能按 JSON 解析）。"""
+    import requests  # noqa: PLC0415
+
+    resp = requests.request(method, url, headers=headers, timeout=timeout)
+    return resp.status_code, dict(resp.headers or {}), resp.content
+
+
 def _addr(entry: Any) -> dict[str, str]:
     """Graph 的收件人结构 → ``{"name": ..., "address": ...}``。"""
     if not isinstance(entry, dict):
@@ -106,6 +115,7 @@ class Graph:
         timeout: float = 20.0,
         base: str = GRAPH,
         request: Transport | None = None,
+        request_raw: Callable[..., tuple[int, dict, bytes]] | None = None,
         sleep: Callable[[float], None] | None = None,
     ) -> None:
         self.auth = auth
@@ -113,6 +123,7 @@ class Graph:
         self.timeout = float(timeout)
         self.base = base.rstrip("/")
         self._request = request or _requests_transport
+        self._request_raw = request_raw or _requests_binary
         self._sleep = sleep or time.sleep
 
     # ------------------------------------------------------------------ 底层
@@ -273,6 +284,41 @@ class Graph:
         out["body_html"] = str(body.get("content") or "") if isinstance(body, dict) else ""
         out["body_type"] = str(body.get("contentType") or "text") if isinstance(body, dict) else "text"
         return out
+
+    # ------------------------------------------------------------------ 附件
+    def attachments(self, message_id: str) -> list[dict[str, Any]]:
+        """附件清单（不下载内容）。内联图片也在里面，靠 ``is_inline`` 区分。"""
+        raw = self.call(
+            "GET", f"/me/messages/{message_id}/attachments",
+            params={"$select": "id,name,contentType,size,isInline"},
+        ) or {}
+        out = []
+        for item in raw.get("value") or []:
+            if not isinstance(item, dict):
+                continue
+            out.append({
+                "id": str(item.get("id") or ""),
+                "name": str(item.get("name") or ""),
+                "content_type": str(item.get("contentType") or ""),
+                "size": int(item.get("size") or 0),
+                "is_inline": bool(item.get("isInline")),
+            })
+        return out
+
+    def attachment_bytes(self, message_id: str, attachment_id: str) -> bytes:
+        """下载附件原始字节（``/$value`` 返回的是二进制，不能走 JSON 那条路）。"""
+        url = (f"{self.base}/me/messages/{message_id}/attachments/{attachment_id}/$value")
+        refreshed = False
+        while True:
+            status, _, data = self._request_raw(
+                "GET", url, headers=self.auth.headers(), timeout=self.timeout)
+            if status == 200:
+                return data or b""
+            if status == 401 and not refreshed:
+                refreshed = True
+                self.auth.token(force=True)
+                continue
+            raise GraphError(f"下载附件失败 HTTP {status}", status=status)
 
     # ------------------------------------------------------------------ 写
     def create_draft(

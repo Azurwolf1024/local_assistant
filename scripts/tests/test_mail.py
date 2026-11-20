@@ -27,6 +27,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
+from voice_loop.mail import attachments as attachments_kit  # noqa: E402
 from voice_loop.mail import auth as auth_mod  # noqa: E402
 from voice_loop.mail.approve import ApprovalQueue  # noqa: E402
 from voice_loop.mail.delta import CURSOR_KEY, Syncer  # noqa: E402
@@ -85,6 +86,7 @@ class FakeGraph:
         self.fail_send: Exception | None = None
         self.gone_once = False
         self.calls: list[str] = []
+        self.attachment_data: dict[str, bytes] = {}
 
     # 读
     def list_recent(self, *, folder: str = "inbox", since_iso: str = "",
@@ -123,6 +125,15 @@ class FakeGraph:
 
     def me(self) -> dict:
         return {"name": "测试账号", "mail": "me@x.com"}
+
+    # 附件
+    def attachments(self, message_id: str) -> list[dict]:
+        self.calls.append("attachments")
+        return []
+
+    def attachment_bytes(self, message_id: str, attachment_id: str) -> bytes:
+        self.calls.append("attachment_bytes")
+        return self.attachment_data.get(attachment_id, b"")
 
     # 写
     def create_draft(self, *, to, subject, body_text, cc=None, reply_to: str = "") -> dict:
@@ -468,8 +479,9 @@ def test_mcp(tmp: Path) -> None:
     queued: list[str] = []
     server = mailsrv.build_server(settings, service=svc, on_draft=queued.append)
     names = [getattr(t, "name", "") for t in server.tools()]
-    check("5 个工具都在", sorted(names),
-          ["mail_draft", "mail_read", "mail_search", "mail_send", "mail_summary"])
+    check("6 个工具都在", sorted(names),
+          ["mail_draft", "mail_read", "mail_search", "mail_send", "mail_summary",
+           "mail_to_event"])
 
     handler = server.call_tool
 
@@ -565,6 +577,125 @@ def test_graph_http(tmp: Path) -> None:
           g5.delta_cursor_from_now(folder="all"), "")
 
 
+def test_attachments(tmp: Path) -> None:
+    print("\n[10] 附件：只记清单 + 按需抽正文（不联网）")
+    settings, cfg = make_cfg(tmp / "att")
+    graph = FakeGraph()
+    svc = MailService(settings, graph=graph)
+    svc.auth.save(auth_mod.Token(access_token="t-att", refresh_token="r-att",
+                                 expires_at=time.time() + 3600))
+    msg = normalize_message(raw_msg("a1", subject="附件测试", sender="a@x.com"))
+    msg["has_attachments"] = True
+    svc.store.upsert_messages([msg])
+    svc.store.set_attachments("a1", [
+        {"id": "att-1", "name": "成绩单.pdf", "content_type": "application/pdf",
+         "size": 2400, "is_inline": False},
+        {"id": "att-2", "name": "备注.txt", "content_type": "text/plain",
+         "size": 30, "is_inline": False},
+        {"id": "att-3", "name": "logo.png", "content_type": "image/png",
+         "size": 900, "is_inline": True},
+    ])
+    listing = svc.attachments("a1", with_text=False)
+    check("清单里有 3 个（含内联图）", len(listing), 3)
+    check("按名字能搜到（附件名参与检索）",
+          [r["id"] for r in svc.search("成绩单")], ["a1"])
+    check("人话清单只报非内联的（按名字排）", attachments_kit.describe(listing),
+          "备注.txt（30 B）、成绩单.pdf（2.3 KB）")
+
+    # ★按需抽正文★：txt 能抽，pdf 没装库时抽不到也不炸
+    graph.attachment_data = {"att-2": "第一行\n第二行".encode("utf-8")}
+    got = svc.read("a1")
+    files = {f["name"]: f for f in got["attachments"]}
+    check("txt 抽到了正文", "第一行" in (files["备注.txt"].get("text") or ""), True,
+          detail=str(files["备注.txt"].get("text"))[:40])
+    check("图片不抽正文（只留清单）", (files["logo.png"].get("text") or ""), "")
+
+    # 太大就不下载（换一封没缓存过的，否则用的是上次抽好的文本）
+    cfg.max_attachment_mb = 0.001
+    msg2 = normalize_message(raw_msg("a2", subject="大附件", sender="b@x.com"))
+    msg2["has_attachments"] = True
+    svc.store.upsert_messages([msg2])
+    svc.store.set_attachments("a2", [
+        {"id": "att-9", "name": "扫描件.txt", "content_type": "text/plain",
+         "size": 9000, "is_inline": False}])
+    big = svc.attachments("a2", with_text=True)
+    note = big[0].get("note") or ""
+    check("超过 max_attachment_mb 就只留清单", "太大" in note, True, detail=note)
+    svc.close()
+
+
+def test_expired_demote(tmp: Path) -> None:
+    print("\n[11] 过期降权：截止时间已过的通知降一档")
+    settings, cfg = make_cfg(tmp / "exp")
+    triage = Triage(cfg)
+    base = {"score": 70, "level": "high", "category": "deadline",
+            "deadline": "2020-01-01", "reasons": ["命中「截止」"]}
+    out = triage.demote_if_expired(base)
+    check("★过期的 high 降成 medium★", out["level"], "medium")
+    check("理由里说清楚为什么降", any("已过" in r for r in out["reasons"]), True,
+          detail=str(out["reasons"]))
+
+    future = dict(base, deadline=datetime.now().strftime("%Y-%m-%d"))
+    check("今天到期的不降", triage.demote_if_expired(future)["level"], "high")
+    check("没有截止时间的不动",
+          triage.demote_if_expired(dict(base, deadline=""))["level"], "high")
+    cfg.demote_expired = False
+    check("配置关掉就完全不降", triage.demote_if_expired(base)["level"], "high")
+
+
+def test_event_link(tmp: Path) -> None:
+    print("\n[12] 邮件 → 日程：模型只提议，人点了才写")
+    settings, cfg = make_cfg(tmp / "evt")
+    graph = FakeGraph()
+    svc = MailService(settings, graph=graph)
+    svc.auth.save(auth_mod.Token(access_token="t-evt", refresh_token="r-evt",
+                                 expires_at=time.time() + 3600))
+    row = normalize_message(raw_msg("m9", subject="作业3已发布，11月24日截止",
+                                    sender="ta@school.edu"))
+    row["deadline"] = "2026-11-24"
+    svc.store.upsert_messages([row])
+
+    got = svc.propose_event("m9")
+    check("提出来一条待批提议", bool(got.get("ok")), True, detail=str(got)[:120])
+    item = got.get("proposal") or {}
+    check("提议里有标题和时间", (bool(item.get("title")), bool(item.get("when_text"))),
+          (True, True), detail=f"{item.get('title')} / {item.get('when_text')}")
+    check("★提议阶段不写日程★", svc.store.proposals(), [
+        x for x in svc.store.proposals() if x["id"] == item["id"]])
+
+    written: list[dict] = []
+    queue = svc.queue_event
+    queue.add_event = lambda it: (written.append(it), 7)[1]
+    ok, msg = queue.decide(item["id"], "send")
+    check("★点「加入」才真的写★", (ok, len(written)), (True, 1), detail=msg)
+    check("写进去的是这条提议", written[0]["title"], item["title"])
+    check("状态改成 accepted",
+          svc.store.get_proposal(item["id"])["state"], "accepted")
+
+    row2 = normalize_message(raw_msg("m10", subject="订阅周报", sender="news@x.com"))
+    svc.store.upsert_messages([row2])
+    check("没时间没动作的邮件不提议",
+          svc.propose_event("m10").get("ok"), False)
+
+    # 英文邮件也认（模型可用时模型说了算；这里测规则兜底那条路）
+    row3 = normalize_message(raw_msg("m11", subject="Final Exam Timetable released",
+                                     sender="reg@school.edu"))
+    row3["deadline"] = "2026-12-14"
+    row3["preview"] = "Please check the exam schedule and register before Dec 14."
+    svc.store.upsert_messages([row3])
+    got3 = svc.propose_event("m11")
+    check("★英文邮件也能提出事件（有 deadline 就算数）★",
+          bool(got3.get("ok")), True, detail=str(got3)[:100])
+
+    # 忽略
+    got2 = svc.propose_event("m9")
+    ok2, msg2 = queue.decide(got2["proposal"]["id"], "cancel")
+    check("点「忽略」不写日程", (ok2, len(written)), (True, 1), detail=msg2)
+    check("忽略后状态是 skipped",
+          svc.store.get_proposal(got2["proposal"]["id"])["state"], "skipped")
+    svc.close()
+
+
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="mail_"))
     try:
@@ -577,6 +708,9 @@ def main() -> int:
         test_notify(tmp)
         test_mcp(tmp)
         test_graph_http(tmp)
+        test_attachments(tmp)
+        test_expired_demote(tmp)
+        test_event_link(tmp)
     finally:
         import shutil
 

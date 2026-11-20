@@ -53,6 +53,32 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_msg_received ON messages(received_at DESC);
 CREATE INDEX IF NOT EXISTS idx_msg_level ON messages(level, received_at DESC);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS attachments (
+    message_id TEXT NOT NULL,
+    att_id TEXT NOT NULL,
+    name TEXT DEFAULT '',
+    content_type TEXT DEFAULT '',
+    size INTEGER DEFAULT 0,
+    is_inline INTEGER DEFAULT 0,
+    text TEXT DEFAULT '',
+    cached_at REAL DEFAULT 0,
+    PRIMARY KEY (message_id, att_id)
+);
+CREATE INDEX IF NOT EXISTS idx_att_name ON attachments(name);
+CREATE TABLE IF NOT EXISTS proposals (
+    id TEXT PRIMARY KEY,
+    message_id TEXT DEFAULT '',
+    title TEXT DEFAULT '',
+    when_text TEXT DEFAULT '',
+    when_iso TEXT DEFAULT '',
+    place TEXT DEFAULT '',
+    source TEXT DEFAULT '',
+    reason TEXT DEFAULT '',
+    state TEXT DEFAULT 'pending',
+    created_at REAL DEFAULT 0,
+    decided_at REAL DEFAULT 0,
+    event_id INTEGER DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS drafts (
     id TEXT PRIMARY KEY,
     created_at REAL DEFAULT 0,
@@ -221,13 +247,49 @@ class MailStore:
             sql += " AND sender LIKE ?"
             args.append(f"%{sender.lower()}%")
         for token in _split_tokens(query):
+            # 附件名也参与检索：问「那个 PDF」「附件里有什么」时得找得到
             sql += (" AND (subject LIKE ? OR sender LIKE ? OR sender_name LIKE ?"
-                    " OR preview LIKE ? OR body_text LIKE ?)")
+                    " OR preview LIKE ? OR body_text LIKE ?"
+                    " OR id IN (SELECT message_id FROM attachments WHERE name LIKE ?))")
             like = f"%{token}%"
-            args.extend([like, like, like, like, like])
+            args.extend([like, like, like, like, like, like])
         sql += " ORDER BY received_at DESC LIMIT ?"
         args.append(max(1, int(limit)))
         return [self._row(r) for r in self._query(sql, args)]
+
+    # ------------------------------------------------------------------ 附件
+    def set_attachments(self, message_id: str, items: list[dict]) -> None:
+        """整批替换这封邮件的附件清单（Graph 每次都返回全量，replace 最简单）。"""
+        self._exec("DELETE FROM attachments WHERE message_id = ?", (message_id,))
+        for item in items or []:
+            self._exec(
+                "INSERT OR REPLACE INTO attachments(message_id, att_id, name, content_type,"
+                " size, is_inline, text, cached_at) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    message_id, str(item.get("id") or ""), str(item.get("name") or ""),
+                    str(item.get("content_type") or ""), int(item.get("size") or 0),
+                    1 if item.get("is_inline") else 0, str(item.get("text") or ""),
+                    float(item.get("cached_at") or 0.0),
+                ),
+            )
+
+    def attachments_of(self, message_id: str) -> list[dict]:
+        rows = self._query(
+            "SELECT * FROM attachments WHERE message_id = ? ORDER BY is_inline, name",
+            (message_id,),
+        )
+        out = []
+        for row in rows:
+            item = dict(row)
+            item["is_inline"] = bool(item.get("is_inline"))
+            out.append(item)
+        return out
+
+    def set_attachment_text(self, message_id: str, att_id: str, text: str) -> None:
+        self._exec(
+            "UPDATE attachments SET text = ?, cached_at = ? WHERE message_id = ? AND att_id = ?",
+            (str(text or ""), time.time(), message_id, att_id),
+        )
 
     def recent(self, *, limit: int = 20, level: str = "") -> list[dict]:
         return self.search("", limit=limit, level=level)
@@ -303,6 +365,39 @@ class MailStore:
         sets = ", ".join(f"{k} = ?" for k in fields)
         self._exec(f"UPDATE drafts SET {sets} WHERE id = ?",
                    [*fields.values(), draft_id])
+
+    # ------------------------------------------------------------------ 事件提议
+    def create_proposal(self, item: dict) -> None:
+        self._exec(
+            "INSERT OR REPLACE INTO proposals(id, message_id, title, when_text, when_iso,"
+            " place, source, reason, state, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (
+                str(item["id"]), str(item.get("message_id") or ""),
+                str(item.get("title") or ""), str(item.get("when_text") or ""),
+                str(item.get("when_iso") or ""), str(item.get("place") or ""),
+                str(item.get("source") or ""), str(item.get("reason") or ""),
+                str(item.get("state") or "pending"), float(item.get("created_at") or time.time()),
+            ),
+        )
+
+    def get_proposal(self, proposal_id: str) -> dict | None:
+        rows = self._query("SELECT * FROM proposals WHERE id = ?", (proposal_id,))
+        return dict(rows[0]) if rows else None
+
+    def proposals(self, *, states: tuple[str, ...] = ("pending",)) -> list[dict]:
+        marks = ", ".join("?" for _ in states)
+        rows = self._query(
+            f"SELECT * FROM proposals WHERE state IN ({marks}) ORDER BY created_at",
+            states,
+        )
+        return [dict(r) for r in rows]
+
+    def set_proposal(self, proposal_id: str, **fields: Any) -> None:
+        if not fields:
+            return
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        self._exec(f"UPDATE proposals SET {sets} WHERE id = ?",
+                   [*fields.values(), proposal_id])
 
     # ------------------------------------------------------------------ 行转换
     @staticmethod
