@@ -36,6 +36,7 @@ class MailWatcher:
         self._thread: threading.Thread | None = None
         self.last: dict[str, Any] = {}
         self.cycles = 0
+        self._warned = False
 
     # ---------------------------------------------------------------- 生命周期
     def start(self) -> bool:
@@ -62,6 +63,18 @@ class MailWatcher:
         """跑一轮（自测直接调它，不用开线程）。"""
         self.cycles += 1
         result: dict[str, Any] = {"cycle": self.cycles}
+        # 没登录 / 没配 client_id 就别每 3 分钟刷一行警告（第一次说一句就够）
+        ready = getattr(self.service, "ready", None)
+        if callable(ready):
+            ok, why = ready()
+            if not ok:
+                if not self._warned:
+                    self.log.info(f"[mail] 巡检跳过：{why}")
+                    self._warned = True
+                result.update({"ok": False, "skipped": why})
+                self.last = result
+                return result
+            self._warned = False
         try:
             result["sync"] = self.service.sync()
             fresh = self.service.store.untriaged(limit=5)
