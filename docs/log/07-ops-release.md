@@ -1116,4 +1116,63 @@ UI 改动最容易「自我感觉良好」。这次每改一个就从屏幕右�
 
 ---
 
+## 72. 控制台也换成 dsh 那套语言（2026-11-20 深夜，用户要求「前端 UI 尽量做到和 dsh 一样，包括控制台」）
+
+弹窗/字幕/审批卡在第 68 节已经换过了，但**网页控制台还是旧皮**（150px 侧栏、6px 圆角、
+`#2b4a78` 那种蓝、粗灰滚动条）。这一轮把 `console/static/` 拉到同一套 token 上，
+顺手修掉三个真机看得见的小毛病。
+
+### 72.1 只改样式表，不动结构
+
+`index.html` 一行没改，`panels/*.js` 一行没改 —— 控制台没有构建步骤，面板靠手写字符串拼 DOM，
+**换皮只能老老实实保留所有现有 class 名**（52 条规则对 43 个在用的 class）。
+重写后 `style.css` 的 token 与 `ui_kit` 逐项对齐：
+
+| CSS 变量 | 深色 | 浅色 | ui_kit |
+| --- | --- | --- | --- |
+| `--bg` / `--bg-soft` | `#1f2023` / `#26272b` | `#f6f7f9` / `#ffffff` | `bg` / `bg_soft`（浅色网页里「纸」和「卡」是反的，故意不同） |
+| `--line` | `#3a3b40` | `#e3e5e8` | `border` |
+| `--fg` / `--fg-dim` | `#f2f4f7` / `#9aa0a6` | `#1b1c1e` / `#8b9096` | `fg` / `fg_mute` |
+| `--accent` / `--accent-hover` | `#3b82f6` / `#2563eb` | 同左 | `accent` / `accent_hover` |
+| `--radius` / `--radius-sm` | `12px` / `8px` | 同左 | `RADIUS` / `RADIUS_SM` |
+
+另外补了这些以前完全没有的东西：`:focus-visible` 焦点环（键盘 Tab 才看得见在哪）、
+细而圆的滚动条、表头吸顶、表格行悬停、`label.field` 的小灰标签、`.tag.ok/warn/err` 的淡色底。
+
+### 72.2 提示条：顶部横幅 → 右下角浮起的小卡片
+
+原来是 `#banner` 一条横幅挂在顶栏下面：一闪而过、把布局往下顶、看着像报错。
+现在 `toast()` 自己建一个 `#toasts` 固定容器，往右下角叠卡片（左边一条色条区分
+ok/warn/err，点一下关掉，超过 4 条挤掉最旧的）。**注意它不只是换皮**：
+`toast._t` 那个「一条 timer 复用」的写法换成了每条自己的 timer，否则连点几下只有最后一条会消失。
+
+### 72.3 窄窗口：托盘拉起的小窗只有 450~640px
+
+真机截图才发现的：`.week` 是 `repeat(7, 1fr)`，七列挤在 296px 里字都叠在一起；
+操作列的 `.row` 会 wrap，四个按钮折成四行把行高撑到 100px。加了两处：
+
+- `td.act .row { flex-wrap: nowrap }` + 按钮缩到 `3px 7px / 11.5px`：**永远一行**
+- `@media (max-width: 760px)`：侧栏变顶部横条（`overflow-x: auto`）、卡片 `overflow-x: auto`
+  自己横向滚、`.week` 换成 `auto-fit minmax(104px, 1fr)`、单元格 padding 收到 `6px 5px`
+
+### 72.4 自测：把「JS 加了 class、CSS 忘了写」钉死
+
+`scripts/tests/test_console_ui.py`（纯静态、不启服务）：
+
+1. **每个用到的 class 都有定义** —— 从 `index.html` + `app.js`/`ui.js`/`panels/*.js`
+   里抠 `class="…"`、`class: "…"`、`cls: "…"`、`className = "…"`，去掉注释、
+   跳过 `"l-" + level` 这种动态前缀，跟样式表里的选择器对一遍。
+   这类 bug 不会报错，只是「那块没样式」，而且只有点进那个面板才看得见。
+2. **提示条还活着**：`toast()` 里有 `#toasts`、不再往 `#banner` 塞文字、容器 `position: fixed`。
+3. **配色跟桌面端对得上**：上面那张表逐项断言（深色 10 项 + 浅色 4 项 + 圆角 + 字体）。
+   改 `ui_kit` 忘了改 CSS（或反过来）会直接红。
+4. **几条踩过的坑**：`.grid > .card { min-width: 0 }`、`overflow-wrap: anywhere`、
+   `td.act .row { flex-wrap: nowrap }`、窄窗口断点、`repeat(7, minmax(0, 1fr))`。
+
+浏览器真机验证用的是 960×633 和 640×633 两个宽度各截一遍（概览/日程/日志/角色/对话），
+深色浅色都看 —— 「样式改了但没生效」这种事，只有截图能发现（静态检查会全绿）。
+
+---
+
+
 ---

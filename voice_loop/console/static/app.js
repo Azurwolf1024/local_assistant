@@ -18,13 +18,27 @@ window.Console = (function () {
   // ------------------------------------------------------------------ DOM 小工具
   const $ = (sel) => document.querySelector(sel);
 
+  // 提示条：右下角浮起来的卡片，点一下就关（原来是顶部横幅，太容易被忽略）
   function toast(message, kind = "ok", ms = 4200) {
-    const box = $("#banner");
-    box.className = "banner " + kind;
-    box.textContent = message;
-    box.classList.remove("hidden");
-    clearTimeout(toast._t);
-    toast._t = setTimeout(() => box.classList.add("hidden"), ms);
+    let wrap = document.getElementById("toasts");
+    if (!wrap) {
+      wrap = document.createElement("div");
+      wrap.id = "toasts";
+      document.body.appendChild(wrap);
+    }
+    const el = document.createElement("div");
+    el.className = "toast " + kind;
+    el.textContent = message;
+    wrap.appendChild(el);
+    requestAnimationFrame(() => el.classList.add("in"));
+    while (wrap.children.length > 4) wrap.removeChild(wrap.firstChild);
+    const close = () => {
+      clearTimeout(timer);
+      el.classList.remove("in");
+      setTimeout(() => el.remove(), 220);
+    };
+    const timer = setTimeout(close, ms);
+    el.addEventListener("click", close);
   }
 
   // ------------------------------------------------------------------ 接口调用
