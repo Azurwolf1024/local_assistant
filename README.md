@@ -245,6 +245,7 @@ flowchart LR
 │  ├─ hotkey.py                # ★ 按 Esc 打断：裸按键监听，只在说话时读键盘
 │  ├─ subtitle.py              # 底部半透明字幕（帮手里说的话都显示出来，跟声音同步）
 │  ├─ toast.py                 # 右下角可视提醒弹窗
+│  ├─ tray.py                  # 通知区域小图标：右键停止/启动服务、打开控制台、看日志
 │  ├─ ui.py                    # Tk 窗口宿主（一个进程只能有一个 Tk 解释器）
 │  ├─ nlp_time.py              # 中文时间解析（明天早上七点 / 十分钟后 / 下周三）
 │  ├─ store.py                 # JSON 存储（★跨进程文件锁★、外部改动自动重载、原子写入）
@@ -319,8 +320,9 @@ flowchart LR
 ```powershell
 python main.py setup          # 一键把机器准备好
 python main.py doctor         # 只读体检
+python main.py listen -B      # 唤醒服务（右下角会出现托盘图标，右键可停止）
 python main.py ui             # 可视化控制台（日程/日志/声线/对话）
-scripts\tests\run_all.cmd # 跑全部离线自测
+scripts\tests\run_all.cmd     # 跑全部离线自测
 ```
 
 ## 许可与隐私

@@ -139,6 +139,7 @@ NEEDED = [
     ("piper", "piper-tts", "backend = piper", "warn"),
     ("pykakasi", "pykakasi", "参考音频是日语时转罗马字", "info"),
     ("PIL", "pillow", "截屏 / 看图", "warn"),
+    ("pystray", "pystray", "后台服务的托盘图标（右键停止服务）", "info"),
     ("cv2", "opencv-python", "摄像头取帧", "info"),
     ("pypdf", "pypdf", "读 .pdf", "info"),
     ("docx", "python-docx", "读 .docx", "info"),

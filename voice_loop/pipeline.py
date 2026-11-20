@@ -102,6 +102,14 @@ class DeferredAnswer:
     first_token: float = 0.0
 
 
+def _steps(marks: dict[str, float], base: float):
+    """把「各步骤的完成时刻」摊成 (名字, 耗时) —— 给收尾日志用。"""
+    previous = base
+    for name, moment in marks.items():
+        yield name, moment - previous
+        previous = moment
+
+
 def _turn_stamp(stats: TurnStats, *, first: bool) -> str:
     """这一轮的墙上时间。用户那句按「助手说完倒推开头」，助手那句就是现在。"""
     end = datetime.now()
@@ -2893,6 +2901,7 @@ class VoiceLoop:
 
     def close(self) -> None:
         self._stop.set()
+        t0 = time.perf_counter()
         # ★先让调度器停下★：它可能正在做梦，梦里会读上下文文件；
         # 让它和下面的收尾并发跑，容易出现「一边封段一边归档」的怪账。
         if self._dream_scheduler is not None:
@@ -2937,21 +2946,36 @@ class VoiceLoop:
             ui.shutdown()
         except Exception:  # noqa: BLE001
             pass
+        # ★收尾打点★：模型/音频设备拆解偶尔会卡十几秒甚至几分钟，只看到
+        # 「TTS 已卸载」然后没下文就只能靠猜。每步耗时都记一行。
+        marks: dict[str, float] = {}
         try:
             self.speaker.close()
+            marks["扬声器"] = time.perf_counter()
         finally:
             if self.mic is not None:
                 self.mic.close()
+            marks["麦克风"] = time.perf_counter()
             if self.asr is not None:
                 self.asr.close()
+            marks["识别"] = time.perf_counter()
             if self.kws is not None:
                 self.kws.close()
+            marks["唤醒"] = time.perf_counter()
             if self.lazy:
                 unload = getattr(self.tts, "unload", None)
                 if callable(unload):
                     unload()
+                marks["TTS"] = time.perf_counter()
                 if self.settings.wake.unload_llm:
                     self.llm.release()
+            marks["LLM"] = time.perf_counter()
+            try:
+                self.log.info("[收尾] " + " / ".join(
+                    "%s %.1fs" % (name, delta) for name, delta in _steps(marks, t0)
+                ))
+            except Exception:  # noqa: BLE001 - 日志不该挡住退出
+                pass
             # 只删属于自己的 pid 文件：
             # 否则 ask / text / 各种测试脚本一退出，就会把后台服务的 pid 文件误删掉
             try:

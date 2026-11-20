@@ -208,7 +208,7 @@ def cmd_ui(settings: Settings, args: argparse.Namespace) -> int:
     return console_serve(
         settings,
         host=args.host,
-        port=int(args.port),
+        port=int(args.port or settings.app.console_port or 8765),
         open_browser=not args.no_browser,
         window=window if window != "browser" else "",
         logger=logging.getLogger("voice_loop.console"),
@@ -251,9 +251,21 @@ def cmd_listen(settings: Settings, args: argparse.Namespace) -> int:
     loop = build_loop(settings, lazy_whisper=settings.wake.lazy_load, auto_sync=True)
     if getattr(args, "wake_file", None):
         loop.use_wake_file(args.wake_file)
+    tray = None
+    if not getattr(args, "no_tray", False):
+        # ★图标在 = 服务在★：托盘跑在服务进程里，右键「停止服务」= 写停止文件，
+        # 服务自己收尾退出、图标随之消失，不会留下孤儿进程（见 voice_loop/tray.py）。
+        from voice_loop import tray as tray_mod  # noqa: PLC0415
+
+        tray = tray_mod.start_embedded(settings, logging.getLogger("voice_loop"))
+        if tray is None:
+            print("  （托盘图标没起来，不影响服务；python main.py tray 可以单独起一个）",
+                  flush=True)
     try:
         loop.service()
     finally:
+        if tray is not None:
+            tray.stop()
         loop.close()
     return 0
 
@@ -378,6 +390,21 @@ def cmd_stop(settings: Settings, args: argparse.Namespace) -> int:
     stop_file.unlink(missing_ok=True)
     print("√ 唤醒服务已停止")
     return 0
+
+
+def cmd_tray(settings: Settings, args: argparse.Namespace) -> int:
+    """系统托盘图标：右键启停服务 / 打开控制台 / 看日志 / 退出。
+
+    ★独立进程★（和 `listen` 分开）：这样服务停了图标还在，能从菜单里再起回来。
+    `listen` 自己也会顺手起一个嵌入式图标（`[app] tray`），两者不要同时开。
+    """
+    from voice_loop import tray as tray_mod  # noqa: PLC0415
+
+    return tray_mod.run_standalone(
+        settings,
+        logging.getLogger("voice_loop.tray"),
+        block=not getattr(args, "no_block", False),
+    )
 
 
 def cmd_text(settings: Settings, args: argparse.Namespace) -> int:
@@ -1646,6 +1673,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--wake-file", default=None, help="唤醒词 json 路径（默认取 config.toml）")
     p.add_argument("-B", "--background", action="store_true", help="转到后台运行（无窗口）")
     p.add_argument("--stop-first", action="store_true", help="启动前先停掉已在运行的服务")
+    p.add_argument("--no-tray", action="store_true",
+                   help="不要托盘图标（默认会起一个，右键可停止服务）")
     p.add_argument("--mode", default=None)
     p.add_argument("--strategy", choices=["sensevoice", "whisper", "hybrid"], default=None)
     p.add_argument("--device", default=None)
@@ -1655,6 +1684,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("stop", help="停止后台运行的唤醒服务")
     p.set_defaults(func=cmd_stop)
+
+    p = sub.add_parser("tray", help="系统托盘图标：右键启停服务 / 打开控制台 / 看日志")
+    p.set_defaults(func=cmd_tray)
 
     p = sub.add_parser("text", help="打字调试（完整技能 + LLM + 语音播报）")
     p.add_argument("--no-tts", action="store_true", help="只输出文字")
@@ -1732,7 +1764,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("ui", help="可视化控制台（网页：日程/闹钟、备忘、日志、声线、对话）")
     p.add_argument("--host", default="127.0.0.1",
                    help="监听地址，默认只给本机；填 0.0.0.0 会让同局域网的人也能进来（能改你的日程，慎用）")
-    p.add_argument("--port", type=int, default=8765, help="端口，默认 8765")
+    p.add_argument("--port", type=int, default=None,
+                   help="端口（默认取 [app] console_port，出厂 8765）")
     p.add_argument("--no-browser", action="store_true", help="不要自动开浏览器")
     p.add_argument("--window", default="", choices=["", "auto", "pywebview", "edge", "browser"],
                    help="用应用窗口而不是浏览器标签页：auto = 有 pywebview 就用它、"
