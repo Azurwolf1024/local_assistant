@@ -277,7 +277,8 @@ def _dream_state(settings) -> dict:
     out["enabled"] = bool(getattr(dcfg, "enabled", False)) and \
         bool(getattr(ctx_cfg, "enabled", True))
     out["window"] = str(getattr(dcfg, "window", "") or "")
-    out["at_tokens"] = int(getattr(dcfg, "at_tokens", 0) or 0)
+    out["night_min_tokens"] = int(getattr(dcfg, "night_min_tokens", 0) or 0)
+    out["hard_tokens"] = int(getattr(dcfg, "hard_tokens", 0) or 0)
     want = str(getattr(cfg, "dir", "") or "")
     root = Path(str(getattr(settings, "root", ".") or "."))
     base = Path(want) if Path(want).is_absolute() else root / (want or "data/memory")

@@ -289,25 +289,39 @@ digest_days = 3               # 提示词里往前带几天的摘要（做梦产
 tail_tokens = 2000            # 「刚才聊的」原文最多占多少 token（按整轮砍，不切半句）
 local_tail_tokens = 800       # 本地模型那一档：窗口小、注意力弱，塞太多反而更糊涂
 
-# ── 做梦（夜里整理 + 压缩，见 voice_loop/memory/dream.py）─────────────────────
+# ── 做梦（整理 + 压缩，见 voice_loop/memory/dream.py）─────────────────────────
 # 白天只管聊天，判断「这条值不值得记」挪到离线做（Letta 的 sleep-time compute 思路）：
 #   rule  = 不调模型：封段 + 规则抽取 + 规则摘要（★本地角色只走这条★）
 #   agent = 云端角色：模型读完今天的对话，提交结构化提议，由确定性代码逐条校验后执行
+#
+# ★只有三个触发★（以前是「夜里到点必跑一次」，哪怕当天只说了三句话 —— 那是纯烧钱）：
+#   ① 深夜 且 够长：在 window 里随机挑一次，**并且** 没整理的内容 ≥ night_min_tokens 才做
+#                    （两个条件同时满足；不够长就跳过，日志里记一句「今天没攒够」）
+#   ② 积得太长    ：任意时刻 ≥ hard_tokens → 立刻做一次**规则版**压缩（毫秒级、不调模型）
+#                    这条是保命：不压就会把上下文顶爆
+#   ③ 模型主动 call：用户说「你整理一下记忆」→ request_dream 工具
+# 「空闲 20 分钟就自己醒一次」已经删掉：它和③重复，而且不请自来。
+# 另外关机时会补一次**规则版**（compress_on_close）：不调模型、不花钱，只为不让当天的对话
+# 因为「没赶上窗口」而永远变不成摘要。
+#
+# 积到多少算够？（1 token ≈ 1.3~1.5 个汉字，一轮日常对话约 100~300 token）
+#   8000 token  ≈ 一整天的长聊（30~60 轮）→ 夜里值得整理一次
+#   24000 token ≈ 上下文开始吃力的量   → 必须压，但只用规则版，不花模型的钱
 # 全部改动都留前镜像（context/dreams/<date>.json），`python main.py dream --undo <date>` 可整批回滚。
 [memory.dream]
 enabled = true
-window = "02:00-05:00"        # 每晚在这个窗口里挑一个时间做一次
+window = "02:00-05:00"        # 深夜窗口（条件①的一半）
 random = true                 # 窗口里随机挑（不是准点，免得每天同一秒醒）
 check_seconds = 30            # 调度器多久看一次条件
-idle_minutes = 20             # 空闲够久 + 攒够轮数 → 做一次小睡式的整理
-idle_min_turns = 8
-at_tokens = 3000              # 没做梦的新内容积到这么多 token → 立刻做**规则版**压缩
-min_turns = 4                 # 新内容少于这个数不值得做梦
+night_min_tokens = 8000       # ★条件①的另一半★：没攒够这么多 token 就跳过（省钱的主要开关）
+hard_tokens = 24000           # 条件②：积到这么多就压（只做规则版）
+min_turns = 4                 # 新内容少于这个数不值得做梦（再短压了也没信息）
+compress_on_close = true      # 关机时补一次规则版（不调模型、不花钱，只为不丢掉当天摘要）
 min_interval_minutes = 30     # 两次 agent 梦之间至少隔多久
 model = ""                    # 空 = 跟角色引擎；"api:deepseek-chat" = 整理用云端更强的模型
 max_rounds = 6                # agent 做梦最多几轮工具调用
 max_actions = 24              # 一次梦最多改多少条记忆
-allow_tool_call = true        # 允许角色在对话里主动调 request_dream（"你整理一下记忆"）
+allow_tool_call = true        # 允许角色在对话里主动调 request_dream（条件③）
 keep_days = 60                # dreams/ 可撤销记录保留多少天
 sync_after = true             # 梦完顺手推云端
 

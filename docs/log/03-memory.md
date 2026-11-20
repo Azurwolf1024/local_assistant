@@ -667,3 +667,72 @@ pending = context.new_turns()        # 上次做梦之后新长出来的
 | 回归 | `test_memory` / `test_memory_mcp`（工具数改 4）/ `test_memory_sync` / `test_agent_tools` / `test_tts_registry` / `test_console` / `test_offline` / `test_persona` / `test_mcp` / `test_tools` / `test_route` / `test_store_lock` | 全 EXIT=0 |
 
 ---
+
+## 73. 「每晚都做一次梦」太贵：把触发条件收紧成三条（2026-11-20 深夜）
+
+用户问得很准：「原来是 3000 token 还是 3000 轮？3000 token 有点少吧」，紧接着
+「每天晚上更新所有 Agent 记忆太奢侈了，明确做梦压缩机制」。查完发现**两件事都成立**：
+
+1. `at_tokens = 3000` 是 **token**（不是轮）。它统计的是 `ContextLog.pending_tokens()` ——
+   **上次做梦之后新增那些轮**折算的 token。按 1 token ≈ 1.3~1.5 个汉字算，
+   3000 token ≈ 2200~2800 字 ≈ 15~30 轮日常对话。
+2. 真正贵的不是它（它只做规则压缩、不调模型），而是**夜色窗口到点必跑**：
+   `02:00-05:00` 里随机挑一分钟，**哪怕当天只说了三句话也要起一次 agent 梦** ——
+   读一遍上下文 + 最多 6 轮工具调用 + 改 24 条记忆 + 推一次云端。收益接近零。
+
+### 73.1 三条触发（用户定的）
+
+| # | 条件 | 跑法 | 为什么 |
+| --- | --- | --- | --- |
+| ① | 深夜窗口 **且** 未整理内容 ≥ `night_min_tokens`（**8000**） | agent | 主路径。**两个条件同时满足才做**，不够长就只记一句「今天没攒够」 |
+| ② | 任意时刻 ≥ `hard_tokens`（**24000**） | rule | 保命：不压就会把上下文顶爆；规则版毫秒级、**不调模型** |
+| ③ | 模型主动调 `request_dream` | agent | 用户说「你整理一下记忆」 |
+
+用户选择：`night_min_tokens = 8000`、`hard_tokens = 24000`、② 只做规则版、**删掉空闲触发**。
+
+**删掉的是「空闲 20 分钟 + 8 轮就自己醒一次」**：它和③功能重复，而且不请自来 ——
+聊完刚起身倒杯水，它就开始烧 token。这是「奢侈」感最直接的来源。
+
+换算成体感：一天只说三五句（<1000 token）→ 不触发；正常用一天（2000~6000）→ 不触发；
+真聊了一大场（8000+）→ 夜里做一次。
+
+### 73.2 顺手补的两处诚实
+
+- **`compress_on_close`**（条件④，默认开）：退出时补一次**规则版**。它存在的原因是
+  「23 点关机、永远赶不上 02:00 窗口」→ 那天的对话永远变不成摘要。不调模型、不花钱，
+  所以留着；但它以前是**写死在 `_dream_on_close` 里、配置里看不见**的，现在有开关也有名字。
+- **`_note_too_short`**：到了窗口但没攒够时，在 `_dream_schedule.json` 写
+  `short_noted` + `short_detail`（`5200/8000 token、3/4 轮`），**一天只写一次**。
+  否则每 30 秒 tick 一次就会刷一行日志；顺便这也是「为什么昨晚没做梦」的唯一线索。
+  ★不把 `done` 置 true★ —— 后半夜又聊够了照样能做。
+
+### 73.3 接口变动
+
+- `MemoryDreamConfig`：`at_tokens` → `hard_tokens`；新增 `night_min_tokens`、`compress_on_close`；
+  删 `idle_minutes` / `idle_min_turns`。
+- `DreamScheduler.__init__` 去掉 `activity` 参数（它只为空闲触发服务）；
+  `pipeline._last_activity` 一并删掉（全项目只有这一处用）。
+- `request_dream` 的工具说明也改了：以前写「这轮聊了很多又快到结束时可以用」——
+  模型会把它当例行公事；现在是「**只在用户明确要求时调用**」。
+
+### 73.4 验证
+
+| 验的东西 | 怎么验 | 结果 |
+| --- | --- | --- |
+| 只有三个触发 | `test_memory_dream.py [8]`：`tick(now=...)` 注入时间——积得太长（rule）/ 深夜且够长（agent）/ 请求文件 / 手动 | 全过 |
+| 到点但不够长 → 不做 | 同上：`night_min_tokens=10000` + 2 轮 → 返回 None、内容一个字没动、`short_noted` 有值、`done` 仍为 false | 全过 |
+| 同一天只记一次 | 同上：再 tick 一次 `short_detail` 不变 | 全过 |
+| idle 彻底没了 | 同上：`not hasattr(dream, "idle_minutes")`，白天静默 tick 返回 None | 全过 |
+| 配置能读 | `python -c "load_settings()"` → `8000 / 24000 / True`，`idle_minutes` 已不存在 | 通过 |
+| 真机 | `python main.py dream --dry-run` → 如实报「新内容只有 2 轮（< 4），不值得做梦」，记忆一个字没改 | 通过 |
+| 回归 | 全套 53 个 + `lint_persona` | 全 EXIT=0 |
+
+### 73.5 文档
+
+「写详细一点」落在三处：`voice_loop/memory/README.md` 整份重写（目录地图逐个文件、
+一条对话的旅程 ASCII 图、做梦三触发表 + 8000/24000 怎么定的、自清洁五个动作、三层知识库、
+双路检索、上云与隐私、配置逐项表、排查「为什么昨晚没做梦」看哪个文件）；
+`docs/guide/memory.md` 的「五种触发」换成「三个触发 + 关机补一次」；
+`config.toml` 的 `[memory.dream]` 注释重写。
+
+---

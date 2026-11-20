@@ -10,7 +10,7 @@
     · agent 版拿假提议走完五道校验（pinned 保护 / 证据必须是对方说的 / NOOP）
     · `--undo` 整批回滚（episodes + facts + last_dream_seq + digest 都退回去）
     · 双时间：`supersede` 之后旧值不删，`include_invalid` 还能翻出来
-    · 调度器五种触发（时间用 `tick(now=...)` 注入，不靠真等）
+    · 调度器三个触发（时间用 `tick(now=...)` 注入，不靠真等）
 
     python scripts\\tests\test_memory_dream.py
 """
@@ -325,14 +325,15 @@ def test_supersede(tmp: Path) -> None:
 
 # --------------------------------------------------------------------------- #
 def test_scheduler(tmp: Path) -> None:
-    print("\n[8] 调度：到量 / 夜间随机窗口 / 空闲 / 模型主动请求（时间注入，不真等）")
+    print("\n[8] 调度：只有三个触发（深夜且够长 / 积得太长 / 被点名），时间注入不真等")
 
     def build(name: str, **cfg_kw):
         room = tmp / name
         room.mkdir(parents=True, exist_ok=True)
-        dream_cfg = MemoryDreamConfig(enabled=True, window="02:00-05:00", random=False,
-                                      check_seconds=1, min_turns=1,
-                                      min_interval_minutes=0, **cfg_kw)
+        base = {"enabled": True, "window": "02:00-05:00", "random": False,
+                "check_seconds": 1, "min_turns": 1, "min_interval_minutes": 0}
+        base.update(cfg_kw)
+        dream_cfg = MemoryDreamConfig(**base)          # type: ignore[arg-type]
         ctx_cfg = MemoryContextConfig(segment_tokens=10_000, segment_turns=1000)
         settings, hub = make_hub(room, dream=dream_cfg, context=ctx_cfg)
         made = {"n": 0}
@@ -342,20 +343,20 @@ def test_scheduler(tmp: Path) -> None:
             return Dreamer(settings, hub, cid)
 
         sched = DreamScheduler(settings, hub, make_dreamer=_make,
-                               character=lambda: "baize", activity=lambda: 0.0)
+                              character=lambda: "baize")
         return settings, hub, sched, made
 
-    # ① 到量：只做规则压缩
-    settings, hub, sched, _ = build("tokens", at_tokens=40, idle_minutes=0)
+    # ① 积得太长：任意时刻都压，且只走规则版
+    settings, hub, sched, _ = build("tokens", hard_tokens=40, night_min_tokens=0)
     mem = hub.for_character("baize")
     mem.context.append(turns(3))
     got = sched.tick(now=datetime(2026, 11, 19, 14, 0))
-    check("到量触发了一次", got is not None and got.ok, True)
-    check("★到量走规则版（不调模型）★", got.source, "rule")
+    check("积得太长就压（白天也压）", got is not None and got.ok, True)
+    check("★这条走规则版（不调模型）★", got.source, "rule")
     check("整理完就没新内容了", len(mem.context.new_turns()), 0)
 
-    # ② 夜间窗口：先挑好时间，再把表拨过去
-    settings, hub, sched, _ = build("window", at_tokens=0, idle_minutes=0)
+    # ② 深夜窗口 + 够长：两个条件都满足才做
+    settings, hub, sched, _ = build("night", hard_tokens=0, night_min_tokens=40)
     mem = hub.for_character("baize")
     mem.context.append(turns(2, day="2026-11-20"))
     off = sched.tick(now=datetime(2026, 11, 20, 0, 30))
@@ -366,20 +367,30 @@ def test_scheduler(tmp: Path) -> None:
     check("挑的时间在窗口里", "02:00" <= str(plan.get("at")) <= "05:00", True,
           detail=str(plan.get("at")))
     night = sched.tick(now=datetime(2026, 11, 20, 4, 59))
-    check("到点后做了一次", night is not None and night.ok, True)
+    check("到点且够长 → 做了一次", night is not None and night.ok, True)
     check("★一天只做一次★", json.loads(plan_path.read_text("utf-8")).get("done"), True)
 
-    # ③ 空闲
-    settings, hub, sched, _ = build("idle", at_tokens=0, idle_minutes=20,
-                                    idle_min_turns=2)
+    # ③ 只到点、不够长 → 跳过（★这就是省下来的那笔钱★）
+    settings, hub, sched, _ = build("shy", hard_tokens=0, night_min_tokens=10_000,
+                                    min_turns=4)
     mem = hub.for_character("baize")
-    mem.context.append(turns(2, day="2026-11-21"))
-    sched.activity = lambda: 1.0
-    idle = sched.tick(now=datetime(2026, 11, 21, 14, 0))
-    check("空闲够久也能触发", idle is not None and idle.ok, True)
+    mem.context.append(turns(2, day="2026-11-21"))       # 2 轮，远不到 10000 token
+    sched.tick(now=datetime(2026, 11, 21, 0, 30))
+    shy = sched.tick(now=datetime(2026, 11, 21, 4, 30))
+    check("到点但没攒够 → 不做梦", shy, None)
+    check("攒的内容一点没动", len(mem.context.new_turns()), 4)   # turns(2) = 2 问 + 2 答
+    shy_plan = json.loads((Path(settings.memory.dir) / "_dream_schedule.json")
+                          .read_text("utf-8"))
+    check("★记下了「今天没攒够」（不是 done）★", bool(shy_plan.get("short_noted")), True)
+    check("没被标成已完成（后半夜聊够了还能做）", shy_plan.get("done"), False)
+    # 再 tick 一次：不该重复刷日志/重复写盘
+    first_detail = str(shy_plan.get("short_detail") or "")
+    sched.tick(now=datetime(2026, 11, 21, 4, 59))
+    again = json.loads((Path(settings.memory.dir) / "_dream_schedule.json").read_text("utf-8"))
+    check("同一天只记一次（不再改写）", str(again.get("short_detail") or ""), first_detail)
 
     # ④ 模型主动请求（写请求文件 → 下一轮被读走）
-    settings, hub, sched, _ = build("tool", at_tokens=0, idle_minutes=0)
+    settings, hub, sched, _ = build("tool", hard_tokens=0, night_min_tokens=0)
     mem = hub.for_character("baize")
     mem.context.append(turns(2, day="2026-11-22"))
     req = Path(settings.memory.dir) / "_dream_requests.jsonl"
@@ -390,7 +401,7 @@ def test_scheduler(tmp: Path) -> None:
     check("请求文件被消费掉", req.is_file(), False)
 
     # ⑤ 手动 request()（预留给「随机时间唤醒」）
-    settings, hub, sched, made = build("manual", at_tokens=0, idle_minutes=0)
+    settings, hub, sched, made = build("manual", hard_tokens=0, night_min_tokens=0)
     mem = hub.for_character("baize")
     mem.context.append(turns(2, day="2026-11-23"))
     sched.request(reason="她自己想整理一下", source="manual")
@@ -398,6 +409,14 @@ def test_scheduler(tmp: Path) -> None:
     check("手动 request 也能触发", manual is not None and manual.ok, True)
     check("调度器每轮都会去拿 dreamer", made["n"] >= 1, True)
     check("此刻不该有排队里的请求了", sched._queue, [])          # noqa: SLF001
+
+    # ⑥ 删掉的那条：空闲再久也不会自己醒
+    settings, hub, sched, _ = build("no-idle", hard_tokens=0, night_min_tokens=10_000)
+    mem = hub.for_character("baize")
+    mem.context.append(turns(2, day="2026-11-24"))
+    check("★不再有 idle_minutes 这个开关★",
+          not hasattr(settings.memory.dream, "idle_minutes"), True)
+    check("白天静默也没有任何触发", sched.tick(now=datetime(2026, 11, 24, 14, 0)), None)
 
 
 def test_cache_accounting(tmp: Path) -> None:
@@ -461,7 +480,6 @@ def test_pipeline_hooks(tmp: Path) -> None:
     loop.character = SimpleNamespace(id="baize")
     loop.log = logging.getLogger("voice_loop.test")
     loop._session_file = tmp / "session-20261119-090000.jsonl"
-    loop._last_activity = 0.0
     loop.llm = SimpleNamespace(engine="api")      # 云端那档预算（本地那档见下面单独断言）
 
     loop._append_context(TurnStats(turn=1, user_text="我昨天说想吃火锅。",
@@ -471,7 +489,6 @@ def test_pipeline_hooks(tmp: Path) -> None:
     check("用户那句进了上下文", "我昨天说想吃火锅。" in texts)
     check("助手那句也进了", "那今晚去吃？" in texts)
     loop._write_session(TurnStats(turn=2, user_text="第二句。", answer="好。"))
-    check("记了活动时间（空闲触发要看它）", loop._last_activity > 0, True)
     after_two = len(mem.context.turns())
     check("第二轮也进去了", after_two, len(texts) + 2)
 

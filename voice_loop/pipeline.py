@@ -392,11 +392,10 @@ class VoiceLoop:
         # 于是第二天说「上次那张截图」也找得回来（文件还在就能再看一眼）。
         if self.skills is not None and getattr(self.skills, "vision", None) is not None:
             self.skills.last_image = self._last_seen_image
-        # ★做梦调度器★：夜里/空闲/到量/被点名时把上下文整理进 L2/L3 并压缩。
+        # ★做梦调度器★：深夜且够长 / 积得太长 / 被点名 时才把上下文整理进 L2/L3 并压缩。
         # 只在 listen/chat 这种「一直开着」的入口值得跑（一次性命令自己会做）。
         self.dreamer = None
         self._dream_scheduler = None
-        self._last_activity = time.time()
         dcfg = getattr(getattr(settings, "memory", None), "dream", None)
         if (self.memory_hub is not None and auto_sync
                 and getattr(dcfg, "enabled", False)):
@@ -2905,7 +2904,7 @@ class VoiceLoop:
             self.log.debug(f"[记忆] 缓存记账失败（忽略）：{exc}")
 
     def _start_dream_scheduler(self, dcfg) -> None:
-        """起一个后台线程，按「到量 / 夜间随机 / 空闲 / 被点名」触发做梦。"""
+        """起一个后台线程，按「深夜且够长 / 积得太长 / 被点名」三个触发决定要不要做梦。"""
         from .memory.dream import DreamScheduler  # noqa: PLC0415
 
         def _make(character: str):
@@ -2918,12 +2917,13 @@ class VoiceLoop:
         self._dream_scheduler = DreamScheduler(
             self.settings, self.memory_hub, make_dreamer=_make,
             character=lambda: self.character.id if self.character else "default",
-            activity=lambda: self._last_activity, logger=self.log,
+            logger=self.log,
         )
         self._dream_scheduler.start()
-        self.log.info(f"[梦] 调度器已启动：窗口 {getattr(dcfg, 'window', '')}，"
-                      f"到量 {getattr(dcfg, 'at_tokens', 0)} token，"
-                      f"空闲 {getattr(dcfg, 'idle_minutes', 0)} 分钟")
+        night = int(getattr(dcfg, "night_min_tokens", 0) or 0)
+        hard = int(getattr(dcfg, "hard_tokens", 0) or 0)
+        self.log.info(f"[梦] 调度器已启动：深夜 {getattr(dcfg, 'window', '')} 且攒够 "
+                      f"{night} token 才做；任意时刻积到 {hard} token 立刻压（规则版）")
 
     def _dream_llm(self, character: str):
         """做梦用的模型：`[memory.dream] model` 指谁就用谁，空则跟角色走。
@@ -3031,15 +3031,19 @@ class VoiceLoop:
     def _dream_on_close(self) -> None:
         """退出前补一次**规则版**梦：把今天的上下文封段 + 写摘要。
 
-        ★为什么要有★：夜里那次梦靠 `[memory.dream] window`（默认 02:00-05:00），
-        可你要是 23 点关机、第二天 9 点再开，那个窗口永远碰不到 —— 上下文就一天天
-        只增不减。所以退出时补一次：★只走规则版★（毫秒级、不花 token、不改事实判断），
-        真正的「该记什么」还是留给夜里那次 agent 梦。
+        ★为什么要有★：夜里那次梦要同时满足「窗口 + 够长」（`night_min_tokens`，默认 8000），
+        可你要是 23 点关机、第二天 9 点再开，那个窗口永远碰不到 —— 这一天的对话就永远
+        变不成摘要，第二天提示词里只剩 `tail_tokens` 那点原文。所以关机时补一次：
+        ★只走规则版★（毫秒级、**不调模型、不花 token**、不做价值判断），
+        真正的「该记什么」还是留给深夜那次 agent 梦。不想要就把
+        `[memory.dream] compress_on_close` 关掉。
         """
         hub = getattr(self, "memory_hub", None)
         cfg = getattr(self.settings, "memory", None)
         dcfg = getattr(cfg, "dream", None)
         if hub is None or not getattr(dcfg, "enabled", False):
+            return
+        if not getattr(dcfg, "compress_on_close", True):
             return
         if not getattr(getattr(cfg, "context", None), "enabled", True):
             return
@@ -3064,7 +3068,6 @@ class VoiceLoop:
         except Exception:  # noqa: BLE001
             pass
         self._append_context(stats)
-        self._last_activity = time.time()
 
     def close(self) -> None:
         self._stop.set()

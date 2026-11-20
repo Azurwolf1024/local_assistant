@@ -569,20 +569,25 @@ class MemoryContextConfig:
 
 @dataclass
 class MemoryDreamConfig:
-    """「做梦」：夜里把上下文整理进 L2/L3 并压缩（见 voice_loop/memory/dream.py）。
+    """「做梦」：把上下文整理进 L2/L3 并压缩（见 voice_loop/memory/dream.py）。
+
+    ★只有三个触发★（多一条就多一份白花的钱）：
+      ① 深夜窗口 **且** 攒够 night_min_tokens —— agent 版，一晚最多一次
+      ② 任意时刻攒够 hard_tokens —— 只做规则版（不调模型），防止上下文顶爆
+      ③ 模型主动调 request_dream（用户说「你整理一下记忆」）—— agent 版
 
     ★两种跑法★：云端角色走 agent（模型自己判断该记什么），本地角色只走规则版
     （4B 做价值判断会往 L3 灌噪声）。agent 失败自动退回规则版。
     """
 
     enabled: bool = True
-    window: str = "02:00-05:00"     # 每晚在这个窗口里**随机**挑一个时间
+    window: str = "02:00-05:00"     # 深夜窗口：★还得攒够 night_min_tokens 才真做★
     random: bool = True
     check_seconds: int = 30         # 调度器多久看一次条件
-    idle_minutes: float = 20        # 空闲多久可以做一次小睡
-    idle_min_turns: int = 8
-    at_tokens: int = 3000           # 上下文积到多少就强制压缩（只做规则版，很快）
+    night_min_tokens: int = 8000    # 深夜那次的「够长」门槛（和窗口**同时**满足才做）
+    hard_tokens: int = 24000        # 任意时刻到这个量就压一次（规则版，不调模型）
     min_turns: int = 4              # 新内容少于这个不值得做梦
+    compress_on_close: bool = True  # 关机时补一次**规则版**（见 dream.md 的「④」）
     min_interval_minutes: float = 30  # 两次 agent 梦之间至少隔多久
     model: str = ""                 # 空 = 跟角色引擎；"api:deepseek-chat" = 显式用云端
     max_rounds: int = 6

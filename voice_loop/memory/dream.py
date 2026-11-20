@@ -14,6 +14,15 @@
              五道校验 → 落盘。提议格式见 :data:`PROPOSAL_SPEC`。
     （`agent` 失败自动退回 `rule`，绝不出现"梦没做完还把记忆改坏"。）
 
+什么时候才会做梦（只有三个触发，见 :class:`DreamScheduler`）
+    ① **深夜 且 够长**：`window` 里随机挑一次，还要没整理的内容 ≥ `night_min_tokens`
+       才真做（agent 版）。以前是「到点必跑」，哪怕当天只说了三句话 —— 那是最贵的
+       一笔开销换零收益，所以改成两个条件同时满足。
+    ② **积得太长**：任意时刻 ≥ `hard_tokens` → 立刻**规则版**压缩（毫秒级、不调模型）。
+       这条是保命：不压就会把上下文顶爆。
+    ③ **模型主动 call**：`request_dream` 工具（用户说「你整理一下记忆」）。
+    「空闲 20 分钟就自己醒一次」那条已经删掉 —— 它和③重复，而且不请自来。
+
 ★这是「整理」不是「重写」★：所有动作都有 undo 前镜像（`dreams/<date>.json`），
 `python main.py dream --undo <date>` 能整批回滚。
 """
@@ -583,16 +592,23 @@ class DreamRequest:
 
 
 class DreamScheduler:
-    """一个后台线程，按四种触发决定「现在要不要做梦」。
+    """一个后台线程，按**三个**触发决定「现在要不要做梦」。
 
-    ★为什么触发这么多★：不同人用法差很大 —— 有人一天只说三五句（靠夜里那次），
-    有人一聊聊两小时（靠长度阈值）。全都塞进一个调度器，条件之间互相让路：
-    长度阈值只做**规则压缩**（毫秒级、不调模型），agent 版永远留在后台。
+    | # | 条件 | 跑法 | 为什么要有 |
+    | --- | --- | --- | --- |
+    | ① | 深夜窗口 **且** 攒够 `night_min_tokens` | agent | 主路径：一天聊下来，夜里一次整理干净 |
+    | ② | 任意时刻攒够 `hard_tokens` | 规则 | 保命：不压就会把上下文顶爆，而规则版毫秒级、不花钱 |
+    | ③ | 模型主动调 `request_dream` / 外部 `request()` | agent | 用户说「你整理一下记忆」 |
+
+    ★为什么是「窗口 且 够长」而不是「到点就跑」★：以前每到 02:00-05:00 必跑一次 agent 版，
+    哪怕当天只说了三句话 —— 模型要读一遍上下文、最多 6 轮工具调用、改 24 条记忆，
+    这是最贵的一笔开销，而收益接近于零。现在不够长就跳过，只记一条「今天没攒够」。
+    ★为什么删掉「空闲 20 分钟就自己醒一次」★：它和③功能重复，且**不请自来** ——
+    聊完刚起身倒杯水，它就开始烧 token 了。
     """
 
     def __init__(self, settings: Any, hub: Any, *, make_dreamer: Callable[[str], Dreamer],
-                 character: Callable[[], str], activity: Callable[[], float],
-                 logger=None) -> None:
+                 character: Callable[[], str], logger=None) -> None:
         cfg = getattr(settings, "memory", None)
         self.settings = settings
         self.hub = hub
@@ -601,7 +617,6 @@ class DreamScheduler:
         self.log = logger or logging.getLogger("voice_loop.memory.dream")
         self.make_dreamer = make_dreamer
         self.character = character
-        self.activity = activity
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._queue: list[DreamRequest] = []
@@ -651,7 +666,7 @@ class DreamScheduler:
 
     def tick(self, now: datetime | None = None) -> DreamReport | None:
         moment = now or datetime.now()
-        # ① 模型/外部主动请求
+        # ① 模型/外部主动请求（★用户说「你整理一下」就走这条★）
         self._drain_requests()
         with self._lock:
             due = [r for r in self._queue if r.at <= time.time()]
@@ -665,23 +680,22 @@ class DreamScheduler:
         dreamer = self.make_dreamer(cid)
         context = dreamer.context
 
-        # ② 长度阈值：只做规则压缩（快，不打扰对话）
-        at_tokens = int(getattr(self.cfg, "at_tokens", 3000) or 0)
-        if at_tokens and context.pending_tokens() >= at_tokens:
-            return self._run(moment, source="tokens", reason="上下文够长了", force=True,
+        # ② 硬门槛：任意时刻积到这个量就压（只做规则压缩，毫秒级、不调模型）
+        hard = int(getattr(self.cfg, "hard_tokens", 0) or 0)
+        if hard and context.pending_tokens() >= hard:
+            return self._run(moment, source="tokens", reason=f"积到 {hard} token", force=True,
                              rule_only=True)
 
-        # ③ 夜间窗口（随机时间，一天一次）
+        # ③ 深夜窗口 **且** 够长（两个条件同时满足才做）
         if self._window_due(moment):
-            return self._run(moment, source="timer", reason="夜间整理")
-
-        # ④ 空闲
-        idle_minutes = float(getattr(self.cfg, "idle_minutes", 20) or 0)
-        idle_min_turns = int(getattr(self.cfg, "idle_min_turns", 8) or 8)
-        if idle_minutes > 0:
-            idle = time.time() - float(self.activity() or 0)
-            if idle >= idle_minutes * 60 and len(context.new_turns()) >= idle_min_turns:
-                return self._run(moment, source="idle", reason=f"空闲 {idle / 60:.0f} 分钟")
+            need = int(getattr(self.cfg, "night_min_tokens", 0) or 0)
+            turns_min = int(getattr(self.cfg, "min_turns", 4) or 4)
+            have = context.pending_tokens()
+            turns = len(context.new_turns())
+            if have >= need and turns >= turns_min:
+                return self._run(moment, source="timer",
+                                 reason=f"夜里整理（{have} token / {turns} 轮）")
+            self._note_too_short(moment, have, need, turns, turns_min)
         return None
 
     def _run(self, moment: datetime, *, source: str, reason: str, force: bool = False,
@@ -743,6 +757,21 @@ class DreamScheduler:
         state["last_source"] = source
         state["last_agent"] = agent
         write_json(self._schedule_path, state)
+
+    def _note_too_short(self, moment: datetime, tokens: int, need: int,
+                        turns: int, turns_min: int) -> None:
+        """到了窗口但内容不够：**一天只记一次**（否则每 30 秒刷一行日志）。
+
+        ★不把 done 置 true★：窗口里要是后半夜又聊了一大段，攒够了照样能做。
+        """
+        today = moment.date().isoformat()
+        state = read_json(self._schedule_path, {}) or {}
+        if str(state.get("short_noted") or "") == today:
+            return
+        state["short_noted"] = today
+        state["short_detail"] = f"{tokens}/{need} token、{turns}/{turns_min} 轮"
+        write_json(self._schedule_path, state)
+        self.log.info(f"[梦] 深夜到点了但没攒够（{state['short_detail']}），今天跳过")
 
     def _drain_requests(self) -> None:
         """读 MCP 工具写下的请求文件（模型主动 call 走这条）。"""

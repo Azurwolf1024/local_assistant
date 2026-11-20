@@ -148,9 +148,10 @@
         body.appendChild(card("上下文与整理（让每天的对话接着长）", [
           table([{ key: "k", label: "角色", cls: "num" }, { key: "v", label: "上下文" }], charRows),
           h("p", { class: "muted", text: md.enabled
-            ? "夜里 " + (md.window || "02:00-05:00") + " 随机整理一次，攒到 "
-              + (md.at_tokens || 0) + " token 也会自动压一次。段封存后不再改写，"
-              + "所以白天的提示词前缀是稳定的（云端缓存能命中）。"
+            ? "深夜里（" + (md.window || "02:00-05:00") + "）攒够 "
+              + (md.night_min_tokens || 0) + " token 才整理一次；平时积到 "
+              + (md.hard_tokens || 0) + " token 只做不花钱的规则压缩。"
+              + "段封存后不再改写，所以白天的提示词前缀是稳定的（云端缓存能命中）。"
               : "做梦关着（[memory.dream] enabled = false）：上下文只追加、不压缩。" }),
           h("div", { class: "row" }, [dreamBtn]),
           dreamBox,
