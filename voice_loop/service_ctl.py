@@ -401,3 +401,131 @@ def stop_service(settings: Settings, *, timeout: float = 20.0) -> tuple[bool, st
 
 def _source_text(st: ServiceStatus) -> str:
     return {"pid_file": "pid 文件", "log": "日志记录（pid 文件丢了）"}.get(st.pid_source, "未知来源")
+
+
+# --------------------------------------------------------------------------- #
+# 控制台进程的记账（托盘的「关闭控制台」和「退出」靠它）
+# --------------------------------------------------------------------------- #
+#: 控制台自己写这个文件（pid + 端口）；托盘点「关闭控制台」时按它去关。
+#: ★为什么不复用 listen.pid★：控制台和服务是两个进程，各记各的，删错一个就出事。
+CONSOLE_PID_FILE = "sessions/console.pid"
+
+
+@dataclass(frozen=True)
+class ConsoleStatus:
+    """控制台进程的状态快照（和 :class:`ServiceStatus` 一样：只说事实）。"""
+
+    running: bool
+    pid: int | None = None
+    port: int = 0
+    stale: bool = False     # pid 文件还在，但那个进程已经没了
+
+
+def console_pid_file(settings: Settings) -> Path:
+    return Path(settings.root) / CONSOLE_PID_FILE
+
+
+def console_port(settings: Settings) -> int:
+    return int(getattr(getattr(settings, "app", None), "console_port", 8765) or 8765)
+
+
+def port_open(port: int, *, timeout: float = 0.25) -> bool:
+    """端口上有没有人在听（只连 127.0.0.1，不做任何 HTTP 请求）。"""
+    import socket  # noqa: PLC0415
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        return sock.connect_ex(("127.0.0.1", int(port))) == 0
+
+
+def write_console_pid(settings: Settings, port: int, pid: int | None = None) -> Path | None:
+    """控制台启动时写一行 ``{"pid": …, "port": …}``（写不了就算了，别拦着它起来）。"""
+    import json  # noqa: PLC0415
+
+    path = console_pid_file(settings)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"pid": int(pid or os.getpid()), "port": int(port)}),
+                        encoding="utf-8")
+    except OSError:
+        return None
+    return path
+
+
+def _console_pid_from(path: Path) -> int | None:
+    import json  # noqa: PLC0415
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return int(raw.get("pid") or 0) or None
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+
+
+def clear_console_pid(settings: Settings, pid: int | None = None) -> None:
+    """删 pid 文件。给了 ``pid`` 就只在文件里记的是它时才删（别误删别人的）。"""
+    path = console_pid_file(settings)
+    try:
+        if pid is not None and _console_pid_from(path) not in (None, int(pid)):
+            return
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def console_status(settings: Settings) -> ConsoleStatus:
+    """控制台在不在跑。
+
+    ★三级判断★：① pid 文件里的进程还活着 → 在跑；② 端口有人在听 → 在跑（老版本没写 pid 文件）；
+    ③ 都不成立 → 没在跑，pid 文件是残留。
+    """
+    path = console_pid_file(settings)
+    pid = _console_pid_from(path)
+    port = console_port(settings)
+    if pid and pid_alive(pid):
+        return ConsoleStatus(running=True, pid=pid, port=port)
+    if port_open(port):
+        return ConsoleStatus(running=True, pid=None, port=port)
+    return ConsoleStatus(running=False, pid=None, port=port,
+                         stale=bool(pid) or path.exists())
+
+
+def _terminate(pid: int, *, timeout: float = 6.0) -> tuple[bool, str]:
+    """结束一个进程并等它真的消失（Windows 上连子进程一起收，pywebview 会挂子进程）。"""
+    import signal  # noqa: PLC0415
+
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                           capture_output=True, timeout=timeout + 10.0)
+        else:
+            os.kill(pid, signal.SIGTERM)
+    except Exception as exc:  # noqa: BLE001 - 结束进程失败要如实说，不能假装成功
+        return False, f"结束进程 {pid} 失败：{type(exc).__name__}: {exc}"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not pid_alive(pid):
+            return True, f"已结束进程 {pid}"
+        time.sleep(0.2)
+    return False, f"进程 {pid} 没在 {timeout:g} 秒内退出"
+
+
+def stop_console(settings: Settings, *, timeout: float = 6.0) -> tuple[bool, str]:
+    """关掉控制台（托盘的「关闭控制台」与「退出」都走这里）。
+
+    ★控制台可以随时硬停★：它只读数据文件 + 往信箱投命令，写文件走的是原子写 + 文件锁
+    （见 voice_loop/store.py），不存在「停一半把数据写坏」。
+    """
+    st = console_status(settings)
+    if not st.running:
+        clear_console_pid(settings)
+        return False, "控制台没有在运行"
+    if not st.pid:
+        return False, (f"端口 {st.port} 上确实有东西在响应，但它没留下 pid 文件（可能是老版本起的）。"
+                       f"请手动关掉那个窗口，或看是谁占着："
+                       f"Get-NetTCPConnection -LocalPort {st.port} | Select-Object OwningProcess")
+    ok, msg = _terminate(st.pid, timeout=timeout)
+    if ok:
+        clear_console_pid(settings, st.pid)
+        return True, f"控制台已关闭（PID {st.pid}）"
+    return False, msg

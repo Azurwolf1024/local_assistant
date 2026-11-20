@@ -396,20 +396,26 @@ def serve(
         return 2
 
     want_window = (window or "").strip().lower()
-    if want_window:
-        picked = window_mod.choose(want_window)
-        if picked == "browser":
-            if want_window not in ("auto", "browser", "off", "none"):
-                print(f"★要的窗口后端（{want_window}）用不了★，退回浏览器：")
-                for item in window_mod.backends():
-                    print(f"    {item['id']:9s} {'可用' if item['ok'] else '不可用'} · {item['detail']}")
-            return _serve_with_server(uvicorn, app, host, port, url, log,
-                                      open_browser=True, settings=settings)
-        print(f"  窗口后端：{picked}（关掉窗口 = 退出控制台，语音服务不受影响）\n", flush=True)
-        return _serve_in_window(uvicorn, app, host, port, url, log, picked, settings)
+    # ★记账★：托盘的「关闭控制台」按 sessions/console.pid 去关这个进程。
+    #   放在端口检查之后 —— 端口被别人占着时我们根本没起来，不该写这个文件。
+    service_ctl.write_console_pid(settings, port)
+    try:
+        if want_window:
+            picked = window_mod.choose(want_window)
+            if picked == "browser":
+                if want_window not in ("auto", "browser", "off", "none"):
+                    print(f"★要的窗口后端（{want_window}）用不了★，退回浏览器：")
+                    for item in window_mod.backends():
+                        print(f"    {item['id']:9s} {'可用' if item['ok'] else '不可用'} · {item['detail']}")
+                return _serve_with_server(uvicorn, app, host, port, url, log,
+                                          open_browser=True, settings=settings)
+            print(f"  窗口后端：{picked}（关掉窗口 = 退出控制台，语音服务不受影响）\n", flush=True)
+            return _serve_in_window(uvicorn, app, host, port, url, log, picked, settings)
 
-    return _serve_with_server(uvicorn, app, host, port, url, log,
-                              open_browser=open_browser, settings=settings)
+        return _serve_with_server(uvicorn, app, host, port, url, log,
+                                  open_browser=open_browser, settings=settings)
+    finally:
+        service_ctl.clear_console_pid(settings)
 
 
 def _serve_with_server(uvicorn, app, host, port, url, log, *, open_browser: bool,

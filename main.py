@@ -251,23 +251,34 @@ def cmd_listen(settings: Settings, args: argparse.Namespace) -> int:
     loop = build_loop(settings, lazy_whisper=settings.wake.lazy_load, auto_sync=True)
     if getattr(args, "wake_file", None):
         loop.use_wake_file(args.wake_file)
-    tray = None
-    if not getattr(args, "no_tray", False):
-        # ★图标在 = 服务在★：托盘跑在服务进程里，右键「停止服务」= 写停止文件，
-        # 服务自己收尾退出、图标随之消失，不会留下孤儿进程（见 voice_loop/tray.py）。
-        from voice_loop import tray as tray_mod  # noqa: PLC0415
-
-        tray = tray_mod.start_embedded(settings, logging.getLogger("voice_loop"))
-        if tray is None:
-            print("  （托盘图标没起来，不影响服务；python main.py tray 可以单独起一个）",
-                  flush=True)
+    _start_sidecars(settings, args)
     try:
         loop.service()
     finally:
-        if tray is not None:
-            tray.stop()
         loop.close()
     return 0
+
+
+def _start_sidecars(settings: Settings, args: argparse.Namespace) -> None:
+    """服务起来时顺手拉起「托盘图标」和「控制台」（两个都是**独立进程**）。
+
+    ★为什么都做成独立进程★：托盘以前跑在服务进程里（`tray.start_embedded`），
+    于是「停止服务」必然连图标一起没 —— 想再启动一次就没入口了。现在：
+      · 托盘 = `main.py tray` 子进程，服务死了它还在，可以直接把服务再起回来；
+      · 控制台 = `main.py ui` 子进程，一直就是独立的（不占麦克风、不加载模型）。
+    默认都开，关掉用 `--no-tray` / `--no-console`。
+    """
+    log = logging.getLogger("voice_loop")
+    from voice_loop import tray as tray_mod  # noqa: PLC0415
+
+    if not getattr(args, "no_tray", False):
+        ok, msg = tray_mod.spawn_tray(settings, log)
+        print(f"  {'√' if ok else '（跳过）'} 托盘：{msg}", flush=True)
+    if not getattr(args, "no_console", False) and bool(
+            getattr(getattr(settings, "app", None), "console_on_start", True)):
+        ok, msg = tray_mod.start_console(settings, log)
+        print(f"  {'√' if ok else '（跳过）'} 控制台：{msg} —— {tray_mod.console_url(settings)}",
+              flush=True)
 
 
 def _tail_hint(log_file: Path) -> str:
@@ -393,10 +404,10 @@ def cmd_stop(settings: Settings, args: argparse.Namespace) -> int:
 
 
 def cmd_tray(settings: Settings, args: argparse.Namespace) -> int:
-    """系统托盘图标：右键启停服务 / 打开控制台 / 看日志 / 退出。
+    """系统托盘图标：右键启停服务 / 开关控制台 / 看日志 / 退出。
 
-    ★独立进程★（和 `listen` 分开）：这样服务停了图标还在，能从菜单里再起回来。
-    `listen` 自己也会顺手起一个嵌入式图标（`[app] tray`），两者不要同时开。
+    ★独立进程★（和 `listen` 分开）：停服务后图标还在，能从菜单里再起回来。
+    `listen` 起服务时会用 `tray.spawn_tray()` 顺手拉起它（同一个单实例锁）。
     """
     from voice_loop import tray as tray_mod  # noqa: PLC0415
 
@@ -1814,7 +1825,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-B", "--background", action="store_true", help="转到后台运行（无窗口）")
     p.add_argument("--stop-first", action="store_true", help="启动前先停掉已在运行的服务")
     p.add_argument("--no-tray", action="store_true",
-                   help="不要托盘图标（默认会起一个，右键可停止服务）")
+                   help="不要托盘图标（默认会起一个独立托盘进程，右键可启停服务）")
+    p.add_argument("--no-console", action="store_true",
+                   help="不要自动拉起控制台（默认会顺带起一个，见 [app] console_on_start）")
     p.add_argument("--mode", default=None)
     p.add_argument("--strategy", choices=["sensevoice", "whisper", "hybrid"], default=None)
     p.add_argument("--device", default=None)
@@ -1826,7 +1839,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("stop", help="停止后台运行的唤醒服务")
     p.set_defaults(func=cmd_stop)
 
-    p = sub.add_parser("tray", help="系统托盘图标：右键启停服务 / 打开控制台 / 看日志")
+    p = sub.add_parser("tray", help="系统托盘图标：右键启停服务 / 开关控制台 / 看日志")
     p.set_defaults(func=cmd_tray)
 
     p = sub.add_parser("mail", help="邮件：登录 / 同步 / 搜索 / 摘要 / 审批发送")

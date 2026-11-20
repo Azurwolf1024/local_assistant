@@ -30,10 +30,13 @@ class AppConfig:
     # 两边读同一个值，所以改这一处就行。
     console_dir: str = "sessions/console"
     console_port: int = 8765      # 控制台端口（托盘「打开控制台」也读它）
-    # 托盘图标：`listen` 启动时顺手起一个（右键可停止服务），见 voice_loop/tray.py。
-    # 没装 pystray 只会少这个图标，服务照常跑。
+    # 托盘图标：`listen` 启动时顺手拉起一个**独立进程**（右键可启停服务 / 开关控制台），
+    # 见 voice_loop/tray.py。没装 pystray 只会少这个图标，服务照常跑。
     tray: bool = True
-    # 「停止服务」的宽限期（秒）：托盘先写停止文件让服务自己收尾，等这么久还没退才强杀。
+    # 启动服务时顺手把控制台也拉起来（`python main.py ui`，同样是独立进程）。
+    # 关掉它就是「只有服务，没有界面」，需要时再 `python main.py ui`。
+    console_on_start: bool = True
+    # 「停止服务」的宽限期（秒）：交给 `main.py stop` 让它自己收尾，等这么久还没退才强杀。
     # 服务收尾里包含记忆归档 + 云端同步（慢网络可能要几秒到几十秒），别调太小。
     tray_stop_grace: float = 20.0
 
