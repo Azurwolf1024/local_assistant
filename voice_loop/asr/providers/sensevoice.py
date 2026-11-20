@@ -14,15 +14,23 @@ from ..spec import CAP_FAST, CAP_LOCAL, HOTWORDS_POST, FieldSpec, ProviderSpec
 SENSEVOICE_DIR = "models/asr/sensevoice-small"
 
 
+def _block(settings) -> dict:
+    """`[asr.providers.sensevoice]` 这一段（★配置写在这里，不是 dataclass 字段★）。"""
+    cfg = getattr(settings, "asr", None)
+    return dict((getattr(cfg, "providers", {}) or {}).get("sensevoice") or {})
+
+
 def model_path(settings) -> str:
-    """新写法 ``[asr.providers.sensevoice] model`` → 老写法 ``sensevoice_model``。"""
+    """provider 块 → 通用字段 → 老写法（三个都认）。"""
     cfg = settings.asr
-    return str(getattr(cfg, "model", "") or getattr(cfg, "sensevoice_model", "") or "")
+    return str(_block(settings).get("model") or getattr(cfg, "model", "")
+               or getattr(cfg, "sensevoice_model", "") or "")
 
 
 def tokens_path(settings) -> str:
     cfg = settings.asr
-    return str(getattr(cfg, "tokens", "") or getattr(cfg, "sensevoice_tokens", "") or "")
+    return str(_block(settings).get("tokens") or getattr(cfg, "tokens", "")
+               or getattr(cfg, "sensevoice_tokens", "") or "")
 
 
 def _missing(settings) -> list[str]:

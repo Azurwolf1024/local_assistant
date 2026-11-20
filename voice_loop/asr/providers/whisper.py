@@ -14,14 +14,28 @@ from ..spec import CAP_HEAVY, CAP_LOCAL, HOTWORDS_POST, FieldSpec, ProviderSpec
 WHISPER_DIR = "models/asr/whisper-large-v3-turbo-int8-ov"
 
 
+def _block(settings) -> dict:
+    """`[asr.providers.whisper]` 这一段（★配置写在这里，不是 dataclass 字段★）。"""
+    cfg = getattr(settings, "asr", None)
+    return dict((getattr(cfg, "providers", {}) or {}).get("whisper") or {})
+
+
 def model_path(settings) -> str:
     cfg = settings.asr
-    return str(getattr(cfg, "model", "") or getattr(cfg, "whisper_model", "") or "")
+    return str(_block(settings).get("model") or getattr(cfg, "model", "")
+               or getattr(cfg, "whisper_model", "") or "")
 
 
 def device_of(settings) -> str:
+    """设备：`[asr.providers.whisper] device` → `[asr] device` → 老字段 → auto。
+
+    ★为什么三个地方都要看★：新配置写在 provider 块里（不是 AsrConfig 字段），
+    只读 dataclass 的话会永远拿到老的 `whisper_device`（实测 `main.py gpu`
+    把 `device = "auto"` 显示成 CPU）。
+    """
     cfg = settings.asr
-    return str(getattr(cfg, "device", "") or getattr(cfg, "whisper_device", "") or "auto")
+    return str(_block(settings).get("device") or getattr(cfg, "device", "")
+               or getattr(cfg, "whisper_device", "") or "auto")
 
 
 def _missing(settings) -> list[str]:
