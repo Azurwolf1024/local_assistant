@@ -128,6 +128,10 @@ class MailService:
             log=self.log,
         )
         self._owner_name = ""
+        #: ★索引新鲜度★：上次同步是什么时候、成没成 —— 模型据此说「我这边可能不是最新的」
+        #: （持久化在 meta 里，服务重启后也知道；见 freshness() / stamp()）
+        self.last_sync_at: float = 0.0
+        self.last_sync: dict[str, Any] = {}
         #: 日程提议队列（``add_event`` 由流水线注入；没接就只提示「接口没接上」）
         self.queue_event = EventQueue(self.store, log=self.log)
         self.triage = Triage(self.cfg, self.store, log=self.log, llm=llm, me=self._me)
@@ -214,6 +218,8 @@ class MailService:
             "account": self.auth.load().account if self.auth.load() else "",
             "db": str(self.root / DB_FILE),
             **self.store.counts(),
+            # 索引新鲜度：控制台 / `main.py mail status` 都靠它回答"到底同没同到最新"
+            "freshness": self.freshness(),
         }
 
     # ---------------------------------------------------------------- 登录
@@ -259,7 +265,74 @@ class MailService:
             for msg in self.store.untriaged(limit=limit):
                 info = self.triage.classify(msg)
                 self.store.set_triage(str(msg["id"]), info)
+        self._note_sync(result)
         return result
+
+    def _note_sync(self, result: dict[str, Any]) -> None:
+        """记下这一轮同步（成功失败都记：失败也要能看出"索引不是最新的"）。"""
+        self.last_sync_at = float(self.clock())
+        self.last_sync = dict(result or {})
+        try:
+            self.store.meta_set("last_sync_at", str(self.last_sync_at))
+            self.store.meta_set("last_sync_ok", "1" if result.get("ok") else "0")
+        except Exception:  # noqa: BLE001 - 记账失败不该影响同步结果
+            self.log.debug("记同步时间失败（忽略）", exc_info=True)
+
+    def freshness(self) -> dict[str, Any]:
+        """索引有多新鲜：上次同步 / 索引里最新一封 / 落后多久。**只读本地，不联网。**
+
+        为什么要它：模型只能看见索引。索引落后时它必须说「我这边可能不是最新的」，
+        而不是把"索引里没有"讲成"没有新邮件"（2026-11-21 真机就是这么翻车的）。
+        """
+        now = float(self.clock())
+        last = float(self.last_sync_at or 0.0)
+        if not last:
+            raw = self.store.meta_get("last_sync_at") or ""
+            try:
+                last = float(raw)
+            except (TypeError, ValueError):
+                last = 0.0
+        newest = self.store.newest_at()
+        newest_ts = 0.0
+        moment = _to_local(newest)
+        if moment is not None:
+            newest_ts = moment.timestamp()
+        interval = max(20.0, float(getattr(self.cfg, "sync_minutes", 3) or 3) * 60.0)
+        # 超过 3 个周期（至少 15 分钟）没同步过 = 不可信
+        limit = max(900.0, interval * 3.0)
+        age = (now - last) if last else None
+        ok = str(self.store.meta_get("last_sync_ok") or "1") == "1"
+        return {
+            "last_sync_at": last,
+            "last_sync_age": age,
+            "last_sync_ok": ok,
+            "newest_at": newest,
+            "newest_age": (now - newest_ts) if newest_ts else None,
+            "total": int(self.store.counts().get("total") or 0),
+            "broken": self.store.broken_count(),
+            "stale": (not last) or (not ok) or (age is not None and age > limit),
+            "limit": limit,
+        }
+
+    def stamp(self) -> str:
+        """给工具结果用的一句话：「（索引同步于 20:55，最新一封 20:50）」。
+
+        ★别小看这句★：模型看见"索引最新一封是昨天"就不会斩钉截铁说"没有新邮件"。
+        """
+        f = self.freshness()
+        if not f["total"]:
+            return "（本地索引还是空的：先让它同步一次，或确认 [mail] 已登录）"
+        parts = []
+        if f["last_sync_at"]:
+            parts.append("索引同步于 " + time.strftime("%H:%M", time.localtime(f["last_sync_at"])))
+        elif f["stale"]:
+            parts.append("这个进程还没同步过")
+        if f["newest_at"]:
+            parts.append("最新一封 " + local_stamp(f["newest_at"]))
+        text = "（" + "，".join(parts) + "）"
+        if f["stale"]:
+            text += "★这份索引可能不是最新的，先别断言「没有新邮件」★"
+        return text
 
     # ---------------------------------------------------------------- 读
     def search(self, query: str = "", *, limit: int = 20, unread_only: bool = False,
@@ -377,12 +450,26 @@ class MailService:
         )
 
     def summary(self, *, since_hours: float = 24, only_important: bool = True) -> str:
-        """一句话清单：给人念，也给模型做二次归纳。"""
+        """一句话清单：给人念，也给模型做二次归纳。
+
+        ★「没有重要邮件」≠「没有邮件」★：只要索引里这段时间有普通邮件，就必须说出来 ——
+        2026-11-21 真机上模型把前者讲成了"没有新邮件"，用户当场发现信箱里有货。
+        """
         rows = self.search("", limit=30, since_hours=since_hours,
                            level="high" if only_important else "")
+        if not rows and only_important:
+            others = self.search("", limit=3, since_hours=since_hours)
+            if others:
+                newest = others[0]
+                who = newest.get("sender_name") or newest.get("sender") or "未知发件人"
+                what = newest.get("one_line") or newest.get("subject") or "（无主题）"
+                many = "几封" if len(others) >= 3 else f"{len(others)} 封"
+                return (f"这段时间没有重要邮件，但有{many}普通邮件；最新一封是 "
+                        f"{_short_time(newest.get('received_at') or '')}"
+                        f"{who}：{what}。")
+            return "这段时间没有新邮件。"
         if not rows:
-            return ("这段时间没有重要邮件。" if only_important
-                    else "这段时间没有新邮件。")
+            return "这段时间没有新邮件。"
         head = f"共 {len(rows)} 封重要邮件：" if only_important else f"共 {len(rows)} 封邮件："
         parts = []
         for row in rows[:10]:

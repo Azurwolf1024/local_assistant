@@ -124,6 +124,7 @@ def register(app, ctx) -> None:
             },
             "memory_sync": _memory_sync_state(settings),
             "memory_dream": _dream_state(settings),
+            "mail": _mail_state(settings),
         }
 
     @app.post("/api/overview/dream")
@@ -246,6 +247,45 @@ def _memory_sync_state(settings) -> dict:
     out["updated_at"] = str(data.get("updated_at") or "")
     out["counts"] = dict(data.get("counts") or {})
     out["characters"] = int(out["counts"].get("characters") or 0)
+    return out
+
+
+def _mail_state(settings) -> dict:
+    """邮件索引的「现在什么情况」：几封、最新一封、上次同步、有没有空行。
+
+    ★只读本地★：`MailService.status()` 只看 token 文件 + SQLite（`ready()` / `auth.status()`
+    都不联网），所以放在概览页是安全的 —— 但它会建一次 `MailService`，
+    因此**任何异常都必须变成一行 error**，不能让概览页 500。
+    """
+    cfg = getattr(settings, "mail", None)
+    out: dict = {"enabled": bool(getattr(cfg, "enabled", False)), "ok": False}
+    if not out["enabled"]:
+        return out
+    try:
+        from ...mail import MailService  # noqa: PLC0415
+        from ...mail.service import local_stamp  # noqa: PLC0415
+
+        svc = MailService(settings)
+        try:
+            st = svc.status()
+        finally:
+            svc.close()
+        fresh = st.get("freshness") or {}
+        last = float(fresh.get("last_sync_at") or 0.0)
+        out.update({
+            "ok": True,
+            "ready": bool(st.get("ready")),
+            "reason": str(st.get("reason") or ""),
+            "account": str(st.get("account") or ""),
+            "total": int(st.get("total") or 0),
+            "unread": int(st.get("unread") or 0),
+            "broken": int(st.get("broken") or 0),
+            "newest": local_stamp(fresh.get("newest_at") or ""),
+            "last_sync": (datetime.fromtimestamp(last).strftime("%m-%d %H:%M") if last else ""),
+            "stale": bool(fresh.get("stale")),
+        })
+    except Exception as exc:  # noqa: BLE001 - 概览页不能因为邮件子系统坏了就白屏
+        out["error"] = f"{type(exc).__name__}: {exc}"
     return out
 
 

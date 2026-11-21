@@ -131,7 +131,7 @@ MCP 工具（6 个）                  ../mcp/servers/mail.py
 | 我是谁 | `GET /me` | `$select=displayName,mail,userPrincipalName` | 显示名（落款）、地址（排除自己发的）、UPN |
 | 文件夹 id | `GET /me/mailFolders/{name}` | `$select=id,displayName`（`inbox` 这种 well-known 名） | `id` |
 | **增量拉信** | `GET /me/messages/delta` 或 `GET /me/mailFolders/{id}/messages/delta` | `$select=<LIST_SELECT>` `$top=page_size`，翻页用上一页的 `@odata.nextLink` | `value[]`、`@odata.nextLink`、`@odata.deltaLink` |
-| **拿「此刻」游标** | 同上，但 `$select=id`，**从头翻到最后一页** | `$top=page_size`，最多 `max_pages` 页 | 最后一页的 `@odata.deltaLink` |
+| **拿「此刻」游标** | 同上，但**必须同样用 `$select=<LIST_SELECT>`**，从头翻到最后一页 | `$top=100`，最多 `max_pages=30` 页 | 最后一页的 `@odata.deltaLink` |
 | 首次按窗口拉 | `GET /me/messages`（或指定文件夹） | `$select=<LIST_SELECT>` `$top` `$filter=receivedDateTime ge <ISO>` `$orderby=receivedDateTime desc` | `value[]`、`@odata.nextLink` |
 | 读一封正文 | `GET /me/messages/{id}` | `$select=<BODY_SELECT>` | `body.content`、`uniqueBody.content`、`webLink` |
 | 附件清单 | `GET /me/messages/{id}/attachments` | `$select=id,name,contentType,size,isInline` | 名字/类型/大小/是不是内嵌图 |
@@ -157,25 +157,67 @@ BODY_SELECT = "id,subject,from,toRecipients,ccRecipients,receivedDateTime,body,u
 
 ```
 第一次（或 --full）：
-  bootstrap → list_recent(days=first_sync_days) → upsert 进 SQLite
+  bootstrap → 先 store.drop_broken()（清掉历史空行）
+            → list_recent(days=first_sync_days) → upsert 进 SQLite
             → delta_cursor_from_now()  ← ★从头翻到最后一页，取 @odata.deltaLink★
             → 写进 meta['delta_cursor']
 
 之后每次：
   delta(cursor) → 只返回「新到的 / 改过的 / 删掉的」
-                → 先写水位：把新的 @odata.deltaLink 立刻存起来
-                → upsert；@removed 的删
-  HTTP 410（Gone，游标过期）→ 丢掉游标，重新 bootstrap 一次
+                → 正常条目 upsert；@removed 的删本地行
+                → 缺字段的（稀疏更新）逐条补 message_row()；补不到就跳过、**游标不前进**
+                → 全吃下来了才把新的 @odata.deltaLink 存起来
+  HTTP 410 / 400 resyncRequired → 丢掉游标，重新 bootstrap 一次
+  「纯 id 且补不了」→ 判形状坏了（见下），丢游标、同一轮重建
 ```
+
+**★★为什么不能用 `$select=id` 铸游标（2026-11-21 真机事故）★★**
+
+delta 令牌**把查询形状烘在令牌里**。用 `$select=id` 铸出来的游标，之后每一页增量
+只带 `id`（实测返回项只有 `@odata.etag / @odata.type / id`）：
+
+| 现象 | 后果 |
+| --- | --- |
+| `normalize_message()` 拿到空对象 | 新邮件被写成「只有 id 的空行」 |
+| 搜索按 `received_at` 排序/过滤 | 这些行永远搜不到 → Agent 说「没有新邮件」 |
+| 日志 | 一路显示「同步完成：新增 2」——看着完全正常 |
+| 老邮件被"更新"时同样是空载荷 | `upsert` 会把已有的**主题/发件人抹空** |
+
+所以现在：**铸游标必须用同一份 `LIST_SELECT`**（代价只是首次多翻几页）；
+另外 `delta.py` 里还有三道兜底 —— 因为**形状对了也不代表每条都有全字段**：
+
+| Graph 行为（实测） | 我们的处理 |
+| --- | --- |
+| **改过**的邮件只回**变化字段**（把一封标未读后，增量里只有 `id` / `isRead` / `parentFolderId`） | 没有 `receivedDateTime` 的条目一律**逐条补**（`GET /me/messages/{id}?$select=<LIST_SELECT>`，一页最多 `BACKFILL_PER_ROUND=60` 封），补完再 upsert |
+| 补不到（网络/权限） | **跳过、不写空行，并且游标不前进** —— 推进了那几条就永远丢了（Graph 不会重发） |
+| 纯 `id` 载荷 + 这个 Graph 连按 id 补都做不到（老版本铸的窄游标） | 判 `ShapeBroken`：丢游标、同一轮按时间窗口重建（`repaired: True`） |
+| 删除通知（`id` + `@removed`） | **删本地行**，绝不能当新邮件 upsert（那又是一行空的） |
+
+日志会分别报：`新增 X、更新 Y、删除 Z（增量 N 页），补字段 A、跳过 B` ——
+★`补字段` 出现说明 Graph 回了稀疏更新（正常），`跳过` 出现说明有条目这一轮没吃下（游标会停在原地）★。
 
 **★为什么不用 `$deltatoken=latest`★**：那是旧版 Outlook REST 的写法，Graph 的
 `/messages/delta` 不认 —— 实机上它返回的对象里**根本没有** `@odata.deltaLink`，
 于是游标永远空、每 3 分钟全量重拉一遍（踩过：一次巡检把 276 封重新索引）。
-现在只能老老实实翻页：`$select=id`、`$top=50`、跟着 `@odata.nextLink` 翻到最后一页，
+现在只能老老实实翻页，跟着 `@odata.nextLink` 翻到最后一页；
 `max_pages` 用完还没到底就放弃（返回空游标，下次再来）—— 至少不会把自己卡死。
 
-**水位先写再处理**：万一 upsert 中途崩了，下次从「更靠后」的位置开始，
-代价是漏几条（可 `--full` 补），而不是无限重复处理同一批。
+**水位先写还是后写**：现在是**吃下了才写**。以前是"先写水位再处理"，好处是崩了不重复，
+坏处是崩了/补不到就**永久丢信**；现在的做法是「有没吃下的条目就把游标停在原地，下一轮重来」，
+重复处理几条（upsert 幂等）比丢信划算。
+
+### 2.4b 索引新鲜度：模型凭什么敢说「没有新邮件」
+
+模型只能看见本地索引。索引落后时它必须说「我这边可能不是最新的」——
+这条写进了两处代码，不再靠提示词自觉：
+
+| 位置 | 行为 |
+| --- | --- |
+| `MailService.freshness()` | `last_sync_at`（存在 `meta` 里，重启也知道）、`newest_at`（索引里最新一封）、`age`、`stale`（> max(15 分钟, 3×`sync_minutes`) 或上次同步失败） |
+| `MailService.stamp()` | 一句话：「（索引同步于 21:08，最新一封 11-21 20:50）」；`stale` 时追加「★这份索引可能不是最新的，先别断言「没有新邮件」★」 |
+| `mail_search` / `mail_summary` | 结果末尾带上面那句（`servers/mail.py`）；`INSTRUCTIONS` 里明说「这句不是邮件内容，别念；它说可能不是最新时不许断言没有新邮件」 |
+| `mail_summary` 措辞 | `only_important=True` 且没有重要邮件时，补一句「但有 N 封普通邮件；最新一封是 …」——★没有重要邮件 ≠ 没有邮件★ |
+| `main.py mail doctor` | 一次体检：开关 / 登录 / 索引 / 空行 / 游标 / 是否够新 |
 
 ### 2.5 限流与错误
 
@@ -449,7 +491,7 @@ secret  = data/mail/confirm.key（第一次用时随机生成 32 字节，不进
 | `attachments` | 一个附件 | `message_id`+`att_id`（主键）、`name` `content_type` `size` `is_inline` `text` `cached_at` |
 | `drafts` | 一封待发/已发草稿 | `id` `to_json` `cc_json` `subject` `body` `reply_to` `graph_draft_id` `state` `body_hash` `approved_at` `approved_by` `expires_at` `sent_at` `error` |
 | `proposals` | 一条日程提议 | `id` `message_id` `title` `when_text` `when_iso` `place` `source` `reason` `state` `event_id` |
-| `meta` | 键值 | `delta_cursor`（增量游标）、`owner_address` / `owner_name`（我是谁，用来排掉自己发的信） |
+| `meta` | 键值 | `delta_cursor`（增量游标）、`last_sync_at` / `last_sync_ok`（同步水位，重启也知道）、`owner_address` / `owner_name`（我是谁，用来排掉自己发的信） |
 
 **检索**（`Store.search`）：中文按「多词 AND」——把 query 拆成 token，
 每个 token 都要在 `subject||sender||sender_name||preview||body_text` 里出现
@@ -484,14 +526,20 @@ secret  = data/mail/confirm.key（第一次用时随机生成 32 字节，不进
 | `ready()` 说没登录 | `token.json` 不存在/没有 refresh token | `python main.py mail login` |
 | 登录后立刻又失效 | 应用没勾 `offline_access`，或管理员撤了同意 | 重新走 adminconsent |
 | 同步一直是 0 封 | `folder` 写错（如 `收件箱` 不是 `inbox`），或租户策略拦了 | `mail status` 看 `graph_scope`；换成 `inbox` |
+| ★**明明有新邮件，Agent 却说「没有新邮件」**★ | 索引落后（没同步）/ 空行（只有 id）/ 摘要只看 `high` | `python main.py mail doctor` 一眼看出来；`mail sync --full` 修 |
 | 每 3 分钟全量重拉 | 游标空（见 §2.4 的 `$deltatoken` 坑） | `mail sync --full` 重建一次游标 |
+| 索引里出现「空行」（主题/时间全空） | 增量载荷只有 id（游标形状不对，见 §2.4 事故） | 新代码会自动判坏并重建；也可以 `mail sync --full` 立刻清掉 |
 | 分级全是 `low` | 模型不可用，只走了规则 | 看日志里 `[mail] 分类` 那行；换 `classify_model` |
 | 草稿建了、点发送说「不在白名单」 | 收件人不在 `send_allowlist` | 加白名单，或临时把 `allow_send` 关掉测试 |
 | 点发送说「token 过期」 | 超过 `approval_ttl`（默认 5 分钟） | 重新点一次「发送」 |
 | 发出去两封 | 用了 `unknown` 状态那封再点一次 | 先去「已发送」确认；`unknown` 就是要人肉确认 |
 | `410` 一直重来 | 游标过期且没重建 | 同上，`mail sync --full` |
 
+一条命令先看全局：**`python main.py mail doctor`**（开关 / 登录 / 索引 / 空行 / 游标 / 是否够新）。
+
 日志里**不写正文**（`service._brief` 只写主题/发件人/分级/一行摘要）。
+同步那行现在是 `[mail] 同步完成：新增 X、更新 Y、删除 Z（增量 N 页）`；
+出现 `补字段` / `跳过` 就说明增量里有条目字段不全（形状问题，见 §2.4）。
 
 ---
 
@@ -505,6 +553,7 @@ secret  = data/mail/confirm.key（第一次用时随机生成 32 字节，不进
 | 附件只抽 `.pdf` / `.docx` / 文本类 | `xlsx` / `pptx` / 图片要 OCR 或表格解析，收益不值当 | 只给清单（名字+大小），需要时人工打开 |
 | 检索是「多词 AND 的 `LIKE`」，不是语义搜索 | 中文分词/FTS5 的复杂度换不来明显好处（§10） | 换成你记得的词；或先 `mail_read` 再看正文 |
 | 分级结果只在**同步时**更新一次 | 避免每轮巡检重复烧 token | 手动 `mail digest` 只看结果，不改分 |
+| 同步是**轮询**（`sync_minutes=3`），没有 webhook | 本机没有公网回调地址 | 想要更实时：调小 `sync_minutes`（下限 20 秒），或问的时候先手动 sync |
 
 ## 14. 自测覆盖（`scripts/tests/test_mail.py`）
 
@@ -520,6 +569,11 @@ secret  = data/mail/confirm.key（第一次用时随机生成 32 字节，不进
 8. 审批队列：点取消 → `rejected`；点两次发送（二次确认）
 9. 提醒去重（`notified_at`）、摘要只给重要的
 10. 邮件→日程：提议落库、点加入才写、点忽略写 `skipped`
+11. **§19 增量形状**（2026-11-21 事故的回归测试）：只有 id 的载荷 → 判坏并重建、
+    个别缺字段 → 逐条补齐、补不到 → 跳过不写空行、`@removed` → 删本地行、历史空行被清掉
+12. **§20 游标形状**：铸游标时 URL 必须带完整 `LIST_SELECT`（不许 `$select=id`）
+13. **§21 新鲜度与摘要措辞**：没同步过 → `stale`；同步后 → 带「索引同步于/最新一封」；
+    「没有重要邮件」时必须补一句「有 N 封普通邮件」
 11. MCP 工具形状（6 个工具的参数名/必填项，防止改签名把模型带偏）
 
 ---

@@ -508,22 +508,40 @@ def _cmd_mail(svc, what: str, args: argparse.Namespace) -> int:
         return 0
     if what == "status":
         st = svc.status()
+        fresh = st.get("freshness") or {}
         print(f"  功能   : {'开' if st['enabled'] else '关'}")
         print(f"  可工作 : {'是' if st['ready'] else '否 —— ' + str(st['reason'])}")
         auth = st["auth"]
         print(f"  账号   : {st['account'] or auth.get('account') or '（未登录）'}")
         print(f"  有效期 : {auth.get('expires_in')} 秒")
         print(f"  索引   : {st['total']} 封（未读 {st['unread']}）"
-              f" 分级 {st['by_level']} 待批草稿 {st['pending_drafts']}")
+              f" 分级 {st['by_level']} 待批草稿 {st['pending_drafts']}"
+              + (f" ★空行 {st['broken']}★" if st.get("broken") else ""))
+        # ★新鲜度：这一行就是「她说没有新邮件」时最先要看的东西★
+        print(f"  最新一封: {local_stamp(fresh.get('newest_at') or '') or '（空）'}")
+        age = fresh.get("last_sync_age")
+        when = time.strftime("%m-%d %H:%M", time.localtime(fresh["last_sync_at"])) \
+            if fresh.get("last_sync_at") else "（这个进程还没同步过）"
+        print(f"  上次同步: {when}"
+              + (f"（{int(age // 60)} 分钟前）" if isinstance(age, (int, float)) else "")
+              + ("  ★可能不是最新的★" if fresh.get("stale") else ""))
         print(f"  数据   : {st['db']}")
         return 0
+    if what == "doctor":
+        return _mail_doctor(svc)
     if what == "sync":
         got = svc.sync(force_full=bool(getattr(args, "full", False)))
         if not got.get("ok"):
             print(f"× 同步失败：{got.get('error')}")
             return 1
         print(f"√ 同步完成：新增 {got['added']}、更新 {got['updated']}"
+              f"、删除 {got.get('deleted', 0)}"
               f"（{'全量' if got.get('full') else '增量'} {got.get('pages')} 页）")
+        if got.get("dropped"):
+            print(f"  顺手清掉 {got['dropped']} 行历史遗留的空行")
+        if got.get("backfilled") or got.get("skipped"):
+            print(f"  字段不全：补齐 {got.get('backfilled', 0)}、跳过 {got.get('skipped', 0)}")
+        print("  " + svc.stamp())
         return 0
     if what == "search":
         rows = svc.search(str(args.query or ""), limit=int(args.limit or 10),
@@ -558,6 +576,7 @@ def _cmd_mail(svc, what: str, args: argparse.Namespace) -> int:
         text = svc.summary(since_hours=float(getattr(args, "hours", 24) or 24),
                            only_important=not bool(getattr(args, "all", False)))
         print(text)
+        print("  " + svc.stamp())
         return 0
     if what == "prune":
         days = int(getattr(args, "days", 0) or getattr(svc.cfg, "prune_days", 30) or 30)
@@ -603,6 +622,47 @@ def _cmd_mail(svc, what: str, args: argparse.Namespace) -> int:
         return 0 if ok else 1
     print(f"× 不认识的子命令：{what}")
     return 2
+
+
+def _mail_doctor(svc) -> int:
+    """邮件体检：一次把「为什么她说没有新邮件」这类问题问清楚（全本地，除最后一项）。"""
+    from voice_loop.mail.delta import CURSOR_KEY  # noqa: PLC0415
+    from voice_loop.mail.service import local_stamp  # noqa: PLC0415
+
+    st = svc.status()
+    fresh = st.get("freshness") or {}
+    problems = 0
+
+    def say(ok: bool, name: str, detail: str = "") -> None:
+        nonlocal problems
+        if not ok:
+            problems += 1
+        print(f"  {'√' if ok else '×'} {name}" + (f"：{detail}" if detail else ""))
+
+    say(bool(st["enabled"]), "功能开关", "[mail] enabled" if st["enabled"] else "关着")
+    say(bool(st["ready"]), "可工作", st.get("reason") or "")
+    say(bool(st["account"]), "账号", st.get("account") or "（未登录）")
+    total = int(st.get("total") or 0)
+    say(total > 0, "索引里有邮件", f"{total} 封（未读 {st.get('unread')}）")
+    broken = int(st.get("broken") or 0)
+    say(broken == 0, "没有空行（只有 id 的行）", f"{broken} 行" + (
+        " → python main.py mail sync --full 会顺手清掉" if broken else ""))
+    cursor = svc.store.meta_get(CURSOR_KEY) or ""
+    say(bool(cursor), "增量游标在", "有（增量同步）" if cursor else
+        "没有 → 下一轮会按时间窗口全量拉一次")
+    age = fresh.get("last_sync_age")
+    say(not fresh.get("stale"), "索引足够新",
+        "还没同步过" if age is None else f"上次同步 {int(age // 60)} 分钟前"
+        + ("（超过阈值，可能不是最新的）" if fresh.get("stale") else ""))
+    newest = local_stamp(fresh.get("newest_at") or "")
+    print(f"  · 索引里最新一封：{newest or '（空）'}")
+    print(f"  · {svc.stamp()}")
+    if problems:
+        print(f"\n  有 {problems} 项要处理：先 `python main.py mail sync --full` 重建一次；"
+              "还不行看 sessions/listen.log 里 [mail] 那几行")
+        return 1
+    print("\n  一切正常：本地索引是最新的，模型不该说「没有新邮件」")
+    return 0
 
 
 def cmd_text(settings: Settings, args: argparse.Namespace) -> int:
@@ -1917,9 +1977,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_mail.add_argument("--hours", type=float, default=24)
     p_mail.add_argument("--all", action="store_true", help="连一般邮件也算上")
     p_mail.set_defaults(mail_cmd="digest")
+    p_mail = mail_sub.add_parser("doctor", help="体检：登录 / 索引 / 游标 / 新鲜度一次看完")
+    p_mail.set_defaults(mail_cmd="doctor")
     p_mail = mail_sub.add_parser("prune", help="清掉本地索引里太老的邮件（不动 Outlook）")
     p_mail.add_argument("--days", type=int, default=0,
                         help="保留多少天（默认读 [mail] prune_days，再默认 30）")
+    p_mail.set_defaults(mail_cmd="prune")
     p_mail = mail_sub.add_parser("drafts", help="看待批草稿")
     p_mail.set_defaults(mail_cmd="drafts")
     p_mail = mail_sub.add_parser("approve", help="批准并发送（★这一步才会真发★）")

@@ -314,14 +314,52 @@ class MailStore:
         rows = self._query(
             "SELECT level, COUNT(*) AS n FROM messages GROUP BY level")
         by_level = {str(r["level"] or "?"): int(r["n"]) for r in rows}
-        total = self._query("SELECT COUNT(*) AS n FROM messages")[0]["n"]
-        unread = self._query("SELECT COUNT(*) AS n FROM messages WHERE is_read = 0")[0]["n"]
+        total = self._query("SELECT COUNT(*) FROM messages")[0][0]
+        unread = self._query("SELECT COUNT(*) FROM messages WHERE is_read = 0")[0][0]
         drafts = self._query(
-            "SELECT COUNT(*) AS n FROM drafts WHERE state IN ('pending','approved')")[0]["n"]
+            "SELECT COUNT(*) FROM drafts WHERE state IN ('pending','approved')")[0][0]
         return {"total": int(total), "unread": int(unread),
-                "by_level": by_level, "pending_drafts": int(drafts)}
+                "by_level": by_level, "pending_drafts": int(drafts),
+                "broken": self.broken_count(), "newest_at": self.newest_at()}
 
-    # ------------------------------------------------------------------ 清理
+    def newest_at(self) -> str:
+        """索引里最新一封的时间（ISO，UTC）。空库返回空串。"""
+        row = self._query("SELECT MAX(received_at) AS m FROM messages")
+        return str((row[0]["m"] if row else "") or "")
+
+    def broken_count(self) -> int:
+        """「只有 id、没有时间」的空行有多少（正常应该是 0）。"""
+        row = self._query(
+            "SELECT COUNT(*) FROM messages WHERE COALESCE(received_at, '') = ''")
+        return int(row[0][0] if row else 0)
+
+    # ------------------------------------------------------------------ 删除 / 清理
+    def delete_messages(self, ids: list[str]) -> int:
+        """按 id 删本地行（Graph 的删除通知）。返回真的删了几行。"""
+        gone = 0
+        for message_id in ids or []:
+            mid = str(message_id or "")
+            if not mid:
+                continue
+            hit = self._query("SELECT id FROM messages WHERE id = ?", (mid,))
+            if not hit:
+                continue
+            self._exec("DELETE FROM attachments WHERE message_id = ?", (mid,))
+            self._exec("DELETE FROM messages WHERE id = ?", (mid,))
+            gone += 1
+        return gone
+
+    def drop_broken(self) -> int:
+        """清掉历史遗留的空行（只有 id：没有时间、没有发件人）。
+
+        为什么要有它：2026-11-21 那次「游标形状不对」的事故，把几十封新邮件写成了
+        只有 id 的行 —— 搜不到、也不能分级，只会在每次同步里被反复挑出来烧 token。
+        另外这类行**不该被补**：它们的 id 还在，下次真变化时会被正常覆盖。
+        """
+        rows = self._query(
+            "SELECT id FROM messages WHERE COALESCE(received_at, '') = ''")
+        return self.delete_messages([str(r["id"]) for r in rows])
+
     def prune(self, days: int) -> int:
         """删掉本地索引里 ``days`` 天以前的邮件（**只动本地库**，不碰 Outlook）。
 

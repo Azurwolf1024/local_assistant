@@ -156,6 +156,13 @@ class Graph:
                 continue
             if status == 410:
                 raise DeltaGone(f"410 Gone：{url.split('?')[0]}")
+            # ★换了 $select 形状 / 令牌太老时 Graph 会要「重同步」★（400 resyncRequired）：
+            # 这跟 410 的处理方式一模一样（丢游标、全量重来），不认它就会每 3 分钟报错却永不修。
+            code = ""
+            if isinstance(body, dict) and isinstance(body.get("error"), dict):
+                code = str(body["error"].get("code") or "")
+            if code.lower() in ("resyncrequired", "syncstatenotfound"):
+                raise DeltaGone(f"Graph 要求重同步（{code}）：{url.split('?')[0]}")
             if status in (429, 503) and attempt < retries:
                 wait = _retry_after(resp_headers, default=2.0 * (attempt + 1))
                 self.log.warning(f"[mail] Graph {status}，{wait:.1f}s 后重试（{method} {path_or_url[:60]}）")
@@ -195,6 +202,8 @@ class Graph:
         """
         folder = (folder or "inbox").strip()
         if cursor:
+            # ★游标里烘着当初那条查询的 $select★：这里只能原样用，不能补字段。
+            # （补了会 400 resyncRequired —— 形状是令牌的一部分）
             url, absolute = cursor, True
         elif folder.lower() == "all":
             url = f"{self.base}/me/messages/delta?$select={LIST_SELECT}&$top={int(page_size)}"
@@ -209,19 +218,34 @@ class Graph:
                        f"?$select={LIST_SELECT}&$top={int(page_size)}")
             absolute = True
         raw = self.call("GET", url, absolute=absolute) or {}
-        items = [normalize_message(x) for x in (raw.get("value") or []) if isinstance(x, dict)]
+        items: list[dict[str, Any]] = []
+        for x in raw.get("value") or []:
+            if not isinstance(x, dict):
+                continue
+            if "@removed" in x:
+                # 删除通知只有 id（reason 在 @removed 里）：标记出来让上层删本地那行，
+                # ★绝不能当正常消息去 upsert★——那会写进一行空邮件（踩过）
+                items.append({"id": str(x.get("id") or ""), "removed": True})
+                continue
+            items.append(normalize_message(x))
         return items, str(raw.get("@odata.nextLink") or ""), str(raw.get("@odata.deltaLink") or "")
 
     def delta_cursor_from_now(self, *, folder: str = "inbox", max_pages: int = 30,
-                             page_size: int = 200) -> str:
+                              page_size: int = 100) -> str:
         """拿到「此刻」的游标（= 最后一页的 ``@odata.deltaLink``）。
 
         ★别再试 ``$deltatoken=latest`` 了★：那是旧版 Outlook 的写法，Graph 的
         ``/messages/delta`` 现在不认 —— 实机上它返回的对象里没有 ``@odata.deltaLink``，
         于是游标一直是空串，**每轮巡检都退化成全量重拉**（276 封 × 6 页，每 3 分钟一次）。
-        正确做法只能是把 delta 从头翻到最后一页（``$select=id``，不要正文），
-        最后一页才带 ``@odata.deltaLink``。翻不动（超过 ``max_pages``）就返回空串，
-        下一轮继续按时间窗口同步，功能不受影响。
+        正确做法只能是把 delta 从头翻到最后一页，最后一页才带 ``@odata.deltaLink``。
+        翻不动（超过 ``max_pages``）就返回空串，下一轮继续按时间窗口同步，功能不受影响。
+
+        ★★这里必须用 ``LIST_SELECT``，不能用 ``$select=id`` 抄近路★★
+        delta 令牌**把查询形状烘在令牌里**：用 ``$select=id`` 铸出来的游标，之后每一页
+        增量都只带 ``id``（实测返回项只有 ``@odata.etag / @odata.type / id``），
+        于是新邮件全被写成"只有 id 的空行"，搜索里永远看不见 ——
+        2026-11-21 真机事故就是这么来的（Agent 说"没有新邮件"，其实当天到了几十封）。
+        代价只是首次铸游标时多翻几页的流量，换来的是增量里字段齐全。
         """
         folder = (folder or "inbox").strip()
         if folder and folder.lower() != "all":
@@ -230,13 +254,13 @@ class Graph:
                     else "/me/messages/delta")
         else:
             base = "/me/messages/delta"
-        url = f"{base}?$select=id&$top={int(page_size)}"
+        url = f"{base}?$select={LIST_SELECT}&$top={int(page_size)}"
         absolute = False
         for page in range(1, max(1, int(max_pages)) + 1):
             raw = self.call("GET", url, absolute=absolute) or {}
             cursor = str(raw.get("@odata.deltaLink") or "")
             if cursor:
-                self.log.info(f"[mail] 取到增量游标（翻了 {page} 页）")
+                self.log.info(f"[mail] 取到增量游标（翻了 {page} 页，$select 与增量一致）")
                 return cursor
             nxt = str(raw.get("@odata.nextLink") or "")
             if not nxt:
@@ -275,6 +299,17 @@ class Graph:
         raw = self.call("GET", url, absolute=True) or {}
         items = [normalize_message(x) for x in (raw.get("value") or []) if isinstance(x, dict)]
         return items, str(raw.get("@odata.nextLink") or "")
+
+    def message_row(self, message_id: str) -> dict[str, Any]:
+        """按 id 单取一封（只取 ``LIST_SELECT`` 那些字段）。
+
+        ★兜底用的★：万一增量里某一项字段不全（Graph 改了行为、或游标形状不对），
+        逐条补一下总比把"只有 id 的空行"写进索引强。**别在正常路径上循环调它**——
+        一次一封，几十封就是几十个请求。
+        """
+        raw = self.call("GET", f"/me/messages/{message_id}",
+                        params={"$select": LIST_SELECT}) or {}
+        return normalize_message(raw) if isinstance(raw, dict) else {}
 
     def message(self, message_id: str) -> dict[str, Any]:
         raw = self.call("GET", f"/me/messages/{message_id}",

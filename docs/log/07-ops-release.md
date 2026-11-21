@@ -1591,3 +1591,115 @@ MCP 宿主现状     11 个工具 ← skills(inproc,9) memory(inproc,2/4) agent(
 
 ---
 
+## 80. 邮件同步的致命形状 bug：她说「没有新邮件」，其实当天到了几十封（2026-11-21 夜，用户报障）
+
+用户原话：「mail有问题吧，我刚问agent，她说没有新邮件，实际上是有的，同步机制怎么做的？先出方案」。
+
+### 80.1 证据链（三面对照才定得下来）
+
+| 面 | 事实 |
+| --- | --- |
+| 对话日志 20:51 | `mail_summary(only_important=True)` → "没有重要邮件"；`only_important=False` → "**这段时间没有新邮件**"；`mail_search('', limit=3)` → 最新一封 **11-20 16:29** |
+| 本地索引 | 294 行，`max(received_at)=2026-11-20T08:29Z`（本地 16:29）→ **11-21 一封都没有**；另有 **20 行 subject/sender/received_at 全空** |
+| 服务日志 | 同时段一直打「同步完成：新增 2 / 2 / 3+1 / 1 / 1」—— 看起来一切正常，加进去的就是那 20 行空行 |
+| Graph 直查（只读） | 最近 3 天真实 50 封，最新 11-21 20:50（npm）、Codeforces 1137、ASC27 招募…全不在索引里 |
+| 决定性实验 | 同文件夹新开 `$select=id` 的 delta → 返回项键只有 `['@odata.etag','@odata.type','id']`；换 `LIST_SELECT` → 17 个字段齐全 |
+
+### 80.2 根因：delta 令牌把「查询形状」烘进令牌，而我们把令牌铸窄了
+
+`delta_cursor_from_now()` 为了省流量，用 **`$select=id`** 翻页取「此刻」的游标。
+Graph 的 `@odata.deltaLink` **把 `$select` 一起存进令牌** —— 之后 `delta(cursor=…)`
+原样复用它，返回的每一条就只有 `id`：
+
+```
+normalize_message({"id": ...})  →  subject="" sender="" received_at=""
+upsert_messages                 →  写进索引 = 一行空壳（甚至把老行抹空）
+search("")                      →  ORDER BY received_at DESC → 空行沉底、永远搜不到
+Agent                           →  "这段时间没有新邮件"
+日志                            →  "新增 2"，一切正常
+```
+
+四处放大因素，缺一不可：
+
+1. [graph.py](../../voice_loop/mail/graph.py) `delta_cursor_from_now()` 用 `$select=id`（元凶）；
+2. `delta(cursor)` 不补 `$select`（令牌里已经有了，补了会 400，所以只能改铸造处）；
+3. `store.upsert_messages` **无脑用空值覆盖** → 老邮件一被"更新"也会被抹空；
+4. `@removed`（删除通知）被当正常消息 → 又插一行空壳。
+   另外 `mail_summary(only_important=True)` 只看 `high` 级，就算索引是好的，
+   普通邮件也会被说成"没有"。
+
+### 80.3 修法（P0 结构 + P1 护栏 + 数据修复）
+
+| 改动 | 文件 |
+| --- | --- |
+| 铸游标改用完整 `LIST_SELECT`（`$top=100`） | `mail/graph.py` |
+| `@removed` 单独标记 → 上层删本地行 | `mail/graph.py` + `mail/delta.py` |
+| **稀疏更新**（Graph 对改过的邮件只回变化字段）→ 逐条补 `message_row()`，补不到跳过 | `mail/delta.py` + `mail/graph.py` |
+| **补不到就不推进游标**（否则那几条永远丢） | `mail/delta.py` |
+| 纯 id 且补不了 → `ShapeBroken`：丢游标、同轮按窗口重建 | `mail/delta.py` |
+| 400 `resyncRequired` 当 410 处理（形状一改必然遇到） | `mail/graph.py` |
+| `store.delete_messages` / `drop_broken` / `newest_at` / `broken` 计数 | `mail/store.py` |
+| 新鲜度：`last_sync_at` 落 `meta`、`freshness()`、`stamp()` | `mail/service.py` |
+| 「没有重要邮件 ≠ 没有邮件」：摘要补一句普通邮件数 | `mail/service.py` |
+| 工具结果带「（索引同步于 …，最新一封 …）」+ 落后时明说 | `mcp/servers/mail.py` |
+| `mail doctor` 体检、`status` 显示新鲜度、`sync` 显示删除/补齐 | `main.py` |
+| 概览页「邮件索引」一行（同步于 / 最新一封 / 空行 / 可能不是最新） | `console/panels/overview.py` + `static/panels/overview.js` |
+
+数据修复（一次性，已在真机做完）：
+
+```
+python main.py stop
+python main.py mail sync --full
+  → [mail] 清掉 20 行历史遗留的空行
+  → [mail] 取到增量游标（翻了 11 页，$select 与增量一致）
+  → [mail] 同步完成：新增 20、更新 68、删除 0（全量 2 页）
+  → （索引同步于 21:08，最新一封 11-21 20:50）
+python main.py mail doctor → 全部 √
+```
+
+### 80.4 修的过程中又挖出第二层：Graph 对"改过"的邮件只回变化字段
+
+修完游标形状、重打并重启服务后，为了**端到端**验一次，我把一封 npm 通知标成未读
+（它本来已读，验完改回去）。增量里回来的东西是：
+
+```json
+{"@odata.type": "#microsoft.graph.message", "id": "AAMk…", "isRead": true, "parentFolderId": "AQMk…"}
+```
+
+**没有 `receivedDateTime`** —— 也就是说「改过」的邮件在 delta 里是**稀疏更新**，
+不是完整对象。这跟"游标铸窄了"是两种不同的情况，但后果一样：直接 upsert 就会写空。
+
+所以最终规则改成（`delta.py` 的 `_apply`）：
+
+| 情况 | 处理 |
+| --- | --- |
+| 有条目但没有 `received_at`（稀疏更新） | 逐条 `message_row(id)` 补齐再 upsert（一页最多 60 封） |
+| 补不到（网络/权限） | 跳过不写，**并且游标不前进**（下一轮重试）——推进了就永久丢信 |
+| 纯 id、且连按 id 补都做不到（老版本铸的窄游标） | `ShapeBroken`：丢游标、同轮重建 |
+| `@removed` | 删本地行 |
+
+真机验证（造了一次真实改动）：
+
+```
+21:22:35 [mail] 巡检已启动（每 180s）
+21:22:43 [mail] 同步完成：新增 0、更新 1、删除 0（增量 1 页），补字段 1、跳过 0
+本地 is_read = 0；空行 0        ← 稀疏更新被补齐，没有写空行、也没有整份重建
+（改回已读后：21:25:49 更新 1、补字段 1；本地 is_read = 1，回到原状）
+```
+
+### 80.5 教训（四条，写下来免得再来一次）
+
+1. **「省一次字段」的优化要用"会不会让下游静默失败"来过一遍**。`$select=id` 当时看起来
+   只是省流量，代价是**整个增量管道失去数据**，而日志一路绿灯。
+2. **日志计数不等于业务正确**：`新增 2` 只证明"有 2 行进了库"，不证明"这 2 行有用"。
+   所以现在 `_apply()` 会分别数 `added/updated/deleted/backfilled/skipped`，
+   并且一页只有 id 就立刻判形状坏。
+3. **模型只能说它看得见的**。索引落后时它必须被明确告知（`stamp()` 里的
+   「★可能不是最新的★」），否则它会用非常自信的语气说出错误结论 ——
+   这不是模型的问题，是我们没给它这句话。
+4. **「仪表盘全绿」不等于没坏**。这一轮所有日志都写着"同步完成：新增 2"，
+   真正坏掉的是**数据的形状**。所以修完不能只看日志：`mail doctor` 看空行/新鲜度，
+   再拿一封真邮件做一次端到端（标未读 → 等一轮同步 → 看本地 `is_read` 和空行数）。
+
+---
+

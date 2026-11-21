@@ -209,6 +209,20 @@
                 : ((data.mcp || {}).servers || []).map((s) => s.name + "(" + s.transport
                     + (s.hidden ? ",hidden" : "") + (s.allow ? "," + s.allow + "个" : "") + ")").join(" ") || "没配服务器")
                 + " · 真实清单去「工具」页点一下" },
+            // ★邮件索引新鲜度★：她说「没有新邮件」时，先看这一行（索引落后 = 话不可信）
+            { k: "邮件索引", v: (() => {
+                const m = data.mail || {};
+                if (!m.enabled) return "关着（[mail] enabled = false）";
+                if (!m.ok) return h("span", { class: "mono wrap-path", text: m.error || "读不到" });
+                if (!m.ready) return "配好了但还不能用：" + (m.reason || "");
+                return [
+                  (m.account || "—") + " · " + m.total + " 封（未读 " + m.unread + "）",
+                  m.newest ? " · 最新 " + m.newest : " · 索引是空的",
+                  m.last_sync ? " · 同步于 " + m.last_sync : " · 这个进程还没同步过",
+                  m.stale ? h("span", { class: "tag warn", text: "可能不是最新" }) : null,
+                  m.broken ? h("span", { class: "tag err", text: "空行 " + m.broken }) : null,
+                ];
+              })() },
             { k: "TTS 后端", v: data.tts.backend + "（" + (data.tts.clone_dir || data.tts.model) + "）" },
             { k: "输出高频压制", v: "≥" + Math.round(data.tts.out_tilt[0] / 1000) + " kHz：" + data.tts.out_tilt[1] + " dB" },
             { k: "音区守卫", v: data.tts.pitch_guard[0] + " 半音 · 最多 " + data.tts.pitch_guard[1] + " 遍" },

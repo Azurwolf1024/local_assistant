@@ -85,6 +85,7 @@ class FakeGraph:
         self.drafts: list[str] = []
         self.fail_send: Exception | None = None
         self.gone_once = False
+        self.row_fail = False
         self.calls: list[str] = []
         self.attachment_data: dict[str, bytes] = {}
 
@@ -106,6 +107,13 @@ class FakeGraph:
     def delta_cursor_from_now(self, *, folder: str = "inbox") -> str:
         self.calls.append("cursor")
         return "CURSOR-1"
+
+    def message_row(self, message_id: str) -> dict:
+        """兜底补字段用（正常路径不该被调用）。"""
+        self.calls.append("message_row")
+        if self.row_fail:
+            raise GraphError("测试用：补字段失败")
+        return normalize_message(raw_msg(message_id, subject="补齐的主题", sender="z@x.com"))
 
     def delta(self, *, folder: str = "inbox", cursor: str = "", page_size: int = 50):
         self.calls.append("delta")
@@ -992,6 +1000,147 @@ def test_end_listening_rule() -> None:
     check("空串安全", VoiceLoop._wants_end_listening(None, ""), False)
 
 
+def test_sync_shape(tmp: Path) -> None:
+    """★2026-11-21 真机事故的回归测试★：增量只带 id → 新邮件写成空行 → 她说"没有新邮件"。
+
+    这里把五条防线都钉住：① 稀疏更新（Graph 只回变化字段）→ 逐条补字段，绝不写空行；
+    ② 连补字段都做不到的纯 id 载荷 → 判"形状坏了"、丢游标重建；
+    ③ 补不到的 → 跳过且**游标不前进**（否则那几条永远丢）；
+    ④ 删除通知要删本地行；⑤ 历史空行会被清掉。
+    """
+    print("\n[19] 增量形状：稀疏更新 / 纯 id 载荷 / 删除通知 / 历史空行")
+    graph = FakeGraph()
+    store = make_store(tmp / "shape")
+    syncer = Syncer(graph, store, first_days=7, page_size=50, max_pages=5)
+
+    # 先正常来一轮，把游标立起来
+    graph.recent = [normalize_message(raw_msg("s1", subject="老邮件", sender="a@x.com"))]
+    syncer.sync()
+    check("先把游标立起来", store.meta_get(CURSOR_KEY), "CURSOR-1")
+
+    # ① 稀疏更新：Graph 对"改过"的邮件只回变化字段（实测只有 id/isRead/parentFolderId）
+    graph.changes = [[{"id": "s2", "isRead": True}]]     # 没有 receivedDateTime
+    got = syncer.sync()
+    check("★稀疏更新 → 逐条补字段★", (got["ok"], got.get("backfilled")), (True, 1))
+    row = store.get("s2")
+    check("补回来的那封有主题/时间（不是空行）",
+          bool(row and row["subject"] and row["received_at"]), True,
+          detail=(row or {}).get("subject"))
+    check("★没有写进空行★", store.broken_count(), 0)
+    check("没被误判成形状坏（游标照常前进）",
+          (store.meta_get(CURSOR_KEY), bool(got.get("repaired"))), ("CURSOR-2", False))
+
+    # ② 纯 id 载荷 + 连补字段都做不到 → 丢游标重建（老版本铸窄游标的兜底）
+    class NoBackfill(FakeGraph):
+        message_row = None          # type: ignore[assignment]
+
+    graph2 = NoBackfill()
+    store2 = make_store(tmp / "shape2")
+    sync2 = Syncer(graph2, store2, first_days=7, page_size=50, max_pages=5)
+    graph2.recent = [normalize_message(raw_msg("t1", subject="老邮件", sender="a@x.com"))]
+    sync2.sync()
+    graph2.changes = [[{"id": "t2"}]]
+    got = sync2.sync()
+    check("★纯 id 且补不了 → 判形状坏、丢游标重建★",
+          (got["ok"], got.get("repaired")), (True, True))
+    check("重建后游标换了新的一份", store2.meta_get(CURSOR_KEY), "CURSOR-1")
+    check("仍然没有空行", store2.broken_count(), 0)
+
+    # ③ 补也补不到：跳过，而且**游标不前进**（推进了那几条就永远丢）
+    store.meta_set(CURSOR_KEY, "CURSOR-2")
+    graph.row_fail = True
+    graph.changes = [[
+        normalize_message(raw_msg("s6", subject="好的一封", sender="c@x.com")),
+        {"id": "s5"},
+    ]]
+    got = syncer.sync()
+    graph.row_fail = False
+    check("补不到就跳过（不写空行）", store.get("s5"), None)
+    check("好的那封照常入库", store.get("s6") is not None, True)
+    check("计数说明有跳过", (got["ok"], got.get("skipped")), (True, 1), detail=str(got))
+    check("★游标停在原地（下一轮重试）★",
+          (store.meta_get(CURSOR_KEY), got.get("cursor_held")), ("CURSOR-2", True))
+
+    # ④ 删除通知：删本地行，不新增
+    store.meta_set(CURSOR_KEY, "CURSOR-2")
+    before = store.counts()["total"]
+    graph.changes = [[{"id": "s1", "removed": True}]]
+    got = syncer.sync()
+    check("★删除通知 → 本地删掉那一行★", (got["deleted"], store.get("s1")), (1, None))
+    check("删除不会插一行新的空行", store.counts()["total"], before - 1)
+
+    # ⑤ 历史遗留空行（以前那版代码写下的）会被清掉
+    store._exec("INSERT INTO messages(id, subject, sender, received_at) VALUES(?,?,?,?)",
+                ("legacy-empty", "", "", ""))
+    check("先造一行历史空行", store.broken_count(), 1)
+    store.meta_set(CURSOR_KEY, "")
+    graph.recent = []
+    got = syncer.sync()
+    check("全量同步顺手清掉它", (got.get("dropped"), store.broken_count()), (1, 0))
+
+
+def test_cursor_shape() -> None:
+    """铸游标时的 $select 必须和增量一致 —— 少一个字段，整条增量就废了。"""
+    print("\n[20] 游标形状：铸游标必须带完整 LIST_SELECT（不许用 $select=id 抄近路）")
+    from voice_loop.mail.graph import LIST_SELECT  # noqa: PLC0415
+
+    seen: list[str] = []
+
+    def transport(method, url, *, headers, params, payload, timeout):
+        seen.append(url)
+        return 200, {}, {"value": [], "@odata.deltaLink":
+                         "https://graph.microsoft.com/v1.0/x?$deltatoken=T"}
+
+    auth = auth_mod.Auth("client", token_file=Path(tempfile.mkdtemp()) / "t.json")
+    auth.save(auth_mod.Token(access_token="t", refresh_token="r",
+                             expires_at=time.time() + 600))
+    graph = Graph(auth, request=transport)
+    graph.delta_cursor_from_now(folder="all")
+    url = seen[0]
+    check("★带的是完整字段，不是 id★", "receivedDateTime" in url and "subject" in url, True,
+          detail=url[:120])
+    check("和增量用的字段是同一份（LIST_SELECT）", LIST_SELECT.split(",")[0] in url, True)
+
+
+def test_freshness_and_summary(tmp: Path) -> None:
+    """索引新鲜度 + 摘要措辞：这两条是「她说没有新邮件」的第二道防线。"""
+    print("\n[21] 新鲜度提示 + 摘要措辞（没有重要邮件 ≠ 没有邮件）")
+    settings, cfg = make_cfg(tmp / "fresh")
+    graph = FakeGraph()
+    svc = MailService(settings, graph=graph)
+    svc.auth.save(auth_mod.Token(access_token="t", refresh_token="r",
+                                 expires_at=time.time() + 3600))
+
+    fresh = svc.freshness()
+    check("没同步过 → 标记为不可信", fresh["stale"], True)
+
+    graph.recent = [normalize_message(raw_msg("f1", subject="今天到的", sender="a@x.com",
+                                             days_ago=0.02))]
+    svc.store.upsert_messages(graph.recent)
+    svc.sync()
+    fresh = svc.freshness()
+    check("同步过 → 可信", (fresh["stale"], fresh["total"] >= 1), (False, True))
+    stamp = svc.stamp()
+    check("结果里带一句「索引同步于 / 最新一封」",
+          "索引同步于" in stamp and "最新一封" in stamp, True, detail=stamp)
+
+    # 只有普通邮件、没有重要邮件：不能说成"没有新邮件"
+    text = svc.summary(since_hours=24, only_important=True)
+    check("★没有重要邮件时要说「有普通邮件」★", "普通邮件" in text and "没有重要邮件" in text,
+          True, detail=text)
+
+    # 真空的时候才说"没有新邮件"
+    empty = svc.summary(since_hours=0.0001, only_important=False)
+    check("真的空才说没有新邮件", "没有新邮件" in empty, True, detail=empty)
+
+    # 工具层要把这句新鲜度带上（模型才看得到）
+    out = mailsrv.make_summary(svc)({"since_hours": 24, "only_important": True})["text"]
+    check("MCP 的 mail_summary 输出里带新鲜度", "索引同步于" in out, True,
+          detail=out[-80:])
+    out2 = mailsrv.make_search(svc)({"query": "", "limit": 3})["text"]
+    check("MCP 的 mail_search 输出里也带", "索引同步于" in out2, True, detail=out2[-60:])
+
+
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="mail_"))
     try:
@@ -1013,6 +1162,9 @@ def main() -> int:
         test_approval_card(tmp)
         test_end_listening(tmp)
         test_end_listening_rule()
+        test_sync_shape(tmp)
+        test_cursor_shape()
+        test_freshness_and_summary(tmp)
     finally:
         import shutil
 

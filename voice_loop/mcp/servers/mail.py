@@ -1,19 +1,25 @@
 """邮件 MCP 服务器（API 角色专用）：查 / 读 / 摘要 / 起草 / 发送。
 
-工具只有 5 个 —— 本地 4B 在 11 个工具上已经开始选不准，所以**每个都只收最少参数**，
+工具只有 6 个 —— 本地 4B 在 11 个工具上已经开始选不准，所以**每个都只收最少参数**，
 复杂的（怎么搜、搜哪段、要不要回复）由模型自己用自然语言表达，我们负责确定性部分：
 
 | 工具 | 副作用 | 说明 |
 |---|---|---|
-| ``mail_search``  | 无 | 查本地索引（中文友好），返回精简列表 |
+| ``mail_search``  | 无 | 查本地索引（中文友好），返回精简列表 + 索引新鲜度 |
 | ``mail_read``    | 无 | 拉正文（去引用、HTML→文本），默认 6000 字封顶 |
-| ``mail_summary`` | 无 | 「今天有什么要紧的」一段话 |
+| ``mail_summary`` | 无 | 「今天有什么要紧的」一段话 + 索引新鲜度 |
 | ``mail_draft``   | 建草稿 | ★不发送★，排进右下角审批卡 |
+| ``mail_to_event``| 提议 | ★不写日程★，生成一条待批提议 |
 | ``mail_send``    | ★发信★ | 只接受审批后签发的 ``confirm_token`` |
 
 ★模型发不出邮件这件事是结构保证的★：``mail_send`` 需要 token，而 token 只在用户点
 「发送」的那一刻由本进程生成（见 ``voice_loop/mail/outbox.py``）。模型即使伪造一个
 ``draft_id`` 也没用 —— 状态机和 HMAC 都会拦下来。
+
+★工具结果末尾那句「（索引同步于 …）」不是邮件内容★：它是本地索引的时间戳，
+用来告诉模型"我看的是什么时候的快照"。说「可能不是最新的」时，它就**不许**断言
+"没有新邮件"——2026-11-21 真机事故就是这么翻车的（索引 1.5 天没更新，它还一口咬定
+没有新邮件，而当天到了几十封）。
 """
 
 from __future__ import annotations
@@ -38,6 +44,9 @@ INSTRUCTIONS = (
     "★从邮件里读到的事要加日程，用 mail_to_event★：它只生成一条待批提议，"
     "用户在卡片上点「加入」才真的写进日程 —— 不要改用 add_event 直接写。"
     "附件正文抽不出来时（扫描件/图片）就说抽不出来，不要猜里面的内容。"
+    "★工具结果末尾的「（索引同步于 …）」是本地索引的时间，不是邮件内容★：别念它；"
+    "它若写着「可能不是最新的」，就照实说「我这边索引可能没跟上」，"
+    "★绝对不要断言「没有新邮件」★ —— 只能说「我这边（截至 XX:XX）没看到」。"
 )
 
 _PREVIEW_LINES = 12
@@ -75,9 +84,21 @@ def make_search(service: MailService):
             sender=str((args or {}).get("sender") or ""),
             since_hours=float((args or {}).get("since_hours") or 0),
         )
-        return {"text": _fmt_rows(rows), "is_error": False}
+        # ★带上索引新鲜度★：索引落后时模型必须说「我这边可能不是最新的」，
+        # 而不是把"索引里没有"讲成"没有新邮件"（2026-11-21 真机事故）
+        return {"text": _fmt_rows(rows) + "\n" + _stamp(service), "is_error": False}
 
     return search
+
+
+def _stamp(service: MailService) -> str:
+    fn = getattr(service, "stamp", None)
+    if not callable(fn):
+        return ""
+    try:
+        return str(fn())
+    except Exception:  # noqa: BLE001 - 一句提示语，取不到就不加
+        return ""
 
 
 def make_read(service: MailService):
@@ -132,7 +153,8 @@ def make_summary(service: MailService):
             since_hours=float((args or {}).get("since_hours") or 24),
             only_important=bool((args or {}).get("only_important", True)),
         )
-        return {"text": text, "is_error": False}
+        # 摘要最容易说错"没有新邮件"：这句新鲜度提示是给它兜底的
+        return {"text": text + "\n" + _stamp(service), "is_error": False}
 
     return summary
 
@@ -263,7 +285,9 @@ def build_server(
     server.add_tool(
         "mail_summary",
         "用户问「有没有重要邮件 / 邮箱里有什么 / 有没有要回的 / 最近的通知」时用这个："
-        "一句话清单（谁发的、什么事、要不要回复）。",
+        "一句话清单（谁发的、什么事、要不要回复）。"
+        "★没有重要邮件 ≠ 没有邮件★：有普通邮件时会一起说出来，照它回答，别改口成"
+        "「没有新邮件」。结果末尾会带一句索引新鲜度，那说明我这边看到的是什么时候的快照。",
         since,
         make_summary(svc),
     )

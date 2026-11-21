@@ -97,8 +97,10 @@ python main.py mail login
 ## 日常命令
 
 ```powershell
-python main.py mail status              # 登录状态 + 索引统计
+python main.py mail status              # 登录状态 + 索引统计 + ★新鲜度★（同步于/最新一封）
+python main.py mail doctor              # 一键体检：开关/登录/索引/空行/游标/是否够新
 python main.py mail sync                # 立刻同步一次（服务在跑时也会每 3 分钟自动同步）
+python main.py mail sync --full         # 丢掉游标、按 7 天窗口重建（索引不对时用这个）
 python main.py mail search 选课 --limit 5
 python main.py mail search --unread --level high
 python main.py mail read <邮件id>
@@ -108,6 +110,20 @@ python main.py mail approve <草稿id>     # ★批准 = 真发送★
 ```
 
 服务（`python main.py listen`）里这些是自动的：巡检、分级、提醒、审批卡弹窗。
+
+### 她说「没有新邮件」，可信箱里明明有 —— 先跑 `mail doctor`
+
+模型只能看见**本地索引**（`data/mail/index.sqlite`），索引不是实时的：
+
+| 症状 | 意思 | 怎么办 |
+| --- | --- | --- |
+| `doctor` 说「空行 N 行」 | 以前同步把一些邮件写成了只有 id 的空行 | `python main.py mail sync --full`（会顺手清掉） |
+| `doctor` 说「索引足够新 ×」 | 服务没在跑 / 刚重启还没同步 / 上次同步失败 | 确保服务在跑；或手动 `mail sync` |
+| 工具结果里带「★这份索引可能不是最新的★」 | 模型看到的就是这句提示 | 它现在会照实说"我这边可能没跟上"，而不是断言"没有" |
+| 摘要说「没有重要邮件，但有 N 封普通邮件」 | 只是没有 `high` 级的 | 让它 `mail_summary only_important=false` 或 `mail_search` |
+
+想看"到底同步到什么时候"：`python main.py mail status` 里的 **最新一封** / **上次同步**
+两行，控制台「概览」页的技术配置一览里也有同一组数字。
 
 ## 省 token（默认就很抠）
 
@@ -336,3 +352,10 @@ data/mail/confirm.key     审批 token 的 HMAC 密钥（32 字节随机，第�
 **Q：一台机器能给两个账号用吗？**
 一份 `data/mail/` 只对应一个账号（令牌覆盖）。要多账号就把 `[mail]` 整段换掉、
 或改 `[app] data_dir` 跑第二份配置。
+
+**Q：说「没有新邮件」但其实有？**
+先 `python main.py mail doctor`。最常见两种：① 服务没在跑（巡检不跑，索引就停在那）；
+② 索引里有"空行"（2026-11-21 那次同步事故：增量只带 id，写进去的是空壳）。
+两种都用 `python main.py mail sync --full` 修，前者再确保服务在跑。
+现在 `mail_search` / `mail_summary` 的结果末尾都会带「索引同步于 …，最新一封 …」，
+索引落后时会明说「可能不是最新的」，所以模型不会再一口咬定"没有"。
