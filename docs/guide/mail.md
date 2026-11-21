@@ -3,8 +3,13 @@
 一句话：**大肥鱼能替你收信、读信、起草回信，但「发送」这一下必须你点。**
 
 真正实现是一个子系统而不是「一个工具」：要登录、要增量同步、要把一百封邮件分出
-轻重、要在右下角弹审批卡、要记审计 —— 所以代码在 [`voice_loop/mail/`](../../voice_loop/mail/)，
-对外只有 5 个 MCP 工具（`mail_search` / `mail_read` / `mail_summary` / `mail_draft` / `mail_send`）。
+轻重、要在右下角弹审批卡、要记审计 —— 所以代码在 [`voice_loop/mail/`](../../voice_loop/mail/)。
+
+| 想知道什么 | 看哪 |
+| --- | --- |
+| 怎么注册应用、怎么登录、日常生活怎么用 | **本文件**（往下看） |
+| 和 Outlook 的接口（Graph 端点、delta、scope、错误码）、6 个工具的签名、
+数据表结构、闸门与 token 怎么算、坏了怎么查 | [`voice_loop/mail/README.md`](../../voice_loop/mail/README.md) |
 
 ## 能干什么
 
@@ -186,6 +191,18 @@ auto_propose = false    # 重要邮件自动生成提议（默认关，免得老
 `deepseek-chat` 会把「我的邮箱里有什么重要邮件」错选成 `list_memos`；砍到 18 个就稳定选
 `mail_summary`。要读工作区文件再加 `"files"`，要写文件/执行命令再加 `"write"` / `"shell"`。
 
+**这 6 个工具分别干什么**（细节和参数说明见
+[`voice_loop/mail/README.md`](../../voice_loop/mail/README.md) §3）：
+
+| 工具 | 你的一句话 | 会不会写 |
+| --- | --- | --- |
+| `mail_search` | 「学校发的通知」「谁给我发过…」 | 只读本地索引 |
+| `mail_read` | 「那封邮件说了什么」「念一下截止时间」 | 只读（引用历史已裁掉） |
+| `mail_summary` | 「有没有重要邮件 / 有没有要回的」 | 只读 |
+| `mail_draft` | 「给 AIAA3102 的老师发封邮件说…」 | **只建草稿**，发不出去 |
+| `mail_to_event` | 「把这个截止时间加到日程里」 | **只提议**，你在卡片上点「加入」才写日程 |
+| `mail_send` | （正常不该由它调） | 要有审批卡签发的 token 才发得出去 |
+
 试一下（不用麦克风）：
 
 ```powershell
@@ -293,12 +310,14 @@ send_allowlist = ["@hku.hk", "mom@example.com"]   # 支持整地址和 @域名
 
 ```
 data/mail/index.sqlite    索引（本地；含附件清单与抽到的附件正文）
-data/mail/token.json     登录令牌（本机；Windows 上尽量加密存放）
+data/mail/token.json     登录令牌（本机；**明文 JSON**，非 Windows 上 chmod 0600）
 data/mail/audit.jsonl     发信审计：谁批的、什么时候、正文 hash
-data/mail/secret.bin     审批 token 的 HMAC 密钥
+data/mail/confirm.key     审批 token 的 HMAC 密钥（32 字节随机，第一次用时生成）
 ```
 
-整个 `data/mail/` 已在 `.gitignore` 里。删掉它就等于「忘掉所有邮件」，不影响 Outlook 本身。
+整个 `data/mail/` 已在 `.gitignore` 里。删掉它就等于「忘掉所有邮件」，不影响 Outlook 本身
+（但会要重新登录一次）。★令牌没有加密★：它和 `config.local.toml` 一个级别 ——
+要更强的隔离就把 `data/mail/` 放到加密盘。
 
 ## 常见问题
 
