@@ -103,23 +103,32 @@ python --version  # 顺带一提：项目要求 Python ≥ 3.11（settings.py �
 
 ### 3.5 控制台 exe（不想开命令行的话）
 
-把控制台冻成**双击就能用**的 exe（原生窗口，不再是浏览器标签页）：
+把**应用**（控制台窗口 + 托盘 + 语音服务）冻成双击就能用的 exe：
 
 ```powershell
-python scripts/make_console_exe.py                  # 产出 dist/local-assistant-console/（约 50 MB，启动 1~2 秒）
-python scripts/make_console_exe.py --with-webview    # 连 pywebview 一起打（真原生窗口，约 54 MB）
+python scripts/make_console_exe.py                  # 产出 dist/local-assistant-console/（约 80 MB，启动 1~2 秒）
+python scripts/make_console_exe.py --with-webview    # 连 pywebview 一起打（真原生窗口，再大一点）
 python scripts/make_console_exe.py --onefile         # 单个 exe（好分发，但每次启动要解包：约 6 秒）
 python scripts/make_console_exe.py --check           # 只打印计划与要补的 hidden-import
 ```
 
+> ★`dist/` 里没有 exe 就是没打过（或被打包脚本清掉了）★ —— 它是**构建产物**，不进 git
+> （`.gitignore` 里 `dist/`、`build/` 都排着）。改完代码也要重打一次，exe 里的代码是**打包那一刻**的。
+
 把产物（`dist/local-assistant-console/` 整个文件夹，或单个 exe）放进项目根，双击即可：
 
 - exe 会**自己往上找** `config.toml` + `main.py` 定位项目（也可以 `--root` 或环境变量 `LOCAL_AI_ROOT` 指定）
-- 窗口按「pywebview → Edge 应用窗口 → 系统浏览器」挑第一个能用的（`--window` 可写死）
-- ★关窗口 = 退出控制台★；语音服务不受影响（它有自己的一套启停，见顶栏）
-- 同一个端口已经有控制台在跑时，双击**不再报错**，直接把那个窗口打开
-- 出问题时看 `sessions/console-exe.log`；`local-assistant-console.exe --selftest` 会把
-  「面板装上了吗、接口答不答」写进同一份日志
+- 它是**应用**：窗口 + 托盘 + 自动带起的语音服务；窗口按「pywebview → Edge 应用窗口 →
+  系统浏览器」挑第一个能用的（打包时默认不含 pywebview，所以多半是 **Edge 应用窗口**）
+- ★关掉窗口 = 收到托盘★（应用还在、服务还在）；要从托盘菜单「显示控制台窗口」或双击图标叫回来；
+  真要退出：托盘菜单「退出应用」（= 停服务 + 关窗口），或命令行 `python main.py stop --app`
+- 同一个端口已经有应用在跑时，双击**不再报错**，直接把那个窗口/标签页打开
+- 出问题时看 `sessions/console-exe.log`（INFO 级也都在里面）；`local-assistant-console.exe --selftest`
+  会把「面板装上了吗、接口答不答」写进同一份日志
+- 双击只弹一个 **「Unhandled exception in script」** 框：那是 PyInstaller 的启动期异常，
+  先看 `sessions/console-exe.log` / 控制台里同名 traceback —— 2026-11-21 撞到过一次，
+  是打包把 `setuptools` 排掉却留下了 `pkg_resources` 运行钩子（缺 `jaraco`）
+
 
 > **为什么不把语音服务也打进 exe**：服务要几 GB 模型 + 外部 Ollama + 真实音频设备，
 > 冻进去会是 2~4 GB 的怪物，还得给用户装驱动。所以 exe 是**控制台/界面**，服务仍旧用

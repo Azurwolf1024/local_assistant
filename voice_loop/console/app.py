@@ -596,8 +596,12 @@ def serve(
                 show_window=app_ctl.show_window,
                 quit_app=lambda: app_ctl.quit("托盘菜单"),
             )
+            # ★成功也要说一句★：exe 是 windowed 的，日志是唯一能看见的通道 ——
+            # 「没有这行」不该是判断托盘好坏的唯一线索（以前只有失败才有输出）。
             if tray_obj is None:
-                print("  （托盘没起来，不影响网页；pip install pystray pillow 可修）", flush=True)
+                print("  托盘：没起来（不影响网页；pip install pystray pillow 可修）", flush=True)
+            else:
+                print("  托盘：已就绪（关窗口不退出；双击图标叫回窗口）", flush=True)
 
         # ---- 开窗口 ----
         if win is not None:

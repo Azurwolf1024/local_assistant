@@ -71,8 +71,16 @@ def _setup_logging(root: Path, *, console: bool) -> Path | None:
         return None
     sys.stdout = handle
     sys.stderr = handle
+    import logging  # noqa: PLC0415
     import time  # noqa: PLC0415
 
+    # ★logging 也要接进这个文件★：windowed exe 没有终端，日志是**唯一**的排查通道。
+    # 不接的话 `logging.lastResort` 只丢 WARNING 及以上（INFO 全丢），于是
+    # 「托盘已就绪」「服务已启动」这类关键信息在 exe 里永远看不到（2026-11-21 撞到）。
+    logging.basicConfig(
+        stream=handle, level=logging.INFO, force=True,
+        format="%(asctime)s %(levelname).1s %(name)s | %(message)s", datefmt="%H:%M:%S",
+    )
     print(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} 控制台 exe 启动 ===", flush=True)
     return log_path
 

@@ -1359,6 +1359,66 @@ pywebview 的 `closing` 事件里我们返回 `False` 来「拦下关闭、改�
 
 ---
 
+## 76. 重打控制台 exe：三个打包坑（2026-11-21 下午，用户问「我的 .exe 找不到了，是不是要重新生成」）
+
+`dist/` 在 `.gitignore` 里 —— exe 是**构建产物**，从来不在 git 里。所以「找不到了」只有一个
+答案：重打。`python scripts/make_console_exe.py`（约 1~2 分钟，产物 80 MB onedir）。
+
+重打时连撞三个坑，全是「系统 Python 里跑得好好的，打包后就不行」那一类：
+
+### 76.1 双击只弹「Unhandled exception in script」
+
+`ModuleNotFoundError: No module named 'jaraco'` —— 新 setuptools 把 `pkg_resources`
+的依赖拆到了 `jaraco.text`，而我们为了瘦身 `--exclude-module setuptools`，
+于是 PyInstaller 的 `pyi_rth_pkgres` **运行钩子**一启动就崩。控制台不需要 pkg_resources
+（没有插件机制、webview 也排掉了），把 `pkg_resources`、`jaraco` 一起排干净即可。
+
+> 排查手法记一笔：windowed exe 的异常框会**卡住进程等点击**，`Start-Process -Wait`
+> 于是永远等下去（我第一次以为「8 秒启动」卡了 4 分钟）。用 `-RedirectStandardError`
+> 抓 traceback 最快；`Get-Process | Select MainWindowTitle` 能看到那个框的标题。
+
+### 76.2 exe 里没有托盘图标
+
+先报 `[托盘] 没装 Pillow` —— `EXCLUDES` 里排了 `PIL`。以前托盘跑在**服务**进程里，
+exe 不需要它；§75 把托盘归到应用之后，`tray.icon_image()` 要 Pillow 现画图标，
+于是 exe 变成「没有托盘的 app」：关掉窗口就再也叫不回来。把 `PIL` 从排除表拿掉（+5 MB）。
+
+紧接着 `pystray` 也没打进去：它是在 `voice_loop/tray.py` 的**函数里**懒导入的
+（`available()` 里包着 try/except），PyInstaller 静态分析没带进来。
+修法是 `EXTRA_HIDDEN = ["pystray", "pystray._base", "pystray._util", "pystray._win32"]`
+（后端是按平台条件 import 的，也得写死）。
+
+### 76.3 「托盘到底起没起来」看不出来
+
+`console_exe._setup_logging` 只把 **stdout** 接到 `sessions/console-exe.log`，
+`logging` 还是默认的 `lastResort`（只放 WARNING 及以上）—— 于是「[托盘] 已就绪」这类
+INFO 在 exe 里**永远看不见**。我一度以为托盘还是挂的，其实只是日志被吞了
+（`pystray` 修好之后不再有 WARNING，于是日志里一片安静）。两处一起改：
+
+- `_setup_logging` 里补 `logging.basicConfig(stream=handle, level=INFO, force=True)`
+- `serve()` 把托盘结果**用 print 说清楚**（以前只有失败才有输出）：
+  `托盘：已就绪（关窗口不退出；双击图标叫回窗口）`
+
+### 76.4 验证
+
+| 验的东西 | 怎么验 | 结果 |
+| --- | --- | --- |
+| 能启动 | `local-assistant-console.exe --version --root D:\local_AI` | 退出码 0，日志写 `local_assistant 1.2.0` |
+| 打包完整 | `--selftest --port 8766` | 7 个面板全在，`/api/meta`、`/style.css`、`/panels/persona.js`、`/api/service` 全 200，结论「通过」 |
+| 作为应用能跑 | 双击（带 `--root`） | exe + 自动起服务两个进程，8765 返回 200，窗口是 **Edge 应用窗口**（打包不含 pywebview） |
+| 托盘在 | 看日志 | `[托盘] 已就绪：关窗口不收应用，双击图标可叫回窗口` |
+| 优雅退出 | `python main.py stop --app` | `√ 服务已停止` + `√ 控制台应用已退出（优雅退出：先停了语音服务）` |
+
+### 76.5 又踩了一次「中文不要过 PowerShell 管道」
+
+写这一节时我用 `@'…'@ | python -` 把中文喂给 python 去追加，控制台代码页把它变成了
+孤立的 surrogate（`\udcb0`），`write_text` 半路抛异常 —— 而 `write_text` 是**先截断再写**，
+于是 1364 行的日志**变成了 0 字节**（`git checkout` 才救回来）。
+规矩重申：**中文内容只用编辑器工具写，别经过 PowerShell 管道**。
+
+---
+
+
 
 
 ---

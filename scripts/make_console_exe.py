@@ -43,9 +43,24 @@ ENTRY = ROOT / "console_exe.py"
 NAME = "local-assistant-console"
 
 EXCLUDES = [
-    "numpy", "scipy", "pandas", "matplotlib", "PIL", "cv2", "sounddevice", "soundfile",
+    "numpy", "scipy", "pandas", "matplotlib", "cv2", "sounddevice", "soundfile",
     "sherpa_onnx", "onnxruntime", "openvino", "torch", "transformers", "optimum",
     "ollama", "httpx", "aiohttp", "sklearn", "IPython", "pytest", "setuptools",
+    # ★pkg_resources / jaraco 必须一起排★：新 setuptools 把 pkg_resources 的依赖拆到了
+    # `jaraco.text`，而我们把 setuptools 排掉了 —— 于是 PyInstaller 的
+    # `pyi_rth_pkgres` 运行钩子一启动就 `ModuleNotFoundError: No module named 'jaraco'`，
+    # 双击 exe 只弹一个「Unhandled exception in script」框（2026-11-21 真机撞到）。
+    # 控制台不需要 pkg_resources（没有插件机制、webview 也排掉了），直接排干净。
+    "pkg_resources", "jaraco",
+]
+
+# ★PIL 不能排★：托盘图标是 `tray.icon_image()` 用 Pillow 现画的，排掉它 exe 就没有托盘
+# —— 而托盘是这个应用的入口（关窗口靠它收、退出靠它点）。多这 5 MB 很值。
+# 以前这里排了 PIL（那时托盘跑在服务进程里、exe 根本不需要它），2026-11-21 改归属后必须留。
+
+#: 静态分析看不见、但 exe 运行时要的模块（见 :func:`hidden_imports` 的说明）
+EXTRA_HIDDEN = [
+    "pystray", "pystray._base", "pystray._util", "pystray._win32",
 ]
 """★控制台不碰的重家什★：排除它们体积 354 MB → 65 MB，启动也快一截。
 
@@ -123,7 +138,13 @@ def _resolve_relative(base: str, package_parts: list[str]) -> str:
 
 
 def hidden_imports() -> list[str]:
-    """★打 exe 时真正要补的那串★：面板 + 面板用的路由模块 + 包根。"""
+    """★打 exe 时真正要补的那串★：面板 + 面板用的路由模块 + 包根 + 托盘那套。
+
+    ★为什么要手写 EXTRA_HIDDEN★：`pystray` 是在 `voice_loop/tray.py` 的**函数里**懒导入的
+    （`available()` 里包着 try/except），PyInstaller 的静态分析没把它带进来 ——
+    于是 exe 里「托盘图标没起来：没装 pystray」，而系统 Python 里一切正常。
+    它的后端（`_win32`）是 import 时按平台条件选择的，也一并写死。
+    """
     panels = sorted((ROOT / "voice_loop" / "console" / "panels").glob("*.py"))
     modules = sorted((ROOT / "voice_loop" / "console").glob("*.py"))
     targets = panels + modules
@@ -135,6 +156,9 @@ def hidden_imports() -> list[str]:
         candidate = ROOT.joinpath(*parts).with_suffix(".py")
         package = ROOT.joinpath(*parts, "__init__.py")
         if candidate.is_file() or package.is_file():
+            clean.append(name)
+    for name in EXTRA_HIDDEN:
+        if name not in clean:
             clean.append(name)
     return clean
 
