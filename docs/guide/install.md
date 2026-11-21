@@ -128,6 +128,9 @@ python scripts/make_console_exe.py --check           # 只打印计划与要补�
 - 双击只弹一个 **「Unhandled exception in script」** 框：那是 PyInstaller 的启动期异常，
   先看 `sessions/console-exe.log` / 控制台里同名 traceback —— 2026-11-21 撞到过一次，
   是打包把 `setuptools` 排掉却留下了 `pkg_resources` 运行钩子（缺 `jaraco`）
+- **界面能开、但某些面板空着**（尤其是「角色」整片没有角色）：多半是**某个被排掉的库**
+  在运行时被摸到了 —— `sessions/console-exe.log` 里的 `ModuleNotFoundError` 就是答案。
+  2026-11-21 的那次是 `import voice_loop.tts.spec` 顺带把 numpy 拖进来（已改成按需加载）
 
 
 > **为什么不把语音服务也打进 exe**：服务要几 GB 模型 + 外部 Ollama + 真实音频设备，

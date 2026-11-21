@@ -1418,6 +1418,59 @@ INFO 在 exe 里**永远看不见**。我一度以为托盘还是挂的，其实
 
 ---
 
+## 77. exe 里角色列表全空：`import voice_loop.tts.spec` 拖进了 numpy（2026-11-21 傍晚）
+
+用户报「控制台里看不到角色文件了」。源码跑没问题，**exe 里角色一片空** ——
+`/api/voices` 返回 `characters: []`，`/api/persona/scan` 只剩 4 个（有素材目录的那几个），
+`/api/persona/get?cid=baize` 直接 **500**。日志里终于有真话（§76.3 刚把 INFO 接进日志）：
+
+```
+File "voice_loop\persona.py", line 499, in normalize_tts
+    from .tts.spec import TtsConfigError, VoiceSpec
+File "voice_loop\tts\__init__.py", line 16, in <module>
+    from .api_tts import ApiTts, api_tts_ready, voice_of
+File "voice_loop\tts\api_tts.py", line 28, in <module>
+    import numpy as np
+ModuleNotFoundError: No module named 'numpy'
+```
+
+### 77.1 根因：包 `__init__` 在顶层 import 了引擎
+
+`persona.normalize_tts()` 只想要 `VoiceSpec` / `TtsConfigError`，但 **`from .tts.spec import …`
+会先执行父包 `voice_loop/tts/__init__.py`**，而它顶层就把 `api_tts`（numpy）、
+`piper_tts`、`zipvoice_tts`（sherpa）全 import 了。源码环境里这些都在，所以看不出来；
+控制台 exe 为了瘦身把它们全排掉了 → 读人格卡时抛异常 → `CharacterRegistry.load()` 挂 →
+控制台把异常当「没有角色」，**整片角色消失**（连白泽都没了）。
+
+这正是打包脚本注释里那句「面板经 `clone` 摸到语音栈」的同一类问题，
+只不过这次是**人格卡**摸到了语音栈。
+
+### 77.2 修法：`tts/__init__.py` 改成「顶层什么都不重」
+
+- 顶层只 `from .spec import …`（纯 dataclass/校验，几毫秒）
+- 十个引擎名字走 **PEP 562** `__getattr__` 按需 import（`_LAZY` 表），
+  `from voice_loop.tts import PiperTts` 这种老写法照样能用（第一次取到就缓存进 globals）
+- `create_tts()` / `registry_for()` 里各自局部 import `VoiceShell` / `TtsRegistry`
+- `__dir__()` 把 `_LAZY` 的名字也报出去，`dir(voice_loop.tts)` 不至于「看不见」
+
+顺带好处：语音服务启动、`main.py skills` 这类「只碰一下 spec」的路径也不再拖 numpy。
+
+### 77.3 回归测试（这条必须钉住）
+
+`test_tts_registry.py [9]`：**用子进程**跑 `import voice_loop.persona` 再看
+`'numpy' in sys.modules`（本进程几乎一定早就 import 过 numpy，同进程测会假通过），
+外加「`from voice_loop.tts import PiperTts` 仍然可用」。
+
+| 验的东西 | 怎么验 | 结果 |
+| --- | --- | --- |
+| 源码：人格卡 import 干净 | `test_tts_registry [9]` | `False False`（numpy / sherpa 都没进） |
+| exe：角色回来 | 重打后查 `/api/voices` | 6 个：baize, kaltsit, amiya, exusiai, clementia, bluefish（修前是空） |
+| exe：界面也回来了 | 浏览器打开 `#persona` | 6 张角色卡片正常渲染（截图确认） |
+| 回归 | 全套 53 个 + `lint_persona` | 全 EXIT=0 |
+
+---
+
+
 
 
 

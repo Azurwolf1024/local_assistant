@@ -1,29 +1,30 @@
 """TTS 层对外只留一个入口：:func:`create_tts`。
 
-以前这里有 ``BACKENDS = ("piper", "zipvoice", "api")`` 和一大串 ``if backend == ...``。
 现在那些都变成了数据（见 :mod:`voice_loop.tts.spec` / :mod:`voice_loop.tts.registry`）：
 
     voice_loop/tts/providers/
       piper.py     zipvoice.py     deepseek.py     edge.py     http.py
                                     ↑ 加后端 = 在这里加一个文件
 
-对外仍然导出老名字（``PiperTts`` / ``ZipVoiceTts`` / ``ApiTts`` / ``LazyTts`` / ``BACKENDS``），
-因为脚本和自测一直在用；但它们只是转发，真正的选择逻辑已经不在这个文件里了。
+★这个 `__init__` 故意「什么都不重」★（2026-11-21 改的）
+    以前它在顶层 `from .api_tts import …` / `from .piper_tts import …`，
+    于是**只要有人 `import voice_loop.tts.spec`（比如读人格卡校验 TTS 字段），
+    就会连带拉进 numpy / sherpa_onnx / onnxruntime**。语音服务无所谓，
+    但控制台 exe 把那堆重库全排掉了（见 scripts/make_console_exe.py）——
+    结果就是 exe 里**角色列表整个空掉**：`CharacterRegistry.load()` 抛
+    `ModuleNotFoundError: No module named 'numpy'`，控制台又把它当成「没有角色」。
+    现在顶层只 import `spec`（纯 dataclass/校验，几毫秒），引擎类按需取（PEP 562），
+    `from voice_loop.tts import PiperTts` 这种老写法照样能用。
 """
 
 from __future__ import annotations
 
-from .api_tts import ApiTts, api_tts_ready, voice_of
-from .base import TtsEngine
-from .lazy import LazyTts
-from .piper_tts import PiperTts
-from .registry import TtsRegistry
-from .session import VoiceShell
+from typing import Any
+
 from .spec import (
     CAP_CLONE, CAP_CLOUD, CAP_SPEED, CAP_STREAM, CAP_STYLE, CAP_VOICE_ID,
     FieldSpec, ProviderSpec, TtsConfigError, VoiceSpec,
 )
-from .zipvoice_tts import ZipVoiceTts, missing_files
 
 __all__ = [
     "BACKENDS", "CAP_CLONE", "CAP_CLOUD", "CAP_SPEED", "CAP_STREAM", "CAP_STYLE",
@@ -37,9 +38,42 @@ __all__ = [
 BACKENDS = ("piper", "zipvoice", "deepseek", "edge", "http")
 ZIPVOICE_HINT = "python scripts/download_models.py --only zipvoice"
 
+#: 名字 → (子模块, 属性名)。不在这里的都当不存在。
+_LAZY = {
+    "ApiTts": (".api_tts", "ApiTts"),
+    "api_tts_ready": (".api_tts", "api_tts_ready"),
+    "voice_of": (".api_tts", "voice_of"),
+    "PiperTts": (".piper_tts", "PiperTts"),
+    "ZipVoiceTts": (".zipvoice_tts", "ZipVoiceTts"),
+    "missing_files": (".zipvoice_tts", "missing_files"),
+    "TtsEngine": (".base", "TtsEngine"),
+    "LazyTts": (".lazy", "LazyTts"),
+    "VoiceShell": (".session", "VoiceShell"),
+    "TtsRegistry": (".registry", "TtsRegistry"),
+}
+
+
+def __getattr__(name: str) -> Any:
+    """PEP 562：用到哪个引擎才 import 哪个（`from voice_loop.tts import PiperTts` 仍然可用）。"""
+    target = _LAZY.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import importlib  # noqa: PLC0415
+
+    module = importlib.import_module(target[0], __name__)
+    value = getattr(module, target[1])
+    globals()[name] = value          # 缓存一下，下次不再走 __getattr__
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted({*globals(), *_LAZY})
+
 
 def registry_for(settings, logger=None) -> TtsRegistry:
     """扫一遍 `providers/` 建注册表（结果不缓存：设置可能被换掉）。"""
+    from .registry import TtsRegistry  # noqa: PLC0415 - 轻，但仍然按需
+
     registry = TtsRegistry(settings, logger)
     registry.discover()
     return registry
@@ -53,6 +87,8 @@ def create_tts(settings, logger=None, lazy: bool = True,
     管线拿到角色后再调 ``shell.use(角色的 spec)``，不需要重建整个 TTS。
     ``lazy=True``（默认）返回按需加载的外壳：待唤醒状态完全不占内存。
     """
+    from .session import VoiceShell  # noqa: PLC0415 - 拖 numpy，必须按需
+
     registry = registry_for(settings, logger)
     if not registry.providers:
         raise TtsConfigError("没有发现任何 TTS 后端（voice_loop/tts/providers/ 是空的？）")

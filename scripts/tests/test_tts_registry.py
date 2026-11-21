@@ -342,6 +342,31 @@ def test_online(settings) -> None:
               f"{pcm.size / max(1, rate):.2f}s @ {rate} Hz")
 
 
+def test_lazy_package() -> None:
+    print("\n[9] ★import 人格卡不许拖 numpy★（控制台 exe 里 numpy 被排掉了）")
+    # 真实事故（2026-11-21）：`persona.normalize_tts` 只想要 VoiceSpec，却因为
+    # `voice_loop/tts/__init__.py` 在顶层 import 了引擎 → 连带拉 numpy / sherpa。
+    # 控制台 exe 排掉了这些重库，于是 `CharacterRegistry.load()` 抛
+    # ModuleNotFoundError，控制台把异常当成「没有角色」——**角色列表整片空掉**。
+    # 这条用子进程验，避免本进程早就 import 过 numpy 造成假通过。
+    import subprocess  # noqa: PLC0415
+
+    code = ("import sys, voice_loop.persona;"
+            "print('numpy' in sys.modules, 'sherpa_onnx' in sys.modules)")
+    try:
+        got = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                             timeout=120, cwd=str(ROOT), encoding="utf-8", errors="replace")
+        tail = (got.stdout or "").strip().splitlines()[-1] if got.stdout else ""
+    except (OSError, subprocess.SubprocessError) as exc:  # noqa: BLE001
+        tail = f"跑不起来：{exc}"
+    check("persona 的 import 不拉 numpy / sherpa", tail, "False False")
+    # 老写法仍要能用（`from voice_loop.tts import PiperTts`）
+    from voice_loop.tts import PiperTts, VoiceSpec  # noqa: PLC0415
+
+    check("from voice_loop.tts import PiperTts 仍然可用", PiperTts.__name__, "PiperTts")
+    check("spec 名字也还在", VoiceSpec(provider="piper").provider, "piper")
+
+
 def main() -> int:
     online = "--online" in sys.argv
     settings = load_settings()
@@ -358,6 +383,7 @@ def main() -> int:
         test_migration()
         test_http_provider(settings, tmp)
         test_decode()
+        test_lazy_package()
         if online:
             test_online(settings)
     print("\n" + "=" * 66)
