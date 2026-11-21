@@ -10,8 +10,11 @@
 
 ★为什么要三级而不是只做 pywebview★：pywebview 在 Windows 上要 pythonnet（.NET），
 冻进 exe 还会再胖一截；而「打不开窗口」这种事不能变成控制台起不来。所以
-:func:`choose` 只负责挑一个**确实能用**的，:func:`open_window` 起不来时由 ``serve()``
-退回浏览器 —— 用户最多是「没有原生窗口」，而不是「界面打不开」。
+:func:`choose` 只负责挑一个**确实能用**的，:func:`prepare_window` 造出来的把手
+起不来时由 ``serve()`` 退回浏览器 —— 用户最多是「没有原生窗口」，而不是「界面打不开」。
+
+★2026-11-21 起它是「应用的窗口」★：除了开，还要能 ``hide`` / ``show`` / ``destroy`` ——
+因为关窗口 = 最小化到托盘，不是退出应用（见 :class:`AppWindow` 与 voice_loop/tray.py）。
 
 ★``edge --app`` 为什么要单独的 ``--user-data-dir``★：不加的话 Edge 会把窗口
 交给**已经在运行的那个 Edge 进程**，我们启动的这个进程立刻退出 ——
@@ -20,10 +23,12 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any, Callable
 
 WEBVIEW2_CLIENT = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
 """WebView2 Runtime 的固定产品 ID（Edge 更新器注册表里用它登记）。"""
@@ -118,49 +123,209 @@ def choose(prefer: str = "auto") -> str:
     return "browser"
 
 
-def open_window(url: str, *, title: str, backend: str = "auto", profile_dir: Path | None = None,
-                size: tuple[int, int] = (1200, 820)) -> tuple[bool, str]:
-    """开窗口并**阻塞到窗口关闭**。返回 (成功了吗, 一句话)。
+# --------------------------------------------------------------------------- #
+# 应用主窗口：一个把手，三种后端
+# --------------------------------------------------------------------------- #
+class AppWindow:
+    """控制台**应用的主窗口**。三种后端背后一个把手：``run`` / ``show`` / ``hide`` / ``destroy``。
 
-    ★必须在主线程调★：pywebview 要求主线程（它要跑自己的事件循环），
-    所以 ``serve()`` 里是「uvicorn 在后台线程、窗口占主线程」这个结构。
+    ★为什么要有这一层★：2026-11-21 起托盘的语义变成「**应用的**托盘」（见 tray.py），
+    于是窗口必须能被**藏起来再拿出来**（关窗口 = 最小化到托盘，不是退出应用）。
+    三种后端的「隐藏」根本不是一回事：
+
+    ============  ============================  ==========================================
+    后端           关窗口                        「再打开」
+    ============  ============================  ==========================================
+    ``pywebview``   拦下 closing → ``hide()``      ``show()``（同一个窗口对象）
+    ``edge``        那个 Edge 进程退出（★不影响   重新 spawn 一个 ``--app`` 窗口
+                    我们的应用进程★）
+    ``browser``     关标签页（拦不住）             再 ``webbrowser.open`` 一次
+    ============  ============================  ==========================================
+
+    ``blocks_main_thread`` 只在 pywebview 上是 True：它要**主线程**跑自己的事件循环，
+    所以 ``serve()`` 里必须「先起托盘、再让主线程进窗口循环」。
     """
-    picked = choose(backend)
-    if picked == "pywebview":
+
+    backend = "browser"
+    blocks_main_thread = False
+
+    def __init__(self, url: str, *, title: str = "", prefer: str = "auto",
+                 profile_dir: Path | None = None, size: tuple[int, int] = (1200, 820),
+                 on_user_close: Callable[[], bool] | None = None, logger=None) -> None:
+        self.url = url
+        self.title = title
+        self.size = size
+        self.profile_dir = profile_dir
+        self.on_user_close = on_user_close
+        self.log = logger or logging.getLogger("voice_loop.console.window")
+        self.picked = choose(prefer)
+        self._window: Any = None
+        self._proc: Any = None
+        self._allow_close = False       # destroy() 时置 True，把「拦下关闭」让路
+
+    # ---- 子类实现 ----
+    def run(self) -> None:
+        """打开窗口。pywebview 会**阻塞到窗口被 destroy**，其余后端立刻返回。"""
+        raise NotImplementedError
+
+    def show(self) -> tuple[bool, str]:
+        raise NotImplementedError
+
+    def hide(self) -> tuple[bool, str]:
+        return False, "这个后端藏不了窗口"
+
+    def destroy(self) -> None:
+        pass
+
+    # ---- 公共 ----
+    @property
+    def can_hide(self) -> bool:
+        return False
+
+    def describe(self) -> str:
+        return {"pywebview": "原生窗口", "edge": "Edge 应用窗口", "browser": "浏览器标签页"}.get(
+            self.picked, self.picked)
+
+
+class _BrowserWindow(AppWindow):
+    backend = "browser"
+
+    def run(self) -> None:
+        self.show()
+
+    def show(self) -> tuple[bool, str]:
         try:
-            import webview  # noqa: PLC0415
-        except ImportError as exc:
-            return False, f"pywebview 用不了（{exc}）"
-        try:
-            window = webview.create_window(title, url, width=size[0], height=size[1],
-                                           min_size=(880, 600), text_select=True)
-            kwargs: dict = {}
-            if profile_dir is not None:
-                kwargs["storage_path"] = str(profile_dir)
-            webview.start(**kwargs)          # 阻塞：窗口关掉才返回
-            _ = window
-            return True, "窗口已关闭"
-        except Exception as exc:  # noqa: BLE001 - 起不来就让上层退回浏览器
-            return False, f"窗口起不来（{type(exc).__name__}: {exc}）"
-    if picked == "edge":
+            import webbrowser  # noqa: PLC0415
+
+            webbrowser.open(self.url)
+        except Exception as exc:  # noqa: BLE001 - 打不开浏览器不该让应用起不来
+            return False, f"打不开浏览器（{exc}），请手动访问 {self.url}"
+        return True, "已在浏览器里打开"
+
+
+class _EdgeWindow(AppWindow):
+    backend = "edge"
+
+    def run(self) -> None:
+        self.show()
+
+    def _spawn(self) -> tuple[bool, str]:
         exe = edge_path()
         if exe is None:
             return False, "找不到 msedge.exe"
-        profile = profile_dir or Path.cwd() / "sessions" / "edge-window"
+        profile = self.profile_dir or Path.cwd() / "sessions" / "edge-window"
         profile.mkdir(parents=True, exist_ok=True)
-        cmd = [str(exe), f"--app={url}", f"--window-size={size[0]},{size[1]}",
+        cmd = [str(exe), f"--app={self.url}", f"--window-size={self.size[0]},{self.size[1]}",
                f"--user-data-dir={profile}", "--no-first-run", "--no-default-browser-check",
-               "--disable-features=Translate,msEdgeSplitScreen", "--disable-session-crashed-bubble"]
+               "--disable-features=Translate,msEdgeSplitScreen",
+               "--disable-session-crashed-bubble"]
         try:
-            proc = subprocess.Popen(cmd)
+            self._proc = subprocess.Popen(cmd)
         except OSError as exc:
             return False, f"Edge 起不来（{exc}）"
+        return True, "已打开 Edge 应用窗口"
+
+    def show(self) -> tuple[bool, str]:
+        # 已经有一个 Edge 窗口在跑 → 前面去（关掉过就重开一个）
+        if self._proc is not None and self._proc.poll() is None:
+            return True, "窗口已经开着（在任务栏里）"
+        return self._spawn()
+
+    def destroy(self) -> None:
+        """只关我们自己起的那个 Edge 窗口进程；应用进程不受影响。"""
+        proc = self._proc
+        if proc is None or proc.poll() is not None:
+            return
         try:
-            proc.wait()                      # ★等窗口关掉★：这样「关窗口 = 退出控制台」
-        except KeyboardInterrupt:
-            pass
-        return True, "窗口已关闭"
-    return False, "这个后端不是窗口（browser）"
+            proc.terminate()
+        except OSError as exc:
+            self.log.debug(f"关窗口失败（忽略）：{exc}")
+
+
+class _PyWebviewWindow(AppWindow):
+    backend = "pywebview"
+    blocks_main_thread = True
+
+    @property
+    def can_hide(self) -> bool:
+        return True
+
+    def run(self) -> None:
+        """★必须在主线程调★：建窗口 + 进事件循环，``destroy()`` 之后才返回。"""
+        try:
+            import webview  # noqa: PLC0415
+        except ImportError as exc:
+            raise RuntimeError(f"pywebview 用不了（{exc}）") from exc
+        self._webview = webview
+        window = webview.create_window(self.title, self.url, width=self.size[0],
+                                       height=self.size[1], min_size=(880, 600),
+                                       text_select=True)
+        self._window = window
+
+        def _on_closing() -> bool:
+            # ★返回 False = 拦下这次关闭★，然后藏起来（关窗口 = 最小化到托盘，不退出应用）
+            if self._allow_close:
+                return True          # 是「退出应用」叫的 destroy()，放行
+            try:
+                window.hide()
+            except Exception as exc:  # noqa: BLE001
+                self.log.warning(f"藏窗口失败（当成真关）：{exc}")
+                return True
+            return False
+
+        try:
+            window.events.closing += _on_closing
+        except Exception as exc:  # noqa: BLE001 - 老版本 pywebview 没有这个事件
+            self.log.warning(f"这条 pywebview 不支持 closing 事件（关窗口会退出应用）：{exc}")
+        kwargs: dict = {}
+        if self.profile_dir is not None:
+            kwargs["storage_path"] = str(self.profile_dir)
+        webview.start(**kwargs)          # 阻塞：窗口被 destroy 才返回
+
+    def show(self) -> tuple[bool, str]:
+        window = self._window
+        if window is None:
+            return False, "窗口还没建好"
+        try:
+            window.show()
+            window.restore() if hasattr(window, "restore") else None
+        except Exception as exc:  # noqa: BLE001
+            return False, f"显示窗口失败（{exc}）"
+        return True, "窗口已显示"
+
+    def hide(self) -> tuple[bool, str]:
+        window = self._window
+        if window is None:
+            return False, "窗口还没建好"
+        try:
+            window.hide()
+        except Exception as exc:  # noqa: BLE001
+            return False, f"藏窗口失败（{exc}）"
+        return True, "窗口已收到托盘"
+
+    def destroy(self) -> None:
+        window = self._window
+        if window is None:
+            return
+        # ★必须先放行 closing★：否则「退出应用」调的 destroy() 会被自己的拦截器拦下，
+        #   窗口永远关不掉、`webview.start()` 不返回、进程就挂在托盘里退不出去。
+        self._allow_close = True
+        try:
+            window.destroy()
+        except Exception as exc:  # noqa: BLE001
+            self.log.warning(f"关窗口失败（继续退出）：{exc}")
+
+
+def prepare_window(url: str, *, title: str = "本地语音助手 · 控制台",
+                   prefer: str = "auto", profile_dir: Path | None = None,
+                   size: tuple[int, int] = (1200, 820),
+                   on_user_close: Callable[[], bool] | None = None,
+                   logger=None) -> AppWindow:
+    """按 ``prefer`` 造一个窗口把手（**不起窗口**，起窗口是 :meth:`AppWindow.run`）。"""
+    cls = {"pywebview": _PyWebviewWindow, "edge": _EdgeWindow,
+           "browser": _BrowserWindow}.get(choose(prefer), _BrowserWindow)
+    return cls(url, title=title, prefer=prefer, profile_dir=profile_dir, size=size,
+               on_user_close=on_user_close, logger=logger)
 
 
 def describe() -> dict:

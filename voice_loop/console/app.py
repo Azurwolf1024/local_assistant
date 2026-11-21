@@ -16,6 +16,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
+from typing import Any
 from pathlib import Path
 
 from ..control import ControlChannel
@@ -203,6 +204,21 @@ def create_app(settings: Settings, logger: logging.Logger | None = None):
     startup_stamp = panel_stamp()
 
     # ------------------------------------------------------------------ 基础接口
+    @app.post("/api/app/quit")
+    def api_app_quit():
+        """★退出应用★（`python main.py stop --app` 与将来的界面按钮都走这里）。
+
+        ★为什么走 HTTP 而不是直接 kill★：退出要按顺序做事（**先停语音服务**，再关窗口，
+        最后让 uvicorn 收尾）。硬杀做不到这些，还会留下「服务还在跑、应用没了」。
+        所以这里只是把活儿丢给 ``serve()`` 里那个 ``_Application.quit``，立刻返回。
+        """
+        quit_fn = getattr(app.state, "quit_app", None)
+        if quit_fn is None:
+            return {"ok": False,
+                    "error": "这个进程没有接退出动作（用 main.py ui 起的时候才有）"}
+        threading.Thread(target=quit_fn, name="app-quit-api", daemon=True).start()
+        return {"ok": True, "message": "正在退出应用（先停服务、再关窗口）"}
+
     @app.get("/api/meta")
     def api_meta():
         """界面启动时拉的第一份数据：我是谁、有哪些面板、数据在哪。"""
@@ -352,6 +368,127 @@ def port_in_use(host: str, port: int) -> bool:
         return sock.connect_ex((target, int(port))) == 0
 
 
+class _Application:
+    """应用的「退出 / 显示窗口」协调器：托盘菜单和终端 Ctrl+C 都走这里。
+
+    ★为什么单独一个对象★：退出要做三件事且顺序固定（停服务 → 关窗口 → 通知主线程），
+    而触发点有两个（托盘线程、主线程 Ctrl+C）。放在一处才不会两处各写一遍、慢慢分叉。
+    ★必须幂等★：托盘连点两下「退出」、或先 Ctrl+C 再从托盘点退出，都不能停两次服务。
+    """
+
+    def __init__(self, settings: Settings, *, log: logging.Logger,
+                 server: Any, done: threading.Event, grace: float = 20.0) -> None:
+        self.settings = settings
+        self.log = log
+        self.server = server
+        self.done = done
+        self.grace = grace
+        self.window: Any = None
+        self._lock = threading.Lock()
+        self._quitting = False
+
+    def set_window(self, window: Any) -> None:
+        self.window = window
+
+    def show_window(self) -> tuple[bool, str]:
+        """把主窗口叫回来（双击托盘图标 / 菜单「显示控制台窗口」）。"""
+        window = self.window
+        if window is None:
+            return False, "这个应用没开窗口（--window off），直接用浏览器打开控制台地址"
+        return window.show()
+
+    def quit(self, reason: str = "") -> None:
+        with self._lock:
+            if self._quitting:
+                return
+            self._quitting = True
+        why = f"（{reason}）" if reason else ""
+        self.log.info(f"[应用] 开始退出{why}")
+        try:
+            from .. import service_ctl  # noqa: PLC0415
+
+            if service_ctl.status(self.settings).running:
+                ok, msg = service_ctl.stop_service(self.settings, timeout=self.grace)
+                self.log.info(f"[应用] 停服务：{msg}" if ok else f"[应用] 停服务没成：{msg}")
+        except Exception as exc:  # noqa: BLE001 - 退出流程不能因为停服务失败而卡住
+            self.log.warning(f"[应用] 停服务出错（继续退出）：{exc}")
+        window = self.window
+        if window is not None:
+            try:
+                window.destroy()
+            except Exception as exc:  # noqa: BLE001
+                self.log.warning(f"[应用] 关窗口出错（继续退出）：{exc}")
+        self.done.set()
+
+
+def _ensure_service(settings: Settings, log: logging.Logger) -> str:
+    """应用启动时把语音服务带起来（★「启动应用默认启动服务」就是这个函数★）。"""
+    from .. import service_ctl  # noqa: PLC0415
+
+    try:
+        st = service_ctl.status(settings)
+        if st.running:
+            return f"语音服务已经在跑（PID {st.pid}）"
+        ok, msg = service_ctl.start_service(settings)
+        return msg if ok else f"语音服务没起来：{msg}"
+    except Exception as exc:  # noqa: BLE001 - 服务起不来也要能看界面
+        log.warning(f"[应用] 启动语音服务失败（界面照常可用）：{exc}")
+        return f"语音服务没起来：{exc}"
+
+
+def _wait_started(server: Any, thread: threading.Thread, log: logging.Logger,
+                  timeout: float = 20.0) -> bool:
+    deadline = time.time() + timeout
+    while not server.started and time.time() < deadline:
+        if not thread.is_alive():
+            log.warning("[应用] uvicorn 线程已退出，控制台没起来")
+            return False
+        time.sleep(0.05)
+    if not server.started:
+        log.warning(f"[应用] 控制台 {timeout:g} 秒内没起来")
+        return False
+    return True
+
+
+def _install_exit_handlers(app_ctl: "_Application") -> dict:
+    """把 Ctrl+C / Ctrl+Break / SIGTERM 变成「退出应用」。返回原处理器，退出时还回去。
+
+    ★为什么必须自己装★：uvicorn 现在跑在**后台线程**里（主线程要让给窗口或等待），
+    而它的信号处理只在主线程安装 —— 不装的话 Windows 会用默认处理器**直接把进程打死**
+    （退出码 0xC000013A），连一句「正在退出」都来不及打。这是 2026-11-21 改架构后
+    真机踩到的（`test_console_exit` 立刻变红）。
+    """
+    import signal  # noqa: PLC0415
+
+    saved: dict = {}
+
+    def _handler(signum, _frame) -> None:  # noqa: ANN001
+        print(f"\n收到退出信号（{signum}），正在退出应用…", flush=True)
+        # 不在信号处理器里干重活（停服务要等几秒）：丢给一个线程，主线程继续等 done
+        threading.Thread(target=app_ctl.quit, args=(f"信号 {signum}",),
+                         name="app-signal-quit", daemon=True).start()
+
+    for name in ("SIGINT", "SIGBREAK", "SIGTERM"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            saved[sig] = signal.signal(sig, _handler)
+        except (ValueError, OSError):   # 不在主线程 / 平台不支持
+            pass
+    return saved
+
+
+def _restore_exit_handlers(saved: dict) -> None:
+    import signal  # noqa: PLC0415
+
+    for sig, handler in (saved or {}).items():
+        try:
+            signal.signal(sig, handler)
+        except (ValueError, OSError, TypeError):
+            pass
+
+
 def serve(
     settings: Settings,
     *,
@@ -360,17 +497,33 @@ def serve(
     open_browser: bool = True,
     window: str = "",
     logger: logging.Logger | None = None,
+    tray: bool = True,
+    service_on_start: bool = True,
 ) -> int:
-    """起控制台（阻塞）。返回进程退出码。
+    """起「应用」（阻塞到退出）。返回进程退出码。
 
-    ``window`` 决定「用什么壳把它显示出来」：空/``browser`` = 老样子（浏览器开标签页），
-    ``auto`` = 有 pywebview 就用它、否则 Edge 应用窗口、再否则浏览器，
-    也可以写死 ``pywebview`` / ``edge``（见 :mod:`voice_loop.console.window`）。
+    ★这里起的不只是一个网页，是一个应用★（2026-11-21 重新定位，见 tray.py 说明）：
+    应用 = 控制台窗口 + **它的托盘图标** + 被它带着的语音服务。
+
+    ``window``：``off/headless`` 不开窗口（只有托盘，双击图标也不开窗，用浏览器看）；
+    ``browser`` 开浏览器标签；``auto`` = pywebview → Edge 应用窗口 → 浏览器。
+
+    ★线程分配（改之前先读这段）★：
+
+    ==========  ==========================================================
+    uvicorn     后台线程（它要跑 asyncio；主线程要留给窗口或等待）
+    pystray     后台线程（自己的消息泵）
+    窗口        pywebview 必须主线程；edge / browser 的窗口是**别的进程**，不占主线程
+    主线程      pywebview 时跑窗口事件循环，否则等 ``done`` 事件
+    ==========  ==========================================================
     """
     try:
         import uvicorn
     except ImportError as exc:  # pragma: no cover
         raise SystemExit("控制台需要 uvicorn：pip install fastapi uvicorn") from exc
+
+    from .. import service_ctl  # noqa: PLC0415
+    from .. import tray as tray_mod  # noqa: PLC0415
 
     log = logger or logging.getLogger("voice_loop.console")
     app = create_app(settings, log)
@@ -380,103 +533,109 @@ def serve(
     print(f"  打开：{url}")
     if host not in ("127.0.0.1", "localhost"):
         print(f"  ★注意★ 绑定在 {host}：同一局域网的人也能访问并改你的日程")
-    print("  Ctrl+C 退出（不影响语音服务本身）")
+    print("  关掉窗口 = 收到托盘（不退出）；退出应用用托盘菜单或 Ctrl+C")
     print("=" * 62 + "\n")
 
     # ★为什么要提前自己查端口★：uvicorn 撞端口时只打一行 `[Errno 10048] error while
     # attempting to bind …` 的 error 日志，然后 **`sys.exit(1)`** —— 用户看到的就是
     # 「输出了个 1，什么也没说」。这里换成人话，并且把「直接开那一个」和「换端口」都写出来。
     if port_in_use(host, port):
-        print(f"★端口 {port} 已经有程序在听★ —— 多半是**已经有一个控制台在跑**。")
-        print(f"  ① 先用浏览器打开现有那个：{url}")
-        print(f"     （能打开就是它，不用再起一个；两个控制台改同一批文件也不会更安全）")
+        print(f"★端口 {port} 已经有程序在听★ —— 多半是**应用已经在跑了**。")
+        print(f"  ① 直接用现有那个：{url}")
         print(f"  ② 确实要再起一个 → 换个端口：python main.py ui --port {int(port) + 1}")
         print(f"  ③ 想看是谁占着 → PowerShell: Get-NetTCPConnection -LocalPort {int(port)} "
               f"| Select-Object OwningProcess")
         return 2
 
-    want_window = (window or "").strip().lower()
-    # ★记账★：托盘的「关闭控制台」按 sessions/console.pid 去关这个进程。
-    #   放在端口检查之后 —— 端口被别人占着时我们根本没起来，不该写这个文件。
-    service_ctl.write_console_pid(settings, port)
-    try:
-        if want_window:
-            picked = window_mod.choose(want_window)
-            if picked == "browser":
-                if want_window not in ("auto", "browser", "off", "none"):
-                    print(f"★要的窗口后端（{want_window}）用不了★，退回浏览器：")
-                    for item in window_mod.backends():
-                        print(f"    {item['id']:9s} {'可用' if item['ok'] else '不可用'} · {item['detail']}")
-                return _serve_with_server(uvicorn, app, host, port, url, log,
-                                          open_browser=True, settings=settings)
-            print(f"  窗口后端：{picked}（关掉窗口 = 退出控制台，语音服务不受影响）\n", flush=True)
-            return _serve_in_window(uvicorn, app, host, port, url, log, picked, settings)
+    want = (window or "").strip().lower()
+    # ★三种「不开窗口」★：显式 --window off；或者压根没要窗口（--no-browser 且没指定后端）。
+    # 后者很重要：`main.py ui --no-browser` 从以前到现在都表示「别弹任何东西」。
+    headless = want in ("off", "none", "headless") or (not want and not open_browser)
 
-        return _serve_with_server(uvicorn, app, host, port, url, log,
-                                  open_browser=open_browser, settings=settings)
+    # ★记账★：`sessions/console.pid` 让 `main.py stop --app` 之类能认人（应用自己退出时也会清）。
+    service_ctl.write_console_pid(settings, port)
+    server = None
+    thread: threading.Thread | None = None
+    tray_obj = None
+    done = threading.Event()
+    prev_handlers: dict = {}
+    try:
+        if service_on_start:
+            print(f"  语音服务：{_ensure_service(settings, log)}", flush=True)
+
+        server = _make_server(uvicorn, app, host, port)
+        thread = threading.Thread(target=server.run, name="console-uvicorn", daemon=True)
+        thread.start()
+        if not _wait_started(server, thread, log):
+            return 1
+
+        grace = float(getattr(getattr(settings, "app", None), "tray_stop_grace", 20.0) or 20.0)
+        app_ctl = _Application(settings, log=log, server=server, done=done, grace=grace)
+        # 让 HTTP 也能退出应用（`main.py stop --app` 走这条，比硬杀干净）：
+        # 先停语音服务 → 关窗口 → uvicorn 收尾，一条龙。
+        app.state.quit_app = lambda: app_ctl.quit("HTTP /api/app/quit")
+        prev_handlers = _install_exit_handlers(app_ctl)
+
+        win = None
+        if not headless:
+            prefer = want or "auto"
+            win = window_mod.prepare_window(url, prefer=prefer,
+                                            profile_dir=settings.sessions_dir / "window",
+                                            logger=log)
+            app_ctl.set_window(win)
+            print(f"  窗口：{win.describe()}（关掉它 = 收到托盘，应用还在）", flush=True)
+        else:
+            # headless 也可以「显示窗口」：双击托盘图标就开个浏览器标签
+            app_ctl.set_window(window_mod.prepare_window(url, prefer="browser", logger=log))
+            print("  窗口：不开（托盘里双击图标会开浏览器标签；要应用窗口就加 --window auto）",
+                  flush=True)
+
+        if tray:
+            tray_obj = tray_mod.start_app_tray(
+                settings, log,
+                show_window=app_ctl.show_window,
+                quit_app=lambda: app_ctl.quit("托盘菜单"),
+            )
+            if tray_obj is None:
+                print("  （托盘没起来，不影响网页；pip install pystray pillow 可修）", flush=True)
+
+        # ---- 开窗口 ----
+        if win is not None:
+            if win.blocks_main_thread:
+                try:
+                    win.run()                       # 阻塞到窗口被 destroy
+                except KeyboardInterrupt:
+                    app_ctl.quit("Ctrl+C")
+                except Exception as exc:  # noqa: BLE001 - 窗口起不来不能变成应用起不来
+                    print(f"★窗口起不来（{exc}）★ 改用浏览器；托盘双击可再试。", flush=True)
+                    fallback = window_mod.prepare_window(
+                        url, prefer="browser", logger=log)
+                    app_ctl.set_window(fallback)
+                    fallback.run()
+            else:
+                win.run()                           # edge/browser：开完就返回
+
+        # ---- 等退出（托盘「退出应用」/ 关掉最后的东西 / Ctrl+C）----
+        try:
+            while not done.wait(0.3):
+                pass
+        except KeyboardInterrupt:
+            print("\n收到 Ctrl+C，正在退出应用…", flush=True)
+            app_ctl.quit("Ctrl+C")
     finally:
+        _restore_exit_handlers(prev_handlers)
+        if tray_obj is not None:
+            tray_obj.stop()
+        if server is not None:
+            try:
+                server.should_exit = True
+            except Exception as exc:  # noqa: BLE001
+                log.warning(f"[应用] 让 uvicorn 收尾失败（忽略）：{exc}")
+        if thread is not None:
+            thread.join(timeout=8.0)
         service_ctl.clear_console_pid(settings)
 
-
-def _serve_with_server(uvicorn, app, host, port, url, log, *, open_browser: bool,
-                       settings: Settings) -> int:
-    """老路径：uvicorn 占主线程，另起一个线程去开浏览器（可选）。"""
-    if open_browser:
-        def _open() -> None:
-            time.sleep(1.0)                       # 等 uvicorn 起来再开，免得看到「无法连接」
-            try:
-                import webbrowser  # noqa: PLC0415
-
-                webbrowser.open(url)
-            except Exception as exc:  # noqa: BLE001 - 打不开浏览器也要能把服务跑起来
-                log.warning(f"没能自动打开浏览器（{exc}），请手动访问 {url}")
-
-        threading.Thread(target=_open, name="console-open", daemon=True).start()
-
-    print("（网页开着的时候，在终端里按 Ctrl+C 也能退出）\n", flush=True)
-    return _run_server(uvicorn, app, host, port, log)
-
-
-def _serve_in_window(uvicorn, app, host, port, url, log, backend: str,
-                     settings: Settings) -> int:
-    """窗口路径：★uvicorn 在后台线程、窗口占主线程★（pywebview 要求主线程）。"""
-    server = _make_server(uvicorn, app, host, port)
-    thread = threading.Thread(target=server.run, name="console-uvicorn", daemon=True)
-    thread.start()
-
-    deadline = time.time() + 20.0
-    while not server.started and time.time() < deadline:
-        if not thread.is_alive():
-            print("★控制台没能起来★（uvicorn 线程已经退出，看上面一行报错）")
-            return 1
-        time.sleep(0.05)
-    if not server.started:
-        print("★控制台 20 秒内没起来★ —— 先别开窗口，看终端里的报错")
-        return 1
-
-    profile = settings.sessions_dir / "window"
-    ok, note = window_mod.open_window(url, title="本地语音助手 · 控制台", backend=backend,
-                                     profile_dir=profile)
-    if not ok:
-        # 窗口起不来不能变成「控制台起不来」：退回去开浏览器，服务继续跑
-        print(f"★{note}★ 改用浏览器显示。", flush=True)
-        try:
-            import webbrowser  # noqa: PLC0415
-
-            webbrowser.open(url)
-        except Exception as exc:  # noqa: BLE001
-            log.warning(f"浏览器也打不开（{exc}），请手动访问 {url}")
-        print("（这个终端按 Ctrl+C 退出）")
-        try:
-            while thread.is_alive():
-                time.sleep(0.5)
-        except KeyboardInterrupt:
-            pass
-
-    # 窗口关掉 → 让 uvicorn 收尾（bus.close 会叫醒挂着的 SSE，见 ConsoleServer）
-    server.should_exit = True
-    thread.join(timeout=8.0)
-    print(f"\n控制台已退出（{note}）。语音服务不受影响，要停服务用 python main.py stop")
+    print("\n应用已退出（语音服务也已停止，要从命令行起：python main.py listen -B）")
     return 0
 
 
@@ -513,19 +672,3 @@ def _make_server(uvicorn, app, host: str, port: int):    # noqa: ANN001, ANN201
         timeout_graceful_shutdown=3.0,
     )
     return ConsoleServer(config)
-
-
-def _run_server(uvicorn, app, host: str, port: int, log) -> int:    # noqa: ANN001
-    server = _make_server(uvicorn, app, host, port)
-    try:
-        server.run()
-    except KeyboardInterrupt:      # 有些终端下 Ctrl+C 会直接抛到这里
-        pass
-    except SystemExit as exc:      # 竞态：刚查完端口就被别人抢了
-        if exc.code not in (0, None):
-            print(f"\n★控制台没能起来（退出码 {exc.code}）★ 看上面一行 uvicorn 的报错："
-                  f"最常见的就是端口 {port} 被占（改用 --port {int(port) + 1} 试试）。")
-            return 1
-        raise
-    print("\n控制台已退出（语音服务不受影响，要停服务用 python main.py stop）")
-    return 0

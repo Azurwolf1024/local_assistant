@@ -183,10 +183,11 @@ def cmd_chat(settings: Settings, args: argparse.Namespace) -> int:
 
 
 def cmd_ui(settings: Settings, args: argparse.Namespace) -> int:
-    """可视化控制台（独立进程，只监听回环地址）。
+    """★启动应用★：控制台窗口 + 它的托盘 + 被它带着的语音服务。
 
-    ★不需要麦克风、不需要加载模型★：它靠读同一批数据文件 + 往服务信箱投命令
-    来工作（见 voice_loop/console/__init__.py 的说明）。
+    ★不需要麦克风、不需要在这个进程里加载模型★：它靠读同一批数据文件 + 往服务信箱
+    投命令来工作（见 voice_loop/console/__init__.py）。语音服务是**另一个进程**，
+    由这里启动（`[app] service_on_start`）、也由这里停掉（退出应用时）。
     """
     try:
         from voice_loop.console import serve as console_serve
@@ -197,7 +198,7 @@ def cmd_ui(settings: Settings, args: argparse.Namespace) -> int:
             f"（导入失败：{exc}）"
         ) from exc
     window = getattr(args, "window", "") or ""
-    if window and window != "browser":
+    if window and window.lower() not in ("browser", "off", "none", "headless"):
         from voice_loop.console import window as window_mod  # noqa: PLC0415
 
         picked = window_mod.choose(window)
@@ -212,6 +213,8 @@ def cmd_ui(settings: Settings, args: argparse.Namespace) -> int:
         open_browser=not args.no_browser,
         window=window if window != "browser" else "",
         logger=logging.getLogger("voice_loop.console"),
+        tray=not getattr(args, "no_tray", False),
+        service_on_start=not getattr(args, "no_service", False),
     )
 
 
@@ -260,25 +263,46 @@ def cmd_listen(settings: Settings, args: argparse.Namespace) -> int:
 
 
 def _start_sidecars(settings: Settings, args: argparse.Namespace) -> None:
-    """服务起来时顺手拉起「托盘图标」和「控制台」（两个都是**独立进程**）。
+    """起服务时顺手把**应用**（控制台 + 托盘）拉起来。
 
-    ★为什么都做成独立进程★：托盘以前跑在服务进程里（`tray.start_embedded`），
-    于是「停止服务」必然连图标一起没 —— 想再启动一次就没入口了。现在：
-      · 托盘 = `main.py tray` 子进程，服务死了它还在，可以直接把服务再起回来；
-      · 控制台 = `main.py ui` 子进程，一直就是独立的（不占麦克风、不加载模型）。
-    默认都开，关掉用 `--no-tray` / `--no-console`。
+    ★归属别搞反★：托盘是**应用的**托盘（`main.py ui` 里起的），不是服务的。
+    所以这里只做一件事：确保「应用进程」在跑；托盘会跟着应用一起来。
+    应用已经在跑（端口占着）就什么都不做。
     """
-    log = logging.getLogger("voice_loop")
-    from voice_loop import tray as tray_mod  # noqa: PLC0415
+    if getattr(args, "no_console", False):
+        return
+    if not bool(getattr(getattr(settings, "app", None), "console_on_start", True)):
+        return
+    import subprocess  # noqa: PLC0415
 
-    if not getattr(args, "no_tray", False):
-        ok, msg = tray_mod.spawn_tray(settings, log)
-        print(f"  {'√' if ok else '（跳过）'} 托盘：{msg}", flush=True)
-    if not getattr(args, "no_console", False) and bool(
-            getattr(getattr(settings, "app", None), "console_on_start", True)):
-        ok, msg = tray_mod.start_console(settings, log)
-        print(f"  {'√' if ok else '（跳过）'} 控制台：{msg} —— {tray_mod.console_url(settings)}",
-              flush=True)
+    from voice_loop import service_ctl  # noqa: PLC0415
+
+    port = service_ctl.console_port(settings)
+    if service_ctl.port_open(port):
+        print(f"  √ 控制台应用已经在跑（端口 {port}）", flush=True)
+        return
+    root = getattr(settings, "project_root", None) or Path(__file__).resolve().parent
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    exe = pythonw if pythonw.exists() else Path(sys.executable)
+    flags = 0
+    if os.name == "nt":
+        flags = (getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                 | getattr(subprocess, "DETACHED_PROCESS", 0))
+    cmd = [str(exe), str(Path(__file__).resolve()), "ui", "--port", str(port)]
+    try:
+        subprocess.Popen(cmd, cwd=str(root), close_fds=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         creationflags=flags)
+    except OSError as exc:
+        print(f"  （跳过）控制台应用没拉起来：{exc}", flush=True)
+        return
+    deadline = time.monotonic() + 15.0
+    while time.monotonic() < deadline:
+        if service_ctl.port_open(port):
+            print(f"  √ 控制台应用已就绪：http://127.0.0.1:{port}/", flush=True)
+            return
+        time.sleep(0.2)
+    print(f"  （跳过）控制台应用没起来（端口 {port} 一直没响应）", flush=True)
 
 
 def _tail_hint(log_file: Path) -> str:
@@ -355,7 +379,24 @@ def _pid_from_log(settings: Settings) -> int | None:
 
 
 def cmd_stop(settings: Settings, args: argparse.Namespace) -> int:
-    """先发停止信号让服务优雅退出，超时才强杀。"""
+    """先发停止信号让服务优雅退出，超时才强杀。``--app`` 时连控制台应用一起关。
+
+    ★`--app` 不能挂在「服务停完」后面★：服务本来就没跑的时候也要能把应用关掉
+    （真机踩过：应用还开着、服务已停 → `stop --app` 直接说「没有找到正在运行的服务」就返回了）。
+    """
+    code = _stop_service_only(settings)
+    if getattr(args, "app", False):
+        from voice_loop import service_ctl  # noqa: PLC0415
+
+        ok, msg = service_ctl.stop_console(settings, timeout=8.0)
+        print(("√ " if ok else "（跳过）") + msg)
+    elif service_ctl_still_running(settings):
+        print("（控制台应用还在跑：从托盘菜单点「退出应用」，或 python main.py stop --app）")
+    return code
+
+
+def _stop_service_only(settings: Settings) -> int:
+    """只管语音服务那半（原来的 cmd_stop 主体）。"""
     pid_file = settings.resolve(settings.wake.pid_file)
     stop_file = settings.resolve(settings.wake.stop_file)
     pid: int | None = None
@@ -403,19 +444,30 @@ def cmd_stop(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def service_ctl_still_running(settings: Settings) -> bool:
+    """控制台应用还在不在（只影响上面那句提示，失败就当它不在）。"""
+    try:
+        from voice_loop import service_ctl  # noqa: PLC0415
+
+        return bool(service_ctl.console_status(settings).running)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def cmd_tray(settings: Settings, args: argparse.Namespace) -> int:
-    """系统托盘图标：右键启停服务 / 开关控制台 / 看日志 / 退出。
+    """只起「应用 + 托盘」，不开窗口（后台常驻那种用法）。
 
-    ★独立进程★（和 `listen` 分开）：停服务后图标还在，能从菜单里再起回来。
-    `listen` 起服务时会用 `tray.spawn_tray()` 顺手拉起它（同一个单实例锁）。
+    ★托盘不再是独立的东西★：它属于应用（`voice_loop/tray.py`），所以这条命令
+    其实就是「headless 地起应用」—— 图标双击会开浏览器标签。
     """
-    from voice_loop import tray as tray_mod  # noqa: PLC0415
-
-    return tray_mod.run_standalone(
-        settings,
-        logging.getLogger("voice_loop.tray"),
-        block=not getattr(args, "no_block", False),
-    )
+    # `tray` 子命令没有 ui 那一堆参数，这里补齐默认值再复用 cmd_ui（少一份实现）
+    for key, value in (("window", "off"), ("no_browser", True), ("no_tray", False),
+                       ("no_service", False), ("host", "127.0.0.1"), ("port", None)):
+        if not hasattr(args, key):
+            setattr(args, key, value)
+    args.window = "off"
+    args.no_browser = True
+    return cmd_ui(settings, args)
 
 
 def cmd_mail(settings: Settings, args: argparse.Namespace) -> int:
@@ -1824,10 +1876,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--wake-file", default=None, help="唤醒词 json 路径（默认取 config.toml）")
     p.add_argument("-B", "--background", action="store_true", help="转到后台运行（无窗口）")
     p.add_argument("--stop-first", action="store_true", help="启动前先停掉已在运行的服务")
-    p.add_argument("--no-tray", action="store_true",
-                   help="不要托盘图标（默认会起一个独立托盘进程，右键可启停服务）")
     p.add_argument("--no-console", action="store_true",
-                   help="不要自动拉起控制台（默认会顺带起一个，见 [app] console_on_start）")
+                   help="不顺手拉起控制台应用（默认会带起来，见 [app] console_on_start）")
     p.add_argument("--mode", default=None)
     p.add_argument("--strategy", choices=["sensevoice", "whisper", "hybrid"], default=None)
     p.add_argument("--device", default=None)
@@ -1837,9 +1887,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_listen)
 
     p = sub.add_parser("stop", help="停止后台运行的唤醒服务")
+    p.add_argument("--app", action="store_true",
+                   help="连控制台应用一起关掉（托盘图标也一起收；等价于托盘菜单「退出应用」里停服务那半）")
     p.set_defaults(func=cmd_stop)
 
-    p = sub.add_parser("tray", help="系统托盘图标：右键启停服务 / 开关控制台 / 看日志")
+    p = sub.add_parser("tray", help="只起应用 + 托盘、不开窗口（后台常驻）")
     p.set_defaults(func=cmd_tray)
 
     p = sub.add_parser("mail", help="邮件：登录 / 同步 / 搜索 / 摘要 / 审批发送")
@@ -1953,15 +2005,19 @@ def build_parser() -> argparse.ArgumentParser:
                    help="把某个服务器挂到 stdio（skills / vision…），给 Copilot / Claude Code 用")
     p.set_defaults(func=cmd_mcp)
 
-    p = sub.add_parser("ui", help="可视化控制台（网页：日程/闹钟、备忘、日志、声线、对话）")
+    p = sub.add_parser("ui", help="★启动应用★：控制台窗口 + 托盘 + 语音服务（日常就用这个）")
     p.add_argument("--host", default="127.0.0.1",
                    help="监听地址，默认只给本机；填 0.0.0.0 会让同局域网的人也能进来（能改你的日程，慎用）")
     p.add_argument("--port", type=int, default=None,
                    help="端口（默认取 [app] console_port，出厂 8765）")
     p.add_argument("--no-browser", action="store_true", help="不要自动开浏览器")
-    p.add_argument("--window", default="", choices=["", "auto", "pywebview", "edge", "browser"],
-                   help="用应用窗口而不是浏览器标签页：auto = 有 pywebview 就用它、"
-                        "否则 Edge 应用窗口（细节见 voice_loop/console/window.py）")
+    p.add_argument("--window", default="",
+                   choices=["", "auto", "pywebview", "edge", "browser", "off"],
+                   help="窗口后端：auto = 有 pywebview 就用它、否则 Edge 应用窗口、"
+                        "再否则浏览器；off = 不开窗口（只有托盘，双击图标开浏览器）")
+    p.add_argument("--no-tray", action="store_true", help="不要托盘图标（纯网页模式）")
+    p.add_argument("--no-service", action="store_true",
+                   help="不自动启动语音服务（默认会带起来，见 [app] service_on_start）")
     p.set_defaults(func=cmd_ui)
 
     p = sub.add_parser("update", help="更新（压缩包/exe 安装：下载新版并安全合并，先备份）")

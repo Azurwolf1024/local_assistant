@@ -63,7 +63,10 @@ def run_case(*, with_sse: bool, wait: float = 15.0) -> tuple[bool, float, str]:
     """起控制台 → （可选）挂 SSE → 发 Ctrl+C → 量退出耗时。"""
     port = free_port()
     proc = subprocess.Popen(
-        [sys.executable, str(ROOT / "main.py"), "ui", "--port", str(port), "--no-browser"],
+        # ★--no-service★：这条测试只验「控制台能不能退出」，别让它顺手停掉真实语音服务
+        # （退出应用会先停服务，收尾宽限期 20s，会把「几秒内退出」这条断言拖红）
+        [sys.executable, str(ROOT / "main.py"), "ui", "--port", str(port),
+         "--no-browser", "--no-service"],
         cwd=str(ROOT),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -124,7 +127,9 @@ def main() -> int:
     print("\n[1] ★网页开着（挂着 SSE）时按 Ctrl+C★ —— 就是用户遇到的那一种")
     ok, cost, out = run_case(with_sse=True)
     check("几秒内退出", ok, True, detail=f"{cost:.1f}s")
-    check("打印了退出提示", "控制台已退出" in out, True, detail=out.strip().splitlines()[-1] if out.strip() else "")
+    # 2026-11-21 起控制台是「应用」，退出那句话改成了「应用已退出」（停服务 + 关窗口）
+    check("打印了退出提示", "已退出" in out, True,
+          detail=out.strip().splitlines()[-1] if out.strip() else "")
 
     print("\n[2] 没有 SSE 的对照组（别把普通情况弄坏）")
     ok2, cost2, _ = run_case(with_sse=False)

@@ -132,7 +132,7 @@ def section_3(tmp: Path) -> None:
     run = FakeRun(script)
     restore = patch({"spawn": fake_spawn, "subprocess": _FakeSubprocess(run)})
     try:
-        ok, message = sc.start_service(s, wait_seconds=3.0)
+        ok, message = sc.start_service(s, wait_seconds=3.0, with_app=False)
     finally:
         restore()
     check("启动成功（没被残留挡住）", ok, True)
@@ -152,7 +152,7 @@ def section_4(tmp: Path) -> None:
     spawned: list[list[str]] = []
     restore = patch({"spawn": lambda command, cwd: spawned.append(list(command)) or 1})
     try:
-        ok, message = sc.start_service(s, wait_seconds=1.0)
+        ok, message = sc.start_service(s, wait_seconds=1.0, with_app=False)
     finally:
         restore()
     check("拒绝启动", ok, False)
@@ -172,7 +172,7 @@ def section_5(tmp: Path) -> None:
         "subprocess": _FakeSubprocess(run),
     })
     try:
-        ok, message = sc.start_service(s, wait_seconds=1.2)
+        ok, message = sc.start_service(s, wait_seconds=1.2, with_app=False)
     finally:
         restore()
     check("报失败", ok, False)

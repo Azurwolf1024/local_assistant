@@ -86,6 +86,9 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
     ap.add_argument("--window", default="auto",
                     help="窗口后端：auto / pywebview / edge / browser")
     ap.add_argument("--no-window", action="store_true", help="用系统浏览器，不开应用窗口")
+    ap.add_argument("--no-tray", action="store_true", help="不要托盘图标（纯网页模式）")
+    ap.add_argument("--no-service", action="store_true",
+                    help="不自动启动语音服务（默认会带起来）")
     ap.add_argument("--console", action="store_true", help="日志同时打到控制台窗口")
     ap.add_argument("--selftest", action="store_true",
                     help="自检：起一下控制台、自己请求几个地址、然后退出（排查用）")
@@ -140,19 +143,22 @@ def _run(args: argparse.Namespace) -> int:
 
     settings = load_settings(root / "config.toml")
 
-    # ★端口上已经有一个 → 直接开它★：双击两次是最常见的动作，
+    # ★端口上已经有一个 → 直接把它叫出来★：双击两次是最常见的动作，
     # 那时用户要的是「把界面给我」，不是一句「端口被占」。
+    # ★2026-11-21★：应用已经在跑时，它自己有托盘；这里只是再开一个窗口/标签页看它。
     if console_app.port_in_use(args.host, args.port):
         url = f"http://127.0.0.1:{args.port}/"
-        print(f"端口 {args.port} 已经有控制台在跑，直接打开它：{url}")
+        print(f"端口 {args.port} 已经有应用在跑，直接打开它：{url}")
         backend = "browser" if args.no_window else args.window
-        ok, note = window_mod.open_window(url, title="本地语音助手 · 控制台", backend=backend,
-                                         profile_dir=settings.sessions_dir / "window")
-        if not ok:
+        win = window_mod.prepare_window(url, prefer=backend,
+                                        profile_dir=settings.sessions_dir / "window")
+        try:
+            win.run()
+        except Exception as exc:  # noqa: BLE001 - 打不开窗口就退回浏览器
+            print(f"窗口起不来（{exc}），改用浏览器")
             import webbrowser  # noqa: PLC0415
 
             webbrowser.open(url)
-            print("（已改用浏览器）")
         return 0
 
     window = "browser" if args.no_window else args.window
@@ -160,7 +166,9 @@ def _run(args: argparse.Namespace) -> int:
     if args.selftest:
         return _selftest(settings, console_app, args)
     return console_app.serve(settings, host=args.host, port=int(args.port),
-                            open_browser=True, window=window)
+                             open_browser=True, window=window,
+                             tray=not getattr(args, "no_tray", False),
+                             service_on_start=not getattr(args, "no_service", False))
 
 
 def _selftest(settings, console_app, args) -> int:

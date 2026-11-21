@@ -15,15 +15,17 @@ save_audio = false            # 是否把每轮用户录音存成 wav
 console_dir = "sessions/console"
 console_port = 8765           # 控制台端口（`main.py ui --port` 与托盘「打开控制台」共用）
 
-# 托盘小图标：`listen` 起服务时顺手在右下角拉起一个（★独立进程★，`main.py tray`）。
-# 右键菜单：打开/关闭控制台、启动/停止服务、退出（= 停服务 + 关控制台 + 收图标）。
-#   ★为什么是独立进程★：图标跑在服务进程里的话，「停止服务」必然连图标一起没，
-#   想再启动一次就只能开命令行；独立之后停服务图标还在，可以直接起回来。
-# 没装 pystray 只会少这个图标（pip install pystray），语音链路照常跑。
+# 托盘小图标：★它是「控制台应用」的托盘★（不是服务的），跑在 `main.py ui` 进程里。
+# 菜单：显示控制台窗口 / 启停服务 / 看日志 / 退出应用（停服务 + 关窗口）。
+#   ★关掉窗口 = 收到托盘，不退出应用★（pywebview 拦下 closing；Edge/浏览器那个窗口
+#   没了但应用还在托盘里，双击图标就能再打开）。
+# 没装 pystray 只会少这个图标（pip install pystray pillow），网页照常能用。
 tray = true
-# 启动服务时顺手把控制台也拉起来（`python main.py ui`，同样是独立进程）。
-# 不想每次开服务都弹控制台就设 false（或 `main.py listen --no-console`）。
+# 启动服务时顺手把控制台应用拉起来（反向那条见 service_on_start）。
+# 不想每次开服务都弹界面就设 false（或 `main.py listen --no-console`）。
 console_on_start = true
+# 启动应用（`main.py ui`）时顺手把语音服务带起来。设 false = 只开界面不管服务。
+service_on_start = true
 # 「停止服务」的宽限期（秒）：交给 `main.py stop` 让服务自己收尾（含记忆归档 + 云端同步），
 # 等这么久还没退才强杀。★别调太小★：同步慢的时候强杀会打断它。
 tray_stop_grace = 20

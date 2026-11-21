@@ -33,9 +33,11 @@ class AppConfig:
     # 托盘图标：`listen` 启动时顺手拉起一个**独立进程**（右键可启停服务 / 开关控制台），
     # 见 voice_loop/tray.py。没装 pystray 只会少这个图标，服务照常跑。
     tray: bool = True
-    # 启动服务时顺手把控制台也拉起来（`python main.py ui`，同样是独立进程）。
-    # 关掉它就是「只有服务，没有界面」，需要时再 `python main.py ui`。
+    # 启动服务时顺手把控制台**应用**拉起来（`python main.py ui`：窗口 + 托盘）。
+    # 反过来也成立：`main.py ui` 启动时会把语音服务带起来（见下面的 service_on_start）。
     console_on_start: bool = True
+    # 启动应用时顺手把语音服务带起来（应用只做界面；服务是它管理的后台子系统）。
+    service_on_start: bool = True
     # 「停止服务」的宽限期（秒）：交给 `main.py stop` 让它自己收尾，等这么久还没退才强杀。
     # 服务收尾里包含记忆归档 + 云端同步（慢网络可能要几秒到几十秒），别调太小。
     tray_stop_grace: float = 20.0

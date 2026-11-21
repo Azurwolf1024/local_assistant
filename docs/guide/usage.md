@@ -12,10 +12,12 @@ python main.py selftest      # ★ 端到端自检（真加载模型，10 项）
 python main.py doctor        # ★ 只读体检：环境/依赖/配置/模型/服务/平台/磁盘（几秒）
 python main.py setup         # ★ 检查并补全依赖/模型（幂等，装完/换机器后都可以再跑）
 python main.py upgrade       # ★ 看有没有新版本（--apply 才真升，升级前自动备份数据）
-python main.py listen        # ★ 唤醒词服务（前台，推荐先这么跑，看得见日志）
-python main.py listen -B     # 唤醒词服务（后台，无窗口，日志写 sessions/listen.log）
-python main.py stop          # 停止后台服务（先发信号优雅退出，超时才强杀）
-python main.py ui            # ★ 可视化控制台（本地网页：日程/闹钟、备忘、日志、声线、对话）
+python main.py ui            # ★★ 启动应用（推荐日常就用这个）：控制台窗口 + 托盘 + 语音服务
+python main.py tray          # 同上但不开窗口（只要托盘 + 服务，双击图标开浏览器）
+python main.py listen        # 只起语音服务（前台，不要界面时用，看得见日志）
+python main.py listen -B     # 只起语音服务（后台，无窗口，日志写 sessions/listen.log）
+python main.py stop          # 停止语音服务（先发信号优雅退出，超时才强杀）
+python main.py stop --app    # 连应用一起关掉（= 托盘菜单「退出应用」）
 python main.py chat          # 普通对话，听到说话就回答（不认唤醒词）
 python main.py text          # 打字调试：完整技能 + LLM + 语音播报，不用麦克风
 python main.py skills        # 查看事件（提醒/闹钟/日程）+ 备忘，以及下一次是什么时候
@@ -61,8 +63,9 @@ python main.py mail drafts                   # 邮件：看待批草稿（发送
 
 | 启动方式 | 怎么关 |
 | --- | --- |
+| `python main.py ui`（应用） | 托盘菜单「退出应用」（= 停服务 + 关窗口 + 收图标）；或 `python main.py stop --app` |
 | `python main.py listen`（前台） | 在那个窗口按 **Ctrl+C**，或另开窗口跑 `python main.py stop` |
-| `python main.py listen -B`（后台） | **右键托盘图标 → 停止服务**（托盘不退出，还能再起回来）；或 `python main.py stop` |
+| `python main.py listen -B`（后台） | `python main.py stop`（托盘属于应用，这条路没有图标） |
 
 `stop` 的工作方式：读 `sessions/listen.pid` → 写一个停止信号文件 →
 服务在下一轮循环看到并优雅退出（归档记忆、释放模型、删掉 pid 文件）；
@@ -74,39 +77,50 @@ python main.py stop
 # ✓ 唤醒服务已停止
 ```
 
-### 托盘图标（右下角）
+### 托盘图标：它是**应用的**托盘（右下角）
 
-`listen` 起服务时会顺手在通知区域放一个小图标。**★图标是独立进程，不再跟着服务生死★**
-（`main.py tray`）—— 停服务后图标还在，可以直接从菜单里再起回来。右键菜单：
+★2026-11-21 重新定的归属★：**控制台是一个应用，托盘是它的托盘**（VS Code / Discord 那种），
+语音服务是这个应用带着的**后台子系统**。所以日常入口是 `python main.py ui`（或双击 exe）：
+
+```
+main.py ui（应用进程）
+ ├─ 窗口            ← 主界面（pywebview / Edge 应用窗口 / 浏览器标签页）
+ ├─ 托盘图标        ← 就在这个进程里：关窗口不退出，图标还在
+ ├─ 网页服务 8765   ← 窗口显示的那一页
+ └─ 语音服务        ← 另一个进程，应用启动时带起来、退出时停掉
+```
+
+右键菜单：
 
 | 菜单项 | 做什么 |
 | --- | --- |
-| 服务运行中（PID 1234）· 控制台在跑 | 只是状态，点不动（服务 + 控制台两件事都写这里） |
-| **打开控制台**（双击图标也行） | 没起就先拉起来，再开浏览器；端口取 `[app] console_port` |
-| **关闭控制台** | 关掉那个控制台进程（按 `sessions/console.pid` 认人）；控制台没开时这项是灰的 |
+| 服务运行中（PID 1234）· 控制台 8765 | 只是状态，点不动 |
+| **显示控制台窗口**（双击图标也行） | 把窗口叫回来：pywebview 直接 `show()`；Edge/浏览器再开一个 |
+| **启动服务 / 停止服务** | 只动语音服务，★应用和托盘都留着★ |
 | 看服务日志 | 用记事本打开 `sessions/listen.log` |
-| **启动服务** | 起服务，★并且顺手把控制台也拉起来★（`[app] console_on_start`） |
-| **停止服务** | 只停服务，★托盘不退出★；收尾宽限期 `[app] tray_stop_grace` 秒（默认 20） |
-| **退出** | ★全收干净★：停服务 → 关控制台 → 收图标 |
+| **退出应用** | ★全收干净★：停服务 → 关窗口 → 收图标 |
 
 ```toml
 [app]
-tray = true               # 关掉就不起图标（服务照常跑）
-console_on_start = true   # 启动服务时顺手拉起控制台
+tray = true               # 关掉就没有图标（纯网页模式，服务照常跑）
+console_on_start = true   # 起服务时顺手拉起应用（listen 那条路）
+service_on_start = true   # 起应用时顺手拉起服务（ui 那条路）
 tray_stop_grace = 20      # 「停止服务」等服务自己收尾等多久才强杀
-console_port = 8765       # 「打开控制台」用的端口
+console_port = 8765       # 应用监听的端口
 ```
 
 几点要知道的：
 
+- **★关窗口 ≠ 退出★**：pywebview 拦下关闭事件改成隐藏；Edge/浏览器那个窗口关掉也不影响应用
+  （应用进程还在，图标还在）。要从托盘点「显示控制台窗口」或双击图标才回来。
+- **退出只有一个入口**：托盘菜单「退出应用」。它按顺序做三件事（停服务 → 关窗口 → 收图标），
+  不会留下「还在听麦克风但没界面」的孤儿。
+- **命令行也能收**：`python main.py stop --app`（服务没在跑时也能关应用）；
+  `python main.py stop` 只停服务，应用和托盘留着。
+- **只想要语音、不要界面**：`python main.py listen -B --no-console`（没有窗口也没有图标）。
+- **只想要图标、不要窗口**：`python main.py tray`（headless 应用，双击图标开浏览器标签）。
 - **Windows 11 默认把新图标藏在「^」里**。想让它常驻：点开「^」，把它拖到任务栏上。
-- **停止服务 ≠ 退出托盘**：停完图标还在，状态行会变成「服务已停止 · 控制台未开」，
-  点「启动服务」就回来了（这条是 2026-11-20 改的，以前图标跑在服务进程里，停服务连图标一起没）。
-- **退出会把三个东西一起收掉**（服务 / 控制台 / 图标），这样不会留下「还在听麦克风但没界面」的孤儿进程。
-- `main.py stop` 只停服务，**不动**托盘和控制台 —— 你在命令行停服务时，托盘还能用来再起回来。
-- 不想要托盘自动起来：`python main.py listen --no-tray`；不想要控制台：`--no-console`。
-- 没装 `pystray` 只会少这个图标（`pip install pystray`），语音链路完全不受影响；
-  日志里会写一句「托盘图标没起来」。
+- 没装 `pystray` 只会少这个图标（`pip install pystray pillow`），网页照常能用。
 
 服务收尾时会记一行每步耗时，用来解释「为什么点了停止要等几秒」：
 
@@ -233,16 +247,19 @@ python main.py ui --host 0.0.0.0   # ★让同一局域网的手机也能看★�
 **想要「像软件」而不是「一个浏览器标签页」**（第 3.5 节做的那个 exe 默认就是这么起的）：
 
 ```powershell
+python main.py ui                 # 应用：窗口（自动挑后端）+ 托盘 + 语音服务
 python main.py ui --window auto   # 自己挑：pywebview → Edge 应用窗口 → 系统浏览器
 python main.py ui --window edge   # 强制用 Edge 的 --app 模式（无地址栏无标签栏）
-python main.py ui                 # 老行为：浏览器开一个标签页
+python main.py ui --no-browser    # 不开任何窗口（只托盘，双击图标开浏览器标签）
 ```
 
-窗口模式下 **关掉窗口 = 退出控制台**（和 Ctrl+C 等价，语音服务不受影响）。
-三个后端的区别、为什么不是只做 pywebview，写在 `voice_loop/console/window.py` 的模块说明里。
+★2026-11-21 起★ `main.py ui` 起的是**应用**：窗口 + 托盘 + 语音服务三件一起。
+**关掉窗口只是收到托盘，不退出应用**（真是要退，用托盘菜单「退出应用」或 Ctrl+C，
+那会连语音服务一起停）。三个窗口后端的脾气各不一样、为什么不是只做 pywebview，
+写在 `voice_loop/console/window.py` 的模块说明里。
 
 > 想知道「加一个新标签页要动哪些文件」「为什么用文件信箱而不是 socket」「启停/退出那两个
-> bug 是怎么修的」，看 [`docs/ENGINEERING_LOG.md`](../ENGINEERING_LOG.md)
+> bug 是怎么修的」，看 [`docs/log/04-console-ui.md`](../log/04-console-ui.md)
 > 第 25 节（控制台）、第 27 节（启停状态）、第 28 节（终端退出 + 聊天选角色）。
 
 ### 能用语音做的事

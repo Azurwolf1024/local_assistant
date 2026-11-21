@@ -211,14 +211,22 @@ def status(settings: Settings) -> ServiceStatus:
     )
 
 
-def start_command(settings: Settings, *, console: bool = False) -> list[str]:
+def start_command(settings: Settings, *, console: bool = False,
+                  with_app: bool = True) -> list[str]:
     """起服务的命令行。
 
     ``console=False``（默认）用 **pythonw.exe**：没有控制台窗口，不会被关窗口时的
     CTRL 事件带走。控制台 UI 点「启动」走的就是这条。
+
+    ``with_app=False`` 会追加 ``--no-console``：服务起来时**不**顺手拉起控制台应用
+    （`[app] console_on_start`）。★自测必须传 False★ —— 否则跑一次测试就在你桌面上
+    多出一个应用窗口和一颗托盘图标。
     """
     exe = service_python(console=console)
-    return [str(exe), str(main_script()), "listen", "-B"]
+    cmd = [str(exe), str(main_script()), "listen", "-B"]
+    if not with_app:
+        cmd.append("--no-console")
+    return cmd
 
 
 def stop_command(settings: Settings | None = None) -> list[str]:
@@ -305,7 +313,7 @@ def _clean_leftovers(settings: Settings) -> str:
 
 
 def start_service(
-    settings: Settings, *, wait_seconds: float = 25.0
+    settings: Settings, *, wait_seconds: float = 25.0, with_app: bool = True
 ) -> tuple[bool, str]:
     """起后台唤醒服务。返回 (真的起来了吗, 给用户看的一句话)。
 
@@ -341,7 +349,7 @@ def start_service(
         )
 
     try:
-        spawn_pid = spawn(start_command(settings), settings.root)
+        spawn_pid = spawn(start_command(settings, with_app=with_app), settings.root)
     except OSError as exc:
         return False, f"启动失败：{exc}{note}"
 
@@ -510,22 +518,89 @@ def _terminate(pid: int, *, timeout: float = 6.0) -> tuple[bool, str]:
     return False, f"进程 {pid} 没在 {timeout:g} 秒内退出"
 
 
-def stop_console(settings: Settings, *, timeout: float = 6.0) -> tuple[bool, str]:
-    """关掉控制台（托盘的「关闭控制台」与「退出」都走这里）。
+def _pid_on_port(port: int) -> int | None:
+    """谁在听这个端口（Windows 用 netstat，不引入 psutil）。"""
+    if os.name != "nt":
+        return None
+    try:
+        out = subprocess.run(["netstat", "-ano", "-p", "tcp"], capture_output=True,
+                             text=True, timeout=15, errors="replace").stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 5 and parts[1].endswith(f":{port}") and parts[3].upper() == "LISTENING":
+            try:
+                return int(parts[4])
+            except ValueError:
+                return None
+    return None
 
-    ★控制台可以随时硬停★：它只读数据文件 + 往信箱投命令，写文件走的是原子写 + 文件锁
-    （见 voice_loop/store.py），不存在「停一半把数据写坏」。
+
+def _looks_like_console(pid: int) -> bool:
+    """★只认「python/pythonw + main.py … ui」★ —— 端口可能被别的程序占着，不能乱杀。"""
+    if os.name != "nt":
+        return False
+    try:
+        got = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f'(Get-CimInstance Win32_Process -Filter "ProcessId={int(pid)}").CommandLine'],
+            capture_output=True, text=True, timeout=20, errors="replace").stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    low = (got or "").lower()
+    return "main.py" in low and " ui" in low
+
+
+def _request_quit(port: int, *, timeout: float = 4.0) -> bool:
+    """请应用自己「优雅退出」（POST /api/app/quit）。成功只代表请求被接受。"""
+    import json as json_mod  # noqa: PLC0415
+    import urllib.request  # noqa: PLC0415
+
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{int(port)}/api/app/quit", data=b"{}", method="POST",
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json_mod.loads(resp.read().decode("utf-8") or "{}")
+    except Exception:  # noqa: BLE001 - 老版本/端口被别人占着 → 退回硬停
+        return False
+    return bool(data.get("ok"))
+
+
+def stop_console(settings: Settings, *, timeout: float = 12.0) -> tuple[bool, str]:
+    """关掉控制台应用（`main.py stop --app` 走这里）。
+
+    ★优先让应用自己退★（`/api/app/quit`）：退出顺序是「停语音服务 → 关窗口 → uvicorn
+    收尾」，硬杀做不到，还会留下「服务还在跑、应用没了」。请求不被接受（老版本、
+    pid 文件丢了）才退回 `taskkill`。
     """
     st = console_status(settings)
     if not st.running:
         clear_console_pid(settings)
-        return False, "控制台没有在运行"
-    if not st.pid:
-        return False, (f"端口 {st.port} 上确实有东西在响应，但它没留下 pid 文件（可能是老版本起的）。"
-                       f"请手动关掉那个窗口，或看是谁占着："
-                       f"Get-NetTCPConnection -LocalPort {st.port} | Select-Object OwningProcess")
-    ok, msg = _terminate(st.pid, timeout=timeout)
+        return False, "控制台应用没有在运行"
+    pid = st.pid
+    if not pid:
+        # pid 文件没了（老版本 / 被人删了）：从端口反查，且必须确认它真是我们的控制台
+        guess = _pid_on_port(st.port)
+        if guess and _looks_like_console(guess):
+            pid = guess
+        else:
+            return False, (f"端口 {st.port} 上有东西在响应，但它没留下 pid 文件、"
+                           f"而且看起来不是控制台（{guess or '查不到'}）—— 请手动处理："
+                           f"Get-NetTCPConnection -LocalPort {st.port} | Select-Object OwningProcess")
+
+    graceful = _request_quit(st.port)
+    if graceful:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not pid_alive(pid) and not port_open(st.port):
+                clear_console_pid(settings, pid)
+                return True, f"控制台应用已退出（PID {pid}，优雅退出：先停了语音服务）"
+            time.sleep(0.2)
+    ok, msg = _terminate(pid, timeout=8.0)
     if ok:
-        clear_console_pid(settings, st.pid)
-        return True, f"控制台已关闭（PID {st.pid}）"
+        clear_console_pid(settings, pid)
+        tail = "（优雅退出超时，已强制结束）" if graceful else ""
+        return True, f"控制台应用已关闭（PID {pid}）{tail}"
     return False, msg
