@@ -40,6 +40,7 @@
 | 语音合成 | `voice_loop/tts/` | [tts/README.md](../voice_loop/tts/README.md) |
 | 记忆 | `voice_loop/memory/` | [memory/README.md](../voice_loop/memory/README.md) |
 | 邮件 | `voice_loop/mail/` | [mail/README.md](../voice_loop/mail/README.md) |
+| MCP 工具层 + harness | `voice_loop/mcp/`、`voice_loop/harness.py` | [mcp/README.md](../voice_loop/mcp/README.md) |
 
 这几个包的边界由自测盯着（AST 扫 import，docstring 提到不算违规）：
 

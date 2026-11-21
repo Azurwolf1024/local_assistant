@@ -204,6 +204,11 @@
             { k: "API 引擎", v: (data.api.enabled ? (data.api.engine === "api" ? "全局默认 API" : "全局默认本地") : "已关闭")
                 + " · " + data.api.model + " @ " + data.api.base_url
                 + (data.api.has_key ? " · 配置里有 key" : " · key 走环境变量 " + data.api.key_env) },
+            // ★工具这一行只放「几个服务器、露不露」★：真实清单要问服务，放「工具」页
+            { k: "工具", v: ((data.mcp || {}).enabled === false ? "MCP 已关闭"
+                : ((data.mcp || {}).servers || []).map((s) => s.name + "(" + s.transport
+                    + (s.hidden ? ",hidden" : "") + (s.allow ? "," + s.allow + "个" : "") + ")").join(" ") || "没配服务器")
+                + " · 真实清单去「工具」页点一下" },
             { k: "TTS 后端", v: data.tts.backend + "（" + (data.tts.clone_dir || data.tts.model) + "）" },
             { k: "输出高频压制", v: "≥" + Math.round(data.tts.out_tilt[0] / 1000) + " kHz：" + data.tts.out_tilt[1] + " dB" },
             { k: "音区守卫", v: data.tts.pitch_guard[0] + " 半音 · 最多 " + data.tts.pitch_guard[1] + " 遍" },

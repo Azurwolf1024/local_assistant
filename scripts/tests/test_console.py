@@ -131,8 +131,8 @@ def section_meta(base: str, app, tmp: Path) -> None:
     code, meta = request(base, "GET", "/api/meta")
     check("GET /api/meta 是 200", code, 200)
     ids = [p["id"] for p in meta.get("panels", [])]
-    check("七个面板都在（★voices 已并入角色，update 是新的★）", ids,
-          ["overview", "schedule", "memos", "logs", "persona", "chat", "update"])
+    check("八个面板都在（★tools 是新的：模型能 call 哪些工具★）", ids,
+          ["overview", "schedule", "memos", "logs", "persona", "tools", "chat", "update"])
     check("没有面板装载失败", meta.get("panels_failed"), {})
     # ★「我是被谁起的」★：exe 还是源码、项目根在哪、窗口后端挑哪个 ——
     # 这几条不写出来的话，「exe 说找不到配置」这类问题只能靠猜。
@@ -149,7 +149,7 @@ def section_meta(base: str, app, tmp: Path) -> None:
 
     for path in ("/", "/index.html", "/style.css", "/app.js", "/ui.js",
                  "/panels/overview.js", "/panels/schedule.js", "/panels/memos.js",
-                 "/panels/logs.js", "/panels/persona.js",
+                 "/panels/logs.js", "/panels/persona.js", "/panels/tools.js",
                  "/panels/chat.js", "/panels/update.js"):
         code, _ = request(base, "GET", path)
         check(f"静态文件 {path}", code, 200)
@@ -289,7 +289,27 @@ def section_misc(base: str, tmp: Path) -> None:
 
     code, health = request(base, "GET", "/api/health")
     check("健康检查 200", code, 200)
-    check("面板清单一致（七个）", len(health["panels"]), 7)
+    check("面板清单一致（八个）", len(health["panels"]), 8)
+
+    # ★工具页★：静态部分要能说清「预设 / 服务器 / 每个角色多开什么」，
+    # 而且**不能**为了列清单就把 MCP 服务器拉起来（邮件那个会去读网络身份）
+    code, tools = request(base, "GET", "/api/tools")
+    check("工具静态清单 200", code, 200)
+    check("报告了预设", sorted(p["name"] for p in tools["presets"])[:3],
+          ["files", "harness", "mail"], detail=str([p["name"] for p in tools["presets"]]))
+    check("报告了服务器（顺序 = config 里的顺序）",
+          [s["name"] for s in tools["mcp"]["servers"]][:1], ["skills"],
+          detail=str([s["name"] for s in tools["mcp"]["servers"]]))
+    check("★hidden 的服务器也列出来（否则「为什么没露出来」没法解释）★",
+          [s["name"] for s in tools["mcp"]["servers"] if s["hidden"]], ["agent", "mail"],
+          detail=str([(s["name"], s["hidden"]) for s in tools["mcp"]["servers"]]))
+    check("报告了 agent 边界（写文件默认关）", tools["agent"]["allow_write"], False)
+    check("角色清单里有 amiya（本地引擎 → 不多开）",
+          [(c["id"], c["active"], c["expanded"]) for c in tools["characters"]],
+          [("amiya", False, [])])
+    code, live = request(base, "POST", "/api/tools/live", {})
+    check("服务没跑时 live 如实失败（不拿静态推算冒充）", (code, live["ok"]), (200, False))
+    check("并且说明原因", "服务" in str(live.get("error") or ""), True, detail=str(live.get("error")))
 
     code, chars = request(base, "GET", "/api/chat/characters")
     check("聊天角色列表 200", code, 200)

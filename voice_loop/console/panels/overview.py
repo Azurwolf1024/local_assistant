@@ -93,6 +93,19 @@ def register(app, ctx) -> None:
                 "key_env": settings.api.api_key_env,
                 "has_key": bool(settings.api.api_key),
             },
+            # ★工具从哪来★：概览只报告「有几个服务器、各自露不露」，真实清单在「工具」页
+            "mcp": {
+                "enabled": bool(getattr(getattr(settings, "mcp", None), "enabled", True)),
+                "servers": [
+                    {
+                        "name": str(getattr(s, "name", "") or ""),
+                        "transport": str(getattr(s, "transport", "inproc") or "inproc"),
+                        "hidden": bool(getattr(s, "hidden", False)),
+                        "allow": len(list(getattr(s, "tools", None) or [])),
+                    }
+                    for s in (getattr(getattr(settings, "mcp", None), "servers", None) or [])
+                ],
+            },
             "persona": {
                 "default": settings.persona.default,
                 "resolved_default": default_id,

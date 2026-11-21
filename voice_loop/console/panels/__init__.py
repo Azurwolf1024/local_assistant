@@ -22,6 +22,7 @@ ALL = [
     "memos",
     "logs",
     "persona",      # ★角色★：资料卡 + 声线（voices 的路由在里面一并挂上）
+    "tools",        # ★工具★：模型能 call 哪些（MCP 服务器 / 预设 / api_tools）
     "chat",
     "update",       # ★更新★：版本 / 检查新版 / 一键更新（放在最后，不是天天用的）
 ]

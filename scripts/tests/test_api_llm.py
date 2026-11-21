@@ -281,13 +281,15 @@ def test_pipeline(tmp: Path) -> None:
         names = {s["function"]["name"] for s in (loop._tool_specs() or [])}  # noqa: SLF001
         check("API 角色多开了白名单外的工具", "mcp__memory__memory_stats" in names,
               detail=str(sorted(names)))
-        check("原有 10 个工具仍在", len(names) == 11, detail=str(len(names)))
+        # 11 个默认（skills 9 + memory 2）+ 这里点名的 memory_stats 一个
+        check("原有默认工具仍在 + 多开的一个", len(names) == 12, detail=str(len(names)))
 
         loop._apply_character(loop.persona.get("local"), "测试")  # noqa: SLF001
         check("本地角色回本地", loop.llm.engine, "local")
         names = {s["function"]["name"] for s in (loop._tool_specs() or [])}  # noqa: SLF001
         check("本地角色不看 api_tools", "mcp__memory__memory_stats" in names, False)
-        check("本地角色仍是 10 个", len(names) == 10, detail=str(len(names)))
+        # ★这个数字是故意的★：默认工具数一变就该有人来看一眼（skills 从 8 变 9 是加了 weather）
+        check("本地角色仍是 11 个（skills 9 + memory 2）", len(names) == 11, detail=str(len(names)))
 
         reg = loop.persona
         before = reg._signature()  # noqa: SLF001
@@ -310,8 +312,8 @@ def test_shipped_characters() -> None:
     check("它是 API 角色", fish.engine, "api")
     check("模型是 deepseek-chat", fish.api_model, "deepseek-chat")
     check("TTS 也走官方 API", (fish.backend, fish.tts_voice), ("deepseek", "stella"))
-    check("额外开放了 harness 工具", {"web", "files"} <= set(fish.api_tools),
-          detail=str(fish.api_tools))
+    check("额外开放了工具（人格文件的 api_tools 是数据，跟着卡片走）",
+          {"web", "mail"} <= set(fish.api_tools), detail=str(fish.api_tools))
     check("退路是出厂 Piper（不碰克隆素材）",
           (fish.voice_ref, fish.voice_model, (fish.tts or {}).get("fallback")),
           ("", "", ["piper:zh_CN-huayan-medium"]))

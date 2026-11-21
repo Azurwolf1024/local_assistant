@@ -51,8 +51,14 @@ BUSY_STALE_SEC = 60.0        # busy 超过这么久 = 服务当时崩了，判�
 KEEP_DONE_SEC = 900.0        # 回执保留多久（控制台最多等十几秒，留 15 分钟够查）
 TMP_PREFIX = ".tmp-"         # 临时文件前缀：小圆点开头，不会被当成请求扫到
 
-# 命令表（服务侧实现见 voice_loop/pipeline.py 的 _serve_console）
-COMMANDS = ("ping", "say", "ask", "character", "toast")
+# 命令表（服务侧实现见本文件下面的 execute；能力在 pipeline 里）
+COMMANDS = ("ping", "say", "ask", "character", "toast", "tools")
+
+# harness 运行时自带的两个工具（不在 MCP 里，见 voice_loop/harness.py）
+RUNTIME_TOOLS = {
+    "ask_user": "向用户提问并等回答（harness 内置）",
+    "update_plan": "写下多步任务的步骤（harness 内置）",
+}
 
 
 @dataclass
@@ -305,6 +311,114 @@ def _describe(loop: Any) -> dict:
     }
 
 
+def _tools(loop: Any) -> dict:
+    """★模型这一轮到底能 call 哪些工具★（以服务里的真实状态为准）。
+
+    为什么要在服务里算，而不是控制台自己读配置：**只有流水线知道现在是什么状态** ——
+    当前角色是不是 API 引擎、人格文件的 `api_tools` 展开了什么、MCP 宿主里哪个服务器
+    真的连上了、白名单挡掉了哪些、路由是不是 `chat`（那样一个工具都不给模型）。
+    控制台照配置推算只会算出「应该是什么」，而这张表是回答「现在是什么」。
+
+    三组数据分清楚（控制台就是照这个分块画的）：
+
+        tools   真的会出现在模型面前的（pipeline._tool_specs 的返回值）
+        known   MCP 宿主里**连着**的能力域与全部工具（用来回答「为什么没露出来」）
+        extra   角色卡额外点名的（没找到的进 missing）
+    """
+    mcp = getattr(loop, "mcp", None)
+    llm = getattr(loop, "llm", None)
+    engine = str(getattr(llm, "engine", "local") or "local")
+
+    agent = False
+    agent_fn = getattr(loop, "_agent_mode", None)
+    if callable(agent_fn):
+        try:
+            agent = bool(agent_fn())
+        except Exception:  # noqa: BLE001 - 报告用，算不出来就当没开
+            agent = False
+
+    specs: list[dict] = []
+    specs_fn = getattr(loop, "_tool_specs", None)
+    if callable(specs_fn):
+        try:
+            specs = list(specs_fn() or [])
+        except Exception as exc:  # noqa: BLE001
+            return {**_describe(loop), "engine": engine, "error": f"{type(exc).__name__}: {exc}"}
+
+    describe: list[dict] = []
+    status = ""
+    if mcp is not None:
+        try:
+            describe = list(mcp.describe())
+            status = str(mcp.status())
+        except Exception as exc:  # noqa: BLE001
+            status = f"（读不到 MCP 状态：{type(exc).__name__}: {exc}）"
+    where = {str(d.get("name") or ""): d for d in describe}
+
+    extra: list[str] = []
+    extra_fn = getattr(loop, "_api_extra_tools", None)
+    if callable(extra_fn):
+        try:
+            extra = sorted(extra_fn())
+        except Exception:  # noqa: BLE001
+            extra = []
+    missing: list[str] = []
+    if mcp is not None and extra:
+        try:
+            missing = list(mcp.missing(extra))
+        except Exception:  # noqa: BLE001
+            missing = []
+
+    tools: list[dict] = []
+    for spec in specs:
+        fn = spec.get("function") or spec
+        name = str(fn.get("name") or "")
+        if not name:
+            continue
+        hit = where.get(name) or {}
+        tools.append({
+            "name": name,
+            "server": str(hit.get("server") or "（进程内注册表）"),
+            "tool": str(hit.get("tool") or name),
+            "description": str(fn.get("description") or ""),
+            "runtime": False,
+        })
+    have = {t["name"] for t in tools}
+    if agent:
+        for name, desc in RUNTIME_TOOLS.items():
+            if name not in have:
+                tools.append({"name": name, "server": "harness 运行时", "tool": name,
+                              "description": desc, "runtime": True})
+
+    settings = getattr(loop, "settings", None)
+    router = str(getattr(getattr(settings, "llm", None), "router", "") or "")
+    out = {
+        **_describe(loop),
+        "engine": engine,
+        "router": router,
+        "agent_mode": agent,
+        "total": len(tools),
+        "tools": tools,
+        "known": [{"name": str(d.get("name") or ""),
+                   "server": str(d.get("server") or ""),
+                   "tool": str(d.get("tool") or ""),
+                   "description": str(d.get("description") or "")} for d in describe],
+        "extra": extra,
+        "missing": missing,
+        "mcp_status": status,
+    }
+    # ★数量警告写在服务侧★：控制台和文档都要用同一个阈值（实测 18 个以内还稳，
+    # 22 个时 deepseek-chat 把「看邮件」错选成了 list_memos）
+    out["warn"] = ""
+    if router and router.lower() != "tools":
+        out["warn"] = f"路由是 {router}（不是 tools）：模型这一轮看不到任何工具"
+    elif len(tools) > 18:
+        out["warn"] = f"{len(tools)} 个工具偏多（实测 18 个以内还稳），注意小模型会选不准"
+    elif agent and not tools:
+        out["warn"] = "harness 模式但一个工具都没有：检查 [[mcp.servers]] 与人格文件的 api_tools"
+    return out
+
+
 def execute(loop: Any, req: Request) -> Reply:
     """执行一条命令。★永不抛异常★：服务侧炸了要变成一张失败回执，不能带崩语音服务。"""
     cmd, args = req.cmd, dict(req.args or {})
@@ -379,6 +493,10 @@ def execute(loop: Any, req: Request) -> Reply:
             if bool(args.get("force")) and callable(reload_voice):
                 reload_voice()
             return Reply(id=req.id, ok=True, text=getattr(char, "name", cid), at=t0, data=_describe(loop))
+
+        if cmd == "tools":
+            # ★模型能 call 的 tool★：控制台的「工具」页直接画这一份（服务在跑才有真数据）
+            return Reply(id=req.id, ok=True, text="工具清单", data=_tools(loop), at=t0)
 
         if cmd == "toast":
             notifier = getattr(loop, "toast", None)

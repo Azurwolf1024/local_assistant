@@ -34,9 +34,11 @@
 | 语音合成 | `voice_loop/tts/` | [tts/README.md](voice_loop/tts/README.md) |
 | 记忆 | `voice_loop/memory/` | [memory/README.md](voice_loop/memory/README.md) |
 | 邮件 | `voice_loop/mail/` | [mail/README.md](voice_loop/mail/README.md)（用法见 [docs/guide/mail.md](docs/guide/mail.md)） |
+| MCP 工具层 + harness | `voice_loop/mcp/`、`voice_loop/harness.py` | [mcp/README.md](voice_loop/mcp/README.md)（用法见 [docs/guide/mcp.md](docs/guide/mcp.md)） |
 
 这几个包**互不 import**（`asr` 与 `tts` 之间靠注入，有自测盯着：
 `python scripts\tests\test_module_boundaries.py`），所以可以各自换代、各自评测。
+（`mcp/` 这一层反过来：它就是用来**聚合**别人能力域的宿主，只依赖 `settings`。）
 
 ### 章节号 → 文件对照（老链接仍然有效）
 

@@ -1515,3 +1515,79 @@ ModuleNotFoundError: No module named 'numpy'
 
 ---
 
+## 79. 文档补齐第二站：harness / MCP 写透 + 控制台「工具」页（2026-11-21 夜，用户要求「写 harness MCP 那一块，然后把模型能 call 的 tool 在控制台也同时展示」）
+
+同一轮里两件事，因为它们本来就是一件事的两面：**说清楚工具从哪来**，
+**并且让人在界面上看得见**。
+
+| 落点 | 这一轮做成什么样 |
+| --- | --- |
+| [`voice_loop/mcp/README.md`](../../voice_loop/mcp/README.md) | **新建，约 480 行**：协议方法表与两种 `ToolSpec` 形状、inproc/stdio 逐项对比、`deps` 为什么必须是回调、宿主的两层清单（`_specs` vs `_all_specs`）、四台服务器的工具参数表、`[[mcp.servers]]`/`[agent]` 每个字段的默认值、预设表、harness 循环与内置工具、提示词侧（`instructions` 不转发）、10 条安全闸门、控制台接口、故障对照表、自测清单、已知限制 |
+| [`docs/guide/mcp.md`](../guide/mcp.md) | 用户视角补三节：**API 角色多开工具（预设 / `api_tools`）**、**harness 多轮循环**、**在控制台看工具**；修掉「自家共 10 个」的旧数字（实际 11：skills 9 + memory 2） |
+| [`docs/guide/usage.md`](../guide/usage.md) | 控制台从「七个标签页」改成八个，新增「工具」一行 |
+| 控制台 | 新面板「工具」（`panels/tools.py` + `static/panels/tools.js`，order=48） |
+| 服务侧 | `control` 命令表加一条 `tools`（`_tools(loop)`） |
+
+### 79.1 为什么真实清单必须**问服务**
+
+控制台是**独立进程**（用户选的架构）。它可以读 `config.toml`、读人格文件、读
+`tool_presets`，但读不到**当下的状态**：当前角色是不是 API 引擎、`api_tools`
+展开了什么、MCP 宿主里哪台服务器真的连上了、白名单挡掉几个、`[llm] router`
+是不是 `chat`（那样一个工具都不给模型）。
+
+所以分成两半：
+
+| 一半 | 接口 | 数据源 |
+| --- | --- | --- |
+| 真实清单 | `POST /api/tools/live` | 信箱投 `tools` 命令 → `control._tools(loop)` |
+| 静态说明 | `GET /api/tools` | 只读配置 + `tool_presets.describe()` + 角色文件 |
+
+★**控制台绝不为列清单去 `build_server()`**★：`mail` 那一台建服务器时会读身份
+（走网络）、`memory` 会开库 —— 一个「列个清单」的请求不该有这种副作用。
+真机验证时这条正好救了场：服务还在跑旧代码，于是 live 那半如实回了
+「不认识的命令：'tools'」，而不是拿静态推算编一个数出来冒充。
+
+### 79.2 `_tools(loop)` 长什么样
+
+```python
+tools   = pipeline._tool_specs()          # ★真的会出现在模型面前的★
+         + (agent_mode ? ask_user/update_plan : [])
+known   = mcp.describe()                  # 连着的能力域（含没露出的，解释"为什么没露"）
+extra   = loop._api_extra_tools()         # 角色卡点名的（预设已展开）
+missing = mcp.missing(extra)              # 点名了但没人提供 → 上层打警告
+warn    = router != tools ? … : len(tools) > 18 ? … : agent && !tools ? …
+```
+
+三个 `warn` 分支对应三种真实故障：路由是 `chat`（模型看不到任何工具）、
+工具数偏多（22 个时 `deepseek-chat` 把「看邮件」错选成 `list_memos`）、
+harness 开着却一个工具都没有。
+
+### 79.3 真机结果（本地角色「白泽」）
+
+```
+√ 服务自报 11 个工具（1.06 s）
+引擎 / 路由      本地 Ollama · router=tools
+harness 多轮循环  关（单轮：选一个工具就执行）
+MCP 宿主现状     11 个工具 ← skills(inproc,9) memory(inproc,2/4) agent(inproc,0/8) mail(inproc,0/6)
+```
+
+`agent` / `mail` 两台是 `hidden`，所以显示 `0/8`、`0/6` —— 一眼能看出
+「不是没配，是等着角色点名」。
+
+### 79.4 自测
+
+| 测试 | 加的是什么 |
+| --- | --- |
+| `test_control.py` §9 | `tools` 命令：清单与来源、missing、`chat` 路由/工具偏多两种 `warn`、算不出来也不抛异常 |
+| `test_console.py` | 面板变成 8 个、`tools.js` 静态可取、`/api/tools` 的预设/服务器/`hidden`/角色多开、**服务没跑时 live 如实失败** |
+| `test_console_ui.py` | 没改样式表：新面板只用了既有 class（`mono` / `wrap-path` / `tag`…），所以测试本来就该绿 |
+| `test_api_llm.py` | ★顺手修的陈旧断言★：它还写着「本地角色 10 个 / API 角色 11 个」和
+「蓝色大肥鱼多开了 `web` `files`」—— 前者是 skills 加了 `weather` 之后没跟上，
+后者是那张卡片的 `api_tools` 早就改成 `mail/web/weather/voice` 了。数字改成当前的
+11 / 12 并注明「默认工具数一变就该有人来看一眼」 |
+
+> 教训：**钉数字的测试是有寿命的**。它拦得住"悄悄多了一个工具"，
+> 但改工具的人得顺手把它改掉 —— 否则整套自测会长期红一项，然后就没人看了。
+
+---
+

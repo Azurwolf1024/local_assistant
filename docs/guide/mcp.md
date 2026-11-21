@@ -3,6 +3,8 @@
 > 从 [`README.md`](../../README.md) 拆出：第 13 章。
 > 索引见 [`docs/README.md`](../README.md)；章节号保持原样，
 > 老地方写的「见第 14 节」仍然指得到（对照表在 README 里）。
+> ★实现细节（协议字段、两种传输、白名单拦在哪、harness 循环、故障对照）在
+> [`voice_loop/mcp/README.md`](../../voice_loop/mcp/README.md)★ —— 这里是「怎么用」。
 
 ---
 ## 13. MCP：自己搭的工具协议层
@@ -32,6 +34,7 @@ pipeline（会话编排）
 | `mcp/servers/memory.py` | ★ 记忆服务器（第 15 节）：`recall` / `remember` / `memory_stats`，默认只露前两个 |
 | `mcp/servers/agent.py` | ★ harness agent：`web_search` / `web_fetch` / `weather` / `read_file` / `list_dir` / `glob` / `grep`（+ 可选 `write_file` / `edit_file` / `run_command`），默认 `hidden` |
 | `harness.py` | ★ harness 运行时：多轮工具循环 + 内置 `ask_user` / `update_plan`（进程内，不是 MCP 工具） |
+| `tool_presets.py` | ★ API 角色的工具预设：人格文件 `api_tools` 里写预设名，展开成真实工具名 |
 
 第一条命令：
 
@@ -75,7 +78,8 @@ claude mcp add voice-assistant -- python -m voice_loop.mcp.serve skills
    把几十个工具摊在模型面前，它就开始乱选甚至不选。所以 `[[mcp.servers]]` 支持
    `tools = [...]` 白名单：**没进白名单的工具根本不出现在模型面前**（比调用时再拒绝安全得多）。
    接外来服务器时请默认只放只读工具。
-   —— 现在自家共 **10 个**（技能 8 + 记忆 2），记忆那边也只露 `recall` / `remember`
+   —— 现在自家技能服务器的白名单是空的（全露 9 个），记忆只露 `recall` / `remember`，
+   所以本地角色看到 **11 个**；`agent` / `mail` 两台是 `hidden`，默认一个都不露
    （`memory_stats` 留给命令行和外部 agent，不占模型的注意力）。
 2. **★stdout 是协议通道★**。服务器里任何 `print()` 都会把对端的解析搞坏，
    日志一律走 `stderr`（`server.log_stderr()`），Python 子进程建议带
@@ -115,8 +119,83 @@ tools = ["get_volume", "set_volume"]    # 白名单（想全开就留空，但�
 ### 命名规则
 
 - 自家的能力域 `namespace = false`：名字保持 `list_events` / `add_memo` 原样
-  （模型已经认得这 8 个，TOOL_HINT 和评估脚本也照旧）。
+  （模型已经认得这些名字，TOOL_HINT 和评估脚本也照旧）。
 - 其它服务器自动加前缀 `mcp__<服务器>__<工具>`（跟 Claude Code 一致），防止撞名 ——
   所以记忆那两个工具在模型眼里叫 `mcp__memory__recall` / `mcp__memory__remember`。
+
+### API 角色能多开工具（预设 / `api_tools`）
+
+本地 4B 能稳定驾驭的工具就那十个，**云端模型更强**，所以"多背几个工具"这件事
+做成了**数据**，不是代码分支：
+
+```jsonc
+// data/personas/<id>.json —— 「蓝色大肥鱼」这种 engine=api 的角色
+{ "engine": "api", "api_tools": ["mail", "web", "weather", "voice"] }
+//                                  ↑ 预设名（展开见下表），也可以直接写具体工具名
+```
+
+| 预设 | 展开成 | 几个 |
+| --- | --- | --- |
+| `memory` | `mcp__memory__recall` / `remember` / `request_dream` | 3 |
+| `skills` | `list_events` … `fix_last`（日程/备忘/提醒/时间） | 8 |
+| `web` | `web_search` / `web_fetch`（DeepSeek Search / Fetch） | 2 |
+| `weather` | `weather`（Open-Meteo，免 key） | 1 |
+| `voice` | `end_listening`（让模型能主动结束这次聆听） | 1 |
+| `mail` | `mail_search` / `read` / `summary` / `draft` / `send` / `to_event` | 6 |
+| `files` | `read_file` / `list_dir` / `glob` / `grep` | 4 |
+| `write` | `write_file` / `edit_file`（要 `[agent] allow_write = true`） | 2 |
+| `shell` | `run_command`（要 `[agent] allow_shell = true`，高风险） | 1 |
+| `harness` | 上面几乎全部（不含 `mail_send` / `add_*`） | 16 |
+
+三条要记住的：
+
+1. **只对 `engine = api` 生效**，本地角色永远只有默认那几个（`_api_extra_tools()` 直接返回空集）；
+2. 人格文件没写 `api_tools` 就退回 `[api] extra_tools`；
+3. 名字写错只打警告（"这些额外工具没有服务器提供"），**不会**让一轮对话失败。
+
+`hidden = true` 的服务器（`agent` / `mail`）就是靠这套点名的：默认一个都不露，
+本地 4B 看不见也就不会误调。
+
+### harness：多轮工具循环（只有 API 角色走）
+
+本地那套是「模型选一个工具 → 执行 → 把结果念出来」。API 角色走的是成熟 agent 的做法：
+
+```
+模型 → 调工具 → 结果喂回模型 → 再决定要不要继续 → … → 最终回答
+```
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `[agent] enabled` | `true` | 关掉 = API 角色也只做单轮 |
+| `[agent] max_rounds` | `6` | 到顶会**再问一次、不给工具**，逼它用已有资料收口 |
+| `[agent] max_tool_chars` | `6000` | 单个工具结果喂回模型的上限（超了截断） |
+| `[agent] allow_write` | `false` | 开了才**注册** `write_file` / `edit_file` |
+| `[agent] allow_shell` | `false` | 开了才注册 `run_command`（等于把本机 shell 交给模型） |
+
+harness 还自带两个工具：`ask_user`（缺信息就真的追问一句）和
+`update_plan`（多步任务先写步骤，计划不会自动执行、也不念给用户听）。
+
+### 在控制台看「模型能 call 什么」
+
+控制台有专门的 **「工具」页**：
+
+- **上半页是真实的**：点一下「问服务要真实清单」，服务会回当前角色此刻能看到的
+  工具（按服务器分组、显示 `11 个工具 ← skills(inproc,9) memory(inproc,2/4) …`、
+  有没有点名了却没找到的、工具数是不是偏多）。**服务没跑就如实说没问到**，不拿推算冒充。
+- **下半页是说明**：预设各展开成什么、每个角色多开了几个、每台服务器的白名单 /
+  `hidden` / 前缀 / 超时、`[agent]` 的写盘与命令开关。
+
+改完人格文件的 `api_tools` 之后回这一页点一下，就能看出"多开了几个、到底叫什么"。
+
+### 工具数量是有上限的（实测）
+
+| 工具数 | 现象 |
+| --- | --- |
+| 8 | 4b 选得 8/8（甜点） |
+| 11 | 本地角色现在的常态，稳 |
+| 18 | 以上开始不保险 |
+| 22 | ★`deepseek-chat` 把「看邮件」错选成了 `list_memos`★ |
+
+所以接外来服务器时**默认只放只读工具**，这也是 `tools = [...]` 白名单存在的理由。
 
 ---

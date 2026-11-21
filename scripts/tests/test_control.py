@@ -306,6 +306,109 @@ def section_8(tmp: Path) -> None:
     check("收到了 bye", any('"bye"' in c for c in chunks), True)
 
 
+def section_9(tmp: Path) -> None:
+    print("\n[9] `tools` 命令：模型能 call 的工具（控制台「工具」页的数据源）")
+    from voice_loop.control import Reply, Request  # noqa: PLC0415
+
+    class FakeMcp:
+        """假的 MCP 宿主：describe/missing/status 都按宿主真实返回的形状给。"""
+
+        def __init__(self) -> None:
+            self.described = [
+                {"name": "list_events", "server": "skills", "tool": "list_events",
+                 "description": "查日程", "namespaced": False},
+                {"name": "mcp__memory__recall", "server": "memory", "tool": "recall",
+                 "description": "查记忆", "namespaced": True},
+            ]
+
+        def describe(self):
+            return list(self.described)
+
+        def missing(self, include=()):
+            return [n for n in include if n not in {d["name"] for d in self.described}]
+
+        def status(self) -> str:
+            return "2 个工具 ← skills(inproc,1) memory(inproc,1/4)"
+
+    class FakeLlm:
+        engine = "api"
+
+    class FakeLoop2(FakeLoop):
+        def __init__(self) -> None:
+            super().__init__()
+            self.llm = FakeLlm()
+            self.mcp = FakeMcp()
+            self.settings = type("S", (), {"llm": type("L", (), {"router": "tools"})()})()
+
+        def _tool_specs(self):
+            return [
+                {"type": "function", "function": {
+                    "name": "list_events", "description": "查日程", "parameters": {}}},
+                {"type": "function", "function": {
+                    "name": "mcp__memory__recall", "description": "查记忆", "parameters": {}}},
+            ]
+
+        def _api_extra_tools(self):
+            return {"web_search", "mail_search"}
+
+        def _agent_mode(self) -> bool:
+            return True
+
+    loop = FakeLoop2()
+    reply = ct.execute(loop, Request(id="t1", cmd="tools", args={}))
+    check("命令 200", reply.ok, True)
+    data = reply.data or {}
+    names = [t["name"] for t in data.get("tools") or []]
+    check("列出的就是模型真能看到的（含两个 harness 内置工具）", names,
+          ["list_events", "mcp__memory__recall", "ask_user", "update_plan"])
+    check("总数对得上", data.get("total"), 4)
+    check("分了来源：进程内服务器 / harness 运行时",
+          sorted({t["server"] for t in data["tools"]}),
+          ["harness 运行时", "memory", "skills"])
+    check("点名了但没有的进 missing", data.get("missing"), ["mail_search", "web_search"])
+    check("harness 开着", data.get("agent_mode"), True)
+    check("MCP 宿主现状一并带回来", data.get("mcp_status"), "2 个工具 ← skills(inproc,1) memory(inproc,1/4)")
+    check("4 个工具不报警", data.get("warn"), "")
+    check("角色身份仍照旧带回来", data.get("character_name"), "阿米娅")
+
+    # ★路由不是 tools 时模型根本看不到工具★：这一条要如实说出来，不能还列一堆
+    class ChatLoop(FakeLoop2):
+        def __init__(self) -> None:
+            super().__init__()
+            self.settings = type("S", (), {"llm": type("L", (), {"router": "chat"})()})()
+
+        def _tool_specs(self):
+            return None
+
+        def _agent_mode(self) -> bool:
+            return False
+
+    chat = ct.execute(ChatLoop(), Request(id="t2", cmd="tools", args={}))
+    check("chat 路由下工具数为 0", (chat.ok, (chat.data or {}).get("total")), (True, 0))
+    check("并说明原因", "路由" in str((chat.data or {}).get("warn")), True,
+          detail=str((chat.data or {}).get("warn")))
+
+    # ★工具太多要提醒★（实测 22 个时模型把「看邮件」错选成 list_memos）
+    class ManyLoop(FakeLoop2):
+        def _tool_specs(self):
+            return [{"type": "function", "function": {"name": f"t{i}", "description": "",
+                                                      "parameters": {}}} for i in range(20)]
+
+    many = ct.execute(ManyLoop(), Request(id="t3", cmd="tools", args={}))
+    check("工具偏多时有提醒", "偏多" in str((many.data or {}).get("warn")), True,
+          detail=str((many.data or {}).get("warn")))
+
+    # 取不到工具（流水线炸了）也只回一张失败回执，不能带崩服务
+    class BoomLoop(FakeLoop2):
+        def _tool_specs(self):
+            raise RuntimeError("假装工具层挂了")
+
+    boom = ct.execute(BoomLoop(), Request(id="t4", cmd="tools", args={}))
+    check("算不出来也不抛异常", boom.ok, True)
+    check("错误写进 data.error", "工具层挂了" in str((boom.data or {}).get("error")), True,
+          detail=str((boom.data or {}).get("error")))
+
+
 def main() -> int:
     print("=" * 70)
     print(" 控制台命令通道自测")
@@ -320,6 +423,7 @@ def main() -> int:
         section_6(tmp)
         section_7(tmp)
         section_8(tmp)
+        section_9(tmp)
     print("\n" + "=" * 70)
     if FAILED:
         print(f" 失败 {len(FAILED)} 项：{FAILED}")
