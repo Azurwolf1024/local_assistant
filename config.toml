@@ -84,7 +84,7 @@ model = "models/asr/whisper-large-v3-turbo-int8-ov"
 # 也可写 CPU / GPU / NPU，但 NPU 跑这个导出会**崩进程**，所以 auto 绝不选它
 device = "auto"
 whisper_word_timestamps = false
-# 词库走这条（Whisper 没有热词表）：[asr.lexicon] 里有词就会自动填进来
+# ★这个 OpenVINO 导出不支持提示词偏置，此项当前不生效；词库走事后纠正★
 initial_prompt = ""
 
 [asr.providers.sherpa]
@@ -107,7 +107,7 @@ files = ["data/lexicon/*.txt"]     # 一行一个词；支持 "词 权重"，以
 from_personas = true               # 名字 / 称呼 / 唤醒词 / aliases 自动并入
 weight = 1.5
 fix = true                         # 事后纠正（拼音 + 编辑距离）
-fix_min_score = 0.78               # 相似度低于它就改（越低越激进、误改越多）
+fix_min_score = 0.78               # 相似度达到它就改（越低越激进、误改越多）
 max_words = 2000
 
 # ── 两阶段唤醒（可选，默认关）：待唤醒只跑 30 MB 流式关键词检测 ────────────────
@@ -115,6 +115,7 @@ max_words = 2000
 [asr.kws]
 enabled = false
 model_dir = "models/asr/kws-zipformer"
+keywords_file = ""                 # 留空 = 用词库按模型 tokens.txt 自动生成 keywords.txt
 num_threads = 2
 keywords_score = 1.0
 keywords_threshold = 0.25
@@ -190,7 +191,8 @@ model = "deepseek-chat"
 temperature = 0.7
 top_p = 1.0
 max_tokens = 512
-history_turns = 6
+history_turns = 30                 # 兜底值：keep_all_history = false 时才按轮数截断
+keep_all_history = true            # ★正常 harness 做法：做梦前的整段历史都保留，只往后追加，缓存前缀不掉★
 timeout = 60                      # 单次请求最长等多少秒
 extra_tools = []                  # ★API 角色额外开放的工具★：预设名或工具名，见 voice_loop/tool_presets.py
                                   #   角色卡上的 api_tools 留空时才用这一份；本地角色不看它
@@ -227,6 +229,7 @@ allow_shell = false               # run_command 默认关；★开了等于把�
 max_file_chars = 6000             # read_file 最多返回多少字
 max_list_entries = 200            # list_dir 最多列多少项
 max_tool_chars = 6000             # 单个工具结果喂回模型的上限
+max_history_chars = 24000         # 整轮累计工具原文上限；超了把早期结果压成一句摘要
 shell_timeout = 30
 
 # ── 角色设定（名字 / 背景 / 对「我」的称呼 / 示例台词…）──────────────────
@@ -293,6 +296,7 @@ segment_tokens = 1200         # 一段写满多少 token 就封存（太小：�
 segment_turns = 30            # 或者多少轮就封存
 digest_days = 3               # 提示词里往前带几天的摘要（做梦产出）
 tail_tokens = 2000            # 「刚才聊的」原文最多占多少 token（按整轮砍，不切半句）
+api_tail_tokens = 4000        # API 角色窗口大，尾预算翻倍，减少同会话上下文丢失
 local_tail_tokens = 800       # 本地模型那一档：窗口小、注意力弱，塞太多反而更糊涂
 
 # ── 做梦（整理 + 压缩，见 voice_loop/memory/dream.py）─────────────────────────
@@ -311,16 +315,17 @@ local_tail_tokens = 800       # 本地模型那一档：窗口小、注意力弱
 # 因为「没赶上窗口」而永远变不成摘要。
 #
 # 积到多少算够？（1 token ≈ 1.3~1.5 个汉字，一轮日常对话约 100~300 token）
-#   8000 token  ≈ 一整天的长聊（30~60 轮）→ 夜里值得整理一次
-#   24000 token ≈ 上下文开始吃力的量   → 必须压，但只用规则版，不花模型的钱
+#   云端 API 的上下文窗口有 1M，所以这两个数按窗口的 8% / 24% 取，给长对话留足空间：
+#   80000 token  ≈ 连续几天的长聊 → 夜里值得整理一次，把该记的提炼进 L3
+#   240000 token ≈ 1M 窗口的 24%  → 必须压，但只用规则版，不花模型的钱
 # 全部改动都留前镜像（context/dreams/<date>.json），`python main.py dream --undo <date>` 可整批回滚。
 [memory.dream]
 enabled = true
 window = "02:00-05:00"        # 深夜窗口（条件①的一半）
 random = true                 # 窗口里随机挑（不是准点，免得每天同一秒醒）
 check_seconds = 30            # 调度器多久看一次条件
-night_min_tokens = 8000       # ★条件①的另一半★：没攒够这么多 token 就跳过（省钱的主要开关）
-hard_tokens = 24000           # 条件②：积到这么多就压（只做规则版）
+night_min_tokens = 80000      # ★条件①的另一半★：没攒够这么多 token 就跳过（省钱的主要开关）
+hard_tokens = 240000          # 条件②：积到这么多就压（只做规则版）
 min_turns = 4                 # 新内容少于这个数不值得做梦（再短压了也没信息）
 compress_on_close = true      # 关机时补一次规则版（不调模型、不花钱，只为不丢掉当天摘要）
 min_interval_minutes = 30     # 两次 agent 梦之间至少隔多久
@@ -332,10 +337,11 @@ keep_days = 60                # dreams/ 可撤销记录保留多少天
 sync_after = true             # 梦完顺手推云端
 
 # ── 语音合成 ─────────────────────────────────────────────────────────────────
-# backend：
-#   "zipvoice" = 用角色本人的音色读中文（零样本克隆，就是凯尔希的声线）——当前默认
-#   "piper"    = 低延迟固定音色（首段 0.13s），想要「反应快」时改回去
-# 两个都不会哑：克隆模型没装全 / 参考音频不可用时自动退回 Piper 出声。
+# provider：用哪个 TTS 后端（可选：piper / zipvoice / deepseek / edge / http，或 providers/ 里自己加的）
+#   "zipvoice" = 用角色本人的音色读中文（零样本克隆）——当前全局默认
+#   "piper"    = 低延迟固定音色（实测首段 0.13s），想要「反应快」时改回去
+#   "deepseek" / "edge" / "http" = 云端；文本会发给对应服务（隐私边界见 docs/guide/privacy.md）
+# 降级链末尾会追加 piper，但 ★piper 模型没装时链尾也会失败★（缺模型会先被体检拦下）。
 [tts]
 # ★provider = 用哪个 TTS 后端★（可选：piper / zipvoice / deepseek / edge / http，或自己加的后端）
 #   ★加一个新模型/服务不用改代码★：在 voice_loop/tts/providers/ 放一个文件，这里选它的 id。
@@ -499,7 +505,8 @@ clone_precision = "int8"
 [tts.providers.deepseek]
 # 官方只有 stella / tide；key 在 [api] 里配。角色卡里 "tts".voice_id 会覆盖这里。
 voice_id = "stella"
-# 云端这一段彻底失败时用哪把本地声线兜底（角色卡里的 tts.fallback 优先）
+# ★只用于显示兼容★：实际兜底声线由角色卡 "tts".fallback / 全局 [tts] fallback 决定
+# （分块参数 tts_block_seconds 在 [api] 里，不在这里）
 fallback_voice = "zh_CN-huayan-medium"
 
 [tts.providers.edge]

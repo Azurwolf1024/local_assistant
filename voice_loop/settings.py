@@ -80,7 +80,7 @@ class AsrLexiconConfig:
     from_personas: bool = True      # 名字 / 称呼 / 唤醒词 / aliases 自动并入
     weight: float = 1.5             # 写进热词表时的默认权重
     fix: bool = True                # 事后纠正（pinyin / 编辑距离）
-    fix_min_score: float = 0.78     # 相似度低于它就改（越低越激进）
+    fix_min_score: float = 0.78     # 相似度达到它就改（越低越激进）
     max_words: int = 2000           # 词库上限（热词表太大反而拖慢解码）
 
 
@@ -221,7 +221,8 @@ class ApiConfig:
     temperature: float = 0.7
     top_p: float = 1.0
     max_tokens: int = 512
-    history_turns: int = 6               # 带几轮历史（user+assistant 各算一条）
+    history_turns: int = 30              # 兜底：关掉 keep_all_history 时才按这个截断
+    keep_all_history: bool = True        # ★API harness：做梦前整段会话都带，前缀稳定才命中缓存★
     timeout: float = 60.0                # 单次请求最长等多久（秒）
     # ★API 角色额外开放的工具★（预设名或具体工具名，见 voice_loop/tool_presets.py）。
     # 角色卡上的 api_tools 留空时用这一份；本地角色不看它。
@@ -264,6 +265,7 @@ class AgentConfig:
     max_file_chars: int = 6000           # read_file 最多返回多少字
     max_list_entries: int = 200          # list_dir 最多列多少项
     max_tool_chars: int = 6000           # 单个工具结果喂回模型的上限
+    max_history_chars: int = 24000       # 整轮累计喂回模型的工具原文上限（防历史膨胀）
     shell_timeout: float = 30.0          # run_command 超时（秒）
 
 
@@ -300,7 +302,8 @@ class TtsConfig:
     # 加一个后端 = 在 `voice_loop/tts/providers/` 放一个文件，这里只是选 id。
     # `backend` 这个名字还留着（只读别名），免得一堆脚本/自测当场炸掉。
     provider: str = "piper"
-    # ★降级链★：provider 缺模型/缺 key 时依次试这些（id 或 "id:音色"）；末尾永远还有 piper
+    # ★降级链★：provider 缺模型/缺 key 时依次试这些（id 或 "id:音色"）；末尾会追加 piper
+    # （★piper 自己没装模型时链尾也会失败★，体检阶段会报出来）
     fallback: list[str] = field(default_factory=lambda: ["piper"])
     # 同时最多留几个引擎实例（克隆模型几百 MB，默认 1 = 换角色就卸掉上一个）
     max_loaded: int = 1
@@ -483,7 +486,7 @@ class McpConfig:
     servers: list[McpServerConfig] = field(
         default_factory=lambda: [
             # 助手的核心能力：日程/备忘/提醒。
-            # ★namespace=False★：工具名保持 list_schedule / add_memo 原样，
+            # ★namespace=False★：工具名保持 list_events / add_memo 原样，
             # 模型已经认得这 8 个名字（实测 qwen3.5:4b 在这 8 个上 8/8）。
             McpServerConfig(
                 name="skills",
@@ -568,6 +571,7 @@ class MemoryContextConfig:
     segment_turns: int = 30
     digest_days: int = 3            # 提示词里往前带几天的摘要
     tail_tokens: int = 2000         # 未压缩的尾最多占多少 token（按整句砍，不切半句）
+    api_tail_tokens: int = 4000     # API 角色的尾预算更大（窗口够，少丢同一会话里的旧事）
     # ★本地模型单独一档★：4B 的上下文窗口小、注意力也弱，塞 2000 token 的原文反而更糊涂
     local_tail_tokens: int = 800
 
@@ -589,8 +593,9 @@ class MemoryDreamConfig:
     window: str = "02:00-05:00"     # 深夜窗口：★还得攒够 night_min_tokens 才真做★
     random: bool = True
     check_seconds: int = 30         # 调度器多久看一次条件
-    night_min_tokens: int = 8000    # 深夜那次的「够长」门槛（和窗口**同时**满足才做）
-    hard_tokens: int = 24000        # 任意时刻到这个量就压一次（规则版，不调模型）
+    # 云端 API 的 1M 窗口按 8% / 24% 取，给长对话留足空间
+    night_min_tokens: int = 80000   # 深夜那次的「够长」门槛（和窗口**同时**满足才做）
+    hard_tokens: int = 240000       # 任意时刻到这个量就压一次（规则版，不调模型）
     min_turns: int = 4              # 新内容少于这个不值得做梦
     compress_on_close: bool = True  # 关机时补一次**规则版**（见 dream.md 的「④」）
     min_interval_minutes: float = 30  # 两次 agent 梦之间至少隔多久

@@ -174,32 +174,52 @@ class SpeechChunker:
         self.first_chunk_max_chars = max(0, int(first_chunk_max_chars))
         self._buf = ""
         self._pending = ""
+        self._pending_start = 0          # _pending 在原始输入流里的起点（字幕进度用）
+        self._consumed = 0               # 已从 _buf 切走的原始字符数
         self._emitted = 0
         self._hold_since: float | None = None
 
     # -------------------------------------------------------------- public
     def feed(self, text: str) -> list[str]:
         """喂入新的增量文本，返回本次可以送去合成的块。"""
+        return [chunk for chunk, _start, _end in self.feed_ex(text)]
+
+    def feed_ex(self, text: str) -> list[tuple[str, int, int]]:
+        """同 :meth:`feed`，但每块带上它在**原始输入**里的 ``(start, end)``。
+
+        TTS 会剥 Markdown / URL 等，清洗后的块比原文短；字幕进度必须按原文下标走，
+        否则长回答的字幕会落后于朗读（2026-11-23 修）。
+        """
         if text:
             self._buf += text
-        chunks = self._drain(flush=False)
+        spans: list[tuple[int, int]] = []
+        chunks = self._drain(flush=False, spans=spans)
         if not chunks:
-            chunks = self._release_if_held_too_long()
-        return chunks
+            self._release_if_held_too_long(spans=spans)
+        return [(c, *s) for c, s in zip(chunks, spans)]
 
     def flush(self) -> list[str]:
         """流结束时调用，返回剩余内容。"""
-        chunks = self._drain(flush=True)
+        return [chunk for chunk, _start, _end in self.flush_ex()]
+
+    def flush_ex(self) -> list[tuple[str, int, int]]:
+        """同 :meth:`flush`，也带原文区间。"""
+        spans: list[tuple[int, int]] = []
+        chunks = self._drain(flush=True, spans=spans)
         tail = prepare_for_reading(self._pending)
+        span = (self._pending_start, self._pending_start + len(self._pending))
         self._pending = ""
         self._hold_since = None
         if tail:
             chunks.append(tail)
-        return chunks
+            spans.append(span)
+        return [(c, *s) for c, s in zip(chunks, spans)]
 
     def reset(self) -> None:
         self._buf = ""
         self._pending = ""
+        self._pending_start = 0
+        self._consumed = 0
         self._emitted = 0
         self._hold_since = None
 
@@ -207,33 +227,43 @@ class SpeechChunker:
     def _need_chars(self) -> int:
         return self.first_min_chars if self._emitted == 0 else self.min_chunk_chars
 
-    def _release_if_held_too_long(self) -> list[str]:
+    def _release_if_held_too_long(self, spans: list[tuple[int, int]] | None = None) -> list[str]:
         if not self._pending or self._hold_since is None:
             return []
         if self.max_hold_seconds and (time.monotonic() - self._hold_since) >= self.max_hold_seconds:
             text = prepare_for_reading(self._pending)
+            span = (self._pending_start, self._pending_start + len(self._pending))
             self._pending = ""
             self._hold_since = None
             self._emitted += 1
-            return [text] if text else []
+            if text:
+                if spans is not None:
+                    spans.append(span)
+                return [text]
         return []
 
-    def _emit(self, chunks: list[str]) -> None:
+    def _emit(self, chunks: list[str], spans: list[tuple[int, int]] | None = None) -> None:
         text = prepare_for_reading(self._pending)
+        span = (self._pending_start, self._pending_start + len(self._pending))
         self._pending = ""
         self._hold_since = None
         self._emitted += 1
         if text:
             chunks.append(text)
+            if spans is not None:
+                spans.append(span)
 
-    def _drain(self, flush: bool) -> list[str]:
+    def _drain(self, flush: bool, spans: list[tuple[int, int]] | None = None) -> list[str]:
         chunks: list[str] = []
         while True:
             cut, kind = self._find_cut(flush)
             if cut <= 0:
                 break
             piece = self._buf[:cut]
+            if not self._pending and piece.strip():
+                self._pending_start = self._consumed
             self._buf = self._buf[cut:]
+            self._consumed += cut
             if piece.strip():
                 self._pending += piece
                 if self._hold_since is None:
@@ -247,10 +277,10 @@ class SpeechChunker:
                 # 短句合并是特意调过的，不能被这条改掉）。
                 first_chunk = self._emitted == 0 and self.first_chunk_max_chars > 0
                 if first_chunk or len(self._pending) >= self._need_chars():
-                    self._emit(chunks)
+                    self._emit(chunks, spans)
             elif kind in ("clause", "hard"):
                 # 长句被从句标点切开 / 硬切：立即送，避免积压
-                self._emit(chunks)
+                self._emit(chunks, spans)
             elif kind == "eof":
                 break
         return chunks

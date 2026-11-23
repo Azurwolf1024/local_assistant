@@ -49,6 +49,24 @@ class EdgeTts:
         self._block_seconds = float(opts.get("block_seconds") or 0.2)
         self._rate_hz = 24000
         self._text_verifier = None
+        self._fallback = None
+        self._fallback_factory = None
+
+    def set_fallback_factory(self, fn) -> None:
+        """注册表注入的退路工厂：这一句彻底失败时用降级链上的下一个引擎出声。"""
+        self._fallback_factory = fn
+
+    def _fallback_engine(self):
+        if self._fallback is not None:
+            return self._fallback
+        if self._fallback_factory is None:
+            return None
+        try:
+            self._fallback = self._fallback_factory()
+        except Exception as exc:  # noqa: BLE001 - 连退路都拿不到就只记日志
+            self.log.warning(f"[tts:edge] 连退路都拿不到：{exc}")
+            self._fallback = None
+        return self._fallback
 
     # ------------------------------------------------------------------ 状态
     @property
@@ -66,14 +84,27 @@ class EdgeTts:
         if not text:
             return
         t0 = time.perf_counter()
-        audio = self._fetch(text)
-        if not audio:
-            return
-        rate, pcm = decode(audio, "mp3")
-        self._rate_hz = rate or self._rate_hz
-        self.log.debug(f"[tts:edge] {len(text)} 字 → {pcm.size / max(1, rate):.2f}s "
-                       f"音频（{time.perf_counter() - t0:.2f}s）")
-        yield from blocks(rate, pcm, self._block_seconds)
+        yielded = False
+        try:
+            audio = self._fetch(text)
+            if not audio:
+                return
+            rate, pcm = decode(audio, "mp3")
+            self._rate_hz = rate or self._rate_hz
+            self.log.debug(f"[tts:edge] {len(text)} 字 → {pcm.size / max(1, rate):.2f}s "
+                           f"音频（{time.perf_counter() - t0:.2f}s）")
+            for item in blocks(rate, pcm, self._block_seconds):
+                yielded = True
+                yield item
+        except Exception as exc:  # noqa: BLE001 - 云端失败不该把一轮对话带崩
+            if yielded:
+                self.log.warning(f"[tts:edge] 合成中途失败（保留已播部分）：{exc}")
+                return
+            self.log.warning(f"[tts:edge] 合成失败，这一段改用本地：{exc}")
+            engine = self._fallback_engine()
+            if engine is None:
+                return
+            yield from engine.synth(text)
 
     def _fetch(self, text: str) -> bytes:
         try:
@@ -104,6 +135,12 @@ class EdgeTts:
         if not parts:
             return rate, np.zeros(0, dtype=np.int16)
         return rate, np.concatenate(parts)
+
+    def close(self) -> None:
+        close = getattr(self._fallback, "close", None)
+        if callable(close):
+            close()
+        self._fallback = None
 
     def benchmark(self, text: str = "你好，这是一次语音合成的速度测试。") -> dict:
         t0 = time.perf_counter()

@@ -76,7 +76,7 @@ def main() -> int:
         loop.llm = fake
         spoken: list[str] = []
         loop.tts_enabled = True
-        loop._speak_chunk = lambda s: (spoken.append(s), True)[1]  # type: ignore[method-assign]
+        loop._speak_chunk = lambda s, _n=None: (spoken.append(s), True)[1]  # type: ignore[method-assign]
 
         answer = loop.respond("你好")
         check("重答了一次（共 2 轮生成）", fake.turns == 2, f"turns={fake.turns}")

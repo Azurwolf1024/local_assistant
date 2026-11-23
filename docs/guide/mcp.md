@@ -21,7 +21,7 @@ pipeline（会话编排）
        └─ …                           │   │
                                       ↓   ↓
                             MCPServer（自家能力域）
-                              skills / memory / vision / system…
+                              skills / memory / agent / mail…
 ```
 
 | 文件 | 干什么 |
@@ -145,7 +145,7 @@ tools = ["get_volume", "set_volume"]    # 白名单（想全开就留空，但�
 | `files` | `read_file` / `list_dir` / `glob` / `grep` | 4 |
 | `write` | `write_file` / `edit_file`（要 `[agent] allow_write = true`） | 2 |
 | `shell` | `run_command`（要 `[agent] allow_shell = true`，高风险） | 1 |
-| `harness` | 上面几乎全部（不含 `mail_send` / `add_*`） | 16 |
+| `harness` | agent 17（含邮件 6）+ 记忆 3 + 技能 8 = **28 项**，对齐 DSH；写 / 命令 / 发送各有闸门；★仅 API 角色★ | 28 |
 
 三条要记住的：
 

@@ -10,7 +10,7 @@
     │        └─ ……                          │   │             │
     │                                       ↓   ↓             │
     │                              MCPServer（自家能力域）     │
-    │                                skills / vision / system  │
+    │                                skills / memory / agent / mail│
     └─────────────────────────────────────────────────────────┘
 
 - ``protocol``：JSON-RPC 2.0 + MCP 的消息形状（自己实现，零额外依赖）

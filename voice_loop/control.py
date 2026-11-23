@@ -407,13 +407,14 @@ def _tools(loop: Any) -> dict:
         "missing": missing,
         "mcp_status": status,
     }
-    # ★数量警告写在服务侧★：控制台和文档都要用同一个阈值（实测 18 个以内还稳，
-    # 22 个时 deepseek-chat 把「看邮件」错选成了 list_memos）
+    # ★数量警告写在服务侧★：本地 4B 实测 18 个以内还稳（22 个时把「看邮件」
+    # 错选成 list_memos）；API harness 对齐 DSH，工具多到 28 个是常态，阈值另算。
     out["warn"] = ""
+    limit = 40 if agent else 18
     if router and router.lower() != "tools":
         out["warn"] = f"路由是 {router}（不是 tools）：模型这一轮看不到任何工具"
-    elif len(tools) > 18:
-        out["warn"] = f"{len(tools)} 个工具偏多（实测 18 个以内还稳），注意小模型会选不准"
+    elif len(tools) > limit:
+        out["warn"] = f"{len(tools)} 个工具偏多，注意模型会选不准"
     elif agent and not tools:
         out["warn"] = "harness 模式但一个工具都没有：检查 [[mcp.servers]] 与人格文件的 api_tools"
     return out

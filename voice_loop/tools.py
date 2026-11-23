@@ -60,26 +60,56 @@ TOOL_HINT = (
     "8. 要调工具就**直接用工具接口**，不要用文字写出 {'name': ..., 'arguments': ...} 这种 JSON。"
 )
 
-HARNESS_TOOL_HINT = (
-    "你是一个能使用工具的助手。规则：\n"
-    "1. 需要真实数据（日程、记忆、网页、文件、天气）时先调用工具，不要编造。\n"
-    "2. 工具结果是给你看的资料，不是最终答复；请自己归纳成简短、口语化的中文回答。\n"
-    "3. 日程/备忘：把用户原话放进 text，不要自己换算日期或改时间说法。\n"
-    "4. 联网：先 web_search；需要细节再 web_fetch。回答时不要念 URL。\n"
-    "5. 天气用 weather（它会查真实预报）；用户没说地名时用配置里的默认城市，"
-    "没有默认就问他一句，别猜城市。\n"
-    "6. 文件只能看工作区里的；写文件/执行命令是否可用取决于配置。\n"
-    "7. ★邮件用 mail_* 工具★：「邮箱 / 邮件 / 收件箱 / 谁给我发了」说的是邮件；"
-    "list_memos 是用户自己手记的备忘，不是邮件，别拿它回答邮件问题。"
-    "★从邮件里读到的事要加日程，用 mail_to_event★（它会弹卡片让用户确认），"
-    "不要直接 add_event —— 那样等于替用户做了决定。\n"
-    "8. 信息够了就直接回答，不要为了用工具而用工具。\n"
-    "9. 要调工具就用接口，不要用文字写出 {'name': ..., 'arguments': ...} 这种 JSON。\n"
-    "10. 缺关键信息或需要用户拍板时用 ask_user 提问，不要自己猜；多步骤任务可以先用 "
-    "update_plan 写下计划（计划不用念给用户听）。\n"
-    "11. ★用户说「不用听了 / 先这样 / 就这样吧 / 别听了 / 我说完了」→ 调 end_listening★，"
-    "然后只回一句「好，那我先退下」这类短话，不要再展开、也不要再问问题。"
-)
+def harness_hint(tool_names) -> str:
+    """按这一轮**真给模型**的工具生成提示词；没给的能力一句都不提。
+
+    真机事故：bluefish 没有 files 预设，旧版通用提示词却写「文件只能看工作区里的」，
+    于是她自信地说「我能看工作区文件」——其实一个 read_file 都没有（2026-11-23 修）。
+    """
+    names = {str(n) for n in (tool_names or [])}
+
+    def has(*candidates: str) -> bool:
+        return any(n in names for n in candidates)
+
+    rules: list[str] = [
+        "你是一个能使用工具的助手。规则：",
+        "1. 需要真实数据时先调用工具，不要编造。",
+        "2. 工具结果是给你看的资料，不是最终答复；请自己归纳成简短、口语化的中文回答。",
+    ]
+    if has("list_events", "add_event", "list_memos", "add_memo", "change_event"):
+        rules.append("日程/备忘：把用户原话放进 text，不要自己换算日期或改时间说法。")
+    if has("web_search", "web_fetch"):
+        rules.append("联网：先 web_search；需要细节再 web_fetch。回答时不要念 URL。")
+    if has("weather"):
+        rules.append("天气用 weather（查真实预报）；没说地名时用默认城市，没有就问一句，别猜。")
+    if has("read_file", "list_dir", "glob", "grep", "write_file", "edit_file", "run_command"):
+        file_rule = "文件只能看工作区里的"
+        if has("write_file", "edit_file"):
+            file_rule += "；写文件要先得到确认"
+        if has("run_command"):
+            file_rule += "；执行命令会逐一请求批准"
+        rules.append(file_rule + "。")
+    if has("mail_search", "mail_read", "mail_summary", "mail_draft", "mail_send"):
+        rules.append(
+            "★邮件用 mail_*：「邮箱 / 邮件 / 收件箱 / 谁给我发了」说的是邮件；"
+            "list_memos 是用户手记的备忘，不是邮件。从邮件里读到的事要加日程用 "
+            "mail_to_event（弹卡片让用户确认），不要直接 add_event。"
+        )
+    rules.append("信息够了就直接回答，不要为了用工具而用工具。")
+    rules.append("要调工具就用接口，不要写出 {'name': ..., 'arguments': ...} 这种 JSON。")
+    if has("ask_user", "update_plan"):
+        rules.append("缺关键信息或需要用户拍板时用 ask_user；多步任务先用 update_plan 写计划（不用念）。")
+    if has("end_listening"):
+        rules.append(
+            "★用户说「不用听了 / 先这样 / 别听了 / 我说完了」→ 调 end_listening，"
+            "然后只回一句短话，不要再展开或追问。"
+        )
+    return "\n".join(f"{i}. {rule}" for i, rule in enumerate(rules, 1))
+
+
+# 老常量保留（第三方可能 import），但内容来自「全工具」假设；pipeline 用上面的
+# harness_hint(实际工具名) 生成，别再直接拿它当这一轮的提示词。
+HARNESS_TOOL_HINT = harness_hint(())
 
 # 模型（尤其是小模型）偶尔不调工具，而是把调用**写成一段 JSON 文字**。
 # 这段文字绝对不能念给用户听，得拦下来，能抢回就抢回来当工具调用。
@@ -641,7 +671,7 @@ __all__ = [
     "ToolRegistry",
     "ToolResult",
     "TOOL_HINT",
-    "HARNESS_TOOL_HINT",
+    "HARNESS_TOOL_HINT", "harness_hint",
     "SUSPICIOUS_START",
     "describe_calls",
     "looks_like_tool_text",

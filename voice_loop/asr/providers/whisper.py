@@ -3,8 +3,9 @@
 它 1 GB 上下、首次编译约 40 s，所以标成 :data:`CAP_HEAVY`：待唤醒状态绝不加载，
 唤醒之后才在后台线程里起来（见 `pipeline._activate/_deactivate` 的两级加载）。
 
-词库：Whisper 没有热词表，只能把词塞进 ``initial_prompt``（解码提示），
-所以 :data:`HOTWORDS_PROMPT`。
+词库：这个 OpenVINO 导出 + transformers 5.x 没有 prompt 入口，
+``initial_prompt`` 当前不生效；词库走 :data:`HOTWORDS_POST`（事后纠正）。
+真正意义上的 :data:`HOTWORDS_PROMPT` 目前没有后端使用。
 """
 
 from __future__ import annotations

@@ -418,9 +418,14 @@ class OpenAICompatClient:
                   else system_override).strip()
         if prompt:
             msgs.append({"role": "system", "content": prompt})
-        keep = max(0, int(self.cfg.history_turns)) * 2
-        if keep:
-            msgs.extend(self._history[-keep:])
+        if bool(getattr(self.cfg, "keep_all_history", False)):
+            # ★正常 harness 的会话上下文★：自上次 reset（做梦 / 换角色）以来的
+            # 全部消息原样带上，只在末尾追加新消息 —— 已缓存的前缀不会被挪走。
+            msgs.extend(self._history)
+        else:
+            keep = max(0, int(self.cfg.history_turns)) * 2
+            if keep:
+                msgs.extend(self._history[-keep:])
         msgs.append({"role": "user", "content": user_text})
         return msgs
 
@@ -571,6 +576,15 @@ class OpenAICompatClient:
     def commit(self, user_text: str, answer: str) -> None:
         self._history.append({"role": "user", "content": user_text})
         self._history.append({"role": "assistant", "content": answer or ""})
+
+    def commit_messages(self, messages: list[dict]) -> None:
+        """把 harness 这一轮的真实轨迹（含 tool / assistant tool_calls）接进历史。
+
+        只接非 system 消息；顺序原样保留，后续 build_messages 才能复用同一前缀。
+        """
+        for msg in messages or ():
+            if str(msg.get("role") or "") in {"user", "assistant", "tool"}:
+                self._history.append(dict(msg))
 
     def chat(self, user_text: str) -> str:
         answer = "".join(self.chat_stream(user_text)).strip()
@@ -800,6 +814,18 @@ class ChatClient:
             self._api.commit(user_text, answer)
         else:
             self.local.commit(user_text, answer)
+
+    def commit_messages(self, messages: list[dict]) -> None:
+        client = self._api if (self._last_used == "api" and self._api is not None) else self.local
+        commit = getattr(client, "commit_messages", None)
+        if callable(commit):
+            commit(messages)
+        else:  # 老客户端没实现：退化成一条 user + 一条 answer
+            user = next((str(m.get("content") or "") for m in messages
+                         if m.get("role") == "user"), "")
+            answer = next((str(m.get("content") or "") for m in reversed(messages)
+                           if m.get("role") == "assistant"), "")
+            self.commit(user, answer)
 
     def chat(self, user_text: str) -> str:
         answer = "".join(self.chat_stream(user_text)).strip()

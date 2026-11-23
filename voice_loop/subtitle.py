@@ -15,6 +15,8 @@
     - ★跟着声音走★：只要「还在生成 或 扬声器还在响」就不隐藏（``set_keepalive``），
       真的停下来之后再停留 ``hold_seconds`` 秒才收——否则长回答会出现
       「话音未落、字幕没了」；没有图形环境 / tkinter 不可用时静默降级
+    - 进度按**原文字符下标**推进：TTS 会剥 Markdown / URL，块比原文短；
+      pipeline 用分块器带回的原文区间累加，长回答才不会「字幕落后于朗读」
 """
 
 from __future__ import annotations

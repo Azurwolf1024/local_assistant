@@ -47,6 +47,7 @@ class MCPHost:
         self._all_routes: dict[str, tuple[str, str]] = {}
         self._all_specs: dict[str, ToolSpec] = {}
         self._stats: dict[str, dict] = {}
+        self._fails: dict[str, int] = {}
         self.calls = 0
         self.errors = 0
 
@@ -78,37 +79,67 @@ class MCPHost:
                 self.log.warning(f"[mcp] 服务器 {spec.name} 起不来，跳过：{exc}")
                 continue
             self._clients[spec.name] = client
-            allow = {str(t) for t in (getattr(spec, "tools", None) or [])}
-            hidden_server = bool(getattr(spec, "hidden", False))
-            prefix = "" if getattr(spec, "namespace", True) is False else f"mcp{SEP}{spec.name}{SEP}"
-            kept = 0
-            for tool in tools:
-                exposed = f"{prefix}{tool.name}"
-                spec_obj = ToolSpec(
-                    name=exposed, description=tool.description,
-                    input_schema=tool.input_schema,
-                )
-                self._all_routes[exposed] = (spec.name, tool.name)
-                self._all_specs[exposed] = spec_obj
-                if hidden_server:
-                    continue          # 默认不露出：等 api_tools / extra_tools 点名
-                if allow and tool.name not in allow:
-                    continue
-                self._routes[exposed] = (spec.name, tool.name)
-                self._specs.append(spec_obj)
-                kept += 1
-            self._stats[spec.name] = {
-                "tools": kept, "available": len(tools),
-                "transport": getattr(spec, "transport", "inproc"),
-                "allowlist": bool(allow),
-                "hidden": hidden_server,
-            }
-            hidden = len(tools) - kept
-            self.log.info(
-                f"[mcp] {spec.name}：露出 {kept}/{len(tools)} 个工具"
-                + ("（hidden：等 API 角色点名）" if hidden_server
-                   else (f"（白名单挡掉 {hidden} 个）" if hidden else ""))
+            self._register(spec.name, spec, tools)
+
+    def _register(self, server_name: str, spec, tools) -> None:
+        """把一台服务器的工具写进路由表（start 和重启共用同一段逻辑）。"""
+        allow = {str(t) for t in (getattr(spec, "tools", None) or [])}
+        hidden_server = bool(getattr(spec, "hidden", False))
+        # ★bool() 而不是 is False★：TOML 写 0 / "" 也该关掉前缀
+        prefix = "" if not bool(getattr(spec, "namespace", True)) else f"mcp{SEP}{server_name}{SEP}"
+        # 先摘掉旧路由，重启后工具集变化才不会留下幽灵条目。
+        doomed = {n for n, (owner, _t) in self._all_routes.items() if owner == server_name}
+        self._all_specs = {n: s for n, s in self._all_specs.items() if n not in doomed}
+        self._specs = [s for s in self._specs if s.name not in doomed]
+        for bucket in (self._routes, self._all_routes):
+            for exposed in doomed:
+                bucket.pop(exposed, None)
+        kept = 0
+        for tool in tools:
+            exposed = f"{prefix}{tool.name}"
+            spec_obj = ToolSpec(
+                name=exposed, description=tool.description,
+                input_schema=tool.input_schema,
             )
+            self._all_routes[exposed] = (server_name, tool.name)
+            self._all_specs[exposed] = spec_obj
+            if hidden_server:
+                continue          # 默认不露出：等 api_tools / extra_tools 点名
+            if allow and tool.name not in allow:
+                continue
+            self._routes[exposed] = (server_name, tool.name)
+            self._specs.append(spec_obj)
+            kept += 1
+        prev = self._stats.get(server_name, {})
+        self._stats[server_name] = {
+            "tools": kept, "available": len(tools),
+            "transport": getattr(spec, "transport", "inproc"),
+            "allowlist": bool(allow), "hidden": hidden_server,
+            "restarts": int(prev.get("restarts", 0)),
+        }
+        hidden = len(tools) - kept
+        self.log.info(
+            f"[mcp] {server_name}：露出 {kept}/{len(tools)} 个工具"
+            + ("（hidden：等 API 角色点名）" if hidden_server
+               else (f"（白名单挡掉 {hidden} 个）" if hidden else ""))
+        )
+
+    def _restart(self, server_name: str, client: MCPClient, *, reason: str) -> bool:
+        """重建 transport + 路由表 + 状态；只让这一路短暂中断。"""
+        try:
+            spec = next(s for s in self.settings.servers if s.name == server_name)
+            client.close()
+            client.transport = make_transport(spec, self.log, self.deps)
+            client.start()
+            tools = client.list_tools()
+            self._register(server_name, spec, tools)
+            self._stats[server_name]["restarts"] += 1
+            self._fails[server_name] = 0
+            self.log.warning(f"[mcp] {server_name} 已重启（{reason}），工具清单已重建")
+            return True
+        except Exception as exc:  # noqa: BLE001
+            self.log.error(f"[mcp] 重启 {server_name} 失败：{exc}")
+            return False
 
     def close(self) -> None:
         for client in self._clients.values():
@@ -121,6 +152,7 @@ class MCPHost:
         self._specs.clear()
         self._all_routes.clear()
         self._all_specs.clear()
+        self._fails.clear()
 
     # ------------------------------------------------------------- 给模型看
     def specs(self, include=()) -> list[dict]:
@@ -153,15 +185,31 @@ class MCPHost:
         self.start()
         return [str(n) for n in (include or ()) if str(n) not in self._all_specs]
 
-    def handleable(self, name: str) -> bool:
+    def handleable(self, name: str, *, allowed=None) -> bool:
         self.start()
-        return str(name) in self._routes or str(name) in self._all_routes
+        name = str(name)
+        # ★allowed = 当前角色这一轮真正看得见的工具名★
+        # 不传时保持老行为（CLI / 自测）；传了就绝不越界。
+        if allowed is not None and name not in {str(n) for n in allowed}:
+            return False
+        return name in self._routes or name in self._all_routes
 
     # --------------------------------------------------------------- 调用
-    def call(self, name: str, arguments: dict | None = None) -> tuple[bool, str]:
-        """调一个工具，返回 ``(ok, 文本)``。名字必须是 :meth:`specs` 里露出的。"""
+    def call(
+        self, name: str, arguments: dict | None = None, *, allowed=None
+    ) -> tuple[bool, str]:
+        """调一个工具，返回 ``(ok, 文本)``。
+
+        ``allowed`` 是本轮可见工具名集合（来自 :meth:`names`）。本地角色不传 hidden 的
+        名字，即使模型幻觉出一个也不放行；API 角色点名过的 hidden 工具才会进来。
+        """
         self.start()
-        route = self._routes.get(str(name)) or self._all_routes.get(str(name))
+        name = str(name)
+        if not self.handleable(name, allowed=allowed):
+            self.errors += 1
+            return False, (f"这个角色不能调用：{name}" if allowed is not None
+                           else f"没有这个工具：{name}")
+        route = self._routes.get(name) or self._all_routes.get(name)
         if route is None:
             self.errors += 1
             return False, f"没有这个工具：{name}"
@@ -173,22 +221,19 @@ class MCPHost:
         self.calls += 1
         t0 = time.perf_counter()
         ok, text = client.call(tool, arguments or {})
-        if not ok:
+        if ok:
+            self._fails[server_name] = 0
+        else:
             self.errors += 1
+            self._fails[server_name] = self._fails.get(server_name, 0) + 1
             self.log.warning(f"[mcp] {server_name}.{tool} 失败：{text[:120]}")
-            # 子进程挂了就顺手拉起来，别让后面每一句都失败
-            if not getattr(client.transport, "alive", lambda: True)():
-                self.log.warning(f"[mcp] {server_name} 的子进程已退出，重启")
-                try:
-                    client.close()
-                    client.transport = make_transport(
-                        next(s for s in self.settings.servers if s.name == server_name),
-                        self.log,
-                        self.deps,
-                    )
-                    client.start()
-                except Exception as exc:  # noqa: BLE001
-                    self.log.error(f"[mcp] 重启 {server_name} 失败：{exc}")
+            alive = getattr(client.transport, "alive", None)
+            dead = alive is not None and not alive()
+            # 卡住但没退出的进程：连续两次失败也拉起来，别让后面每句都耗满 timeout
+            stuck = alive is not None and self._fails[server_name] >= 2
+            if dead or stuck:
+                self._restart(server_name, client,
+                              reason="子进程退出" if dead else "连续超时")
         self.log.info(f"[mcp:{server_name}.{tool}] {time.perf_counter() - t0:.2f}s "
                       f"{'√' if ok else '×'} {text[:60]}")
         return ok, text
@@ -234,5 +279,6 @@ class MCPHost:
         parts = []
         for name, info in self._stats.items():
             flag = "" if info["tools"] == info["available"] else f"/{info['available']}"
-            parts.append(f"{name}({info['transport']},{info['tools']}{flag})")
+            restarts = f"*restart:{info['restarts']}" if info.get("restarts") else ""
+            parts.append(f"{name}({info['transport']},{info['tools']}{flag}{restarts})")
         return f"{len(self._specs)} 个工具 ← " + " ".join(parts)

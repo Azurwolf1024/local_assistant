@@ -147,11 +147,16 @@ class Decoder:
                 text = self._buf.strip()
                 if text:
                     try:
-                        yield validate(json.loads(text))
+                        msg = validate(json.loads(text))
                     except json.JSONDecodeError:
                         pass                      # 还没收全，等下一块
                     except MCPError:
                         raise
+                    else:
+                        # ★解析成功后必须清空★：否则下一条裸 JSON 会拼到旧消息后面，
+                        # 一直涨到 max_buffer 才报 PARSE_ERROR（2026-11-22 修）。
+                        self._buf = ""
+                        yield msg
                 if len(self._buf) > self.max_buffer:
                     raise MCPError(PARSE_ERROR, "缓冲超过上限，疑似对端没有按行分帧")
                 return

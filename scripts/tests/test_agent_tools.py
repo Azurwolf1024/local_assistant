@@ -17,6 +17,7 @@ from voice_loop.mcp.servers import agent as ag                  # noqa: E402
 from voice_loop.settings import (ApiConfig, McpConfig, McpServerConfig,  # noqa: E402
                                  load_settings)
 from voice_loop.tool_presets import expand                      # noqa: E402
+from voice_loop.tools import harness_hint                      # noqa: E402
 
 PASS, FAIL = "√", "×"
 _failures: list[str] = []
@@ -195,6 +196,12 @@ def test_files(tmp: Path) -> None:
     (sandbox / "sessions").mkdir()
     (sandbox / "sessions" / "log.txt").write_text("private", encoding="utf-8")
     (sandbox / "config.local.toml").write_text("[api]\n", encoding="utf-8")
+    (sandbox / ".git").mkdir()
+    (sandbox / ".git" / "config").write_text("[remote]\n", encoding="utf-8")
+    check("★.git 路径被识别为禁区★", ag._denied(".git/config"), True)  # noqa: SLF001
+    check("★./.git 也一样★", ag._denied("./.git/config"), True)  # noqa: SLF001
+    text, err = call(srv, "read_file", {"path": ".git/config"})
+    check("★.git/config 读不到★", err, True, text)
     text, err = call(srv, "read_file", {"path": "sessions/log.txt"})
     check("★隐私目录被拒★", err, True)
     text, err = call(srv, "read_file", {"path": "config.local.toml"})
@@ -252,10 +259,18 @@ def test_hidden_and_preset() -> None:
     check("mail 预设", expand(["mail"]),
           {"mail_search", "mail_read", "mail_summary", "mail_draft", "mail_send",
            "mail_to_event"})
-    check("harness 预设", expand(["harness"]),
+    check("★提示词不吹没给的工具★", "文件" not in harness_hint({"weather", "ask_user"}), True)
+    check("给了 read_file 才提文件", "文件" in harness_hint({"read_file"}), True)
+    check("没给邮件工具就不提 mail", "mail_" not in harness_hint({"weather"}), True)
+    check("harness 预设（对齐 DSH：agent + 邮件 + 记忆 + 技能）", expand(["harness"]),
           {"web_search", "web_fetch", "weather", "read_file", "list_dir", "glob", "grep",
            "write_file", "edit_file", "run_command", "end_listening",
-           "mail_search", "mail_read", "mail_summary", "mail_draft", "mail_to_event"})
+           "mail_search", "mail_read", "mail_summary", "mail_draft", "mail_send",
+           "mail_to_event",
+           "mcp__memory__recall", "mcp__memory__remember",
+           "mcp__memory__request_dream",
+           "list_events", "next_event", "add_event", "change_event",
+           "list_memos", "add_memo", "now", "fix_last"})
 
 
 class ScriptedLLM:
@@ -452,6 +467,33 @@ def test_pipeline_agent(tmp: Path) -> None:
         loop.close()
 
 
+def test_harness_api_only() -> None:
+    print("\n[7] 不变量：harness 循环 / 28 项工具只给 API 角色")
+    from types import SimpleNamespace
+
+    from voice_loop.pipeline import VoiceLoop
+    from voice_loop import tool_presets
+
+    ctx = SimpleNamespace(
+        llm=SimpleNamespace(engine="local"),
+        character=SimpleNamespace(api_tools=["harness"]),
+        settings=SimpleNamespace(
+            agent=SimpleNamespace(enabled=True),
+            api=SimpleNamespace(extra_tools=[]),
+            llm=SimpleNamespace(router="tools"),
+        ),
+        tools=object(), mcp=None,
+    )
+    check("★本地角色不进 harness 循环★", VoiceLoop._agent_mode(ctx) is False)  # noqa: SLF001
+    check("★本地角色连 api_tools 都展开不了★",
+          VoiceLoop._api_extra_tools(ctx) == set())  # noqa: SLF001
+    ctx.llm.engine = "api"
+    check("API 角色才进 harness 循环", VoiceLoop._agent_mode(ctx) is True)  # noqa: SLF001
+    extra = VoiceLoop._api_extra_tools(ctx)  # noqa: SLF001
+    check("★28 项只出现在 API 角色★",
+          extra == tool_presets.expand(["harness"]), True, str(len(extra)))
+
+
 # --------------------------------------------------------------------------- #
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="agent_tools_") as d:
@@ -462,6 +504,7 @@ def main() -> int:
         test_files(d)
         test_hidden_and_preset()
         test_pipeline_agent(d)
+        test_harness_api_only()
     print("\n" + "=" * 66)
     if _failures:
         print(f"  {len(_failures)} 项没通过：{'、'.join(_failures)}")

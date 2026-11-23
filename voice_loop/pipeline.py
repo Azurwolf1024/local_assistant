@@ -48,7 +48,7 @@ from .toast import VisualNotifier
 from .tools import (
     SUSPICIOUS_START,
     TOOL_HINT,
-    HARNESS_TOOL_HINT,
+    harness_hint,
     ToolRegistry,
     describe_calls,
     looks_like_tool_text,
@@ -662,9 +662,11 @@ class VoiceLoop:
         """一轮发言结束：字幕放开限制，显示全文（方便回头读）。"""
         self._sync_active = False
 
-    def _speak_chunk(self, chunk: str) -> bool:
+    def _speak_chunk(self, chunk: str, source_chars: int | None = None) -> bool:
         """合成并排队一小段，顺手把字幕进度往前推。
 
+        ``source_chars`` 是这段在**原始回答文本**里占了多少字：TTS 会剥 Markdown / URL，
+        清洗后的 ``chunk`` 比原文短；字幕进度必须按原文下标走，否则长回答字幕会落后于朗读。
         返回「真的排出音频了吗」。字幕那边靠 :meth:`_spoken_position` 问
         「现在念到第几个字」，所以这里要记住每段念到了哪、以及它有多长。
         """
@@ -686,7 +688,7 @@ class VoiceLoop:
             queued += pcm.size / float(rate or 1)
         if not queued:
             return False
-        self._spoken_chars += len(chunk)
+        self._spoken_chars += max(len(chunk), int(source_chars or 0))
         self._spoken_seconds += queued
         self._speech_marks.append((self._spoken_chars, self._spoken_seconds))
         self._last_submit_at = time.monotonic()
@@ -752,10 +754,10 @@ class VoiceLoop:
             max_hold_seconds=0.0,
             first_chunk_max_chars=int(getattr(tts_cfg, "first_chunk_max_chars", 0) or 0),
         )
-        for chunk in chunker.feed(text) + chunker.flush():
+        for chunk, start, end in chunker.feed_ex(text) + chunker.flush_ex():
             if self._interrupt.is_set():
                 return
-            self._speak_chunk(chunk)
+            self._speak_chunk(chunk, end - start)
 
     def speak_text(self, text: str, wait: bool = True, fresh: bool = False) -> float:
         """直接朗读一段文字（技能回答、提醒播报）。"""
@@ -1499,6 +1501,12 @@ class VoiceLoop:
             entries = list(getattr(api_cfg, "extra_tools", []) or [])
         return tool_presets.expand(entries)
 
+    def _visible_tool_names(self) -> set[str]:
+        """这一轮模型真正看得见的工具名（本地 = 白名单；API + 点名才多开 hidden）。"""
+        if self.mcp is None:
+            return set()
+        return self.mcp.names(include=self._api_extra_tools())
+
     def _agent_mode(self) -> bool:
         """这一轮走不走 harness agent 多轮循环（只给 API 引擎）。"""
         if str(getattr(self.llm, "engine", "local")) != "api":
@@ -1511,9 +1519,10 @@ class VoiceLoop:
 
     def _call_tool_for_model(self, name: str, args: dict) -> tuple[bool, str]:
         """执行工具并把结果整理成**给模型看**的文本（不是给用户念的）。"""
+        allowed = self._visible_tool_names()
         try:
-            if self.mcp is not None and self.mcp.handleable(name):
-                ok, text = self.mcp.call(name, args)
+            if self.mcp is not None and self.mcp.handleable(name, allowed=allowed):
+                ok, text = self.mcp.call(name, args, allowed=allowed)
             else:
                 assert self.tools is not None
                 res = self.tools.call({"function": {"name": name, "arguments": args}})
@@ -1554,7 +1563,9 @@ class VoiceLoop:
 
         runtime = now_block()
         if tools:
-            runtime = f"{runtime}\n{HARNESS_TOOL_HINT}\n{TRUTH_HINT}"
+            # ★提示词只提这一轮真给的工具★：没有 read_file 就别说「能看工作区文件」
+            given = {str(t.get("function", {}).get("name") or "") for t in tools}
+            runtime = f"{runtime}\n{harness_hint(given)}\n{TRUTH_HINT}"
         else:
             runtime = f"{runtime}\n{TRUTH_HINT}"
         hint = [{"role": "system", "content": runtime}]
@@ -1572,15 +1583,17 @@ class VoiceLoop:
                 if style_hint:
                     hint = [{"role": "system", "content": style_hint}] + hint
 
-        def speak(sentence: str) -> None:
+        def speak(sentence: str, source_chars: int | None = None) -> None:
             nonlocal first_audio
             if not self.tts_enabled:
                 return
-            if self._speak_chunk(sentence) and first_audio is None:
+            if self._speak_chunk(sentence, source_chars) and first_audio is None:
                 first_audio = time.perf_counter() - t0
 
         self._speak_lock.acquire()
         try:
+            # DSH 形状：工具执行前再过一道闸门（host 那层也校验，这里纵深防御）
+            visible = self._visible_tool_names() | {"ask_user", "update_plan"}
             agent = HarnessAgent(
                 self.llm,
                 self.settings,
@@ -1589,6 +1602,11 @@ class VoiceLoop:
                 call_tool=self._call_tool_for_model,
                 ask_user=self._ask_user,
                 should_stop=lambda: self._interrupt.is_set(),
+                guard=lambda name, _args: (
+                    (True, "") if str(name) in visible
+                    else (False, "这个角色看不到这个工具")
+                ),
+                on_event=lambda ev: self.log.debug(f"[agent:{ev['kind']}] {ev}"),
             )
             result = agent.run(prompt, extra_messages=hint, model=model, num_ctx=num_ctx)
             final_text = result.text
@@ -1606,6 +1624,7 @@ class VoiceLoop:
             stats.extra["agent"] = True
             stats.extra["tool_rounds"] = result.rounds
             stats.extra["model_calls"] = result.model_calls
+            stats.extra["agent_events"] = result.events
             if result.calls:
                 stats.extra["tool"] = describe_calls(result.calls)
                 stats.extra["tool_ok"] = result.ok
@@ -1628,14 +1647,13 @@ class VoiceLoop:
                     first_chunk_max_chars=int(
                         getattr(tts_cfg, "first_chunk_max_chars", 0) or 0),
                 )
-                for sentence in chunker.feed(final_text):
+                # ★字幕按原文进度翻动★：块里记着它在 final_text 里的区间，
+                # 即使 TTS 剥掉了 Markdown / URL，字幕也不会落后于朗读。
+                for sentence, start, end in (chunker.feed_ex(final_text)
+                                             + chunker.flush_ex()):
                     if self._interrupt.is_set():
                         break
-                    speak(sentence)
-                for sentence in chunker.flush():
-                    if self._interrupt.is_set():
-                        break
-                    speak(sentence)
+                    speak(sentence, end - start)
                 self._drain_playback()
                 self._speech_end()
         finally:
@@ -1656,7 +1674,18 @@ class VoiceLoop:
         stats.interrupted = self._interrupt.is_set()
         stats.first_audio = first_audio or 0.0
         stats.total_seconds = time.perf_counter() - t0
-        self.llm.commit(commit_text or prompt, final_text)
+        # ★正常 harness 上下文★：把这一轮的 user + 工具调用/结果 + 最终答复
+        # 整段接进 API 历史，下轮原样带回去；只追加不重写，缓存前缀才不会掉。
+        turn_history = [{"role": "user", "content": commit_text or prompt}]
+        turn_history.extend(result.messages[result.initial_messages:])
+        if final_text and not (turn_history and turn_history[-1].get("role") == "assistant"
+                               and turn_history[-1].get("content") == final_text):
+            turn_history.append({"role": "assistant", "content": final_text})
+        commit_all = getattr(self.llm, "commit_messages", None)
+        if callable(commit_all):
+            commit_all(turn_history)
+        else:  # 兼容自测里的极简 LLM 替身
+            self.llm.commit(commit_text or prompt, final_text)
         self._write_session(stats)
 
     def _ask_user(self, question: str, options: list[str]) -> str:
@@ -1731,14 +1760,15 @@ class VoiceLoop:
         """
         fn = call.get("function") or call
         name = str(fn.get("name") or "")
-        if self.mcp is not None and self.mcp.handleable(name):
+        allowed = self._visible_tool_names()
+        if self.mcp is not None and self.mcp.handleable(name, allowed=allowed):
             args = fn.get("arguments")
             if isinstance(args, str):
                 try:
                     args = json.loads(args) if args.strip() else {}
                 except json.JSONDecodeError:
                     args = {}
-            return self.mcp.call(name, dict(args or {}))
+            return self.mcp.call(name, dict(args or {}), allowed=allowed)
         assert self.tools is not None
         res = self.tools.call(call)
         return res.ok, (res.reply or res.error or "")
@@ -1970,11 +2000,11 @@ class VoiceLoop:
                     # 放在 TOOL_HINT 前面：工具提示必须紧贴用户那一句（实测过）
                     hint = [{"role": "system", "content": style_hint}] + (hint or [])
 
-        def speak(sentence: str) -> None:
+        def speak(sentence: str, source_chars: int | None = None) -> None:
             nonlocal first_audio
             if not self.tts_enabled:
                 return
-            if self._speak_chunk(sentence) and first_audio is None:
+            if self._speak_chunk(sentence, source_chars) and first_audio is None:
                 first_audio = time.perf_counter() - t0
 
         try:
@@ -2072,8 +2102,8 @@ class VoiceLoop:
                             self.subtitle.append(delta)
                         if self._interrupt.is_set():
                             break
-                        for sentence in chunker.feed(delta):
-                            speak(sentence)
+                        for sentence, start, end in chunker.feed_ex(delta):
+                            speak(sentence, end - start)
                             if self._interrupt.is_set():
                                 break
                         # 模型还在吐字、扬声器里也还在放：顺手听一下有没有人插话。
@@ -2103,8 +2133,8 @@ class VoiceLoop:
                             on_delta(leftover)
                         if self.subtitle is not None:
                             self.subtitle.append(leftover)
-                        for sentence in chunker.feed(leftover):
-                            speak(sentence)
+                        for sentence, start, end in chunker.feed_ex(leftover):
+                            speak(sentence, end - start)
                     break
 
                 if not self._interrupt.is_set() and not calls:
@@ -2113,10 +2143,10 @@ class VoiceLoop:
                         tail = stripper.finish()
                         if tail:
                             pieces.append(tail)
-                            for sentence in chunker.feed(tail):
-                                speak(sentence)
-                    for sentence in chunker.flush():
-                        speak(sentence)
+                            for sentence, start, end in chunker.feed_ex(tail):
+                                speak(sentence, end - start)
+                    for sentence, start, end in chunker.flush_ex():
+                        speak(sentence, end - start)
                     self._drain_playback()
                     self._speech_end()
 
@@ -2140,10 +2170,10 @@ class VoiceLoop:
                         on_delta(raw)
                     if self.subtitle is not None:
                         self.subtitle.append(raw)
-                    for sentence in chunker.feed(raw):
-                        speak(sentence)
-                    for sentence in chunker.flush():
-                        speak(sentence)
+                    for sentence, start, end in chunker.feed_ex(raw):
+                        speak(sentence, end - start)
+                    for sentence, start, end in chunker.flush_ex():
+                        speak(sentence, end - start)
                     self._drain_playback()
 
             if calls and self.tools is not None:
@@ -2834,7 +2864,9 @@ class VoiceLoop:
             if not getattr(ctx_cfg, "enabled", True):
                 return facts_text
             budget = int(getattr(ctx_cfg, "tail_tokens", 2000) or 2000)
-            if str(getattr(getattr(self, "llm", None), "engine", "local")) != "api":
+            if str(getattr(getattr(self, "llm", None), "engine", "local")) == "api":
+                budget = int(getattr(ctx_cfg, "api_tail_tokens", 4000) or budget)
+            else:
                 # ★本地模型给一档更小的预算★：4B 的窗口本来就紧，
                 # 塞 2000 token 原文的结果是「记得更少、还更爱跑题」。
                 budget = min(budget, int(getattr(ctx_cfg, "local_tail_tokens", 800) or 800))
@@ -2862,9 +2894,16 @@ class VoiceLoop:
         # ★同一轮只记一次★：`_write_session` 有几条路径（正常/打断/技能兜底），
         # 重试时 stats 可能被写两遍；uid 里带时间戳，时间戳会变，所以要额外按内容拦一次。
         sig = (stats.turn, stats.user_text, stats.answer)
-        if sig == getattr(self, "_ctx_last_sig", None):
+        seen = getattr(self, "_ctx_sigs", None)
+        if seen is None:
+            seen = set()
+            self._ctx_sigs = seen
+        # ★按内容比整轮，不只比上一轮★：重试可能隔了几轮才补写，
+        # 而 uid 带秒级时间戳，跨秒时同一轮也会拿到新 uid（2026-11-23 修）。
+        if sig in seen:
             return
-        self._ctx_last_sig = sig
+        seen.add(sig)
+        self._ctx_last_sig = sig          # 兼容旧读法
         try:
             mem = hub.for_character(self.character.id if self.character else "default")
             session = self._session_file.name
@@ -3031,7 +3070,7 @@ class VoiceLoop:
     def _dream_on_close(self) -> None:
         """退出前补一次**规则版**梦：把今天的上下文封段 + 写摘要。
 
-        ★为什么要有★：夜里那次梦要同时满足「窗口 + 够长」（`night_min_tokens`，默认 8000），
+        ★为什么要有★：夜里那次梦要同时满足「窗口 + 够长」（`night_min_tokens`，默认 80000），
         可你要是 23 点关机、第二天 9 点再开，那个窗口永远碰不到 —— 这一天的对话就永远
         变不成摘要，第二天提示词里只剩 `tail_tokens` 那点原文。所以关机时补一次：
         ★只走规则版★（毫秒级、**不调模型、不花 token**、不做价值判断），

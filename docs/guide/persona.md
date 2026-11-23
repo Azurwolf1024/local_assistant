@@ -113,7 +113,7 @@ python main.py memory --who amiya            # 她记得什么、知识库读到
   "name": "蓝色大肥鱼",
   "engine": "api",              // ★这个角色走云端★
   "api_model": "deepseek-chat", // 空 = 跟 [api] model
-  "api_tools": ["web"]          // 额外工具：web = 官方联网搜索/网页读取
+  "api_tools": ["harness"]       // 蓝色大肥鱼的真实配置（展开成 28 项 DSH 工具）
 }
 ```
 
@@ -157,8 +157,9 @@ api_key_file = "D:/你的路径/assistant.txt"
 
 **额外工具**：本地 4B 能稳定驾驭的工具就那十个，所以默认所有角色一样。
 API 角色可以在 `api_tools`（或 `[api] extra_tools`）里按 **预设名** 或 **具体工具名**
-点名多开。现在有的预设是 `memory`（recall / remember）、`skills`（八个生活技能）、
-`web`（搜索 / 读网页）、`weather`（真实天气）和 `files`（读工作区）；
+点名多开。现在有的预设是 `memory`（recall / remember / request_dream）、`skills`（八个生活技能）、
+`web`、`weather`、`files`、`mail`（含 `mail_send`，但发送要审批卡签名）、`harness`（对齐
+DeepSeek Harness 的 28 项：agent + 邮件 + 记忆 + 技能）；
 也可以直接点名一个被白名单挡住的工具，例如
 `"api_tools": ["mcp__memory__memory_stats"]`。预设表在
 [`voice_loop/tool_presets.py`](../../voice_loop/tool_presets.py)：加一个预设 = 加一行，
@@ -304,11 +305,17 @@ max_tool_chars = 6000     # 单个工具结果喂回模型的上限
 | `list_dir` | 工作区目录 | `api_tools` 含 `files` |
 | `glob` | 按通配符找文件（`**/*.py`） | `api_tools` 含 `files` |
 | `grep` | 在文件内容里搜正则 | `api_tools` 含 `files` |
+| `mail_search` / `mail_read` / `mail_summary` | 邮件查 / 读 / 摘要 | `api_tools` 含 `mail` |
+| `mail_draft` | 起草邮件（不发送） | `api_tools` 含 `mail` |
+| `mail_send` | 真发送（必须带审批卡签发的 `confirm_token`） | `api_tools` 含 `mail` |
+| `mail_to_event` | 把邮件提成日程 | `api_tools` 含 `mail` |
+| `mcp__memory__recall` / `remember` / `request_dream` | 记忆查 / 记 / 主动整理 | `api_tools` 含 `memory` |
+| `list_events` / `add_event` / … | 技能层日程 / 备忘 / 报时 | `api_tools` 含 `skills`，或 `harness` |
 | `write_file` | 写工作区文件 | `[agent] allow_write = true` 且点名 |
 | `edit_file` | 精确替换文件里的一处文本 | `[agent] allow_write = true` 且点名 |
 | `run_command` | 工作区 shell | `[agent] allow_shell = true` 且点名 |
-| `ask_user` | ★内置★：向用户提问（可带选项） | 一律有（API 角色） |
-| `update_plan` | ★内置★：把步骤计划写进这一轮的状态 | 一律有（API 角色） |
+| `ask_user` | ★内置★：向用户提问（可带选项） | 对话型 API 角色默认有（dream 等专用 harness 不注入） |
+| `update_plan` | ★内置★：把步骤计划写进这一轮的状态 | 对话型 API 角色默认有（同上） |
 
 `ask_user` 的两种模式：
 
@@ -316,7 +323,8 @@ max_tool_chars = 6000     # 单个工具结果喂回模型的上限
   所以即使刚才按了静音也能听见回答。
 - **纯文本**（`enable_listening=false` / 没有麦克风）：直接 `input()` 读一行。
 
-`update_plan` 不念给用户听，只把步骤记到 `TurnStats.extra["plan"]`（控制台/日志可见），
+`update_plan` 不念给用户听，只把步骤记到 `TurnStats.extra["plan"]`（日志 / session 可见，
+控制台「工具」页显示的是可调用能力，不是本轮计划），
 模型想怎么规划都行，不会因为「计划」多占一轮回答。
 
 `api_tools` 里写预设名即可：
@@ -331,7 +339,9 @@ max_tool_chars = 6000     # 单个工具结果喂回模型的上限
 - `files` → `read_file` + `list_dir` + `glob` + `grep`
 - `write` → `write_file` + `edit_file`（需要先在 `[agent]` 里显式开启）
 - `shell` → `run_command`（需要先在 `[agent]` 里显式开启）
-- `harness` → 全部（当前不可用的会自动跳过并告警）
+- `harness` → 对齐 DSH 的 **28 项**：agent 17（已含邮件 6）+ 记忆 3 + 技能 8；
+  ★只对 `engine = "api"` 的角色生效★，本地小模型即使写了也不会展开；
+  写 / 命令 / 发送各有闸门，不可用的自动跳过并告警
 
 | 设计点 | 原因 |
 | --- | --- |
@@ -342,8 +352,10 @@ max_tool_chars = 6000     # 单个工具结果喂回模型的上限
 | **文件边界** | 所有路径都限制在 `[agent] workspace` 里；`..` / 越界绝对路径会被拒 |
 | **隐私路径** | 即使 workspace 指到项目根，`sessions/`、`data/memory/`、`data/knowledge/`、`data/vision/`、`data/backup/`、`config.local.toml` 也永远不给模型看/写 |
 | **写/命令默认关** | `write_file` / `edit_file` / `run_command` 只有显式开启才出现在工具列表里；命令等于把本机 shell 交给模型，风险自负 |
-| **会问也会等** | `ask_user` 会把问题念出来并真的等回答（语音或键盘），答案作为工具结果喂回模型；用户打断/取消就结束这一轮 |
-| **计划不占回答** | `update_plan` 只记录步骤，不念出来也不额外花一轮；最后一轮模型仍要给出正常的一句话回答 |
+| **会问也会等** | `ask_user` 会把问题念出来并真的等回答（语音或键盘），答案作为工具结果喂回模型；★取消 / 没听清 / 无回调记为 `ok=False`，不会被当成"用户说了 yes"★ |
+| **计划不占回答** | `update_plan` 只记录步骤，不念出来也不额外花一轮；写在日志 / session 里（控制台工具页显示的是可调用能力，不是本轮计划） |
+| **DSH 形状的事件轨迹** | 一个 Turn 分若干 Step；`turn/start` → `step/start` → `tool/pre-execute` → `tool/call` → `tool/result` → `step/end` → `turn/end` 都留在 `AgentResult.events`，观察者可通过 `on_event` 订阅；权限闸门只拒不放 |
+| **整段会话上下文** | API harness 从上次 reset（做梦 / 换角色）起保留**全部** user / assistant / tool 消息，只在尾部追加；`keep_all_history = true`，不再按轮数截断，云端缓存前缀才不会掉 |
 | **计费** | Search / Fetch 各 $0.75 / 1000 次成功请求；`count` 不影响单价；空结果/失败/超时不计费 |
 | **隐私** | 查询内容会发给 DeepSeek；本地角色完全不会触发联网工具 |
 

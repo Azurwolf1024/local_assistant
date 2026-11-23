@@ -5,7 +5,7 @@
 好处是加能力域时不用动 pipeline，而且同一份 handler 既能给本地模型用，
 也能通过 stdio 交给 Copilot / Claude Code 用。
 
-工具名沿用原样（list_schedule / add_memo …），不带 mcp__ 前缀——
+工具名沿用原样（list_events / add_memo …），不带 mcp__ 前缀——
 它们是助手自己的核心能力，模型已经认得这 8 个名字（实测 4b 在这 8 个上 8/8）。
 """
 

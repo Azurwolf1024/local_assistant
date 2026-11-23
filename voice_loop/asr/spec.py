@@ -72,7 +72,7 @@ class When:
         if self.kind == WHEN_EMPTY:
             return empty
         if self.kind == WHEN_LONG:
-            return seconds >= self.value
+            return self.value > 0 and seconds >= self.value
         if self.kind == WHEN_SCORE:
             return score < self.value
         if self.kind == WHEN_ALWAYS:
@@ -93,7 +93,16 @@ def parse_when(raw: Any) -> tuple[When, ...]:
         items: list[Any] = [raw]
     elif isinstance(raw, Mapping):
         # 也认 {"long": 6.0, "score<": 0.45} 这种写法
-        items = [f"{k}:{v}" for k, v in raw.items()]
+        items = []
+        for key, value in raw.items():
+            name = str(key or "").strip().lower()
+            if name in (WHEN_SCORE, f"{WHEN_SCORE}<"):
+                # ★阈值在 value 里：拼成 score<0.45，别拼成 score<:0.45★
+                items.append(f"{WHEN_SCORE}<{value}")
+            elif name.startswith(f"{WHEN_SCORE}<"):
+                items.append(name)               # 阈值已经在 key 里
+            else:
+                items.append(f"{name}:{value}")
     else:
         items = list(raw)
     out: list[When] = []
@@ -113,10 +122,10 @@ def parse_when(raw: Any) -> tuple[When, ...]:
             try:
                 out.append(When(left.strip(), float(right)))
             except ValueError:
-                out.append(When(left.strip()))
+                continue                             # long:abc 是写坏了，别当成恒真
             continue
-        if text in (WHEN_EMPTY, WHEN_LONG, WHEN_SCORE, WHEN_ALWAYS):
-            out.append(When(text))
+        if text in (WHEN_EMPTY, WHEN_ALWAYS):
+            out.append(When(text))                   # 裸 long / score 没有阈值，忽略
     return tuple(out)
 
 

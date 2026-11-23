@@ -1,7 +1,7 @@
 """把一个自家服务器挂到 stdio 上（给别人当 MCP 服务器用）。
 
     python -m voice_loop.mcp.serve skills
-    python -m voice_loop.mcp.serve vision --list      # 只打印工具清单，方便调试
+    python -m voice_loop.mcp.serve skills --list     # 只打印工具清单，方便调试
 
 配到别的 agent 里（例）：
 
@@ -45,7 +45,7 @@ def resolve(name: str) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser(description="把自家能力域挂成 MCP 服务器（stdio）")
     ap.add_argument("server", nargs="?", default="skills",
-                    help="服务器名（skills / vision / system…）或完整模块路径")
+                    help="服务器名（skills / memory / agent / mail）或完整模块路径")
     ap.add_argument("--list", action="store_true", help="只打印工具清单，不起协议循环")
     args = ap.parse_args()
 

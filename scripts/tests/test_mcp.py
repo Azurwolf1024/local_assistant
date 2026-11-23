@@ -96,6 +96,13 @@ def test_protocol() -> None:
     dec = P.Decoder()
     got = list(dec.feed(P.encode(P.request(3, "ping")).rstrip(b"\n")))
     check("没有换行的裸 JSON 也认", len(got) == 1 and got[0]["id"] == 3)
+    # ★连续两条裸 JSON 不能串包★（缓冲区必须清空）
+    dec = P.Decoder()
+    a = P.encode(P.request(7, "ping")).rstrip(b"\n")
+    b = P.encode(P.request(8, "ping")).rstrip(b"\n")
+    got = list(dec.feed(a)) + list(dec.feed(b))
+    check("连续两条裸 JSON 不串包", [m["id"] for m in got] == [7, 8],
+          str([m["id"] for m in got]))
 
     for bad in (b"{not json}\n", b'{"jsonrpc":"1.0","id":1,"method":"ping"}\n',
                 b'{"jsonrpc":"2.0","id":1}\n'):
@@ -247,19 +254,40 @@ def test_host(tmp: Path) -> None:
         ok, text = host.call("不存在的工具", {})
         check("未知工具 → ok=False", not ok and "没有这个工具" in text, text[:40])
 
+        # ★调用层授权：白名单/hidden 只决定"看不看得见"★
+        hidden_tool = "mcp__ro__add_memo"
+        check("老接口仍能路由到白名单外（CLI 用）", host.handleable(hidden_tool))
+        check("★带 allowed 时没露出就不放行★",
+              not host.handleable(hidden_tool, allowed=host.names()))
+        ok, text = host.call(hidden_tool, {"text": "越权"}, allowed=host.names())
+        check("★越权调用被拒★", not ok and "不能调用" in text, text[:40])
+        ok, text = host.call(hidden_tool, {"text": "记一下：点名后可写"},
+                             allowed=host.names(include=[hidden_tool]))
+        check("★点名后才可调★", ok, text[:40])
+
         check("describe 标出来源", any(i["name"] == "mcp__ro__list_memos" and i["server"] == "ro"
                                       for i in host.describe()))
         check("status 一行能看明白", "skills" in host.status() and "ro" in host.status(),
               host.status())
 
-        # 服务器崩了（handler 里抛异常）不能让宿主整体挂掉
-        class Boom(InProcessTransport):
+        # 服务器崩了：要真重启 + 重建路由，不能只"这一路失败"就完事
+        class Dead(InProcessTransport):
             def send(self, msg: dict) -> None:
                 raise MCPError(-32603, "假装子进程死了")
 
-        host._clients["skills"].transport = Boom(MCPServer("dead"))  # noqa: SLF001
+            def alive(self) -> bool:  # ★没有这个方法的假对象以前根本不进重启分支★
+                return False
+
+        dead = Dead(MCPServer("dead"))
+        host._clients["skills"].transport = dead  # noqa: SLF001
         ok, text = host.call("list_memos", {})
         check("服务器挂了只这一路失败", not ok, text[:40])
+        check("★失败后真的重启了★", host._stats["skills"]["restarts"] >= 1,
+              host._stats["skills"])
+        check("★重启换掉了 transport★",
+              host._clients["skills"].transport is not dead)  # noqa: SLF001
+        ok, text = host.call("list_memos", {})
+        check("★重启后这一路恢复★", ok, text[:40])
         ok, text = host.call("mcp__ro__list_memos", {})
         check("其它服务器照常", ok, text[:40])
     finally:

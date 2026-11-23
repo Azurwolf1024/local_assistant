@@ -239,7 +239,11 @@ _DENY_FILES = ("config.local.toml",)
 
 
 def _denied(rel: str) -> bool:
-    rel = rel.replace("\\", "/").lstrip("./")
+    # ★不能 lstrip("./")★：它会把 ".git/config" 变成 "git/config"，
+    # 于是黑名单第一条 .git 永远拦不住（2026-11-22 修）。
+    parts = [p for p in str(rel or "").replace("\\", "/").split("/")
+             if p not in ("", ".")]
+    rel = "/".join(parts)
     if rel in _DENY_FILES:
         return True
     return any(rel == d or rel.startswith(d + "/") for d in _DENY_DIRS)

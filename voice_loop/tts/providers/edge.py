@@ -60,6 +60,6 @@ PROVIDER = ProviderSpec(
     apply=_apply,
     ready=_ready,
     voices=lambda _settings: list(VOICES),
-    hint="免费、不用 key；文本会发到微软的朗读服务。失败自动退回 Piper。",
+    hint="免费、不用 key；文本会发到微软的朗读服务。失败自动退回降级链上的下一个（默认 Piper）。",
     wants_fallback_factory=True,
 )

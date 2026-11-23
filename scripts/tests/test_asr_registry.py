@@ -180,6 +180,13 @@ def test_default_spec(tmp: Path) -> None:
 
     check("复核条件解析：score<0.45", parse_when("score<0.45")[0].value, 0.45)
     check("复核条件解析：乱写就忽略", parse_when(["", "什么鬼"]), ())
+    check("★字典写法 score<★", parse_when({"score<": 0.45})[0].as_text(), "score<0.45")
+    check("字典写法 long", parse_when({"long": 6.0})[0].as_text(), "long:6")
+    check("字典写法：阈值在 key 里", parse_when({"score<0.45": True})[0].as_text(), "score<0.45")
+    check("★裸 long 不再恒真★", parse_when("long"), ())
+    check("long:abc 也不恒真", parse_when("long:abc"), ())
+    check("long:6 在 1 秒时不命中",
+          parse_when("long:6")[0].hit(empty=False, seconds=1.0, score=1.0), False)
 
 
 def test_effective(tmp: Path) -> None:

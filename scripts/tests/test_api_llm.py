@@ -19,7 +19,9 @@ sys.path.insert(0, str(ROOT))
 from voice_loop import llm as llm_mod                      # noqa: E402
 from voice_loop.llm import ApiError, ChatClient, OpenAICompatClient  # noqa: E402
 from voice_loop.persona import Character, CharacterRegistry          # noqa: E402
-from voice_loop.settings import ApiConfig, LlmConfig, load_settings   # noqa: E402
+from voice_loop.settings import (ApiConfig, LlmConfig, MemoryContextConfig,  # noqa: E402
+                                 load_settings)
+from voice_loop.tool_presets import expand                    # noqa: E402
 
 PASS, FAIL = "√", "×"
 _failures: list[str] = []
@@ -136,15 +138,38 @@ def test_openai_client() -> None:
         check("system prompt 在第一句", monkey["payload"]["messages"][0],
               {"role": "system", "content": "你是测试"})
 
-        # 历史窗口
+        # 历史窗口：显式关掉整段保留，才按轮数截
         llm_mod.requests.post = fake_stream(monkey, ['data: {"choices":[{"delta":{}}]}'])
+        client.cfg.keep_all_history = False
         client.cfg.history_turns = 1
         client.commit("u1", "a1")
         client.commit("u2", "a2")
         list(client.chat_events("u3"))
         roles = [(m["role"], m["content"]) for m in monkey["payload"]["messages"]]
-        check("只带最近一轮历史", roles[1:], [("user", "u2"), ("assistant", "a2"),
-                                             ("user", "u3")])
+        check("关掉整段保留后只带最近一轮", roles[1:], [("user", "u2"), ("assistant", "a2"),
+                                                        ("user", "u3")])
+
+        # ★正常 harness：做梦前的整段历史都带上，只在尾部追加★
+        client.cfg.keep_all_history = True
+        list(client.chat_events("u4"))
+        roles = [(m["role"], m["content"]) for m in monkey["payload"]["messages"]]
+        check("整段历史都保留（前缀稳定）", roles[1:-1],
+              [("user", "u1"), ("assistant", "a1"), ("user", "u2"), ("assistant", "a2")],
+              str(roles[1:-1]))
+        client.commit_messages([
+            {"role": "user", "content": "u5"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "type": "function",
+                 "function": {"name": "now", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "现在十点"},
+            {"role": "assistant", "content": "a5"},
+        ])
+        list(client.chat_events("u6"))
+        sent = monkey["payload"]["messages"]
+        check("工具轨迹原样进下一轮上下文",
+              any(m.get("role") == "tool" and m.get("tool_call_id") == "c1" for m in sent), True)
+        check("system 不会重复写进历史",
+              [m["role"] for m in sent].count("system"), 1)
 
         # 没有 key
         llm_mod.requests.post = fake_stream(monkey, [])
@@ -312,16 +337,29 @@ def test_shipped_characters() -> None:
     check("它是 API 角色", fish.engine, "api")
     check("模型是 deepseek-chat", fish.api_model, "deepseek-chat")
     check("TTS 也走官方 API", (fish.backend, fish.tts_voice), ("deepseek", "stella"))
-    check("额外开放了工具（人格文件的 api_tools 是数据，跟着卡片走）",
-          {"web", "mail"} <= set(fish.api_tools), detail=str(fish.api_tools))
+    check("额外开放了工具（预设展开后含 web / mail）",
+          {"web_search", "mail_search"} <= expand(fish.api_tools),
+          detail=str(fish.api_tools))
     check("退路是出厂 Piper（不碰克隆素材）",
           (fish.voice_ref, fish.voice_model, (fish.tts or {}).get("fallback")),
           ("", "", ["piper:zh_CN-huayan-medium"]))
     check("没有把密钥写进文件", bool((fish.api_key or "").strip()), False)
 
 
+def test_context_budget() -> None:
+    print("\n[0] API 上下文预算：长会话不能刚聊过就忘")
+    check("API 默认带 30 轮历史", ApiConfig().history_turns >= 30, True)
+    check("API L1 尾原文预算 4000", MemoryContextConfig().api_tail_tokens >= 4000, True)
+    s = load_settings()
+    check("config.toml 的 API 历史配置生效", s.api.history_turns >= 30, True,
+          str(s.api.history_turns))
+    check("config.toml 的 API 尾预算生效", s.memory.context.api_tail_tokens >= 4000, True,
+          str(s.memory.context.api_tail_tokens))
+
+
 # --------------------------------------------------------------------------- #
 def main() -> int:
+    test_context_budget()
     test_config()
     test_character_fields()
     test_openai_client()

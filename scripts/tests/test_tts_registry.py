@@ -8,7 +8,7 @@
 2. `VoiceSpec` 能把各种写法（字符串/字典/短名）解析成同一份数据；
 3. `effective()` 给的是**副本** —— 切角色绝不改全局配置（两个角色可共存）；
 4. `use()` 幂等，换的是会话的 spec，不重建外壳（补丁还在）；
-5. 降级链永远以 piper 收尾（不会哑），配置问题只提示一次；
+5. 降级链以 piper 收尾；piper 模型缺失时体检会报出来（链尾也救不了哑）；
 6. 云端后端必须声明 `cloud` 能力（「本地角色不联网」这条不变量靠它守）；
 7. `http` 这个「给个 API 就能接」的后端，用一个**本地假服务器**跑通端到端。
 
@@ -163,7 +163,7 @@ def test_session(settings) -> None:
 
 
 def test_fallback(settings) -> None:
-    print("\n[5] 降级链：缺东西就往下一个试，末尾永远有 piper")
+    print("\n[5] 降级链：缺东西就往下一个试，末尾追加 piper（模型须装好）")
     reg = registry_for(settings)
     chain = reg.chain(VoiceSpec(provider="http"))
     check("http 没配 url → 链里排到 piper", [c.provider for c in chain][-1], "piper")
@@ -315,6 +315,51 @@ def test_http_provider(settings, tmp: Path) -> None:
         os.environ.pop("SELF_TEST_TTS_KEY", None)
 
 
+def test_edge_fallback(settings) -> None:
+    print("\n[11] Edge 云端失败 → 走退路（假失败，不联网）")
+    from voice_loop.tts.edge_tts import EdgeTts, EdgeTtsError
+
+    original = EdgeTts._fetch
+
+    def boom(self, text):  # noqa: ARG001 - 故意让网络请求失败
+        raise EdgeTtsError("假的 edge-tts 失败")
+
+    class FakeLocal:
+        def synth(self, text):  # noqa: ARG002 - 退路只要能出块
+            yield 24000, np.zeros(240, dtype=np.int16)
+
+    EdgeTts._fetch = boom
+    try:
+        engine = EdgeTts(settings)
+        engine.set_fallback_factory(lambda: FakeLocal())
+        got = list(engine.synth("这一句会失败"))
+        check("★edge 运行时失败 → 自动用退路出声★", len(got) >= 1, True, len(got))
+        check("退路音频仍是 int16 单声道", got[0][1].dtype.name if got else "", "int16")
+    finally:
+        EdgeTts._fetch = original
+
+
+def test_piper_ready(tmp: Path) -> None:
+    print("\n[12] Piper 体检：没有 onnx 声线时 ready=False（链尾也不哑的前提）")
+    from voice_loop.tts.providers.piper import PROVIDER as PIPER
+
+    class NoModels:
+        def resolve(self, path: str) -> Path:  # noqa: D102 - 测试替身
+            return tmp / path
+
+    class WithModels(NoModels):
+        def resolve(self, path: str) -> Path:  # noqa: D102 - 测试替身
+            room = tmp / "models/tts/piper"
+            room.mkdir(parents=True, exist_ok=True)
+            (room / "fake.onnx").touch()
+            return super().resolve(path)
+
+    ok, why = PIPER.ready(NoModels())
+    check("★空目录 → 不可就绪★", (ok, bool(why)), (False, True), why)
+    ok2, _ = PIPER.ready(WithModels())
+    check("有声线 → 就绪", ok2, True)
+
+
 def test_decode() -> None:
     print("\n[11] 音频解码：wav / 裸 PCM 都能吃（云端格式五花八门）")
     data = wav_bytes(0.2, 16000, 500)
@@ -382,6 +427,8 @@ def main() -> int:
         test_persona_spec()
         test_migration()
         test_http_provider(settings, tmp)
+        test_edge_fallback(settings)
+        test_piper_ready(tmp)
         test_decode()
         test_lazy_package()
         if online:

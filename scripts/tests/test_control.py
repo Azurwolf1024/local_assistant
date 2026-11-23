@@ -388,15 +388,25 @@ def section_9(tmp: Path) -> None:
     check("并说明原因", "路由" in str((chat.data or {}).get("warn")), True,
           detail=str((chat.data or {}).get("warn")))
 
-    # ★工具太多要提醒★（实测 22 个时模型把「看邮件」错选成 list_memos）
+    # ★工具太多要提醒★：本地 4B 18 个以上会选不准；API harness 对齐 DSH，阈值 40
     class ManyLoop(FakeLoop2):
         def _tool_specs(self):
             return [{"type": "function", "function": {"name": f"t{i}", "description": "",
                                                       "parameters": {}}} for i in range(20)]
 
     many = ct.execute(ManyLoop(), Request(id="t3", cmd="tools", args={}))
-    check("工具偏多时有提醒", "偏多" in str((many.data or {}).get("warn")), True,
+    check("★API harness 20 个工具不报警★",
+          "偏多" not in str((many.data or {}).get("warn")), True,
           detail=str((many.data or {}).get("warn")))
+
+    class ManyLocalLoop(ManyLoop):
+        def _agent_mode(self) -> bool:
+            return False
+
+    many_local = ct.execute(ManyLocalLoop(), Request(id="t3b", cmd="tools", args={}))
+    check("★本地角色 20 个工具仍报警★",
+          "偏多" in str((many_local.data or {}).get("warn")), True,
+          detail=str((many_local.data or {}).get("warn")))
 
     # 取不到工具（流水线炸了）也只回一张失败回执，不能带崩服务
     class BoomLoop(FakeLoop2):

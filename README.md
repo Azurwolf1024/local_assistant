@@ -1,12 +1,14 @@
-# 本地语音到语音助手（全离线）
+# 本地优先的语音到语音助手（本地 / API 双模）
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**SenseVoiceSmall / Whisper-large-v3-turbo → Ollama qwen3.5:4b → 凯尔希音色（ZipVoice 零样本克隆，可一行改回 Piper）**
-（可选：某个角色可以把「脑子」和「嗓子」都切到 DeepSeek API —— 见第 14 节。）
+**SenseVoiceSmall / Whisper → Ollama 或云端 LLM → ZipVoice / Piper / 云端 TTS**
+按角色切换引擎，识别、思考、出声各有本地与云端选项（见第 14 节）。
 
-完全跑在本机的「说话 → 识别 → 思考 → 说话」闭环，不联网、不上传任何数据。
-支持唤醒词常驻待命、闹钟与会议提醒、备忘、日程查询，并且边说边播（首音 1~2 秒）。
+默认链路全部跑在本机；需要时可以让某个角色改用 API、开联网工具，
+或把记忆镜像到你自己的私有仓库——离线只是其中一种配置。
+支持唤醒词常驻待命、闹钟与会议提醒、备忘、日程查询，并且边说边播
+（Piper 首段约 0.13 s，克隆音色约 1~3 s；详见 §1.3）。
 
 ---
 
@@ -18,9 +20,10 @@
 | **日常怎么用**（唤醒、技能、控制台） | [docs/guide/usage.md](docs/guide/usage.md) |
 | 改配置 / 改唤醒词 / 加事件 | [docs/guide/usage.md](docs/guide/usage.md#5-两个可配置的-json) |
 | 调音（断句 / 停顿 / 语速） | [docs/guide/usage.md](docs/guide/usage.md#6-调音断句--停顿--语速) |
+| **TTS 后端怎么选 / 加新引擎 / 换嗓子** | 下面 §1.3 + [tts/README.md](voice_loop/tts/README.md) · [docs/guide/persona.md](docs/guide/persona.md#声音tts换成任何模型--任何-api-都不用改代码) |
 | **加角色 / 换音色 / 训专属声线 / 只用 API** | [docs/guide/persona.md](docs/guide/persona.md) |
 | **它会记住什么、怎么忘、怎么查旧事** | [docs/guide/memory.md](docs/guide/memory.md) |
-| **语音识别怎么配、词库、评测** | [docs/guide/asr.md](docs/guide/asr.md) |
+| **语音识别怎么配、词库、评测** | 下面 §1.4 + [asr/README.md](voice_loop/asr/README.md) · [docs/guide/asr.md](docs/guide/asr.md) |
 | 接自己的工具（MCP） | [docs/guide/mcp.md](docs/guide/mcp.md) |
 | 出问题了 | [docs/guide/faq.md](docs/guide/faq.md) |
 | 隐私 / 协议 | [docs/guide/privacy.md](docs/guide/privacy.md) |
@@ -64,9 +67,9 @@ flowchart LR
     A["🎤 麦克风<br/>16 kHz"] --> B["VAD 断句<br/>Silero"]
     B --> C{"唤醒词?"}
     C -->|未唤醒| B
-    C -->|已唤醒 / 连续对话中| D["ASR 路由"]
-    D -->|快| E["SenseVoiceSmall<br/>ONNX int8"]
-    D -->|准| F["Whisper turbo<br/>OpenVINO int8"]
+    C -->|已唤醒 / 连续对话中| D["Hearing<br/>能力选路"]
+    D -->|快·常驻| E["SenseVoiceSmall<br/>ONNX int8"]
+    D -->|按需复核| F["Whisper turbo<br/>OpenVINO int8 · 后台加载"]
     E --> G{"生活技能命中?"}
     F --> G
     G -->|是| H["事件 / 备忘 / 时间<br/>本地 JSON"]
@@ -75,7 +78,7 @@ flowchart LR
     I -->|tool_call| Q["工具层<br/>复用同一套技能与守卫"]
     Q --> J
     H --> J
-    J --> K["凯尔希音色<br/>ZipVoice 克隆（可改回 Piper）"]
+    J --> K["TTS 后端（按角色选）<br/>piper / zipvoice / 云端"]
     K --> L["🔊 边说边播"]
 
     M["调度器<br/>每 5s 轮询"] -. 到点播报 .-> J
@@ -101,9 +104,9 @@ flowchart LR
 
 | 状态 | 加载了什么 | 内存 |
 | --- | --- | --- |
-| **待唤醒**（平时） | Silero VAD + SenseVoiceSmall | **约 0.9 GB** |
-| **已唤醒**（加载） | 前台加载 TTS，后台预热 Whisper 与 qwen3.5:4b | 约 2.5 GB + Ollama |
-| **空闲超时**（回收） | 卸载 Whisper / TTS，并让 Ollama 释放模型 | 回到 0.9 GB |
+| **待唤醒**（平时） | Silero VAD + SenseVoiceSmall | 约 250 MB（`config.toml` 注释） |
+| **已唤醒**（加载） | 前台加载 TTS，后台预热 Whisper（约 1 GB）与 qwen3.5:4b（约 3.4 GB） | 视角色后端而定 |
+| **空闲超时**（回收） | 卸载 Whisper / TTS，并让 Ollama 释放模型（`unload_llm = true`） | 回到待唤醒那一档 |
 
 记忆和知识库**不占这两级**：它们就是磁盘上的 json / markdown（`data/memory/`、`data/knowledge/`），
 每轮只读几个文件，不加载模型（第 15 节）。
@@ -144,17 +147,22 @@ flowchart LR
 > 想完全不调工具：`[llm] router = "chat"`（这时自动走 `rules`）。
 > 想自己量一遍选工具准不准：`python scripts/tools/eval_router.py --builtin`（带预期标注，会算选对率）。
 
-工具一共 11 个：**8 个生活技能**都只收一句原话（`text`）——
+工具一共 11 个：**8 个生活技能**都只收一句原话（`text`，但 `next_event` /
+`list_memos` 是无参工具，不用传）——
 `list_events`（事件列表，也接「有哪些提醒」）`next_event` `add_event` `change_event`
 `list_memos` `add_memo`、`now`（报时）、`fix_last`（「我说是…」改刚记下那条）；
 再加 **2 个记忆工具**（第 15 节）：`mcp__memory__recall`、`mcp__memory__remember`；
 以及 **`weather`**（真实天气，Open-Meteo 免 key，见 [`docs/guide/usage.md`](docs/guide/usage.md#能用语音做的事)）。
 
+> ★harness 多轮循环**只给 API 角色**★：本地 Ollama 小模型仍走单轮、默认 11 个工具，
+> 不会看到下面这 28 项；这是能力边界，不是配置偏好。
 > 可选：某个角色可以在人格文件里改用**云端 API**（`"engine": "api"`，见第 14 节）。
 > 默认工具还是这 11 个；API 角色在 `api_tools` 里按预设多开 harness 工具
 > （`web` = 联网搜索/读取，`weather` = 天气，`files` = 工作区读/列/glob/grep，
 > `mail` = 邮件查/读/摘要/起草（发送要人工审批，见 [docs/guide/mail.md](docs/guide/mail.md)），
-> `harness` = 全部；另外 `ask_user` / `update_plan` 是 harness 内置的，不用点名；
+> `harness` = 对齐 DeepSeek Harness 的 **28 项**（agent 工具 + 邮件含发送 + 记忆 3 项 +
+> 技能 8 项；写文件 / 跑命令 / 发邮件仍各有独立闸门）；另外 `ask_user` / `update_plan`
+> 是 harness 运行时内置的，不用点名；
 > 见 `voice_loop/tool_presets.py`）。
 
 > ★合并前是 11 个★：`add_schedule`/`add_alarm` 是一回事，`change_schedule`/`cancel_alarm`
@@ -171,8 +179,8 @@ flowchart LR
 实测日志：
 
 ```
-[待唤醒] 请说「凯尔希」…
-[已唤醒] 凯尔希。                          ← 1.6s 加载 TTS
+[待唤醒] 请说「白泽」…
+[已唤醒] 我在。                            ← 前台加载当前角色的声线
 你说：用一句话介绍杭州。
 助手：杭州是个美丽的地方。  [首字 0.35s / 首音 1.25s]   ← 秒回
   Whisper 已就绪（后台加载 17.8s）           ← 后台加载，不阻塞对话
@@ -186,10 +194,150 @@ flowchart LR
 
 | 位置 | 做法 | 原因 |
 | --- | --- | --- |
-| ASR | SenseVoice 快路径 + Whisper 按需复核 + 标点移植 | 中文短句 0.1s 出结果，长句/可疑结果才花 3s 让 Whisper 复核 |
+| ASR | SenseVoice 常驻快路径 + Whisper 按需复核（`empty` / `long:6` / `score<0.45`）+ 择优与标点移植 | CPU 上约 10 倍实时（代码注释）；长句、空结果或质量分低才复核，Whisper 核显实测 1.05 s；幻觉句宁可当没听清 |
 | 意图 | **模型先选工具，正则技能层兜底** | 说法千变万化，正则只能盖住写过的那些（踩过：误删日程、纠正丢空）。模型选工具实测 29/29 全对，而算时间/守卫仍在代码里 |
 | TTS 分块 | **只在句末切，短句合并** | Piper 中文音色看不到标点，切太碎会又平又顿（见工程日志「语调和断句」）；克隆后端更在意分块长短——它一段生成一次，每块都要等 |
 | 播放 | 单独线程 + 队列，随时可打断 | 边生成边播，说错了**按 Esc 立刻停** |
+
+### 1.3 语音合成（TTS）：五种后端、按角色切换、不会哑
+
+出声这一层是**数据驱动**的：一个后端 = `voice_loop/tts/providers/` 里的一个声明文件，
+它自己说清能力、参数、怎么造引擎；引擎的发现、加载、切换不写 `if backend == ...`
+（状态横幅与基准输出里仍有按 provider 分支的显示代码）。
+加一个新模型或服务 = 加一个文件 + 一段配置（完整契约见 [tts/README.md](voice_loop/tts/README.md)）。
+
+| 后端 | 在哪跑 | 要什么 | 特点 |
+| --- | --- | --- | --- |
+| `piper` | 本地 | 一个公开 onnx（`zh_CN-huayan-medium`） | 实测样本首段 0.13 s / RTF 0.05；★所有后端的链尾退路★（模型须已安装） |
+| `zipvoice` | 本地 | 克隆模型 + 一段参考音频及逐字文本 | 零样本克隆角色音色、可分风格；实测样本 CPU 首段 1.4~2.7 s / RTF 1.1~1.4（非硬指标） |
+| `deepseek` | 云端 | `[api]` 的 key | 官方音色 `stella` / `tide`，按字符计费 |
+| `edge` | 云端 | 无需 key（装 `edge-tts`） | 音色多、可调语速；不保证延迟和音质 |
+| `http` | 云端或自建 | url / headers / body 配置 | ★给个 API 就能接★，不写 Python |
+
+当前全局默认是 `[tts] provider = "zipvoice"`、`fallback = ["piper"]`、`max_loaded = 1`；
+**角色卡可以覆盖它**，各角色的声线互不污染：默认角色**白泽**固定 `piper`（公开出厂声线，
+不接任何克隆素材），凯尔希走 `zipvoice` 克隆，蓝色大肥鱼走 `deepseek` 云端嗓子并带 `piper` 退路。
+
+```toml
+[tts]                              # 全局默认；角色没写 tts.provider 时才用它
+provider = "zipvoice"
+fallback = ["piper"]               # 缺模型 / 缺 key 时依次试；链尾追加 piper（模型须装好）
+max_loaded = 1                     # 同时缓存几个引擎（克隆模型几百 MB）
+
+# deepseek / edge / http 都不用改代码：参数写在自己的块里
+[tts.providers.deepseek]
+voice_id = "stella"
+# fallback_voice 只用于显示兼容；真正的退路看角色 tts.fallback / 全局 fallback
+# tts_block_seconds 在 [api] 里，不在这里
+```
+
+```jsonc
+// data/personas/<角色>.json
+"tts": {
+  "provider": "deepseek",                      // 空 = 跟全局
+  "voice_id": "stella",                        // 官方音色 / piper 声线名 / edge 音色
+  "fallback": ["piper:zh_CN-huayan-medium"],   // 云端挂了 → 换这把本地嗓子
+  "params": { "rate": "+0%" }                  // 只有 edge / http 会原样透传；deepseek 的块在 [api]
+}
+```
+
+`deepseek` / `http` / `edge` 运行时失败都会走退路；链尾是 Piper，
+但它缺模型会在体检阶段先报出来（`providers/piper.py` 的 `ready()`）。
+
+两条不变量（含边界）：**尽量不哑**——deepseek / http / edge 的运行时失败沿注册表的退路工厂换下一个候选，
+链尾会追加 Piper（边界：Piper 模型没装时链尾同样失败，体检会先报），缺文件提示可能重复；
+**换角色不污染全局**——注册表按 `VoiceSpec` 造配置副本，`use()` 幂等，
+两个角色可以同时持有不同后端。云端中途失败时保留已播部分，不重播半句。
+
+加载时机跟 §1.1 一致：待唤醒只有 VAD + 快识别；唤醒后前台加载当前角色的 TTS，
+空闲超时卸载。控制台「角色」页能切声线、试听、只用一条语音克隆，
+概览页显示当前 TTS 标签（如 `DeepSeek TTS / stella`，音色取自 `[api]`）。
+
+调音与守卫（参数都在 `[tts]`，实测依据见 [使用 §6](docs/guide/usage.md#6-调音断句--停顿--语速)
+和 [工程日志 01](docs/log/01-tts-quality.md)）：
+
+- **断句**：只在句末切、短句合并（`min_chunk_chars` / `max_chunk_chars` / `first_chunk_*`）。
+  Piper 中文声线看不到标点，切碎了又平又顿；克隆后端每段生成一次，块长直接影响首音。
+- **停顿**：ZipVoice 每段开头有随机死静音 → `trim_output_silence` 裁掉；
+  `trim_min_gap_ms` 默认 **0（关）**（会把词内 60~240 ms 的自然空隙撑成停顿，听感是"词中间卡一下"）；
+  `trim_shrink_pause` 按比例压长停顿，保留逗号 / 句号的长短关系（代码默认 0 = 关，
+  当前 `config.toml` 配了 0.35 才生效）。
+- **音质守卫**：`pitch_guard_st` 用 YIN 量整句音区——第一句以参考音为靶，之后以最近几句中位为靶，
+  偏离超阈值就重采（★只重采、不变调 DSP★）；`text_guard_min` 用本地 ASR 回听，
+  把「排好了」念成「排好」就重采（没注入 ASR 时自动关闭）；
+  `out_tilt_hz` / `out_tilt_db` 定向压 10~12 kHz 的沙沙声（当前 `out_tilt_db = 0`，即关；
+  跟模型绑定，换模型要重新量并重新听）。
+- **尺子**：`python scripts\tools\ab_voice.py`（A/B 试听）、`pitch_report.py`（音区）、
+  `spk_check.py`（声纹像不像）；契约自测 `python scripts\tests\test_tts_registry.py`（假后端，不联网）。
+
+```powershell
+python main.py tts "你好呀" --out a.wav     # 合成一段并听效果
+python main.py persona                      # 看各角色的嗓音配置
+```
+
+### 1.4 语音识别（ASR）：主引擎 + 按需复核 + 词库
+
+「怎么听」也是数据驱动的：一个后端 = `voice_loop/asr/providers/` 里的一个声明文件；
+管线只持有一个 `Hearing`（`voice_loop/asr/session.py`），按**能力**选引擎（`prefer="fast"`，
+仅 Python API；CLI 的 `--engine` 只能指定具体后端），不写引擎名。链路是：VAD 断句 → 引擎（audio → 文字）→ 解码策略（快路径 / 按需复核 / 择优）
+→ 词库 → 唤醒（文本匹配，或可选的流式关键词检测）。完整契约见 [asr/README.md](voice_loop/asr/README.md)。
+
+| 角色 | 当前后端 | 什么时候用 | 说明 |
+| --- | --- | --- | --- |
+| 主引擎 `provider` | `sensevoice` | 常驻 | ONNX int8，CPU 上约 10 倍实时（代码注释）；不支持热词表，词库走事后纠正 |
+| 复核 `verify` | `whisper` | 条件命中才跑 | large-v3-turbo / OpenVINO int8（约 1 GB）；核显上实测 3.79 s → 1.05 s；NPU 跑这个导出会崩，别选。默认 `preload=True` 仍可能提前构造 |
+| 兜底 `fallback` | 空 | — | ★只在 `prefer="fast"` 选路时参与★；默认转写主引擎失败直接返空，靠 `verify` 复核补 |
+| 可选 `sherpa` | paraformer / zipformer | 想认真提人名 / 术语 | zipformer 有原生热词表（要另下模型） |
+
+`verify_when` 默认 `["empty", "long:6.0", "score<0.45"]`——没听出字、音频超过 6 秒、
+质量分偏低才复核（`always` 只用于调试）。复核结果与主结果择优（复核分还享受 `avg_logprob` 加权）；
+复核胜出且主引擎有文本时，才把**主引擎的标点搬到复核结果**上（要求两句内容相近）。
+
+```toml
+[asr]
+provider = "sensevoice"
+verify = "whisper"
+verify_when = ["empty", "long:6.0", "score<0.45"]
+max_loaded = 2                # 主 + 复核
+allow_cloud = false           # ★识别目前没有云端后端★，闸门留给以后自己接
+```
+
+三条不变量：**待唤醒绝不加载 `heavy` 引擎**（关闭不阻塞，拿不到锁就返回 `False`，
+由加载线程自己收尾卸掉，没有 0.3 s 上限保证）；**复核只在条件命中时才跑**
+（默认 `preload=True` 仍可能提前构造引擎，两级加载下才严格不构造）；
+**宁可「没听清」也不凭空编**（主引擎没听出字母数字，且复核零汉字或汉字占比 < 0.15，
+就当空结果——Whisper 在短音上会吐 `MING PAO CANADA…` 这种整句幻觉）。
+
+**词库：一份数据，四种用法**。`data/lexicon/*.txt` 一行一词（可写权重 `罗德岛 2.5` 和拼音变体
+`泰拉|泰拉大陆,泰拉世界`），人格卡里的名字 / 唤醒词 / aliases 也自动并入。后端有热词表就喂热词表
+（`sherpa` 的 transducer / zipformer），只能塞提示词就塞提示词（当前 Whisper 导出不支持），
+都不行就事后纠正（`sensevoice` / `whisper`，拼音 + 编辑距离，保守匹配，实测不会把「海尔洗衣机」
+改成「凯尔希」）。`fix_min_score` 的判定是**相似度达到阈值才改**，阈值越低越激进；误改要用负样本盯着。
+`HOTWORDS_PROMPT` 目前没有后端使用，`initial_prompt` 不生效，Whisper 的词库也走事后纠正。
+
+**唤醒**：默认走 `wake.py` 的文本匹配（精确 + 别名 + 模糊，说「没事了」收回唤醒）；
+可选 `[asr.kws]` 两阶段唤醒——待唤醒先跑 30 MB 流式模型做关键词检测，命中才进完整识别，
+先量再开（`python scripts\download_models.py --only kws`），没下模型会自动退回。
+注意它是**逐句触发**（把 VAD 切好的那段喂进去），不是常驻流式监听，省掉的是完整识别的开销。
+
+**加后端**：往 `providers/` 丢一个声明文件，配置里写 `provider = "mine"` 就生效，
+pipeline / 控制台 / `require_models` 都不用改。推荐写能力名 `prefer="fast"`；老写法 `strategy = "hybrid"`、`prefer="sensevoice"`、
+`AsrRouter` 仍然认。
+
+**评测台**（改完靠数说话）：
+
+```powershell
+python scripts\tests\test_asr_registry.py            # 契约自测（假引擎，不下载模型）
+python scripts\eval_asr.py --synth                   # 合成干净素材（唤醒词 / 人名 / 命令 / 负样本）
+python scripts\eval_asr.py --set wake                # 唤醒命中率 + 误唤醒
+python scripts\eval_asr.py --set names --set command # CER
+python scripts\eval_asr.py --matrix                  # 各就绪后端一张对比表
+python main.py asr some.wav                          # 单文件：看分工、耗时与 RTF
+```
+
+合成素材（`data/asr_eval/synth/`）证明「词库和模型对得上」；自己录的
+（`data/asr_eval/wake|names|command|negative/`，带同名 `.txt`）带口音和噪声，才是结论。
+人名 / 术语听错先加词库或 aliases，再不行把 `fix_min_score` 调低或换 `sherpa` + zipformer 原生热词。
 
 ## 2. 目录结构
 
@@ -274,7 +422,7 @@ flowchart LR
 │  │  ├─ registry.py           #   面板注册表（加面板只动 panels/ 里的文件）
 │  │  ├─ bus.py                #   实时通道（SSE）：日志行 + 服务状态变化
 │  │  ├─ follow.py             #   后台跟随：日志尾巴（只读）
-│  │  ├─ panels/               #   overview/schedule/memos/logs/persona/chat
+│  │  ├─ panels/               #   overview / schedule / memos / logs / persona / voices / tools / update / chat
 │  │  └─ static/               #   index.html + app.js + ui.js + style.css + panels/*.js
 │  ├─ manifest.py              # 模型清单：该下哪些文件、对不对（download/check 共用）
 │  ├─ text.py                  # LLM 输出清洗 + 流式分块 + 标点移植
@@ -283,13 +431,20 @@ flowchart LR
 │  ├─ accel.py                 # 加速设备选择（核显 / NPU / CUDA → 每段用什么）
 │  ├─ names.py                 # ★ 数值朗读：把 3810 念成「三千八百一十」
 │  ├─ voice_data.py            # 角色声线素材：够不够、缺什么（persona_voice 用）
-│  ├─ asr/                     # base.py（接口）/ sensevoice.py（快）/ whisper_ov.py（准）/ router.py
-│  └─ tts/                     # base.py（引擎契约）/ spec.py（VoiceSpec·ProviderSpec）/ registry.py（发现·降级·LRU）
-│                              # session.py（可换声线的外壳）/ providers/（★每个后端一个文件★：piper/zipvoice/deepseek/edge/http）
+│  ├─ asr/                     # base.py / spec.py（AsrSpec·ProviderSpec）/ registry.py（发现·降级·LRU）
+│                              # providers/（★每个后端一个声明文件★：sensevoice/whisper/sherpa）
+│                              # sensevoice.py / whisper_ov.py / sherpa_offline.py（引擎实现）
+│                              # session.py（Hearing：快路径 + 按需复核 + 择优）/ quality.py（质量分与幻觉判定）
+│                              # lexicon.py（一份词库四种用法）/ kws.py（可选流式关键词唤醒）
+│                              # router.py（老入口，AsrRouter = Hearing 的别名）/ eval.py（CER / 唤醒 / RTF）
+│  └─ tts/                     # base.py（引擎契约）/ spec.py（VoiceSpec·ProviderSpec）/ registry.py（发现·能力·降级·LRU）
+│                              # __init__.py（顶层只导 spec，重引擎按需 import：控制台 exe 不再因缺 numpy 丢角色）
+│                              # session.py（VoiceShell：按角色换嗓子）/ providers/（★每个后端一个声明文件★：piper/zipvoice/deepseek/edge/http）
 │                              # piper_tts.py / zipvoice_tts.py / api_tts.py / edge_tts.py / http_tts.py（引擎实现）
 │                              # lazy.py（按需加载）/ pacing.py（停顿与断句）/ refclean.py（参考净化+去嘶声）
 │                              # audio_decode.py（wav/pcm/mp3 解码）/ async_bridge.py（同步里跑异步）
-│                              # ★ textcheck.py（合成回听：丢了字自动重采）/ pitch.py（音区量尺+守卫）
+│                              # ★ textcheck.py（合成回听：丢了字自动重采）/ pitch.py（音区量尺+守卫）/ style.py（分风格参考）
+│                              # hooks.py（注入识别能力，TTS 不 import ASR）/ speaker.py（声纹相似度尺子）
 │                              # precision.py（int8/fp32 选哪份模型）
 ├─ scripts/                    # 根=文档里照抄的命令 / tests=离线自测 / tools=探针与训练（分工见 scripts/README.md）
 │  ├─ README.md                # 三层分工：为什么有些脚本不搬家
@@ -300,7 +455,7 @@ flowchart LR
 │  ├─ check_deploy.py          # ★ 搬家/换系统前的只读自检（setup / doctor 复用它）
 │  ├─ make_release.py / make_console_exe.py / persona_voice.py / import_persona.py
 │  ├─ import_lines.py / say.py / clean_junk_data.py
-│  ├─ tests/                   # 59 个离线自测（49 个进全套）+ run_all.cmd，退出码 0 = 通过
+│  ├─ tests/                   # 63 个离线自测（53 个进全套）+ run_all.cmd，退出码 0 = 通过
 │  │  ├─ test_asr_registry.py  # ★ 识别解耦：注册表 / 能力协商 / 降级链 / 词库 / 幻觉守卫
 │  │  ├─ test_tts_registry.py  # ★ 合成解耦：注册表 / 声音描述 / 云端能力 / http 端到端
 │  │  ├─ test_module_boundaries.py # ★ 模块边界：asr/tts/memory 互不 import，只依赖叶子工具
@@ -329,10 +484,11 @@ flowchart LR
 
 ## 现状（一眼）
 
-- **全离线**：识别、思考、出声都在本机；只有你显式配置的 API 角色才联网。
+- **本地优先，按需上云**：默认识别 / 思考 / 出声都在本机；角色可单独切 API 引擎，
+  天气 / 邮件 / 记忆同步按需联网，所有外部动作都有明确开关。
 - **可换零件**：识别 / 合成 / 记忆 / 邮件都是可插拔子系统（见上面四份模块文档）。
-- **会自己整理**：记忆按四级分层；**不是每晚都跑** —— 深夜且当天真聊够了（≥8000 token）
-  才做一次 agent 梦，平时积到 24000 token 只做不花钱的规则压缩，改动可 `--undo` 回滚。
+- **会自己整理**：记忆按四级分层；**不是每晚都跑** —— 深夜且未整理内容攒够了（≥80000 token）
+  才做一次 agent 梦，平时积到 240000 token 只做不花钱的规则压缩，改动可 `--undo` 回滚。
 - **有尺子**：`scripts\tests\` 是离线自测，`scripts\eval_asr.py` 量识别准确率与唤醒，
   `scripts\tools\ab_voice.py` 量音质 —— 改完靠数说话，不靠感觉。
 - **对外动作要过人**：发邮件只有「草稿」是自动的，真发送必须在右下角卡片点一下。
@@ -342,12 +498,11 @@ python main.py setup          # 一键把机器准备好
 python main.py doctor         # 只读体检
 python main.py ui            # ★启动应用：窗口 + 托盘 + 语音服务（日常就用这个）
 python main.py listen -B     # 只起语音服务（不要界面时；--no-console 才完全无界面）
-python main.py ui             # 可视化控制台（日程/日志/声线/对话）
+python main.py tts "你好呀"   # 单独合成一段试听（--out a.wav 可存文件）
 scripts\tests\run_all.cmd     # 跑全部离线自测
 ```
 
 ## 许可与隐私
 
-MIT（见 [LICENSE](LICENSE)）。**默认不上传任何数据**；
-记忆可以镜像到**你自己的私有仓库**、API 角色会把对话发给对应厂商 ——
-细节与边界见 [docs/guide/privacy.md](docs/guide/privacy.md)。
+MIT（见 [LICENSE](LICENSE)）。默认走本机；API 角色、天气 / 联网工具、邮件与记忆同步
+会把相应内容发给对应服务，均由配置显式开启 —— 细节与边界见 [docs/guide/privacy.md](docs/guide/privacy.md)。

@@ -189,11 +189,32 @@ class _NeverSet:
         return False
 
 
+def test_original_length_progress() -> None:
+    print("\n[5] TTS 清洗后的块不能拖慢字幕进度")
+    from voice_loop.text import SpeechChunker
+
+    original = "**重点**：看 https://example.com 这个链接。好的，下一句。"
+    c = SpeechChunker(max_chars=60, min_chunk_chars=1, max_hold_seconds=0.0)
+    items = c.feed_ex(original) + c.flush_ex()
+    check_true(all(original[a:b] for _chunk, a, b in items), "每块都能映回原文")
+    check(sum(b - a for _chunk, a, b in items), len(original), "原文区间连续覆盖全文")
+    check_true(sum(len(chunk) for chunk, _a, _b in items) < len(original),
+               "TTS 清洗确实缩短了朗读文本")
+
+    loop = fake_loop([], playing=True)
+    loop.tts = _FakeTts()
+    loop._interrupt = _NeverSet()
+    for chunk, a, b in items:
+        loop._speak_chunk(chunk, b - a)  # 这段在原文里占多少字
+    check(loop._spoken_chars, len(original), "字幕进度按原文长度推进，不按清洗后长度")
+
+
 def main() -> int:
     test_subtitle_slice()
     test_collapse_keeps_current_sentence()
     test_pipeline_position()
     test_reset()
+    test_original_length_progress()
     print(f"\n结果：{PASS} 通过，{FAIL} 失败")
     print("EXIT=" + ("0" if FAIL == 0 else "1"))
     return 0 if FAIL == 0 else 1

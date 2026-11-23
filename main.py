@@ -1148,7 +1148,7 @@ def cmd_mcp(settings: Settings, args: argparse.Namespace) -> int:
 
     三种用法：
         python main.py mcp                         看工具清单（名字、来自哪个服务器、耗时）
-        python main.py mcp --call list_schedule --args '{"text": "下周"}'
+        python main.py mcp --call list_events --args '{"text": "下周"}'
         python main.py mcp --serve skills           挂到 stdio，给 Copilot / Claude Code 用
     """
     if args.serve:
@@ -2062,7 +2062,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_persona)
 
     p = sub.add_parser("mcp", help="自己的 MCP 工具层：看 / 调 / 挂到 stdio 给别人用")
-    p.add_argument("--call", default=None, help="调一个工具，例如 --call list_schedule")
+    p.add_argument("--call", default=None, help="调一个工具，例如 --call list_events")
     p.add_argument("--args", default=None, help="配合 --call：JSON 参数，例如 '{\"text\": \"下周\"}'")
     p.add_argument("--serve", default=None, metavar="服务器",
                    help="把某个服务器挂到 stdio（skills / vision…），给 Copilot / Claude Code 用")

@@ -10,8 +10,9 @@
 ## 0. 一句话设计
 
 **模型面前只有一份钉死的工具清单**（白名单 ∩ 服务器实际提供的），
-**清单里每个名字都能被路由回某个服务器**，**没进清单的模型根本看不见**
-（比"调用时再拒绝"安全得多）。
+**清单里每个名字都能被路由回某个服务器**，**没进清单的模型根本看不见**。
+展示层不发名字，调用层也再校验一次：`host.call(..., allowed=本轮可见集合)`，
+本地角色幻觉出 hidden 工具也执行不了（CLI / 自测不传 `allowed`，保持老行为）。
 
 ```
 pipeline（会话编排）                                   ← 谁在用
@@ -218,7 +219,7 @@ for spec in settings.servers:
 ```python
 host.call("list_events", {"text": "下周"})
   → 失败：{"ok": False, "text": "没有这个工具：..."} / "服务器 x 没连上"
-  → 子进程死了：close + 重新 make_transport + start（下一次调用不会再失败）
+  → 子进程死了 / 连续两次失败：重建 transport + 路由表 + 状态（`status()` 显示 `*restart:N`）
   → 每次都记 info：`[mcp:skills.list_events] 0.01s √ 查提醒...`
 ```
 
@@ -395,7 +396,7 @@ handler 照旧。
 | `files` | `read_file` `list_dir` `glob` `grep` | 4 |
 | `write` | `write_file` `edit_file` | 2（要 `allow_write`） |
 | `shell` | `run_command` | 1（要 `allow_shell`） |
-| `harness` | 上面几乎全部（不含 `mail_send`/`add_*`/`memory`） | 16 |
+| `harness` | agent 17（含邮件 6）+ 记忆 3 + 技能 8 = **28 项**；对齐 DSH，写 / 命令 / 发送仍各有闸门；★仅 API 角色★ | 28 |
 
 **接入点只有三处**（都在 `pipeline.py`）：
 
@@ -411,20 +412,25 @@ handler 照旧。
 
 ## 9. harness 运行时（`../harness.py`）
 
-**为什么需要它**：本地 4B 那套是"单轮选一个工具就执行"，而成熟 agent（Claude Code /
-Copilot）是"模型自己决定搜什么、读哪页，结果喂回去，直到它给出最终回答"。
+**为什么需要它**：本地 4B 那套是"单轮选一个工具就执行"，而成熟 agent 是"模型自己决定
+搜什么、读哪页，结果喂回去，直到它给出最终回答"。形状对齐 DeepSeek Harness：
+一个 Turn = 本轮任务，里面若干 Step；每一步的事件（模型流、工具前置闸门、调用、结果）
+都留痕，权限与可观测挂在事件点上而不是写死在循环里。
 这一层只做「模型 ↔ 工具」的循环，**不碰麦克风 / TTS**，所以能被语音管线用，
 也能被自测单独驱动。
 
 ```
-messages = llm.build_messages(...)
-for round in range(max_rounds):
-    模型输出文字 + tool_calls
-    没有 tool_calls → 这就是最终回答，break
-    有 → 逐个执行，结果作为 role="tool" 消息追加，继续下一轮
-else:
-    轮数到顶：再问一次，★不给工具★，逼它用已有资料收口
+turn/start
+  step/start → llm/stream → tool/pre-execute → tool/call → tool/result → step/end
+  ...（重复，直到模型不再给 tool_calls）
+turn/end
+轮数到顶：再问一次，★不给工具★，逼它用已有资料收口
 ```
+
+`guard(name, args) -> (ok, why)` 就是 DSH 的 tools/pre-execute 闸门（只拒不放）；
+`on_event(ev)` 是观察者钩子；事件留在 `AgentResult.events`，控制台 / 日志都能订阅。
+上下文按 DSH 的会话日志做：从上次 reset（做梦 / 换角色）起，整段 user / assistant /
+tool 消息全带，只追加不截断（`[api] keep_all_history = true`），缓存前缀稳定。
 
 **注入点**（构造参数，全部可换）：
 
@@ -461,20 +467,21 @@ else:
 
 1. **工具的 `description` / `parameters`**（`mail.py` 里的收件人别名表就是这么塞进去的 ——
    真机栽过一次：模型看不到别名，反问用户"你的私人邮箱是哪个"）；
-2. **`HARNESS_TOOL_HINT`**（`tools.py`，只在 harness 模式下拼进 system）：
+2. **`harness_hint(实际工具名)`**（`tools.py`，只在 harness 模式下拼进 system）：
+   按这一轮**真给模型**的工具动态生成，没给的能力一句都不提。
+   （旧版常量 `HARNESS_TOOL_HINT` 留作兼容，不再直接当本轮提示词用。）
 
-| 条 | 说什么 |
+| 条件（这一轮真有这些工具） | 才说 |
 | --- | --- |
-| 1–2 | 需要真实数据先调工具；工具结果是资料，自己归纳成口语短句 |
-| 3 | 日程/备忘把原话放进 `text`，**不要自己换算日期** |
-| 4 | 联网先 `web_search` 再 `web_fetch`；回答里不要念 URL |
-| 5 | 天气用 `weather`，没说地名用默认城市，别猜 |
-| 6 | 文件只能看工作区；写盘/跑命令取决于配置 |
-| 7 | ★邮件用 `mail_*`★（`list_memos` 不是邮件）；从邮件来的日程用 `mail_to_event` 别用 `add_event` |
-| 8 | 信息够了就回答，别为了用工具而用工具 |
-| 9 | 要调工具就用接口，不要写成 JSON 文字 |
-| 10 | 缺信息用 `ask_user`；多步任务可用 `update_plan` |
-| 11 | 用户说「不用听了/先这样」→ `end_listening`，回一句就退下 |
+| 通用 | 需要真实数据先调工具；工具结果是资料，自己归纳成口语短句 |
+| `list_events` / `add_memo` … | 日程/备忘把原话放进 `text`，**不要自己换算日期** |
+| `web_search` / `web_fetch` | 联网先 `web_search` 再 `web_fetch`；回答里不要念 URL |
+| `weather` | 天气用 `weather`，没说地名用默认城市，别猜 |
+| `read_file` / `write_file` / `run_command` | 文件只能看工作区；写盘 / 跑命令要确认 |
+| `mail_*` | ★邮件用 `mail_*`★（`list_memos` 不是邮件）；从邮件来的日程用 `mail_to_event` |
+| 通用 | 信息够了就回答，别为了用工具而用工具；调工具用接口，不写 JSON 文字 |
+| `ask_user` / `update_plan` | 缺信息用 `ask_user`；多步任务可用 `update_plan` |
+| `end_listening` | 用户说「不用听了/先这样」→ `end_listening`，回一句就退下 |
 
 **工具数量是有上限的**（实测，别拿"反正是云端模型"糊过去）：
 
@@ -486,7 +493,8 @@ else:
 | 22 | ★`deepseek-chat` 把「看邮件」错选成了 `list_memos`★ |
 
 所以在 `config.toml` 里给外来服务器**默认只放只读工具**，并把这个门槛写进了
-控制台：`tools` 命令会算 `warn`（>18 个工具提醒、`router != tools` 提醒）。
+控制台：本地角色 >18 个提醒；API harness 对齐 DSH，工具多是常态，阈值 40
+（这条实测是给本地 4B 标的，别拿它限制 API 角色）。
 
 ---
 
@@ -494,12 +502,13 @@ else:
 
 | 闸门 | 在哪 | 拦住什么 |
 | --- | --- | --- |
-| 白名单 `tools` | `host.start()` | 没写进白名单的工具**根本不出现在模型面前** |
-| `hidden = true` | `host.start()` | 邮件/文件/命令默认一个都不露，要人格文件点名 |
+| 白名单 `tools` | `host.start()` + `host.call(allowed=...)` | 没写进白名单的工具**不出现在模型面前，调用层也拒** |
+| `hidden = true` | 同上 | 邮件/文件/命令默认一个都不露，要人格文件点名才可调 |
 | `allow_write` | `servers/agent.py` | 关着时 `write_file` **不注册**（点名也没用） |
 | `allow_shell` | `servers/agent.py` | 同上，`run_command` 默认不存在 |
 | `workspace` | `servers/agent.py` | 文件工具只能碰工作区内；命令的 `cwd` 也在里面 |
-| `max_tool_chars` | `harness.py` / `servers/agent.py` | 工具结果截断，防"一次读满上下文" |
+| `max_tool_chars` | `harness.py` / `servers/agent.py` | 单条工具结果截断，防"一次读满上下文" |
+| `max_history_chars` | `harness.py` | 整轮工具原文预算（超了压缩早期结果，防历史膨胀） |
 | `max_rounds` | `harness.py` | 到顶不收口就强制收口，防无限循环 |
 | 邮件发送令牌 | `servers/mail.py` + `mail/outbox.py` | 模型没有 `confirm_token` 就发不出去（见 mail README） |
 | stdout 纪律 | `server.serve_stdio` | 服务器里 `print()` 会把对端解析搞坏 |
@@ -583,7 +592,7 @@ MCP 宿主现状    11 个工具 ← skills(inproc,9) memory(inproc,2/4) agent(i
 | `python main.py mcp` 说「未配置 MCP 服务器」 | `[mcp] enabled = false` 或 `[[mcp.servers]]` 全被禁用 | 看 `start()` 的 `log.warning`：每台跳过都会说一句 |
 | 模型答"我不会查日程" | 白名单把 `list_events` 挡了，或 `router = chat`（不给工具） | `python main.py mcp` 看清单；`/api/tools/live` 看 `router` |
 | 点名了工具却没出现 | ① `hidden` 服务器 + 名字拼错 ② `allow_write` 没开（工具根本没注册） | 看 `missing` 警告；先开开关 |
-| `工具调用失败：x 在 15s 内没回 tools/call` | 服务器卡住（网络/磁盘） | 调大 `timeout`；`stdio` 模式看子进程 stderr |
+| `工具调用失败：x 在 15s 内没回 tools/call` | 服务器卡住（网络/磁盘） | 调大 `timeout`；连续两次失败会自动重启；stderr 被丢弃，看 `sessions/listen.log` 的客户端侧日志 |
 | 服务器崩了以后每句都失败 | 子进程死了 | 宿主会自愈一次（`close` + 重建）；还不行看 `sessions/listen.log` |
 | 中文变成乱码 / 对端解析失败 | 服务器里 `print()` 走了 stdout，或没设 `PYTHONIOENCODING` | 日志一律 `log_stderr()`；stdio 配置带 `utf-8` |
 | 模型把「看邮件」选成 `list_memos` | 工具太多（22 个时实测发生） | 关掉不要的预设；单台服务器别超 8–10 个工具 |

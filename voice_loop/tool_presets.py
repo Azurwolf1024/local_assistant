@@ -1,8 +1,9 @@
 """API 角色的工具预设。
 
 本地 4B 模型能稳定驾驭的工具就那十个（见 README 第 1.2 节），所以默认这十个
-对所有角色都一样。**云端模型更强**，可以多背几个工具 —— 但具体加哪些还在讨论，
-先把「怎么加」这件事定下来：
+对所有角色都一样。**harness 预设虽然列在这里，但只对 `engine = "api"` 的角色展开**
+（`pipeline._api_extra_tools` 在本地角色直接返回空集），本地小模型永远不会看到 28 项。
+云端模型更强，可以多背几个工具 —— 具体加哪些见下面的预设。
 
     角色卡（人格文件）里的 ``api_tools`` 写预设名或具体工具名即可
         "api_tools": ["memory", "web_search"]
@@ -62,11 +63,20 @@ PRESETS: dict[str, dict] = {
         "tools": ["run_command"],
     },
     "harness": {
-        "title": "完整 harness 工具集（不可用的会自动跳过）",
-        "tools": ["web_search", "web_fetch", "weather", "mail_search", "mail_read",
-                  "mail_summary", "mail_draft", "mail_to_event", "end_listening",
-                  "read_file", "list_dir",
-                  "glob", "grep", "write_file", "edit_file", "run_command"],
+        "title": "完整 harness 工具集（对齐 DSH：agent + 邮件 + 记忆 + 技能，缺失的自动跳过）",
+        "tools": [
+            # agent 服务器（写/命令仍受 [agent] allow_write / allow_shell 闸门）
+            "web_search", "web_fetch", "weather", "mail_search", "mail_read",
+            "mail_summary", "mail_draft", "mail_send", "mail_to_event",
+            "end_listening", "read_file", "list_dir", "glob", "grep",
+            "write_file", "edit_file", "run_command",
+            # 记忆（request_dream 默认 hidden，点名才露）
+            "mcp__memory__recall", "mcp__memory__remember",
+            "mcp__memory__request_dream",
+            # 技能层（日程 / 备忘 / 报时 / 纠正上一条）
+            "list_events", "next_event", "add_event", "change_event",
+            "list_memos", "add_memo", "now", "fix_last",
+        ],
     },
     # ★下一步讨论好的额外工具加在这里★，例如：
     #   "web": {"title": "联网", "tools": ["web_search", "web_fetch"]},
