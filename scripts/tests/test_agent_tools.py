@@ -393,6 +393,12 @@ def test_pipeline_agent(tmp: Path) -> None:
         check("喂回了 tool 结果", len(tool_msgs), 1)
         check("tool_call_id 对上了", tool_msgs[0].get("tool_call_id"), "c1")
         check("结果内容真的在里面", "https://example.com/news" in tool_msgs[0]["content"], True)
+        first = fake.calls[0]
+        check("运行上下文并入当前用户消息",
+              "本轮运行信息" in first[-1]["content"] and "现在是" in first[-1]["content"], True)
+        check("动态信息不再插成 system 块",
+              all("现在是" not in str(m.get("content") or "")
+                  for m in first if m.get("role") == "system"), True)
         check("历史只存最终问答", fake.history, [("最近 DeepSeek 有什么新闻？",
                                                    "根据搜索结果，DeepSeek 最近发布了新模型。")])
 

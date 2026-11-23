@@ -241,8 +241,9 @@ def test_doctor() -> None:
     # ★别钉「这台机器没问题」★：那取决于机器状态。钉「翻译得对」就够。
     check("翻译成 Report（至少有汇总那一行）", len(rep.steps) >= 1, True)
     check("汇总结论与 failed 自洽", rep.ok, len(rep.failed) == 0)
+    # 第一条是「体检」汇总，它没有 section；其余才是具体失败项
     check("失败项都带 section（知道是哪一类）",
-          all("·" in s.name for s in rep.failed), True)
+          all("·" in s.name for s in rep.failed if s.name != "体检"), True)
 
 
 def test_release(tmp: Path) -> None:

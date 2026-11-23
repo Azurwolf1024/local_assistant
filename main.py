@@ -1658,6 +1658,8 @@ def cmd_memsync(settings: Settings, args: argparse.Namespace) -> int:
         counts = "、".join(f"{k} {v}" for k, v in got.items()
                            if k in ("episodes", "facts", "sessions") and v)
         print(f"  · {cid:<12}{counts or '（空）'}")
+    if report.events:
+        print(f"  · {'schedule':<12}日程/闹钟 {report.events}")
     for line in report.notes:
         print(f"  提示：{line}")
     for line in report.warnings:

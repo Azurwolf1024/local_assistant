@@ -153,13 +153,15 @@
 
 ## 云端同步（`sync.py`）与隐私
 
-- 只同步**每角色一份**的记忆：`episodes.jsonl` / `facts.json` / `sessions.json` / `knowledge/` /
-  `context/`；**原始对话 `sessions/*.jsonl` 不上云** —— 它是会过期的工作记忆，也最隐私。
+- 同步**每角色一份**的记忆：`episodes.jsonl` / `facts.json` / `sessions.json` / `knowledge/` /
+  `context/`；再加一份全角色共用的 `schedule/events.json`（日程 / 闹钟 / 事件链）。
+  **原始对话 `sessions/*.jsonl` 不上云** —— 它是会过期的工作记忆，也最隐私。
 - 推送前会查远端仓库可见性，**public 一律拒推**（`allow_public=True` 才放行）。
-- 拉回来是**合并**不是覆盖：episodes 按 `id`、facts 按 `(key, valid_at)`、上下文段**按 `uid`**
-  （两台机器各自追加过同一段时，整段覆盖会丢行）。
-- `memory_root(settings)` 是路径解析的唯一入口：`[memory] dir` 留空时跟 `[skills] data_dir` 走
-  （测试/多开把 data_dir 指到临时目录时，记忆自动隔离 —— 踩过：自测的请求被真实服务捡走）。
+- 拉回来是**合并**不是覆盖：episodes 按 `id`、facts 按 `(key, valid_at)`、上下文段**按 `uid`**、
+  日程按 `id`（`state.fired` 取并集，本机已提醒过的不被旧快照抹掉）。
+- `events_root(settings)` / `memory_root(settings)` 是路径解析的唯一入口：
+  `[memory] dir` / `[skills] event_file` 留空时都跟 `[skills] data_dir` 走
+  （测试/多开把 data_dir 指到临时目录时，记忆和日程自动隔离）。
 
 ## 公开契约
 

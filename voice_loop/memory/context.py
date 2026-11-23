@@ -297,6 +297,8 @@ class ContextLog:
 
     def _tail(self, max_tokens: int) -> list[CtxTurn]:
         """取最近的若干个 turn，按 token 预算从头砍（★绝不把一句砍成半句★）。"""
+        if max_tokens <= 0:
+            return []
         rows = self.turns()
         if not rows:
             return []

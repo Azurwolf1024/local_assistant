@@ -10,6 +10,7 @@
     memory/<角色>/facts.json       L3 事实（身份类 pinned，不衰减）
     memory/<角色>/sessions.json    L1 索引：哪些原始对话已经归档过
     memory/<角色>/knowledge/       L4 这个角色自己的知识库（有才同步）
+    schedule/events.json           日程 / 闹钟 / 事件链（全角色共用，不在角色目录下）
     manifest.json                  这台机器最后一次同步的清单（角色 / 条数 / 时间）
     README.md                      第一次同步时写下的说明（别把这个仓库设成公开）
 
@@ -57,6 +58,8 @@ from .store import read_json, read_jsonl, rewrite_jsonl, write_json
 DEFAULT_BRANCH = "main"
 DEFAULT_CLONE = "memory_cloud"
 REPO_MEMORY = "memory"                 # 仓库里的目录名：memory/<角色>/…
+REPO_SCHEDULE = "schedule"             # 日程/闹钟不归某个角色，单独一层
+EVENTS_FILE = "events.json"
 LOCAL_FILES = ("episodes.jsonl", "facts.json", "sessions.json")
 # ★L1 连续上下文★：段/摘要/状态三个子目录（见 memory/context.py）
 CONTEXT_DIR = "context"
@@ -80,13 +83,14 @@ memory/<角色>/episodes.jsonl   L2 情景记忆（会衰减、会合并）
 memory/<角色>/facts.json       L3 事实（名字/称呼这类是 pinned，不会掉）
 memory/<角色>/sessions.json    L1 索引（哪些原始对话已归档）
 memory/<角色>/knowledge/       L4 这个角色自己的知识库
+schedule/events.json           日程 / 闹钟 / 事件链（全角色共用）
 manifest.json                  最近一次同步的清单（角色 / 条数 / 设备 / 时间）
 ```
 
 | 方向 | 语义 | 说明 |
 | --- | --- | --- |
 | 本地 → 这里 | **镜像** | 本地删了这里也删；删掉的内容在 git 历史里还能找回来 |
-| 这里 → 本地 | **合并** | 按 episode `id` / fact `key` 取新的那份，本地独有的保留 |
+| 这里 → 本地 | **合并** | 按 episode `id` / fact `key` / 日程 `id` 取新的那份，本地独有的保留；日程的 `state.fired` 取并集 |
 
 **L1 滑窗日志（`sessions/session-*.jsonl`）不在这个仓库里**：按设计它是会过期的工作记忆。
 但 `memory/<角色>/context/` 在 —— 那是「接着长」的活动上下文（含对话原文），换机器靠它接上。
@@ -106,6 +110,18 @@ def memory_root(settings: Any) -> Path:
     else:
         data_dir = str(getattr(getattr(settings, "skills", None), "data_dir", "data") or "data")
         path = Path(data_dir) / "memory"
+    return path if path.is_absolute() else (base / path)
+
+
+def events_root(settings: Any) -> Path:
+    """日程/闹钟那一份事件表（跟 Skills / 记忆层读的是同一个文件）。"""
+    skills = getattr(settings, "skills", None)
+    base = Path(str(getattr(settings, "root", ".") or "."))
+    configured = str(getattr(skills, "event_file", "") or "").strip()
+    if not configured:
+        data_dir = str(getattr(skills, "data_dir", "data") or "data")
+        configured = str(Path(data_dir) / "events.json")
+    path = Path(configured)
     return path if path.is_absolute() else (base / path)
 
 
@@ -230,6 +246,49 @@ def merge_episodes(local: list[dict], cloud: list[dict]) -> tuple[list[dict], di
     return out, stats
 
 
+def _event_key(row: dict) -> str:
+    rid = str(row.get("id") or "").strip()
+    if rid:
+        return rid
+    # 没有 id 的旧数据：拿「标题 + 开始时间 + 创建时间」当身份
+    return json.dumps([row.get("title") or "", row.get("start") or "",
+                       row.get("created_at") or ""], ensure_ascii=False, sort_keys=True)
+
+
+def merge_events(local: list[dict], cloud: list[dict]) -> tuple[list[dict], dict]:
+    """日程/闹钟：按 `id` 合并，两边独有的都留；`state.fired` 取并集。
+
+    事件表是**全角色共用**的一份文件，不属于某个角色。云端→本地是合并而不是覆盖：
+    另一台机器新加的日程要带回来，本机已经 firing 过的提醒也不能被旧快照抹掉。
+    """
+    by_key: dict[str, dict] = {}
+    stats = {"added": 0, "updated": 0, "kept": 0}
+    for row in local:
+        by_key[_event_key(row)] = dict(row)
+    stats["kept"] = len(local)
+    for row in cloud:
+        key = _event_key(row)
+        cur = by_key.get(key)
+        if cur is None:
+            by_key[key] = dict(row)
+            stats["added"] += 1
+            continue
+        fired = sorted(set((cur.get("state") or {}).get("fired") or [])
+                       | set((row.get("state") or {}).get("fired") or []))
+        # 有更新时间就用它；没有就按 created_at，仍相同则保留本地版本
+        use_cloud = _newer(str(row.get("updated_at") or row.get("created_at") or ""),
+                           str(cur.get("updated_at") or cur.get("created_at") or ""))
+        merged = dict(row) if use_cloud else dict(cur)
+        if fired:
+            merged["state"] = {**(merged.get("state") or {}), "fired": fired}
+        by_key[key] = merged
+        if use_cloud:
+            stats["updated"] += 1
+    out = sorted(by_key.values(),
+                 key=lambda r: (str(r.get("start") or ""), str(r.get("id") or "")))
+    return out, stats
+
+
 def merge_facts(local: list[dict], cloud: list[dict]) -> tuple[list[dict], dict]:
     """按 `key` 取新（`last_seen` 晚的赢）；`evidence` 取大、`pinned` 或起来、`sources` 并起来。"""
     by_key: dict[str, dict] = {}
@@ -295,6 +354,7 @@ class SyncReport:
     branch: str = DEFAULT_BRANCH
     remote: str = ""
     characters: dict[str, dict] = field(default_factory=dict)
+    events: int = 0                                   # schedule/events.json 的条数
     changed: list[str] = field(default_factory=list)
     commit: str = ""
     pushed: bool = False
@@ -306,7 +366,7 @@ class SyncReport:
         return {
             "ok": self.ok, "action": self.action, "clone": self.clone,
             "branch": self.branch, "remote": self.remote,
-            "characters": self.characters, "changed": self.changed,
+            "characters": self.characters, "events": self.events, "changed": self.changed,
             "commit": self.commit, "pushed": self.pushed,
             "warnings": self.warnings, "notes": self.notes, "error": self.error,
         }
@@ -322,6 +382,8 @@ class SyncReport:
             for key in total:
                 total[key] += int(got.get(key) or 0)
         bits.append("、".join(f"{k} {v}" for k, v in total.items() if v))
+        if self.events:
+            bits.append(f"日程 {self.events}")
         if self.changed:
             bits.append("改动 " + "、".join(self.changed[:6]))
         if self.pushed:
@@ -506,9 +568,26 @@ class MemorySync:
             shutil.rmtree(room)
         report.characters[cid] = counts
 
+    def _copy_events(self, report: SyncReport) -> None:
+        """日程/闹钟那一整份事件表 → 仓库（本地有才镜像，没本地文件绝不删云端）。"""
+        source = events_root(self.settings)
+        target = self.clone_dir / REPO_SCHEDULE / EVENTS_FILE
+        if not source.is_file():
+            report.notes.append("本地没有日程事件表，云端那份没动")
+            return
+        try:
+            rows = read_json(source, []) or []
+        except (OSError, ValueError):
+            rows = []
+        report.events = len(rows) if isinstance(rows, list) else 0
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+
     def export(self, report: SyncReport, *, characters: Iterable[str] | None = None) -> None:
         """本地 → 仓库（每个本地角色镜像过去）。"""
         report.action = "export"
+        # ★日程先拷★：就算本地一个角色记忆都没有，也不能因此丢掉云端事件表。
+        self._copy_events(report)
         ids = list(characters) if characters is not None else characters_of(self.local_root)
         if not ids:
             # ★这条闸门是防手滑的★：记忆目录指错 / 刚换机器 / 自测用了临时目录时，
@@ -540,9 +619,12 @@ class MemorySync:
                 "episodes": sum(v.get("episodes", 0) for v in report.characters.values()),
                 "facts": sum(v.get("facts", 0) for v in report.characters.values()),
                 "sessions": sum(v.get("sessions", 0) for v in report.characters.values()),
+                "events": report.events,
             },
-            "layout": "memory/<character>/{episodes.jsonl,facts.json,sessions.json,knowledge/}",
-            "note": "L1 原始对话不同步（会过期的工作记忆）；本地→云端是镜像，云端→本地是合并",
+            "layout": ("memory/<character>/{episodes.jsonl,facts.json,sessions.json,knowledge/}, "
+                       "schedule/events.json"),
+            "note": ("L1 原始对话不同步（会过期的工作记忆）；本地→云端是镜像，"
+                     "云端→本地是合并；日程按 id 合并、fired 状态取并集"),
         }
         path = self.clone_dir / STATE_FILE
         old = read_json(path, {}) or {}
@@ -682,8 +764,12 @@ class MemorySync:
             report.characters[cid] = got
             if got.get("changed"):
                 report.changed.append(f"{cid}:{','.join(got['changed'])}")
+        events = self._merge_events(dry_run=dry_run)
+        report.events = int(events.get("events") or 0)
+        if events.get("changed"):
+            report.changed.append("schedule/events")
         if not report.changed:
-            report.notes.append("云端的记忆都已经在本地了")
+            report.notes.append("云端的记忆和日程都已经在本地了")
         return report
 
     def _merge_char(self, cid: str, cloud_dir: Path, *, dry_run: bool) -> dict:
@@ -789,6 +875,32 @@ class MemorySync:
                 write_json(dst / CONTEXT_STATE, merged)
         return out
 
+    def _merge_events(self, *, dry_run: bool) -> dict:
+        """云端日程 → 本地（按 id 合并，fired 状态并集；不覆盖本地独有事件）。"""
+        cloud = self.clone_dir / REPO_SCHEDULE / EVENTS_FILE
+        if not cloud.is_file():
+            return {"events": 0, "changed": False}
+        try:
+            incoming = read_json(cloud, []) or []
+        except (OSError, ValueError):
+            return {"events": 0, "changed": False}
+        if not isinstance(incoming, list):
+            return {"events": 0, "changed": False}
+        local_path = events_root(self.settings)
+        try:
+            current = read_json(local_path, []) or [] if local_path.is_file() else []
+        except (OSError, ValueError):
+            current = []
+        if not isinstance(current, list):
+            current = []
+        merged, stats = merge_events(current, incoming)
+        changed = merged != current
+        if changed and not dry_run:
+            self._backup(local_path)
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            write_json(local_path, merged)
+        return {"events": len(merged), "changed": changed, **stats}
+
     # ----------------------------------------------------------------- 状态
     def status(self) -> SyncReport:
         report = SyncReport(action="status")
@@ -817,6 +929,10 @@ class MemorySync:
                 "sessions": len(read_json(cloud_root / cid / "sessions.json", {}) or {}),
             }
         report.characters = total
+        events_file = self.clone_dir / REPO_SCHEDULE / EVENTS_FILE
+        if events_file.is_file():
+            rows = read_json(events_file, []) or []
+            report.events = len(rows) if isinstance(rows, list) else 0
         return report
 
 

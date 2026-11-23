@@ -356,6 +356,7 @@ max_tool_chars = 6000     # 单个工具结果喂回模型的上限
 | **计划不占回答** | `update_plan` 只记录步骤，不念出来也不额外花一轮；写在日志 / session 里（控制台工具页显示的是可调用能力，不是本轮计划） |
 | **DSH 形状的事件轨迹** | 一个 Turn 分若干 Step；`turn/start` → `step/start` → `tool/pre-execute` → `tool/call` → `tool/result` → `step/end` → `turn/end` 都留在 `AgentResult.events`，观察者可通过 `on_event` 订阅；权限闸门只拒不放 |
 | **整段会话上下文** | API harness 从上次 reset（做梦 / 换角色）起保留**全部** user / assistant / tool 消息，只在尾部追加；`keep_all_history = true`，不再按轮数截断，云端缓存前缀才不会掉 |
+| **动态信息不切前缀** | 时间 / 工具提示 / 记忆摘要不再当 system 插在历史与当前用户之间，而是并入**当前用户消息**并随该轮一起写进历史；有完整历史后不再重复注入 L1 尾巴，usage 事件也记进缓存账 |
 | **计费** | Search / Fetch 各 $0.75 / 1000 次成功请求；`count` 不影响单价；空结果/失败/超时不计费 |
 | **隐私** | 查询内容会发给 DeepSeek；本地角色完全不会触发联网工具 |
 

@@ -1561,6 +1561,12 @@ class VoiceLoop:
         final_text = ""
         self._interrupt.clear()
 
+        # ★缓存优先★：动态上下文不再当 system 插在「历史」与「当前用户」之间，
+        # 而是并进当前用户消息。这一整条消息提交进历史后会成为下轮的稳定前缀。
+        context_blocks: list[str] = []
+        memory_block = self._memory_context(prompt)
+        if memory_block:
+            context_blocks.append(memory_block)
         runtime = now_block()
         if tools:
             # ★提示词只提这一轮真给的工具★：没有 read_file 就别说「能看工作区文件」
@@ -1568,10 +1574,11 @@ class VoiceLoop:
             runtime = f"{runtime}\n{harness_hint(given)}\n{TRUTH_HINT}"
         else:
             runtime = f"{runtime}\n{TRUTH_HINT}"
-        hint = [{"role": "system", "content": runtime}]
-        memory_block = self._memory_context(prompt)
-        if memory_block:
-            hint = [{"role": "system", "content": memory_block}] + hint
+        context_blocks.append(runtime)
+        turn_prompt = prompt
+        if context_blocks:
+            turn_prompt = (f"{prompt}\n\n（下面是本轮运行信息，不是用户新说的事）\n"
+                           + "\n".join(context_blocks))
 
         stripper = None
         if bool(getattr(tts_cfg, "style_from_llm", False)):
@@ -1608,7 +1615,7 @@ class VoiceLoop:
                 ),
                 on_event=lambda ev: self.log.debug(f"[agent:{ev['kind']}] {ev}"),
             )
-            result = agent.run(prompt, extra_messages=hint, model=model, num_ctx=num_ctx)
+            result = agent.run(turn_prompt, extra_messages=None, model=model, num_ctx=num_ctx)
             final_text = result.text
 
             if stripper is not None and final_text:
@@ -1669,6 +1676,8 @@ class VoiceLoop:
 
         stats.answer = final_text
         stats.extra["tool_seconds"] = round(time.perf_counter() - t0, 3)
+        for usage in getattr(result, "usages", ()):
+            self._record_usage(usage)
         self._note_spoken(final_text)
         self._note_dialog(commit_text or prompt, final_text)
         stats.interrupted = self._interrupt.is_set()
@@ -1676,7 +1685,7 @@ class VoiceLoop:
         stats.total_seconds = time.perf_counter() - t0
         # ★正常 harness 上下文★：把这一轮的 user + 工具调用/结果 + 最终答复
         # 整段接进 API 历史，下轮原样带回去；只追加不重写，缓存前缀才不会掉。
-        turn_history = [{"role": "user", "content": commit_text or prompt}]
+        turn_history = [{"role": "user", "content": turn_prompt}]
         turn_history.extend(result.messages[result.initial_messages:])
         if final_text and not (turn_history and turn_history[-1].get("role") == "assistant"
                                and turn_history[-1].get("content") == final_text):
@@ -2866,6 +2875,11 @@ class VoiceLoop:
             budget = int(getattr(ctx_cfg, "tail_tokens", 2000) or 2000)
             if str(getattr(getattr(self, "llm", None), "engine", "local")) == "api":
                 budget = int(getattr(ctx_cfg, "api_tail_tokens", 4000) or budget)
+                # ★整段历史已经带上了同样的原文★：第二句起再塞 L1 尾巴就是重复，
+                # 而且它每轮都变，正好切在缓存前缀尾部（2026-11-23 修）。
+                # 首轮历史为空时仍要带，跨进程/换机器才接得上。
+                if len(getattr(self.llm, "_history", ()) or ()) > 0:
+                    budget = 0
             else:
                 # ★本地模型给一档更小的预算★：4B 的窗口本来就紧，
                 # 塞 2000 token 原文的结果是「记得更少、还更爱跑题」。

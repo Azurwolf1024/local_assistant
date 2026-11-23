@@ -431,6 +431,8 @@ turn/end
 `on_event(ev)` 是观察者钩子；事件留在 `AgentResult.events`，控制台 / 日志都能订阅。
 上下文按 DSH 的会话日志做：从上次 reset（做梦 / 换角色）起，整段 user / assistant /
 tool 消息全带，只追加不截断（`[api] keep_all_history = true`），缓存前缀稳定。
+每轮动态信息（时间 / 工具提示 / 记忆摘要）并入**当前用户消息**而非前置 system，
+有完整历史后不再重复注入 L1 尾巴；模型回传的 `usage` 事件收进 `AgentResult.usages` 并记账。
 
 **注入点**（构造参数，全部可换）：
 

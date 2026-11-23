@@ -84,6 +84,7 @@ class AgentResult:
     messages: list[dict] = field(default_factory=list)  # 完整轨迹（含 system / user / tool）
     initial_messages: int = 0   # build_messages 造出的前缀长度；后面全是这一轮新增的
     events: list[dict] = field(default_factory=list)  # Turn/Step/工具事件轨迹
+    usages: list[dict] = field(default_factory=list)  # 每轮模型的 usage（缓存命中记账用）
 
 
 @dataclass
@@ -277,6 +278,9 @@ class HarnessAgent:
                     if self.should_stop():
                         result.interrupted = True
                         break
+                    if "usage" in ev:
+                        result.usages.append(ev["usage"])
+                        continue
                     if "tool_calls" in ev:
                         calls.extend(ev["tool_calls"])
                         continue
@@ -345,6 +349,9 @@ class HarnessAgent:
                     if self.should_stop():
                         result.interrupted = True
                         break
+                    if "usage" in ev:
+                        result.usages.append(ev["usage"])
+                        continue
                     if "delta" in ev:
                         text_parts.append(ev["delta"])
             except Exception as exc:  # noqa: BLE001

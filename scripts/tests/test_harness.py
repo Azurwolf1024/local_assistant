@@ -64,7 +64,8 @@ def test_turn_step() -> None:
     print("\n[1] Turn/Step 事件 + 工具结果回灌")
     llm = FakeLlm([
         [tool_call("search", {"q": "天气"}, "c1")],
-        [{"delta": "今天晴。"}],
+        [{"usage": {"prompt_tokens": 100, "prompt_cache_hit_tokens": 70}},
+         {"delta": "今天晴。"}],
     ])
     seen: list[tuple[str, dict]] = []
 
@@ -86,6 +87,9 @@ def test_turn_step() -> None:
               for m in result.messages))
     check("记下了上下文前缀长度", result.initial_messages == 1,
           str(result.initial_messages))
+    check("usage 事件被收下（缓存记账用）",
+          result.usages == [{"prompt_tokens": 100, "prompt_cache_hit_tokens": 70}],
+          str(result.usages))
     check("ok=True", result.ok)
 
 

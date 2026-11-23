@@ -505,6 +505,14 @@ def test_pipeline_hooks(tmp: Path) -> None:
     check("★本地那档预算更小（同一份上下文，提示词更短）★",
           len(loop._memory_context("火锅")) <= len(block), True)
 
+    # ★API：整段历史已经带上 L1 原文，别再每轮重复塞一遍（缓存前缀会掉）
+    loop.llm = SimpleNamespace(engine="api", _history=[{"role": "user", "content": "x"}])
+    check("★API 有历史时不重复带 L1 尾巴★",
+          "刚才聊的" not in loop._memory_context("火锅"), True)
+    loop.llm._history = []
+    check("API 首轮仍带 L1 尾巴（跨进程接得上）",
+          "刚才聊的" in loop._memory_context("火锅"), True)
+
     # 再写一次**同一轮** → 不该长
     loop._write_session(TurnStats(turn=1, user_text="我昨天说想吃火锅。",
                                   answer="那今晚去吃？", total_seconds=4.0))

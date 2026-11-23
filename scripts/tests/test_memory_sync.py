@@ -62,6 +62,14 @@ def episode(rid: str, ts: str, title: str, updated: str = "") -> dict:
             "created_at": ts, "updated_at": updated or ts}
 
 
+def event(rid: int, start: str, title: str, *, fired: list[str] | None = None) -> dict:
+    row = {"id": rid, "title": title, "category": "activity", "start": start,
+           "repeat": "none", "remind_before": [0], "created_at": start}
+    if fired:
+        row["state"] = {"fired": fired}
+    return row
+
+
 def fact(key: str, value: str, seen: str, **extra) -> dict:
     row = {"key": key, "value": value, "about": "user", "confidence": 0.6, "evidence": 1,
            "pinned": False, "first_seen": seen, "last_seen": seen, "sources": [], "note": ""}
@@ -107,6 +115,12 @@ def seed_project(tmp: Path) -> Path:
     (memory / "alpha" / "knowledge").mkdir(parents=True, exist_ok=True)
     (memory / "alpha" / "knowledge" / "设定.md").write_text("# 设定\n\n海里的鱼。\n", encoding="utf-8")
     (memory / "alpha" / "knowledge" / "跳过.bin").write_bytes(b"\x00\x01")
+    events = tmp / "data" / "events.json"
+    events.parent.mkdir(parents=True, exist_ok=True)
+    events.write_text(json.dumps([
+        event(1, "2026-11-24 09:00:00", "晨会", fired=["2026-11-24T09:00:00|0"]),
+        event(2, "2026-11-25 19:30:00", "排练"),
+    ], ensure_ascii=False, indent=2), encoding="utf-8")
     return memory
 
 
@@ -125,6 +139,7 @@ def test_layout(tmp: Path) -> None:
     check("L2 情景在", (clone / "memory" / "alpha" / "episodes.jsonl").is_file(), True)
     check("L3 事实在", (clone / "memory" / "alpha" / "facts.json").is_file(), True)
     check("L1 索引在", (clone / "memory" / "alpha" / "sessions.json").is_file(), True)
+    check("日程/闹钟表在", (clone / "schedule" / "events.json").is_file(), True)
     check("知识库跟着走", (clone / "memory" / "alpha" / "knowledge" / "设定.md").is_file(), True)
     check("★非文本知识库文件不上云★",
           (clone / "memory" / "alpha" / "knowledge" / "跳过.bin").exists(), False)
@@ -134,6 +149,7 @@ def test_layout(tmp: Path) -> None:
     check("manifest 记了角色与条数",
           (manifest["counts"]["characters"], manifest["counts"]["episodes"],
            manifest["counts"]["facts"]), (2, 3, 2))
+    check("manifest 记了日程条数", manifest["counts"]["events"], 2)
     check("manifest 写明 L1 不同步", "不同步" in manifest["note"], True)
     check("README 建了一次（提醒这是私人仓库）",
           "Private" in (clone / "README.md").read_text(encoding="utf-8"), True)
@@ -216,6 +232,54 @@ def test_pull(tmp: Path) -> None:
     # 再拉一次：都已在本地 → 不该再动文件
     again = sync.pull()
     check("★第二次拉取不再改文件★", again.changed, [])
+
+
+def test_events(tmp: Path) -> None:
+    print("\n[3b] 日程/闹钟上云：镜像 + 按 id 合并 + fired 并集")
+    seed_project(tmp)
+    remote = tmp / "remote-events.git"
+    git(["init", "--bare", "-b", "main", str(remote)], tmp)
+    settings = settings_for(tmp, sync_dir="cloud-events", remote=remote.as_uri())
+    sync = msync.MemorySync(settings)
+    report = sync.sync()
+    cloud_events = tmp / "cloud-events" / "schedule" / "events.json"
+    check("日程表进了私有仓库", cloud_events.is_file(), True)
+    check("报告记了日程条数", report.events, 2)
+    manifest = json.loads((tmp / "cloud-events" / "manifest.json").read_text(encoding="utf-8"))
+    check("manifest 记了日程条数", manifest["counts"]["events"], 2)
+    check("README 写明日程按 id 合并",
+          "日程 `id`" in (tmp / "cloud-events" / "README.md").read_text(encoding="utf-8"), True)
+
+    # 另一台机器：加了一条新日程，还给旧日程补了一个 fired 记录
+    other = tmp / "other-events"
+    git(["clone", "--branch", "main", remote.as_uri(), str(other)], tmp)
+    ident(other)
+    path = other / "schedule" / "events.json"
+    rows = json.loads(path.read_text(encoding="utf-8"))
+    rows.append(event(3, "2026-11-26 08:30:00", "另一台机器的闹钟"))
+    for row in rows:
+        if row["id"] == 2:
+            row["state"] = {"fired": ["2026-11-25T19:30:00|0"]}
+    path.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    git(["add", "-A"], other)
+    git(["commit", "-m", "另一台机器的日程"], other)
+    git(["push", "origin", "HEAD:main"], other)
+
+    pulled = sync.pull()
+    local_rows = {r["id"]: r for r in json.loads(
+        (tmp / "data" / "events.json").read_text(encoding="utf-8"))}
+    check("云端新日程合并进来了", 3 in local_rows, True)
+    check("本地原日程没被覆盖", local_rows[1]["title"], "晨会")
+    check("★fired 状态取并集（本机旧的还在）★",
+          local_rows[1]["state"]["fired"], ["2026-11-24T09:00:00|0"])
+    check("★云端补的 fired 也带回来了★",
+          local_rows[2]["state"]["fired"], ["2026-11-25T19:30:00|0"])
+    check("拉取报告记了日程变化", any("schedule/events" in c for c in pulled.changed), True)
+
+    # 新机器本地还没 events.json：导出时不能把云端那份删掉
+    (tmp / "data" / "events.json").unlink()
+    sync.sync()
+    check("★本地没事件表也不删云端★", cloud_events.is_file(), True)
 
 
 def test_public_guard(tmp: Path) -> None:
@@ -338,6 +402,7 @@ def main() -> int:
         test_layout(_room(tmp, "layout"))
         test_mirror(_room(tmp, "m2"))
         test_pull(_room(tmp, "p"))
+        test_events(_room(tmp, "ev"))
         test_public_guard(_room(tmp, "g"))
         test_status_and_edges(_room(tmp, "s"))
         test_guards(_room(tmp, "guard"))

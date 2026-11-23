@@ -571,7 +571,7 @@ class MemoryContextConfig:
     segment_turns: int = 30
     digest_days: int = 3            # 提示词里往前带几天的摘要
     tail_tokens: int = 2000         # 未压缩的尾最多占多少 token（按整句砍，不切半句）
-    api_tail_tokens: int = 4000     # API 角色的尾预算更大（窗口够，少丢同一会话里的旧事）
+    api_tail_tokens: int = 4000     # 仅历史为空时带（首轮）；有完整历史后置 0，防重复/掉缓存
     # ★本地模型单独一档★：4B 的上下文窗口小、注意力也弱，塞 2000 token 的原文反而更糊涂
     local_tail_tokens: int = 800
 
