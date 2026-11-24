@@ -45,6 +45,7 @@ import os
 import shutil
 import socket
 import subprocess
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -189,13 +190,31 @@ def parse_github(url: str) -> tuple[str, str] | None:
     return parts[0], parts[1]
 
 
+_VIS_CACHE: dict[str, tuple[float, str, str]] = {}
+_VIS_TTL = 3600.0     # 一小时：同一台机器反复推送时别每次都去查一遍（见下面的注释）
+
+
 def remote_visibility(url: str, timeout: float = 5.0) -> tuple[str, str]:
     """这个 GitHub 仓库是不是公开的？返回 ``(private|public|unknown, 说明)``。
 
     ★免鉴权的问法★：公开仓库谁都能查（200 + `"private": false`）；
     私有仓库对匿名请求是 404 —— 正好和「查不到」一个样，所以判不准时**不拦**，
     只把地址打出来让人自己确认（宁可多一条提示，也不要因为网络问题挡住同步）。
+
+    ★结果缓存一小时（2026-11-24）★：开了「每轮同步」之后每次推送都查一遍，
+    而这台机器到 api.github.com 经常握手超时（一次卡 8 秒），推一次要 14 秒。
+    同一个地址的可见性不会几分钟就变，缓存住即可；超时也缓存（判不准时本来就不拦）。
     """
+    now = time.monotonic()
+    hit = _VIS_CACHE.get(url)
+    if hit and now - hit[0] < _VIS_TTL:
+        return hit[1], hit[2]
+    got = _remote_visibility_uncached(url, timeout=timeout)
+    _VIS_CACHE[url] = (now, got[0], got[1])
+    return got
+
+
+def _remote_visibility_uncached(url: str, timeout: float = 5.0) -> tuple[str, str]:
     pair = parse_github(url)
     if pair is None:
         return "unknown", "不是 GitHub 仓库（是不是私有得你自己确认）"
@@ -700,9 +719,15 @@ class MemorySync:
                 return
         rc, out, err = self._git(["push", "origin", f"HEAD:{self.branch}"])
         if rc != 0:
-            report.ok = False
-            report.error = f"推送失败：{err or '（没输出，可能是凭据没缓存）'}"
-            return
+            # ★另一台设备刚推过★：push 会被拒（non-fast-forward）。先 rebase 再推一次；
+            # rebase 的是镜像提交（内容来自 data/），不会动本地数据。
+            rc2, _, _ = self._git(["pull", "--rebase", "origin", self.branch])
+            if rc2 == 0:
+                rc, out, err = self._git(["push", "origin", f"HEAD:{self.branch}"])
+            if rc != 0:
+                report.ok = False
+                report.error = f"推送失败：{err or '（没输出，可能是凭据没缓存）'}"
+                return
         if "everything up-to-date" in f"{out} {err}".lower():
             report.notes.append("远端已是最新（没有可推的提交）")
             return
@@ -747,10 +772,15 @@ class MemorySync:
                 return report
             rc, _, err = self._git(["merge", "--ff-only", f"origin/{self.branch}"])
             if rc != 0:
-                report.ok, report.error = False, (
-                    f"先把云端合进来失败（{err}）—— 大概本地克隆里有没推送的提交，"
-                    "先 `--dry-run` 看一眼，或者手动处理这个克隆目录")
-                return report
+                # ★多设备必然遇到★：本地克隆里有上次导出留下的提交（一端推、一端也推），
+                # ff-only 合不进来。克隆只是「data/ 的镜像」，重置它**不会丢本地数据**
+                # （真正的内容在 data/memory 里，下一次导出会重新生成），所以这里直接对齐远端。
+                rc2, _, err2 = self._git(["reset", "--hard", f"origin/{self.branch}"])
+                if rc2 != 0:
+                    report.ok, report.error = False, f"先把云端合进来失败（{err} / {err2}）"
+                    return report
+                report.notes.append("克隆里有本地提交，已对齐远端（数据在 data/ 里，没丢）")
+                err = ""
         cloud_root = self.clone_dir / REPO_MEMORY
         local_ids = set(characters_of(self.local_root))
         cloud_ids = set(characters_of(cloud_root))

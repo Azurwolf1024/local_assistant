@@ -52,7 +52,7 @@ KEEP_DONE_SEC = 900.0        # 回执保留多久（控制台最多等十几秒�
 TMP_PREFIX = ".tmp-"         # 临时文件前缀：小圆点开头，不会被当成请求扫到
 
 # 命令表（服务侧实现见本文件下面的 execute；能力在 pipeline 里）
-COMMANDS = ("ping", "say", "ask", "character", "toast", "tools")
+COMMANDS = ("ping", "say", "ask", "character", "toast", "tools", "sync")
 
 # harness 运行时自带的两个工具（不在 MCP 里，见 voice_loop/harness.py）
 RUNTIME_TOOLS = {
@@ -505,6 +505,48 @@ def execute(loop: Any, req: Request) -> Reply:
                 return Reply(id=req.id, ok=False, error="画面提醒没开着（[skills] visual 关了？）", at=t0)
             notifier.show(str(args.get("title") or "控制台"), str(args.get("text") or ""))
             return Reply(id=req.id, ok=True, text="已弹出提醒", at=t0)
+
+        if cmd == "sync":
+            # ★多设备：立刻「拉一次 + 推一次」★。
+            # 为什么放在服务这边做：服务是记忆的唯一写者，控制台再起一份 git 操作
+            # 会和它在同一个克隆目录上抢 index.lock（而且可能把没写完的段读走）。
+            from .memory.sync import sync_memory  # noqa: PLC0415
+
+            settings = getattr(loop, "settings", None)
+            if settings is None:
+                return Reply(id=req.id, ok=False, error="这个服务实例没有 settings", at=t0)
+            logger = getattr(loop, "log", None)
+            pulled = sync_memory(settings, pull=True, logger=logger)
+            pushed = (sync_memory(settings, logger=logger)
+                      if getattr(pulled, "ok", False) else None)
+            ok = bool(getattr(pulled, "ok", False) and (pushed is None or pushed.ok))
+            bits = []
+            if getattr(pulled, "ok", False):
+                bits.append(f"拉取 {len(getattr(pulled, 'characters', {}) or {})} 个角色")
+            else:
+                bits.append(f"拉取失败：{getattr(pulled, 'error', '') or '未知'}")
+            if pushed is not None:
+                if pushed.ok:
+                    bits.append("推送" + ("成功" if pushed.pushed else "：远端已是最新"))
+                else:
+                    bits.append(f"推送失败：{pushed.error}")
+            return Reply(
+                id=req.id, ok=ok, text="；".join(bits), at=t0,
+                data={
+                    "pulled": {
+                        "ok": bool(getattr(pulled, "ok", False)),
+                        "error": getattr(pulled, "error", "") or "",
+                        "characters": sorted((getattr(pulled, "characters", {}) or {}).keys()),
+                        "notes": list(getattr(pulled, "notes", []) or []),
+                    },
+                    "pushed": None if pushed is None else {
+                        "ok": bool(pushed.ok),
+                        "pushed": bool(getattr(pushed, "pushed", False)),
+                        "error": getattr(pushed, "error", "") or "",
+                        "commit": getattr(pushed, "commit", "") or "",
+                    },
+                },
+            )
 
         return Reply(id=req.id, ok=False, error=f"不认识的命令：{cmd!r}", at=t0)
     except Exception as exc:  # noqa: BLE001 - 一条命令失败不能影响服务

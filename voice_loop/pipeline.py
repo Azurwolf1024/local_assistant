@@ -396,6 +396,11 @@ class VoiceLoop:
         # 只在 listen/chat 这种「一直开着」的入口值得跑（一次性命令自己会做）。
         self.dreamer = None
         self._dream_scheduler = None
+        # ★多设备同步的状态★（见 _schedule_memory_sync / _start_sync_pull）
+        self._sync_timer: threading.Timer | None = None
+        self._sync_lock = threading.Lock()
+        self._sync_stop = threading.Event()
+        self._sync_pull_thread: threading.Thread | None = None
         dcfg = getattr(getattr(settings, "memory", None), "dream", None)
         if (self.memory_hub is not None and auto_sync
                 and getattr(dcfg, "enabled", False)):
@@ -2637,6 +2642,9 @@ class VoiceLoop:
             self.log.warning(f"清理控制台信箱失败（忽略）：{exc}")
         if self.scheduler:
             self.scheduler.start()
+        # ★多设备：定时把云端的记忆拉下来★（[memory] sync_pull_seconds，0 = 关）。
+        # 拉下来之后控制台的聊天记录会读到别的设备聊过的内容。
+        self._start_sync_pull()
         # 邮件：审批卡先起（它要占用 Tk 宿主），再开巡检线程
         if self.mail_approval is not None and not self.mail_approval.start():
             self.log.warning("[mail] 审批卡起不来（没有图形环境？）——草稿只能用 "
@@ -2946,8 +2954,83 @@ class VoiceLoop:
                              "text": stats.answer, "session": session})
             if rows:
                 mem.context.append(rows, session=session)
+                self._schedule_memory_sync()
         except Exception as exc:  # noqa: BLE001 - 记上下文失败不该影响这一轮
             self.log.debug(f"[记忆] 上下文追加失败（忽略）：{exc}")
+
+    # ---------------------------------------------------------------- 多设备同步
+    def _schedule_memory_sync(self) -> None:
+        """每轮之后「隔一会儿推一次」（多设备才需要，见 [memory] sync_after_turn）。
+
+        为什么是延迟而不是立刻：一轮对话里可能连着调工具、补写上下文，立即推会连推
+        好几次；延迟窗口内的后续轮次会把定时器往后挪，等于「说完这句话、安静下来
+        20 秒，再推一次」。推的是镜像提交，不影响本地 data/。
+        """
+        delay = float(getattr(self.settings.memory, "sync_after_turn", 0) or 0)
+        if not (self.auto_sync and delay > 0 and self.memory_hub is not None):
+            return
+        if not getattr(self.settings.memory, "sync_on_close", False):
+            return
+        old = getattr(self, "_sync_timer", None)
+        if old is not None:
+            try:
+                old.cancel()
+            except Exception:  # noqa: BLE001
+                pass
+        timer = threading.Timer(delay, self._sync_now)
+        timer.daemon = True
+        self._sync_timer = timer
+        timer.start()
+
+    def _sync_now(self, *, pull: bool = False) -> Any:
+        """跑一次记忆同步（默认推；`pull=True` 是拉）。失败只记日志，绝不往外抛。"""
+        from .memory.sync import sync_memory  # noqa: PLC0415
+
+        with self._sync_lock:
+            try:
+                report = sync_memory(self.settings, pull=pull, logger=self.log)
+            except Exception as exc:  # noqa: BLE001 - 同步失败不能影响说话
+                self.log.debug(f"[记忆] 同步异常（忽略）：{exc}")
+                return None
+        if report is not None:
+            if getattr(report, "ok", False) and (report.pushed or report.changed):
+                self.log.info(f"[记忆] 已同步：{len(report.characters)} 个角色"
+                              + ("（已推送）" if report.pushed else ""))
+            elif not getattr(report, "ok", False):
+                self.log.debug(f"[记忆] 同步没成（不影响使用）：{report.error}")
+        return report
+
+    def _start_sync_pull(self) -> None:
+        """服务跑着的时候定时拉一次云端（多设备才需要，见 [memory] sync_pull_seconds）。"""
+        interval = float(getattr(self.settings.memory, "sync_pull_seconds", 0) or 0)
+        if not (self.auto_sync and interval > 0 and self.memory_hub is not None):
+            return
+        if self._sync_pull_thread is not None:
+            return
+
+        def run() -> None:
+            while not self._sync_stop.wait(interval):
+                if self._stop.is_set():
+                    return
+                self._sync_now(pull=True)
+
+        thread = threading.Thread(target=run, name="memory-pull", daemon=True)
+        thread.start()
+        self._sync_pull_thread = thread
+
+    def _stop_sync(self) -> None:
+        timer = getattr(self, "_sync_timer", None)
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:  # noqa: BLE001
+                pass
+            self._sync_timer = None
+        self._sync_stop.set()
+        thread = getattr(self, "_sync_pull_thread", None)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+            self._sync_pull_thread = None
 
     def _record_usage(self, usage: dict) -> None:
         """把云端报的真实用量记下来（★缓存到底省了多少，只能靠这个数★）。
@@ -3141,6 +3224,8 @@ class VoiceLoop:
     def close(self) -> None:
         self._stop.set()
         t0 = time.perf_counter()
+        # ★先停多设备同步的后台线程/定时器★：不然它可能在归档写到一半时去读文件
+        self._stop_sync()
         # ★先让调度器停下★：它可能正在做梦，梦里会读上下文文件；
         # 让它和下面的收尾并发跑，容易出现「一边封段一边归档」的怪账。
         if self._dream_scheduler is not None:

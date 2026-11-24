@@ -367,6 +367,22 @@ def register(app, ctx) -> None:
         return {"ok": reply.ok, "error": reply.error, "character": cid,
                 "entry": entry, "seconds": round(reply.seconds, 2)}
 
+    @app.post("/api/chat/sync")
+    def api_sync(payload: dict = Body(default={})):
+        """立刻跟云端对一次（拉 + 推）。
+
+        ★为什么让服务去做★：服务是记忆的唯一写者，控制台再起 git 会和它抢
+        `memory_cloud/.git/index.lock`；这里只投一条 `sync` 命令、等回执。
+        """
+        reply = ctx.call_service("sync", timeout=float((payload or {}).get("timeout") or 120.0))
+        data = reply.data or {}
+        return {
+            "ok": bool(reply.ok),
+            "message": reply.text or reply.error or "",
+            "detail": data,
+            "seconds": round(reply.seconds, 2),
+        }
+
     @app.post("/api/chat/clear")
     def api_clear(payload: dict = Body(default={})):
         """清掉**这个角色此刻之前的聊天记录显示**。

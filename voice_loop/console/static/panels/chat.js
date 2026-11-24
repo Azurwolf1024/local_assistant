@@ -10,6 +10,7 @@
      绝不靠「后端自己猜」。切换时用序号丢弃过期响应（晚回来的旧请求不会覆盖新记录）。 */
 (function () {
   let handleEvent = null;
+  let refreshTimer = null;      // 「每 30 秒轻刷一次」的定时器（离开面板要清掉）
   const LS_KEY = "console.chat.character";   // 记住上次选的，刷新后还在
   const PAGE = 40;
 
@@ -40,6 +41,7 @@
       ]);
       const sendBtn = h("button", { class: "btn primary", text: "发送" });
       const sayBtn = h("button", { class: "btn", text: "只念不答" });
+      const syncBtn = h("button", { class: "btn", text: "同步" });
       const who_label = h("span", { class: "muted", text: "" });
 
       function remembered() {
@@ -103,6 +105,7 @@
           sendBtn,
           sayBtn,
           pickerWrap,
+          syncBtn,
           h("button", {
             class: "btn ghost", text: "清屏",
             onclick: async () => {
@@ -257,6 +260,36 @@
       sayBtn.onclick = () => send("say");
       input.addEventListener("keydown", (e) => { if (e.key === "Enter") send("ask"); });
 
+      function atBottom() {
+        return box.scrollTop + box.clientHeight >= box.scrollHeight - 60;
+      }
+
+      async function syncNow() {
+        if (busy) return;
+        syncBtn.disabled = true;
+        const oldText = syncBtn.textContent;
+        syncBtn.textContent = "同步中…";
+        const r = await ctx.api.safe(() => ctx.api.post("/api/chat/sync", { timeout: 120 }));
+        syncBtn.disabled = false;
+        syncBtn.textContent = oldText;
+        if (r && r.ok) {
+          ctx.toast("已同步：" + (r.message || "ok"), "ok", 4000);
+          await reload();
+        } else {
+          ctx.toast("同步失败：" + ((r && (r.message || r.error)) || "服务没在跑？"), "err", 9000);
+        }
+      }
+      syncBtn.onclick = syncNow;
+
+      // 每 30 秒轻刷一次：服务那边定时拉云端（[memory] sync_pull_seconds），
+      // 拉下来的新记录只要刷新就能看见。★只在「在底部」时重载★，免得把你正在
+      // 往上翻的旧记录冲掉；想看最新的手动点「同步」。
+      clearInterval(refreshTimer);
+      refreshTimer = setInterval(() => {
+        if (busy || loading) return;
+        if (atBottom()) reload();
+      }, 30000);
+
       // 往上滚到顶 → 再要一页
       box.addEventListener("scroll", () => {
         if (box.scrollTop <= 24) loadOlder();
@@ -315,6 +348,6 @@
     },
 
     onEvent(ev, ctx) { if (handleEvent) handleEvent(ev, ctx); },
-    onLeave() { handleEvent = null; },
+    onLeave() { handleEvent = null; clearInterval(refreshTimer); refreshTimer = null; },
   });
 })();

@@ -286,6 +286,12 @@ sync_dir = "memory_cloud"     # 仓库的本地克隆目录（不进主仓库 gi
 sync_remote = "https://github.com/Azurwolf1024/assistant_memories.git"
 sync_branch = "main"
 sync_timeout = 120            # 单条 git 命令超时（秒）；没凭据会立刻失败而不是弹窗
+# ★多设备一致性（2026-11-24）★：两个都开，两台机器才会「这边说完、对面一分钟内就看见」。
+#   sync_after_turn   = 每轮对话结束后隔多久推一次（0 = 只用退出时那一次）
+#   sync_pull_seconds = 服务在跑时隔多久拉一次（0 = 不自动拉；控制台「同步」按钮仍可手动）
+#   代价：多设备时记忆仓库会多出一些提交（每轮一条，20 秒内的连续几轮会合并成一条）。
+sync_after_turn = 20
+sync_pull_seconds = 60
 
 # ── L1 连续上下文（★「命中缓存」的实现★，见 voice_loop/memory/context.py）──────
 # 一天里的对话接着上一天往下长，而不是每次开机另起一段。做法是「不可变段 + 追加尾」：

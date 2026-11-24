@@ -643,6 +643,12 @@ class MemoryConfig:
     sync_remote: str = ""                 # 仓库地址；空 = 这个克隆里已经有的 origin
     sync_branch: str = "main"
     sync_timeout: float = 120.0           # 单条 git 命令的超时（别把退出挂住）
+    # ★多设备一致性★（2026-11-24）：
+    #   sync_after_turn   —— 每轮对话结束后隔多少秒推一次（0 = 只用退出时那一次）
+    #   sync_pull_seconds —— 服务在跑时每隔多少秒拉一次（0 = 不自动拉）
+    #   两个都开着，两台机器才会「你这边说完，对面一分钟内就能看到」。
+    sync_after_turn: float = 0.0
+    sync_pull_seconds: float = 0.0
     # ★L1 连续上下文 + 做梦★（见 memory/context.py / memory/dream.py）
     context: MemoryContextConfig = field(default_factory=MemoryContextConfig)
     dream: MemoryDreamConfig = field(default_factory=MemoryDreamConfig)
