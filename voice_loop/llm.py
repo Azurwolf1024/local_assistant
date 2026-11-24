@@ -62,6 +62,26 @@ def resolve_api_key(cfg: ApiConfig) -> str:
     return os.environ.get(str(getattr(cfg, "api_key_env", "") or "").strip(), "").strip()
 
 
+def _demote_extra_system(msgs: list[dict]) -> list[dict]:
+    """把第一条之后的 system 就地改成 user（位置、内容都不动）。
+
+    ★为什么★：有些本地 GGUF（例如从 unsloth 导入的 Qwen3.5）自带 Jinja 聊天模板，
+    模板要求 system 只能是消息列表的第一条，否则 Ollama 直接 500：
+    「System message must be at the beginning」。而本项目会把「此刻 + 工具规则」
+    作为第二条 system 紧贴用户那句（实测这个位置工具调用最稳，见 README §1.2）。
+    官方 Ollama 包里的模板不较真，本地导入的 GGUF 会。降级成 user 后语义不变、
+    模板也能过（实测工具照常调）。
+    """
+    if not any(m.get("role") == "system" for m in msgs[1:]):
+        return msgs
+    out: list[dict] = []
+    for i, m in enumerate(msgs):
+        if i and m.get("role") == "system":
+            m = {**m, "role": "user"}
+        out.append(m)
+    return out
+
+
 class OllamaClient:
     def __init__(self, cfg: LlmConfig) -> None:
         self.cfg = cfg
@@ -263,6 +283,8 @@ class OllamaClient:
         if prefix_messages:
             # 放在最前面：例如「你可以调用工具」这类说明，跟用户的人设各自独立
             msgs = [dict(m) for m in prefix_messages] + msgs
+        # 本地导入的 GGUF 模板要求 system 只能出现在第一条：多出来的降级成 user
+        msgs = _demote_extra_system(msgs)
         payload = {
             "model": model or self.cfg.model,
             "messages": msgs,

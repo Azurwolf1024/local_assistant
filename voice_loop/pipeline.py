@@ -2582,12 +2582,14 @@ class VoiceLoop:
         if self.lexicon is not None:
             stats = self.lexicon.stats()
             asr_desc += f" · 词库 {stats['total']} 条"
+        input_line = "  输入: 文字模式（没开麦克风）\n" if self.mic is None else ""
         print(
             f"\n=== 本地语音助手 · 常驻服务 ===\n"
             f"  ASR : {asr_desc}\n"
             f"  LLM : {self.settings.llm.model} @ {self.settings.llm.host}\n"
             f"  TTS : {self._tts_label()}\n"
             f"  唤醒词: {words}    (改 {wake_where}，保存即生效)\n"
+            f"{input_line}"
             + (
                 f"  角色  : {self.persona.stats()}\n" if self.persona is not None else ""
             )
@@ -2616,7 +2618,13 @@ class VoiceLoop:
         # 在日志里也记一份 PID，pid 文件被意外删掉时 stop 能靠它恢复
         self.log.info(f"服务已启动 PID={os.getpid()}")
 
-        self.mic.open()
+        if self.mic is None:
+            # ★文字模式★：没有麦克风（或 `listen --no-mic`）时也把服务跑起来 ——
+            #   控制台的文字对话 / 播报 / 提醒 / 热重载都照常，只是不收音。
+            print("\n[文字模式] 没开麦克风：语音唤醒关闭；"
+                  "控制台的文字对话 / 播报 / 提醒照常可用。\n")
+        else:
+            self.mic.open()
         # 常驻服务没有「按回车录音」这回事，所以直接用裸按键（Esc）
         self._start_interrupt_watcher()
         # 上一次服务如果是崩在半路的，信箱里会留着「已认领没回执」的请求：
@@ -2638,7 +2646,10 @@ class VoiceLoop:
         if not self.lazy:
             # 不分级时模型已经加载好了，直接算活跃
             self._active = True
-        print(f"\n[待唤醒] 请说「{self._wake_hint()}」…\n")
+        if self.mic is None:
+            print("\n[文字模式] 等控制台文字输入（不需要麦克风）…\n")
+        else:
+            print(f"\n[待唤醒] 请说「{self._wake_hint()}」…\n")
 
         try:
             while not self._stop.is_set():
@@ -2646,6 +2657,11 @@ class VoiceLoop:
                     break
                 # 控制台（网页 UI）的命令：最多 5 秒内被响应（本循环每轮也会被 listen_once 上限带走）
                 self._serve_console()
+                if self.mic is None:
+                    # 文字模式：没有麦克风，这一轮只做「控制台命令 + 提醒」，
+                    # 不收音、也就不做唤醒/会话那套。
+                    time.sleep(0.2)
+                    continue
                 if self._end_listen_requested:
                     # ★模型在上一轮里调了 end_listening★：这一轮起不再收音，回待唤醒
                     self._end_listen_requested = False

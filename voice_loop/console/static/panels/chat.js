@@ -1,35 +1,61 @@
 /* 文字对话面板：打字 → 服务走完整链路 → 文字回来 + 声音由服务放出。
    ★可以选角色★：选了谁，这句话就用谁的设定与声线回答。角色是**跟着这条消息一起**
    发过去的（不是「先切角色再问」），免得中间被语音唤醒或另一个页面换走。
-   历史只存在控制台内存里（刷新就没），真正的对话记忆在服务的 llm 里。 */
+
+   ★聊天记录（2026-11-24）★
+   - 一个角色一份文件：`sessions/console/chat/<角色id>.jsonl`。切角色就切记录。
+   - 「跟随服务当前角色」= 服务此刻那个人；它换人（语音唤醒/日志里的 [角色]）就跟着换。
+   - 不一次性加载：先给最近一页（PAGE 条），往上滚到底再要更早的一页，且**不跳位置**。
+   - ★隔离靠「显式 character」★：每次请求都带上「我要看/我要问的是谁」这个 id，
+     绝不靠「后端自己猜」。切换时用序号丢弃过期响应（晚回来的旧请求不会覆盖新记录）。 */
 (function () {
   let handleEvent = null;
   const LS_KEY = "console.chat.character";   // 记住上次选的，刷新后还在
+  const PAGE = 40;
 
   window.Console.register("chat", {
     render(root, ctx) {
       const { h, card, secs } = UI;
       let busy = false;
+      let loading = false;
+      let seq = 0;                // 每次 reload +1；晚到的旧响应直接丢掉
       let characters = [];
-      let serviceWho = "";        // 服务当前是谁（ping 回来）
+      let serviceWho = "";        // 服务当前是谁（名字）
+      let serviceCid = "";        // 服务当前角色 id
+      // 当前**正在展示**的那一份记录
+      let viewCid = "";
+      let items = [];             // 已加载的条目（旧 → 新）
+      let total = 0;
+      let nextBefore = 0;         // 已加载的最早那条在整个文件里的下标
+      let hasMore = false;
 
       const box = h("div", { class: "chat" });
       const input = h("input", { placeholder: "打一句话，按回车发送（她会念出来）" });
       const hint = h("span", { class: "muted", text: "" });
-      const picker = h("select", { title: "用哪个角色回答" });
+      const viewLabel = h("span", { class: "muted", text: "" });
+      const counter = h("span", { class: "muted", text: "" });
+      const picker = h("select", { title: "用哪个角色回答（也决定看谁的聊天记录）" });
       const pickerWrap = h("label", { class: "row", style: "gap:6px;width:auto" }, [
         h("span", { class: "muted", text: "角色" }), picker,
       ]);
       const sendBtn = h("button", { class: "btn primary", text: "发送" });
       const sayBtn = h("button", { class: "btn", text: "只念不答" });
+      const who_label = h("span", { class: "muted", text: "" });
 
       function remembered() {
         try { return localStorage.getItem(LS_KEY) || ""; } catch (_e) { return ""; }
       }
-      function chosen() {
-        const v = picker.value || "";
+      function remember(v) {
         try { v ? localStorage.setItem(LS_KEY, v) : localStorage.removeItem(LS_KEY); } catch (_e) {}
-        return v;
+      }
+      function labelOf(id) {
+        const hit = characters.find((c) => c.id === id);
+        return hit ? hit.name : (id || "");
+      }
+
+      /** 现在要「看/问」的是谁：显式选了就选他，否则跟随服务当前角色。 */
+      function targetCid() {
+        return picker.value || serviceCid || "";
       }
 
       function fillPicker() {
@@ -40,24 +66,37 @@
           picker.appendChild(h("option", {
             value: c.id,
             text: c.name + (c.enabled === false ? "（未启用）" : "")
-              + (serviceWho && c.name === serviceWho ? " · 现在是她" : ""),
+              + (serviceCid && c.id === serviceCid ? " · 现在是她" : ""),
           }));
         });
-        // 上次选的还在就恢复；不在（角色被删/改名）就回到「跟随」
+        // ★别把用户选的覆盖掉★：还在就恢复，不在（角色被删/改名）才回到「跟随」
         picker.value = (keep && characters.some((c) => c.id === keep)) ? keep : "";
       }
 
       function updateHint() {
         const v = picker.value;
         if (v) {
-          const hit = characters.find((c) => c.id === v) || {};
-          hint.textContent = "这句话会用「" + (hit.name || v) + "」的设定与声线";
+          hint.textContent = "这句话会用「" + labelOf(v) + "」的设定与声线；显示的是她的聊天记录";
         } else {
-          hint.textContent = serviceWho ? "跟随服务当前角色（现在是 " + serviceWho + "）" : "";
+          hint.textContent = serviceWho
+            ? "跟随服务当前角色（现在是 " + serviceWho + "）—— 显示她的聊天记录"
+            : "";
         }
       }
 
+      function updateLabels() {
+        const name = labelOf(viewCid) || viewCid || "（未定）";
+        viewLabel.textContent = "正在看：" + name;
+        who_label.textContent = serviceWho ? "服务现在：" + serviceWho : "服务没在跑";
+        if (!total) { counter.textContent = ""; return; }
+        const base = "已加载 " + items.length + " / 共 " + total + " 条";
+        counter.textContent = hasMore ? base + " · 往上滚动加载更早的" : base + " · 已经到最早";
+      }
+
       root.appendChild(card("文字对话", [
+        h("div", { class: "row", style: "align-items:center;gap:10px;margin-bottom:6px" }, [
+          viewLabel, who_label, counter,
+        ]),
         box,
         h("div", { class: "row", style: "margin-top:10px" }, [
           h("div", { class: "grow" }, input),
@@ -67,8 +106,9 @@
           h("button", {
             class: "btn ghost", text: "清屏",
             onclick: async () => {
-              await ctx.api.safe(() => ctx.api.post("/api/chat/clear", {}));
-              paint([]);
+              const who = targetCid();
+              await ctx.api.safe(() => ctx.api.post("/api/chat/clear", { character: who }));
+              await reload();
             },
           }),
         ]),
@@ -76,7 +116,7 @@
         hint,
       ]));
 
-      function msg(m) {
+      function msgNode(m) {
         const meta = [];
         if (m.at) meta.push(m.at);
         if (m.character) meta.push(m.character);
@@ -88,18 +128,102 @@
         ]);
       }
 
-      function paint(items) {
+      function emptyNote() {
+        return h("p", { class: "muted", text: "还没有对话。注意：这里打字不经过麦克风，但回答会从扬声器说出来。" });
+      }
+
+      function paintAll() {
         box.innerHTML = "";
-        if (!items.length) {
-          box.appendChild(h("p", { class: "muted", text: "还没有对话。注意：这里打字不经过麦克风，但回答会从扬声器说出来。" }));
-        }
-        items.forEach((m) => box.appendChild(msg(m)));
+        if (!items.length) box.appendChild(emptyNote());
+        const frag = document.createDocumentFragment();
+        items.forEach((m) => frag.appendChild(msgNode(m)));
+        box.appendChild(frag);
         box.scrollTop = box.scrollHeight;
+        updateLabels();
+      }
+
+      function pushPair(entries) {
+        const note = box.querySelector("p.muted");
+        if (note) note.remove();
+        entries.forEach((m) => {
+          if (!m) return;
+          items.push(m);
+          total += 1;
+          nextBefore = total - items.length;   // 最早那条在整个文件里的下标
+          box.appendChild(msgNode(m));
+        });
+        box.scrollTop = box.scrollHeight;
+        updateLabels();
+      }
+
+      async function loadOlder() {
+        if (loading || !hasMore) return;
+        loading = true;
+        const mySeq = seq;
+        const prevH = box.scrollHeight;
+        const prevTop = box.scrollTop;
+        const note = h("p", { class: "muted", text: "正在加载更早的…" });
+        box.insertBefore(note, box.firstChild);
+        try {
+          const d = await ctx.api.get(
+            "/api/chat/history?character=" + encodeURIComponent(viewCid)
+            + "&limit=" + PAGE + "&before=" + nextBefore
+          );
+          if (mySeq !== seq) return;           // 期间换过角色：这一页作废
+          const older = (d && d.items) || [];
+          if (older.length) {
+            const frag = document.createDocumentFragment();
+            older.forEach((m) => frag.appendChild(msgNode(m)));
+            box.insertBefore(frag, note);
+            items = older.concat(items);
+            nextBefore = d.next_before;
+            hasMore = !!d.has_more;
+            total = d.total || total;
+          } else {
+            hasMore = false;
+          }
+        } catch (_e) {
+          /* 加载失败就保持原样，下次滚动再试 */
+        } finally {
+          if (mySeq === seq) {
+            note.remove();
+            // 把视口钉在原来那条上，别让内容“跳”一下
+            box.scrollTop = box.scrollHeight - prevH + prevTop;
+            updateLabels();
+          }
+          loading = false;
+        }
       }
 
       async function reload() {
-        const items = await ctx.api.get("/api/chat/history").then((d) => d.items || []).catch(() => []);
-        paint(items);
+        const mySeq = ++seq;
+        const want = targetCid();
+        items = [];
+        total = 0;
+        nextBefore = 0;
+        hasMore = false;
+        viewCid = want;                 // 先按目标显示，避免闪一下旧角色
+        loading = true;
+        box.innerHTML = "";
+        try {
+          const d = await ctx.api.get(
+            "/api/chat/history?character=" + encodeURIComponent(want) + "&limit=" + PAGE
+          );
+          if (mySeq !== seq) return;    // 晚回来的旧请求：丢掉，别覆盖新记录
+          viewCid = d.character || want;
+          items = d.items || [];
+          total = d.total || items.length;
+          nextBefore = d.next_before;
+          hasMore = !!d.has_more;
+        } catch (err) {
+          if (mySeq !== seq) return;
+          ctx.toast("读聊天记录失败：" + err.message, "err");
+        } finally {
+          if (mySeq === seq) {
+            loading = false;
+            paintAll();
+          }
+        }
       }
 
       async function send(kind) {
@@ -109,14 +233,23 @@
         sendBtn.disabled = sayBtn.disabled = true;
         input.value = "";
         hint.textContent = kind === "ask" ? "服务正在处理（可能要十几秒）…" : "正在念…";
-        const r = await ctx.api.safe(() => ctx.api.post(
-          kind === "ask" ? "/api/chat/ask" : "/api/chat/say",
-          { text, character: chosen() },
-        ));
-        busy = false;
-        sendBtn.disabled = sayBtn.disabled = false;
+        let r = null;
+        try {
+          r = await ctx.api.safe(() => ctx.api.post(
+            kind === "ask" ? "/api/chat/ask" : "/api/chat/say",
+            { text, character: targetCid() },
+          ));
+        } finally {
+          busy = false;
+          sendBtn.disabled = sayBtn.disabled = false;
+        }
         if (r && !r.ok) ctx.toast("没成：" + (r.error || "未知错误"), "err", 12000);
-        await reload();
+        // 回来的那份记录就是当前看的这份才追加；换人了 / 不是这份 → 重载
+        if (r && r.entry && r.character && r.character === viewCid) {
+          pushPair([r.entry]);
+        } else {
+          await reload();
+        }
         updateHint();
       }
 
@@ -124,11 +257,25 @@
       sayBtn.onclick = () => send("say");
       input.addEventListener("keydown", (e) => { if (e.key === "Enter") send("ask"); });
 
+      // 往上滚到顶 → 再要一页
+      box.addEventListener("scroll", () => {
+        if (box.scrollTop <= 24) loadOlder();
+      });
+
       function refreshWho() {
         return ctx.api.post("/api/overview/ping", {})
-          .then((r) => { if (r && r.ok && r.data) serviceWho = r.data.character_name || ""; })
+          .then((r) => {
+            if (r && r.ok && r.data) {
+              serviceWho = r.data.character_name || "";
+              serviceCid = r.data.character_id || "";
+            }
+          })
           .catch(() => {})
-          .then(() => { fillPicker(); updateHint(); });
+          .then(() => {
+            fillPicker();
+            updateHint();
+            updateLabels();
+          });
       }
 
       ctx.api.get("/api/chat/characters")
@@ -141,17 +288,28 @@
         .catch((err) => ctx.toast("读角色列表失败：" + err.message, "err"))
         .finally(() => { reload(); refreshWho(); });
 
-      picker.onchange = () => { chosen(); updateHint(); };
+      picker.onchange = () => {
+        remember(picker.value || "");
+        updateHint();
+        reload();                      // ★切角色 = 切记录★（序号会作废在途的旧请求）
+      };
 
-      // 服务被关掉 / 语音里换了角色 → 刷新一下「现在是谁」
+      // 服务被关掉 / 语音里换了角色 → 刷新「现在是谁」；跟随模式下记录也跟着换
       handleEvent = (ev) => {
         if (ev.kind === "status" && ev.data && !ev.data.running) {
           serviceWho = "";
+          serviceCid = "";
+          updateLabels();
           hint.textContent = "服务没在跑——先点右上角「启动服务」";
         }
         if (ev.kind === "log" && ev.data && /\[角色\]/.test(ev.data.line || "")) {
           clearTimeout(refreshWho._t);
-          refreshWho._t = setTimeout(refreshWho, 1200);
+          refreshWho._t = setTimeout(() => {
+            const before = serviceCid;
+            refreshWho().then(() => {
+              if (!picker.value && serviceCid && serviceCid !== before) reload();
+            });
+          }, 1200);
         }
       };
     },

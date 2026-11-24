@@ -353,13 +353,43 @@ def start_service(
     except OSError as exc:
         return False, f"启动失败：{exc}{note}"
 
-    st2 = wait_for(settings, lambda s: s.running, timeout=wait_seconds)
+    # ★起不来就别干等 25 秒★：服务一失败会往日志里写「[错误] ...」，
+    #   只认**spawn 之后**新写进来的那一段（否则上一轮的旧错误会把这次也判死）。
+    log_path = settings.resolve(settings.wake.log_file)
+    try:
+        size0 = log_path.stat().st_size if log_path.exists() else 0
+    except OSError:
+        size0 = 0
+
+    def _failed_early() -> bool:
+        try:
+            if not log_path.exists():
+                return False
+            with log_path.open("r", encoding="utf-8", errors="replace") as fh:
+                fh.seek(max(0, size0))
+                return "[错误]" in fh.read()[-4000:]
+        except OSError:
+            return False
+
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < deadline:
+        st2 = status(settings)
+        if st2.running or _failed_early():
+            break
+        time.sleep(0.4)
+    else:
+        st2 = status(settings)
     if st2.running:
         return True, f"服务已启动（PID {st2.pid}，来自{_source_text(st2)}）{note}"
-    rows = tail_lines(settings, 2)
-    why = f"日志最后一行：{rows[-1]}" if rows else "日志还是空的（服务可能连启动都没走到）"
+    # ★失败原因要捞「错误那行」★：日志最后两行经常是提示的尾巴
+    #   （比如麦克风提示的第 3 条），用户看了等于没说。
+    rows = tail_lines(settings, 12)
+    err = next((r for r in reversed(rows) if "[错误]" in r or "Error" in r), "")
+    why = (f"日志：{err}" if err
+           else (f"日志最后一行：{rows[-1]}" if rows else "日志还是空的（服务可能连启动都没走到）"))
     return False, (
-        f"启动命令发出去了（pythonw 进程 {spawn_pid}），但 {wait_seconds:g} 秒内没看到服务起来。\n"
+        f"启动命令发出去了（pythonw 进程 {spawn_pid}），但服务没有起来"
+        f"（最多等 {wait_seconds:g} 秒）。\n"
         f"{why}{note}"
     )
 

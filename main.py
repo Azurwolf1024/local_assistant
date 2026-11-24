@@ -162,6 +162,29 @@ _pid_alive = service_ctl.pid_alive
 _pid_from_log = service_ctl.pid_from_log
 
 
+def _pid_is_our_service(pid: int) -> bool:
+    """pid 活着，**而且命令行确实是本项目的 listen**（防 PID 被别的进程复用后误判）。
+
+    ★踩过的坑★：服务崩过一次，`sessions/listen.pid` 留在那儿；Windows 很快把这个号
+    分给了别的进程，于是下次启动读到「pid 还活着」就直接拒绝，日志里反复出现
+    「唤醒服务已经在运行（PID xxxx）」，可那个 xxxx 根本不是服务。现在多看一眼命令行：
+    不是本项目的 `main.py listen` 一律当成残留。读不到命令行（权限/刚退出）时按「是」
+    处理 —— 宁可拦一下，也不要并发跑两份服务。
+    """
+    if not _pid_alive(pid):
+        return False
+    try:
+        import psutil  # noqa: PLC0415
+
+        cmd = " ".join(psutil.Process(pid).cmdline())
+    except Exception:  # noqa: BLE001
+        return True
+    if not cmd.strip():
+        return True
+    low = cmd.lower()
+    return "main.py" in low and "listen" in low
+
+
 def write_pid(settings: Settings, pid: int | None = None) -> Path:
     pid_file = settings.resolve(settings.wake.pid_file)
     pid_file.parent.mkdir(parents=True, exist_ok=True)
@@ -235,7 +258,11 @@ def cmd_listen(settings: Settings, args: argparse.Namespace) -> int:
             old = int(pid_file.read_text(encoding="utf-8").strip())
         except ValueError:
             old = 0
-        if old and _pid_alive(old) and old != os.getpid():
+        # ★old == 父进程也要放过★：venv 里的 pythonw.exe 是个 launcher，
+        #   它先 CreateProcess 出真正的解释器再等它退出 —— 所以 `listen -B` 记下的
+        #   pid 是 launcher 的，而脚本自己跑在子进程里。只比 os.getpid() 的话，
+        #   子进程会把自己爹当成「已经有一个服务在跑」，于是刚绿一下就没了（真机踩过）。
+        if old and old != os.getpid() and old != os.getppid() and _pid_is_our_service(old):
             print(
                 f"[错误] 唤醒服务已经在运行（PID {old}）。\n"
                 f"        先停掉：python main.py stop\n"
@@ -250,16 +277,58 @@ def cmd_listen(settings: Settings, args: argparse.Namespace) -> int:
         return _spawn_background(settings, args, log_file)
 
     # 前台运行
+    # ★先试开一次麦克风★：打不开就**降级成文字模式**继续跑（不是直接退出）——
+    #   控制台的文字对话 / 播报 / 提醒本来就不需要麦克风。
+    #   （以前是等服务跑到一半 PortAudio 抛 -1 才炸，还会留下 pid 文件，
+    #    控制台就成了「绿一下变红」）
+    text_only = bool(getattr(args, "no_mic", False))
+    if not text_only:
+        try:
+            from voice_loop.audio import MicReader  # noqa: PLC0415
+
+            with MicReader(settings):
+                pass
+        except Exception as exc:  # noqa: BLE001
+            print(_explain_start_failure(exc)
+                  + "\n        → 先用**文字模式**把服务跑起来（控制台文字对话/播报/提醒照常）。",
+                  file=sys.stderr)
+            text_only = True
+
     write_pid(settings)
-    loop = build_loop(settings, lazy_whisper=settings.wake.lazy_load, auto_sync=True)
-    if getattr(args, "wake_file", None):
-        loop.use_wake_file(args.wake_file)
-    _start_sidecars(settings, args)
     try:
-        loop.service()
-    finally:
-        loop.close()
+        try:
+            loop = build_loop(settings, enable_listening=not text_only,
+                              lazy_whisper=settings.wake.lazy_load, auto_sync=True)
+            if getattr(args, "wake_file", None):
+                loop.use_wake_file(args.wake_file)
+            _start_sidecars(settings, args)
+            try:
+                loop.service()
+            finally:
+                loop.close()
+        except BaseException:  # noqa: BLE001 - 起不来/跑到一半崩了都别留 pid 文件
+            pid_file.unlink(missing_ok=True)
+            raise
+    except KeyboardInterrupt:
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        print(_explain_start_failure(exc), file=sys.stderr)
+        return 1
     return 0
+
+
+def _explain_start_failure(exc: Exception) -> str:
+    """把「服务起不来」翻译成人话 —— 最常见的是没有麦克风（设备默认值 -1）。"""
+    text = str(exc)
+    if "querying device" in text or "PortAudio" in type(exc).__name__:
+        return (
+            "[错误] 打不开麦克风：系统没有可用的输入设备（默认输入 = -1）。\n"
+            "        1) 插一个 USB 麦克风 / 连上蓝牙耳机，在 Windows「设置 → 系统 → 声音 → 输入」里设为默认；\n"
+            "        2) 或把 config.toml 的 [audio] input_device 填成设备名关键字/编号"
+            "（python main.py devices 能看清单）；\n"
+            "        3) 不想开语音就先用文字：python main.py text（不需要麦克风）。"
+        )
+    return f"[错误] 服务起不来：{text}"
 
 
 def _start_sidecars(settings: Settings, args: argparse.Namespace) -> None:
@@ -339,6 +408,8 @@ def _spawn_background(settings: Settings, args: argparse.Namespace, log_file: Pa
         cmd += ["--device", args.device]
     if getattr(args, "llm", None):
         cmd += ["--llm", args.llm]
+    if getattr(args, "no_mic", False):
+        cmd += ["--no-mic"]
 
     # ★不要「起个进程就完事」★：
     #   Windows：DETACHED_PROCESS 让它没有控制台，也不会被关窗口时的 CTRL 事件杀掉；
@@ -361,10 +432,18 @@ def _spawn_background(settings: Settings, args: argparse.Namespace, log_file: Pa
             close_fds=True,
             **popen_kwargs,
         )
-    write_pid(settings, proc.pid)
+    # ★这里不写 pid 文件★（真机踩过）：venv 的 pythonw.exe 是个 launcher，
+    #   它先 CreateProcess 出真解释器再等它退出，所以 `proc.pid` 是 launcher 的号。
+    #   父进程把它写进 listen.pid 会有两个后果：
+    #     ① 子进程看到「有个 pid 在跑」以为已经有一份服务（虽然现在放过了父进程）；
+    #     ② 服务其实起不来时，launcher 还活着的这一两秒里控制台会先亮绿灯，然后突然变红
+    #        —— 就是用户看到的「绿一会就变成服务没在跑（还有残留文件）」。
+    #   交给服务自己写（`cmd_listen` 在麦克风预检通过之后 `write_pid(settings)`），
+    #   起不来就永远不会留下 pid 文件。
     print(
         f"√ 唤醒服务已在后台启动\n"
-        f"  PID      : {proc.pid}\n"
+        f"  进程     : {proc.pid}（启动器；服务起来后会把自己的 PID 写进 "
+        f"{settings.resolve(settings.wake.pid_file)}）\n"
         f"  日志     : {log_file}\n"
         f"  唤醒词   : {settings.resolve(settings.wake.file)}\n"
         f"  停止服务 : python main.py stop\n"
@@ -1390,16 +1469,14 @@ def cmd_selftest(settings: Settings, args: argparse.Namespace) -> int:
         probe_dir = Path(tempfile.mkdtemp(prefix="voiceloop_selftest_"))
         probe = Skills(settings, logging.getLogger("voice_loop"))
         probe.data_dir = probe_dir
-        probe.alarms = type(probe.alarms)(probe_dir / "alarms.json")
+        probe.store = type(probe.store)(probe_dir / "events.json")
         probe.memos = type(probe.memos)(probe_dir / "memos.json")
-        probe.schedule = type(probe.schedule)(probe_dir / "schedule.json")
 
         real = Skills(settings, logging.getLogger("voice_loop"))
         print(f"  √ {real.stats()}")
         for label, path in (
-            ("提醒/闹钟", real.alarms.path),
+            ("事件（提醒/闹钟/日程）", real.store.path),
             ("备忘", real.memos.path),
-            ("日程", real.schedule.path),
         ):
             print(f"    {'√' if path.exists() else '×'} {label}: {path}")
         for q in ("现在几点了", "十分钟后提醒我喝水", "今天有什么课"):
@@ -1940,6 +2017,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--stop-first", action="store_true", help="启动前先停掉已在运行的服务")
     p.add_argument("--no-console", action="store_true",
                    help="不顺手拉起控制台应用（默认会带起来，见 [app] console_on_start）")
+    p.add_argument("--no-mic", action="store_true",
+                   help="文字模式：不开麦克风（控制台文字对话/播报/提醒照常）；"
+                        "没有输入设备时也会自动降级到这个模式")
     p.add_argument("--mode", default=None)
     p.add_argument("--strategy", choices=["sensevoice", "whisper", "hybrid"], default=None)
     p.add_argument("--device", default=None)
