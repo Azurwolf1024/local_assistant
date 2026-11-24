@@ -43,6 +43,7 @@ from pathlib import Path
 
 import requests
 
+from .proc import popen_hidden, run_hidden
 from .settings import LlmConfig, Settings
 
 
@@ -236,7 +237,7 @@ def restart_ollama() -> list[str]:
         return ["这是 Windows 专属操作；POSIX 上请自己重启 ollama：sudo systemctl restart ollama"]
     exe = Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama" / "ollama app.exe"
     try:
-        subprocess.run(
+        run_hidden(
             ["taskkill", "/F", "/IM", "ollama app.exe", "/IM", "ollama.exe"],
             capture_output=True, timeout=20,
         )
@@ -249,7 +250,7 @@ def restart_ollama() -> list[str]:
     env = dict(os.environ)
     env[IGPU_ENV] = "1"
     try:
-        subprocess.Popen([str(exe)], env=env, close_fds=True)
+        popen_hidden([str(exe)], env=env, close_fds=True)
         time.sleep(6)
         notes.append("已用 OLLAMA_IGPU_ENABLE=1 重新拉起 Ollama（等它起完约 5~10 秒）")
     except Exception as exc:  # noqa: BLE001

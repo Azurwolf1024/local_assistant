@@ -11,8 +11,9 @@
 
     python scripts/tests/test_service_ctl.py
 
-★怎么保证不起真服务★：把 `service_ctl.spawn` / `subprocess.run` 换成假的
-（只记下被调的参数，然后按剧本改“状态”），所以这个脚本永远只会写临时目录里的文件。
+★怎么保证不起真服务★：把 `service_ctl.spawn` / `service_ctl.run_hidden` 换成假的
+（只记下被调的参数，然后按剧本改"状态"），所以这个脚本永远只会写临时目录里的文件。
+（原先打桩的是模块里的 subprocess.run；加了无窗口包装层后改打 run_hidden 这一层。）
 """
 
 from __future__ import annotations
@@ -130,7 +131,7 @@ def section_3(tmp: Path) -> None:
         (s.root / "sessions" / "listen.stop").unlink(missing_ok=True)
 
     run = FakeRun(script)
-    restore = patch({"spawn": fake_spawn, "subprocess": _FakeSubprocess(run)})
+    restore = patch({"spawn": fake_spawn, "run_hidden": run})
     try:
         ok, message = sc.start_service(s, wait_seconds=3.0, with_app=False)
     finally:
@@ -169,7 +170,7 @@ def section_5(tmp: Path) -> None:
     run = FakeRun()
     restore = patch({
         "spawn": lambda command, cwd: 12345,      # 假装发出去了，但什么都没发生
-        "subprocess": _FakeSubprocess(run),
+        "run_hidden": run,
     })
     try:
         ok, message = sc.start_service(s, wait_seconds=1.2, with_app=False)
@@ -184,7 +185,7 @@ def section_6(tmp: Path) -> None:
     print("\n[6] 停止：没在跑要说清楚；停完要验证")
     s = make_settings(tmp / "f")
     run = FakeRun()
-    restore = patch({"subprocess": _FakeSubprocess(run)})
+    restore = patch({"run_hidden": run})
     try:
         ok, message = sc.stop_service(s, timeout=1.0)
         check("没在跑 → 失败但说明白", ok, False)
@@ -200,7 +201,7 @@ def section_6(tmp: Path) -> None:
             (s.root / "sessions" / "listen.pid").unlink(missing_ok=True)
 
         run2 = FakeRun(script)
-        patch_restore = patch({"subprocess": _FakeSubprocess(run2)})
+        patch_restore = patch({"run_hidden": run2})
         try:
             ok, message = sc.stop_service(s, timeout=2.0)
         finally:
@@ -212,7 +213,7 @@ def section_6(tmp: Path) -> None:
         # 命令返回了但服务还在跑（卡住）→ 必须判失败
         (s.root / "sessions" / "listen.pid").write_text(str(os.getpid()), encoding="utf-8")
         run3 = FakeRun()          # 剧本：什么都不做 = 服务还在
-        patch_restore = patch({"subprocess": _FakeSubprocess(run3)})
+        patch_restore = patch({"run_hidden": run3})
         try:
             ok, message = sc.stop_service(s, timeout=0.8)
         finally:
@@ -233,18 +234,6 @@ def section_7(tmp: Path) -> None:
     stop = sc.stop_command()
     check("停止用普通 python.exe", Path(stop[0]).name.lower().startswith("python"), True, detail=stop[0])
     check("停止参数是 stop", stop[2:], ["stop"])
-
-
-class _FakeSubprocess:
-    """替掉 service_ctl 里的 subprocess 模块（只用到 run 与异常类）。"""
-
-    def __init__(self, runner) -> None:
-        self.run = runner
-        self.TimeoutExpired = subprocess.TimeoutExpired
-        self.PIPE = subprocess.PIPE
-        self.DEVNULL = subprocess.DEVNULL
-        self.DETACHED_PROCESS = getattr(subprocess, "DETACHED_PROCESS", 0)
-        self.CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 
 
 def main() -> int:

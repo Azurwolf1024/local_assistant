@@ -109,3 +109,6 @@ data/lexicon/*.txt
 
 # 邮件子系统：token / 本地索引 / 草稿 / 审计（含隐私，绝不进 git）
 data/mail/
+
+# 工作区记忆 / 助手本地状态（每日工作日志等），只留本机
+.workbuddy/

@@ -38,6 +38,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .paths import app_root
+from .proc import run_hidden
 
 ROOT = app_root()
 """项目根（exe 旁边 / 源码根）—— 冻结之后 ``__file__`` 是临时解包目录，不能用。"""
@@ -184,7 +185,7 @@ def doctor_json(*, strict: bool = False, timeout: float = 180.0) -> dict:
         return {"error": f"找不到 {script}", "items": [], "failed": []}
     cmd = [sys.executable, str(script), "--json"] + (["--strict"] if strict else [])
     try:
-        got = subprocess.run(cmd, cwd=ROOT, capture_output=True, timeout=timeout,
+        got = run_hidden(cmd, cwd=ROOT, capture_output=True, timeout=timeout,
                              encoding="utf-8", errors="replace", env=child_env())
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"error": f"{type(exc).__name__}: {exc}", "items": [], "failed": []}
@@ -246,7 +247,7 @@ def download_models(groups: list[str] | tuple[str, ...] | None = None, *,
     script = ROOT / "scripts" / "download_models.py"
     cmd = [sys.executable, str(script), "--only", *chosen] + (["--force"] if force else [])
     try:
-        got = subprocess.run(cmd, cwd=ROOT, capture_output=True, timeout=timeout,
+        got = run_hidden(cmd, cwd=ROOT, capture_output=True, timeout=timeout,
                              encoding="utf-8", errors="replace", env=child_env())
     except (OSError, subprocess.TimeoutExpired) as exc:
         return 1, f"{type(exc).__name__}: {exc}"
@@ -261,7 +262,7 @@ def pip_install(*, timeout: float = 1800.0) -> tuple[int, str]:
         return 1, f"找不到 {req}"
     cmd = [sys.executable, "-m", "pip", "install", "-r", str(req)]
     try:
-        got = subprocess.run(cmd, cwd=ROOT, capture_output=True, timeout=timeout,
+        got = run_hidden(cmd, cwd=ROOT, capture_output=True, timeout=timeout,
                              encoding="utf-8", errors="replace", env=child_env())
     except (OSError, subprocess.TimeoutExpired) as exc:
         return 1, f"{type(exc).__name__}: {exc}"
@@ -275,7 +276,7 @@ def pip_install(*, timeout: float = 1800.0) -> tuple[int, str]:
 def git(args: list[str], *, cwd: str | Path = ROOT, timeout: float = 60.0
         ) -> tuple[int, str, str]:
     try:
-        got = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
+        got = run_hidden(["git", *args], cwd=str(cwd), capture_output=True,
                              timeout=timeout, encoding="utf-8", errors="replace",
                              env=child_env())
     except (OSError, subprocess.TimeoutExpired) as exc:

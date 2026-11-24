@@ -30,6 +30,7 @@ from typing import Any
 import requests
 
 from ...llm import resolve_api_key
+from ...proc import run_hidden
 from ...settings import Settings, load_settings
 from ..server import MCPServer
 
@@ -523,7 +524,7 @@ def make_run_command(settings: Settings, log: logging.Logger):
         except (TypeError, ValueError):
             timeout = float(getattr(settings.agent, "shell_timeout", 30.0))
         try:
-            proc = subprocess.run(
+            proc = run_hidden(
                 command, shell=True, cwd=str(workspace_of(settings)),
                 capture_output=True, text=True, errors="replace",
                 timeout=max(1.0, min(300.0, timeout)),

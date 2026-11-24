@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from voice_loop import __version__, service_ctl  # noqa: E402
 from voice_loop import setup_flow  # noqa: E402  （只用标准库，见它的模块说明）
+from voice_loop.proc import run_hidden  # noqa: E402
 from voice_loop.settings import Settings, load_settings  # noqa: E402
 
 # ★依赖没装齐时也要能跑 setup / doctor / upgrade★：那几条命令只用标准库，
@@ -512,7 +513,7 @@ def _stop_service_only(settings: Settings) -> int:
     else:
         print("服务没有响应，强制结束进程")
         if os.name == "nt":
-            subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True)
+            run_hidden(["taskkill", "/PID", str(pid), "/F"], capture_output=True)
         else:
             os.kill(pid, 9)
         time.sleep(0.5)

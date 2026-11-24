@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .paths import ENV_PYTHON, app_root, find_python
+from .proc import run_hidden
 from .settings import Settings
 
 PYTHON_EXE = Path(sys.executable)
@@ -297,7 +298,7 @@ def _clean_leftovers(settings: Settings) -> str:
     在这里重写一份清理逻辑只会多一处会跑偏的地方。
     """
     try:
-        proc = subprocess.run(
+        proc = run_hidden(
             stop_command(settings),
             cwd=str(settings.root),
             capture_output=True,
@@ -406,7 +407,7 @@ def stop_service(settings: Settings, *, timeout: float = 20.0) -> tuple[bool, st
 
     was_running = st.running
     try:
-        proc = subprocess.run(
+        proc = run_hidden(
             stop_command(settings),
             cwd=str(settings.root),
             capture_output=True,
@@ -534,7 +535,7 @@ def _terminate(pid: int, *, timeout: float = 6.0) -> tuple[bool, str]:
 
     try:
         if os.name == "nt":
-            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+            run_hidden(["taskkill", "/PID", str(pid), "/T", "/F"],
                            capture_output=True, timeout=timeout + 10.0)
         else:
             os.kill(pid, signal.SIGTERM)
@@ -553,7 +554,7 @@ def _pid_on_port(port: int) -> int | None:
     if os.name != "nt":
         return None
     try:
-        out = subprocess.run(["netstat", "-ano", "-p", "tcp"], capture_output=True,
+        out = run_hidden(["netstat", "-ano", "-p", "tcp"], capture_output=True,
                              text=True, timeout=15, errors="replace").stdout
     except (OSError, subprocess.SubprocessError):
         return None
@@ -572,7 +573,7 @@ def _looks_like_console(pid: int) -> bool:
     if os.name != "nt":
         return False
     try:
-        got = subprocess.run(
+        got = run_hidden(
             ["powershell", "-NoProfile", "-Command",
              f'(Get-CimInstance Win32_Process -Filter "ProcessId={int(pid)}").CommandLine'],
             capture_output=True, text=True, timeout=20, errors="replace").stdout

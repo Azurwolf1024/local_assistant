@@ -53,6 +53,7 @@ from typing import Any, Iterable
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
+from ..proc import run_hidden
 from .model import now_iso
 from .store import read_json, read_jsonl, rewrite_jsonl, write_json
 
@@ -161,7 +162,7 @@ def _git(args: list[str], cwd: str | Path, timeout: float = 120.0) -> tuple[int,
         "LANG": "C.UTF-8",
     }
     try:
-        got = subprocess.run(
+        got = run_hidden(
             ["git", *args], cwd=str(cwd), capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=timeout, env=env,
         )
