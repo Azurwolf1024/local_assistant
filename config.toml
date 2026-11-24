@@ -224,8 +224,8 @@ fetch_max_chars = 6000            # 网页正文最多给模型多少字（最�
 enabled = true
 max_rounds = 6                    # 最多几轮「模型→工具→模型」；到顶会强制收口
 workspace = "."                   # 文件/命令工具的根目录（相对项目根）
-allow_write = false               # write_file 默认关；开了也只能写 workspace 里面
-allow_shell = false               # run_command 默认关；★开了等于把本机 shell 交给模型★
+allow_write = true                # write_file / edit_file：只能写 workspace（= 项目根）里面
+allow_shell = true                # run_command：★开了等于把本机 shell 交给模型★（2026-11-24 用户要求开）
 max_file_chars = 6000             # read_file 最多返回多少字
 max_list_entries = 200            # list_dir 最多列多少项
 max_tool_chars = 6000             # 单个工具结果喂回模型的上限
