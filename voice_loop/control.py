@@ -408,7 +408,7 @@ def _tools(loop: Any) -> dict:
         "mcp_status": status,
     }
     # ★数量警告写在服务侧★：本地 4B 实测 18 个以内还稳（22 个时把「看邮件」
-    # 错选成 list_memos）；API harness 对齐 DSH，工具多到 28 个是常态，阈值另算。
+    # 错选成 list_memos）；API harness 对齐 DSH，工具多到 31 个是常态，阈值另算。
     out["warn"] = ""
     limit = 40 if agent else 18
     if router and router.lower() != "tools":

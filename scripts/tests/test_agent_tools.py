@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -216,6 +217,34 @@ def test_files(tmp: Path) -> None:
     check("开启后有写文件", "write_file" in names, detail=str(sorted(names)))
     check("开启后有改文件", "edit_file" in names)
     check("开启后有执行命令", "run_command" in names)
+    check("开启后有后台作业工具",
+          {"job_output", "job_list", "job_kill"} <= names, detail=str(sorted(names)))
+    text, err = call(srv2, "run_command", {"command": f'{sys.executable} -c "print(chr(104)+chr(105))"'})
+    check("DSH 风格 exit marker", err is False and "[exit code: 0]" in text, detail=text)
+    check("stdout 回来了", "hi" in text, detail=text)
+    text, err = call(srv2, "run_command", {"command": f'{sys.executable} -c "raise SystemExit(3)"'})
+    check("★非零退出是结果不是工具错误★", err is False and "[exit code: 3]" in text,
+          detail=text)
+    os.environ["PROBE_SECRET_TOKEN"] = "should-not-leak"
+    try:
+        text, _ = call(srv2, "run_command", {
+            "command": f'{sys.executable} -c "import os;print(os.environ.get(chr(80)+chr(82)+chr(79)+chr(66)+chr(69)+chr(95)+chr(83)+chr(69)+chr(67)+chr(82)+chr(69)+chr(84)+chr(95)+chr(84)+chr(79)+chr(75)+chr(69)+chr(78), chr(69)+chr(77)+chr(80)+chr(84)+chr(89)));print(os.environ.get(chr(68)+chr(83)+chr(72)+chr(95)+chr(87)+chr(79)+chr(82)+chr(75)+chr(83)+chr(80)+chr(65)+chr(67)+chr(69), chr(69)+chr(77)+chr(80)+chr(84)+chr(89)))"',
+        })
+        check("★环境里的 token 被洗掉★", "should-not-leak" not in text, detail=text)
+        check("DSH_WORKSPACE 已注入", str(sandbox) in text, detail=text)
+    finally:
+        os.environ.pop("PROBE_SECRET_TOKEN", None)
+    text, err = call(srv2, "run_command", {
+        "command": f'{sys.executable} -c "print(chr(98)+chr(103)+chr(45)+chr(111)+chr(107))"',
+        "run_in_background": True,
+    })
+    jid = text.strip().split()[-1] if text.strip() else ""
+    check("后台作业立刻返回 job id", err is False and jid.isalnum() and len(jid) == 12,
+          detail=text)
+    out, err = call(srv2, "job_output", {"job_id": jid, "wait": True, "timeout_ms": 5000})
+    check("后台输出收得到", err is False and "bg-ok" in out and "[exit code: 0]" in out,
+          detail=out)
+    call(srv2, "job_kill", {"job_id": jid})
     text, err = call(srv2, "write_file", {"path": "new.txt", "content": "你好"})
     check("写文件成功", err, False)
     check("文件真的写了", (sandbox / "new.txt").read_text(encoding="utf-8"), "你好")
@@ -264,7 +293,8 @@ def test_hidden_and_preset() -> None:
     check("没给邮件工具就不提 mail", "mail_" not in harness_hint({"weather"}), True)
     check("harness 预设（对齐 DSH：agent + 邮件 + 记忆 + 技能）", expand(["harness"]),
           {"web_search", "web_fetch", "weather", "read_file", "list_dir", "glob", "grep",
-           "write_file", "edit_file", "run_command", "end_listening",
+           "write_file", "edit_file", "run_command", "job_output", "job_list",
+           "job_kill", "end_listening",
            "mail_search", "mail_read", "mail_summary", "mail_draft", "mail_send",
            "mail_to_event",
            "mcp__memory__recall", "mcp__memory__remember",
@@ -383,6 +413,16 @@ def test_pipeline_agent(tmp: Path) -> None:
         check("走了 agent 循环", bool(st.extra.get("agent")), True)
         check("工具轮数 = 1", st.extra.get("tool_rounds"), 1)
         check("工具被调用", used, [("web_search", {"query": "DeepSeek"})])
+        trace_files = sorted((tmp / "sessions" / "agent_trace" / "fish").glob("*.jsonl"))
+        check("★全量追踪落盘★", bool(trace_files), True, str(trace_files))
+        rows = [json.loads(x) for x in trace_files[0].read_text(encoding="utf-8").splitlines()] \
+            if trace_files else []
+        kinds = [r.get("kind") for r in rows]
+        check("追踪含 turn/start 与 turn/end",
+              "turn/start" in kinds and "turn/end" in kinds, True, str(kinds))
+        check("追踪含工具完整结果",
+              any(r.get("kind") == "harness/tool/result" and "https://example.com/news"
+                  in str(r.get("content") or "") for r in rows), True)
         check("第一次调用带了工具", fake.tools_seen[0], True)
         check("第二轮仍带工具（模型自己决定不调）", fake.tools_seen[1], True)
         second = fake.calls[1]
@@ -474,7 +514,7 @@ def test_pipeline_agent(tmp: Path) -> None:
 
 
 def test_harness_api_only() -> None:
-    print("\n[7] 不变量：harness 循环 / 28 项工具只给 API 角色")
+    print("\n[7] 不变量：harness 循环 / 31 项工具只给 API 角色")
     from types import SimpleNamespace
 
     from voice_loop.pipeline import VoiceLoop
@@ -496,7 +536,7 @@ def test_harness_api_only() -> None:
     ctx.llm.engine = "api"
     check("API 角色才进 harness 循环", VoiceLoop._agent_mode(ctx) is True)  # noqa: SLF001
     extra = VoiceLoop._api_extra_tools(ctx)  # noqa: SLF001
-    check("★28 项只出现在 API 角色★",
+    check("★31 项只出现在 API 角色★",
           extra == tool_presets.expand(["harness"]), True, str(len(extra)))
 
 

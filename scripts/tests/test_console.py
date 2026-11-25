@@ -303,7 +303,8 @@ def section_misc(base: str, tmp: Path) -> None:
     check("★hidden 的服务器也列出来（否则「为什么没露出来」没法解释）★",
           [s["name"] for s in tools["mcp"]["servers"] if s["hidden"]], ["agent", "mail"],
           detail=str([(s["name"], s["hidden"]) for s in tools["mcp"]["servers"]]))
-    check("报告了 agent 边界（写文件默认关）", tools["agent"]["allow_write"], False)
+    check("报告了 agent 边界（这台机器已给 API 角色开写/命令）",
+          (tools["agent"]["allow_write"], tools["agent"]["allow_shell"]), (True, True))
     check("角色清单里有 amiya（本地引擎 → 不多开）",
           [(c["id"], c["active"], c["expanded"]) for c in tools["characters"]],
           [("amiya", False, [])])

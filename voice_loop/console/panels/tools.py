@@ -10,7 +10,7 @@
    `voice_loop/tool_presets.py`），这里把每个预设展开成真实工具名，
    写角色卡的时候不用去翻源码。
 3. **哪些东西在拦着** —— `[[mcp.servers]]` 的白名单 / `hidden`，
-   以及 `[agent] allow_write` / `allow_shell` 这两个默认关着的开关。
+   以及 `[agent] allow_write` / `allow_shell` 这两个高风险开关（出厂默认关，本机可显式开启）。
 
 ★本面板不加载任何服务器★：`build_server()` 里有的会去连网络（邮件要读身份），
 控制台进程不该为了「列个清单」就把这些东西拉起来。所以静态部分只读配置，

@@ -155,12 +155,12 @@ flowchart LR
 以及 **`weather`**（真实天气，Open-Meteo 免 key，见 [`docs/guide/usage.md`](docs/guide/usage.md#能用语音做的事)）。
 
 > ★harness 多轮循环**只给 API 角色**★：本地 Ollama 小模型仍走单轮、默认 11 个工具，
-> 不会看到下面这 28 项；这是能力边界，不是配置偏好。
+> 不会看到下面这 31 项；这是能力边界，不是配置偏好。
 > 可选：某个角色可以在人格文件里改用**云端 API**（`"engine": "api"`，见第 14 节）。
 > 默认工具还是这 11 个；API 角色在 `api_tools` 里按预设多开 harness 工具
 > （`web` = 联网搜索/读取，`weather` = 天气，`files` = 工作区读/列/glob/grep，
 > `mail` = 邮件查/读/摘要/起草（发送要人工审批，见 [docs/guide/mail.md](docs/guide/mail.md)），
-> `harness` = 对齐 DeepSeek Harness 的 **28 项**（agent 工具 + 邮件含发送 + 记忆 3 项 +
+> `harness` = 对齐 DeepSeek Harness 的 **31 项**（agent 工具含后台作业 + 邮件含发送 + 记忆 3 项 +
 > 技能 8 项；写文件 / 跑命令 / 发邮件仍各有独立闸门）；另外 `ask_user` / `update_plan`
 > 是 harness 运行时内置的，不用点名；
 > 见 `voice_loop/tool_presets.py`）。

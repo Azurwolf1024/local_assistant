@@ -284,7 +284,16 @@ def build_server(settings=None, skills=None, logger=None, **kw) -> MCPServer
 | `grep` | `pattern` / `path` / `glob` / `max_results` | 工作区内 |
 | `write_file` | `path` / `content` / `append` | **只** `[agent] allow_write = true` 时注册 |
 | `edit_file` | `path` / `old` / `new` / `replace_all` | 同上 |
-| `run_command` | `command` / `timeout` | **只** `[agent] allow_shell = true` 时注册 |
+| `run_command` | `command` / `description` / `workdir` / `timeoutMs` / `timeout` / `run_in_background` | **只** `[agent] allow_shell = true` 时注册 |
+| `job_output` | `job_id` / `wait` / `timeout_ms` | 后台作业消费型读输出；同上才注册 |
+| `job_list` | 无 | 列出后台作业；同上才注册 |
+| `job_kill` | `job_id` | 杀后台作业；同上才注册 |
+
+`run_command` 按 DSH 契约渲染：`stdout` → `[stderr]` → 截断/超时/信号 → `[exit code: N]`；
+非零退出是结果（`is_error=false`），只有基础设施失败才是工具错误。前台受 `timeoutMs`
+（1s~300s）约束，输出超限时保留尾部并把完整流写进 `sessions/agent_shell/`，报告 spill 路径。
+后台作业没有超时，用 `job_output` 消费读、`job_kill` 终止。子进程环境会洗掉含
+TOKEN/SECRET/PASSWORD 等字样的变量，再注入受管的 `DSH_WORKSPACE` / `DSH_SHELL` / `DSH_PROJECT`。
 
 ★注意「没注册」和「没露出」是两件事★：`allow_write = false` 时 `write_file`
 **根本不存在**（不是被白名单挡），所以 `api_tools: ["write"]` 也点名不出来 ——
@@ -396,7 +405,7 @@ handler 照旧。
 | `files` | `read_file` `list_dir` `glob` `grep` | 4 |
 | `write` | `write_file` `edit_file` | 2（要 `allow_write`） |
 | `shell` | `run_command` | 1（要 `allow_shell`） |
-| `harness` | agent 17（含邮件 6）+ 记忆 3 + 技能 8 = **28 项**；对齐 DSH，写 / 命令 / 发送仍各有闸门；★仅 API 角色★ | 28 |
+| `harness` | agent 20（含邮件 6 + 后台作业 3）+ 记忆 3 + 技能 8 = **31 项**；对齐 DSH，写 / 命令 / 发送仍各有闸门；★仅 API 角色★ | 31 |
 
 **接入点只有三处**（都在 `pipeline.py`）：
 

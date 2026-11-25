@@ -85,9 +85,10 @@ def harness_hint(tool_names) -> str:
     if has("read_file", "list_dir", "glob", "grep", "write_file", "edit_file", "run_command"):
         file_rule = "文件只能看工作区里的"
         if has("write_file", "edit_file"):
-            file_rule += "；写文件要先得到确认"
+            file_rule += "；写文件只在工作区内，写完告诉用户改了哪里"
         if has("run_command"):
-            file_rule += "；执行命令会逐一请求批准"
+            file_rule += ("；★shell 没有审批卡，调用即执行，务必先看结果末尾的 "
+                          "[exit code: N]，长命令用 run_in_background + job_output")
         rules.append(file_rule + "。")
     if has("mail_search", "mail_read", "mail_summary", "mail_draft", "mail_send"):
         rules.append(

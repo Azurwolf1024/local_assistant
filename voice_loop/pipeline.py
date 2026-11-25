@@ -1557,6 +1557,7 @@ class VoiceLoop:
         循环本身在 :class:`voice_loop.harness.HarnessAgent` 里；
         这里只负责搭人设/记忆/时间提示，以及把最终回答念出来。
         """
+        from .agent_trace import AgentTrace  # noqa: PLC0415
         from .harness import HarnessAgent  # noqa: PLC0415
         from .persona import now_block  # noqa: PLC0415
 
@@ -1593,7 +1594,16 @@ class VoiceLoop:
                 stripper = stylekit.StyleStripper()
                 style_hint = stylekit.hint(self.character)
                 if style_hint:
-                    hint = [{"role": "system", "content": style_hint}] + hint
+                    context_blocks.append(style_hint)
+                    turn_prompt = (f"{prompt}\n\n（下面是本轮运行信息，不是用户新说的事）\n"
+                                   + "\n".join(context_blocks))
+
+        trace = AgentTrace(
+            self.settings, self.character, mode="harness",
+            prompt=prompt, turn_prompt=turn_prompt,
+            persona=str(getattr(self.llm, "system_prompt", "") or ""),
+            tools=tools, model=str(model or ""),
+        )
 
         def speak(sentence: str, source_chars: int | None = None) -> None:
             nonlocal first_audio
@@ -1618,10 +1628,16 @@ class VoiceLoop:
                     (True, "") if str(name) in visible
                     else (False, "这个角色看不到这个工具")
                 ),
-                on_event=lambda ev: self.log.debug(f"[agent:{ev['kind']}] {ev}"),
+                on_event=lambda ev: (
+                    self.log.debug(f"[agent:{ev['kind']}] {ev}"), trace.event(ev)
+                ),
             )
             result = agent.run(turn_prompt, extra_messages=None, model=model, num_ctx=num_ctx)
             final_text = result.text
+            trace.finish(answer=final_text, ok=result.ok,
+                         interrupted=result.interrupted, rounds=result.rounds,
+                         model_calls=result.model_calls, usages=result.usages,
+                         stats=dict(stats.extra), calls=result.calls)
 
             if stripper is not None and final_text:
                 cleaned = stripper.feed(final_text) + stripper.finish()
@@ -1987,6 +2003,7 @@ class VoiceLoop:
         # （一条时间、一条工具），加上记忆和情绪提示，一轮能堆三四条 system，
         # 4B 会开始分不清哪条是「设定」哪条是「要办的事」，甚至把提示词当台词念出来。
         # 时间和「别编造」都属于**每轮才成立**的运行时信息，跟工具提示天然是一类。
+        from .agent_trace import AgentTrace  # noqa: PLC0415
         from .persona import now_block  # noqa: PLC0415
 
         runtime = now_block()
@@ -2013,6 +2030,13 @@ class VoiceLoop:
                 if style_hint:
                     # 放在 TOOL_HINT 前面：工具提示必须紧贴用户那一句（实测过）
                     hint = [{"role": "system", "content": style_hint}] + (hint or [])
+
+        trace = AgentTrace(
+            self.settings, self.character, mode="stream", prompt=prompt,
+            turn_prompt=prompt, persona=str(getattr(self.llm, "system_prompt", "") or ""),
+            tools=tools, model=str(model or ""),
+        )
+        trace.write("llm/hint", messages=hint)
 
         def speak(sentence: str, source_chars: int | None = None) -> None:
             nonlocal first_audio
@@ -2053,6 +2077,7 @@ class VoiceLoop:
                             continue
                         if "usage" in ev:
                             self._record_usage(ev["usage"])
+                            trace.write("llm/usage", usage=ev["usage"])
                             continue
                         if calls:
                             continue          # 已经在调工具了，后面的解释性文字不念
@@ -2166,6 +2191,10 @@ class VoiceLoop:
 
             if not calls and hold_for_route and not self._interrupt.is_set():
                 # 模型一个字都没念、也没调工具：交给 respond() 问过技能层再决定
+                deferred_text = "".join(held)
+                trace.write("llm/text", text=deferred_text)
+                trace.finish(answer=deferred_text, model_calls=1,
+                             stats=dict(stats.extra))
                 return DeferredAnswer(
                     text="".join(held), t0=t0, first_token=stats.llm_first_token
                 )
@@ -2216,6 +2245,10 @@ class VoiceLoop:
 
         answer = "".join(pieces).strip()
         stats.answer = answer
+        trace.write("llm/text", text=answer)
+        trace.finish(answer=answer, ok=not self._interrupt.is_set(),
+                     interrupted=self._interrupt.is_set(), model_calls=1,
+                     stats=dict(stats.extra), calls=calls)
         self._note_spoken(answer)
         self._note_dialog(commit_text or prompt, answer)
         stats.interrupted = self._interrupt.is_set()

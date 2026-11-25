@@ -280,6 +280,7 @@ class HarnessAgent:
                         break
                     if "usage" in ev:
                         result.usages.append(ev["usage"])
+                        self._emit(result, "llm/usage", usage=ev["usage"])
                         continue
                     if "tool_calls" in ev:
                         calls.extend(ev["tool_calls"])
@@ -298,7 +299,7 @@ class HarnessAgent:
             if result.interrupted:
                 break
             text = "".join(text_parts).strip()
-            self._emit(result, "step/end", step=round_no,
+            self._emit(result, "step/end", step=round_no, text=text,
                        text_chars=len(text), tool_calls=len(calls))
             if not calls:
                 final_text = text
@@ -324,7 +325,7 @@ class HarnessAgent:
                     seen.add(key)
                     ok, content, note = self._execute(call)
                     self._emit(result, "tool/call", tool=call.name,
-                               arguments=call.arguments, ok=ok)
+                               arguments=call.arguments, ok=ok, note=note)
                 ok_all = ok_all and ok
                 calls_all.append(call.message)
                 messages.append({
@@ -333,7 +334,7 @@ class HarnessAgent:
                     "content": content,
                 })
                 self._emit(result, "tool/result", tool=call.name, ok=ok,
-                           chars=len(content))
+                           chars=len(content), content=content)
                 self.log.info(f"[agent] {call.name}({call.arguments}) -> "
                               f"{'√' if ok else '×'} {note}")
             self._trim_history(messages)
@@ -351,6 +352,7 @@ class HarnessAgent:
                         break
                     if "usage" in ev:
                         result.usages.append(ev["usage"])
+                        self._emit(result, "llm/usage", usage=ev["usage"])
                         continue
                     if "delta" in ev:
                         text_parts.append(ev["delta"])
@@ -361,7 +363,7 @@ class HarnessAgent:
                 self.log.warning(f"[agent] 收口调用失败：{exc}")
             final_text = "".join(text_parts).strip()
             self._emit(result, "step/end", step=self.max_rounds + 1,
-                       closeout=True, text_chars=len(final_text))
+                       closeout=True, text=final_text, text_chars=len(final_text))
 
         # ★打断后不拼残留文本★（以前靠 pipeline 再清一次，太脆弱）
         if result.interrupted:

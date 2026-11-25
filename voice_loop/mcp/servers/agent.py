@@ -22,8 +22,10 @@ Search / Fetch JSON API；模型自己多轮调用，最终回答由模型综合
 from __future__ import annotations
 
 import logging
+import os
 import re
 import subprocess
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +34,7 @@ import requests
 from ...llm import resolve_api_key
 from ...proc import run_hidden
 from ...settings import Settings, load_settings
+from ...shell_jobs import ShellJobManager, manager_for
 from ..server import MCPServer
 
 NAME = "agent"
@@ -510,37 +513,172 @@ def make_edit_file(settings: Settings, log: logging.Logger):
     return edit_file
 
 
-def make_run_command(settings: Settings, log: logging.Logger):
+_SENSITIVE_ENV = re.compile(
+    r"(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH|COOKIE|SESSION|PRIVATE)",
+    re.IGNORECASE,
+)
+
+
+def _shell_env(workdir: Path, settings: Settings) -> dict[str, str]:
+    """DSH 风格：先洗掉环境里的凭据，最后注入受管的 DSH_* 快照。"""
+    env = {k: v for k, v in os.environ.items() if not _SENSITIVE_ENV.search(k)}
+    env["DSH_WORKSPACE"] = str(workdir)
+    env["DSH_SHELL"] = "pwsh" if os.name == "nt" else "bash"
+    env["DSH_PROJECT"] = Path(str(getattr(settings, "root", ".") or ".")).name
+    return env
+
+
+def _as_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _spill(settings: Settings, jid: str, stream: str, text: str) -> Path:
+    root = Path(str(getattr(settings, "root", ".") or ".")) / "sessions" / "agent_shell"
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"{jid}-{stream}.log"
+    path.write_text(text, encoding="utf-8", errors="replace")
+    return path
+
+
+def _render_shell(stdout: str, stderr: str, *, exit_code: int | None,
+                  timed_out: bool, timeout_ms: int, signal: str = "",
+                  spill_paths: dict[str, str] | None = None) -> str:
+    """DSH 的渲染契约：stdout → [stderr] → 条件行 → exit marker。"""
+    out = (stdout or "").rstrip()
+    err = (stderr or "").rstrip()
+    body = out if out else "(no output)"
+    if err:
+        body += "\n[stderr]\n" + err
+    for stream, path in (spill_paths or {}).items():
+        if path:
+            body += f"\n[output truncated; full output: {path}]"
+    if timed_out:
+        body += f"\n[timed out after {timeout_ms}ms]"
+    if signal:
+        body += f"\n[killed by signal: {signal}]"
+    body += f"\n[exit code: {exit_code if exit_code is not None else 137}]"
+    return body
+
+
+def make_run_command(settings: Settings, log: logging.Logger,
+                     jobs: ShellJobManager | None = None):
     def run_command(args: dict) -> dict:
         if not bool(getattr(settings.agent, "allow_shell", False)):
             return {"text": "执行命令没开：需要在 config.toml 里设 [agent] allow_shell = true。",
                     "is_error": True}
         command = str((args or {}).get("command") or "").strip()
         if not command:
-            return {"text": "要执行什么命令？", "is_error": True}
+            return {"text": "Error: invalid command: expected a non-empty string",
+                    "is_error": True}
+        default_ms = max(1000, int(float(getattr(settings.agent, "shell_timeout", 30)) * 1000))
+        raw = (args or {}).get("timeoutMs", (args or {}).get("timeout"))
         try:
-            timeout = float((args or {}).get("timeout")
-                            or getattr(settings.agent, "shell_timeout", 30.0))
+            timeout_ms = int(float(raw) * 1000) if raw is not None and float(raw) <= 300 \
+                else int(float(raw)) if raw is not None else default_ms
         except (TypeError, ValueError):
-            timeout = float(getattr(settings.agent, "shell_timeout", 30.0))
+            timeout_ms = default_ms
+        timeout_ms = max(1000, min(timeout_ms, 300000))
+
+        try:
+            workdir = _safe(settings, (args or {}).get("workdir") or ".")
+        except ValueError as exc:
+            return {"text": f"Error: {exc}", "is_error": True}
+        env = _shell_env(workdir, settings)
+
+        if bool((args or {}).get("run_in_background")):
+            if jobs is None:
+                return {"text": "Error: background jobs unavailable", "is_error": True}
+            try:
+                job = jobs.start(command, workdir, env)
+            except Exception as exc:  # noqa: BLE001
+                return {"text": f"Error: {exc}", "is_error": True}
+            log.info(f"[mcp:agent.run_command] started job {job.id}: {command}")
+            return {"text": f"started background job {job.id}",
+                    "is_error": False, "job_id": job.id}
+
+        timed_out = False
+        signal = ""
         try:
             proc = run_hidden(
-                command, shell=True, cwd=str(workspace_of(settings)),
+                command, shell=True, cwd=str(workdir), env=env,
                 capture_output=True, text=True, errors="replace",
-                timeout=max(1.0, min(300.0, timeout)),
+                timeout=timeout_ms / 1000.0,
             )
-        except subprocess.TimeoutExpired:
-            return {"text": f"命令超时（>{timeout:g}s）：{command}", "is_error": True}
-        except Exception as exc:  # noqa: BLE001
-            return {"text": f"命令没跑起来：{exc}", "is_error": True}
+            out, err = _as_text(proc.stdout), _as_text(proc.stderr)
+            exit_code = proc.returncode
+        except subprocess.TimeoutExpired as exc:
+            timed_out = True
+            out, err = _as_text(exc.stdout), _as_text(exc.stderr)
+            exit_code = None
+        except Exception as exc:  # noqa: BLE001 - 只有基础设施失败才是工具错误
+            return {"text": f"Error: {type(exc).__name__}: {exc}", "is_error": True}
+
         limit = max(500, int(getattr(settings.agent, "max_tool_chars", 6000) or 6000))
-        out = (proc.stdout or "").strip()
-        err = (proc.stderr or "").strip()
-        text = f"exit: {proc.returncode}\nstdout:\n{out[:limit]}\nstderr:\n{err[:limit // 2]}"
-        log.info(f"[mcp:agent.run_command] {command} -> {proc.returncode}")
-        return {"text": _clip(text, limit * 2), "is_error": proc.returncode != 0}
+        spills: dict[str, str] = {}
+        jid = uuid.uuid4().hex[:12]
+        if len(out) > limit:
+            spills["stdout"] = str(_spill(settings, jid, "stdout", out))
+            out = out[-limit:]
+        if len(err) > max(500, limit // 2):
+            spills["stderr"] = str(_spill(settings, jid, "stderr", err))
+            err = err[-max(500, limit // 2):]
+        text = _render_shell(out, err, exit_code=exit_code, timed_out=timed_out,
+                             timeout_ms=timeout_ms, signal=signal, spill_paths=spills)
+        log.info(f"[mcp:agent.run_command] {command} -> {exit_code} "
+                 f"(timed_out={timed_out})")
+        # ★非零退出是「结果」不是工具错误★：交给模型自己判断下一步。
+        return {"text": text, "is_error": False}
 
     return run_command
+
+
+def make_job_tools(jobs: ShellJobManager, log: logging.Logger):
+    def job_output(args: dict) -> dict:
+        got = jobs.get(str((args or {}).get("job_id") or ""))
+        if got is None:
+            return {"text": "Error: unknown job id", "is_error": True}
+        try:
+            wait_ms = max(0, min(300000, int((args or {}).get("timeout_ms") or 0)))
+        except (TypeError, ValueError):
+            wait_ms = 0
+        out = got.read(wait=bool((args or {}).get("wait")), timeout_ms=wait_ms)
+        body = out["stdout"] or "(no output)"
+        if out["stderr"]:
+            body += "\n[stderr]\n" + out["stderr"]
+        if out["lossy"]:
+            body += f"\n[output truncated; full output: {out['stdout_spill']}]"
+        if out["error"]:
+            body += f"\n{out['error']}"
+        if out["running"]:
+            body += "\n[running]"
+        else:
+            if out["killed"]:
+                body += "\n[killed by signal: SIGKILL]"
+            if out["signal"]:
+                body += f"\n[killed by signal: {out['signal']}]"
+            body += f"\n[exit code: {out['exit_code'] if out['exit_code'] is not None else 137}]"
+        return {"text": body, "is_error": False}
+
+    def job_list(_args: dict) -> dict:
+        rows = jobs.list()
+        if not rows:
+            return {"text": "没有后台作业。", "is_error": False}
+        lines = [f"{r['job_id']}  {'running' if r['running'] else 'done'}  "
+                 f"{r['elapsed']}s  {r['command'][:80]}" for r in rows]
+        return {"text": "\n".join(lines), "is_error": False}
+
+    def job_kill(args: dict) -> dict:
+        jid = str((args or {}).get("job_id") or "")
+        ok = jobs.kill(jid)
+        log.info(f"[mcp:agent.job_kill] {jid} -> {ok}")
+        return {"text": f"job {jid} {'killed' if ok else 'already finished or unknown'}",
+                "is_error": False}
+
+    return job_output, job_list, job_kill
 
 
 # --------------------------------------------------------------------------- #
@@ -554,6 +692,7 @@ def build_server(
     log = logger or logging.getLogger("voice_loop")
     settings = settings or load_settings()
     agent_cfg = settings.agent
+    jobs = manager_for(settings) if bool(getattr(agent_cfg, "allow_shell", False)) else None
 
     server = MCPServer(name=NAME, version="1.0.0", instructions=INSTRUCTIONS)
 
@@ -727,16 +866,61 @@ def build_server(
     if bool(getattr(agent_cfg, "allow_shell", False)):
         add(
             "run_command",
-            "在工作区里执行一条 shell 命令。★高风险★，只有显式开启才可用。",
+            "执行一条 shell 命令（DSH 风格）。前台返回 stdout/[stderr]/[exit code: N]；"
+            "run_in_background=true 立刻返回 job id，再用 job_output / job_list / job_kill 收集。"
+            "非零退出是结果不是错误。★高风险★，只有显式开启才可用。",
             {
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "要执行的命令"},
+                    "description": {"type": "string",
+                                    "description": "一句话说明这条命令做什么（5-10 词）"},
+                    "workdir": {"type": "string",
+                                "description": "工作区内的相对目录（默认项目根）"},
+                    "timeoutMs": {"type": "integer", "minimum": 1000, "maximum": 300000,
+                                  "description": "前台超时毫秒；后台命令忽略"},
                     "timeout": {"type": "number",
-                                "description": "超时秒数（默认按配置）"},
+                                "description": "兼容旧参数：超时秒数"},
+                    "run_in_background": {"type": "boolean",
+                                          "description": "true = 后台作业，立即返回 job id"},
                 },
                 "required": ["command"],
             },
-            make_run_command(settings, log),
+            make_run_command(settings, log, jobs),
         )
+        if jobs is not None:
+            job_output, job_list, job_kill = make_job_tools(jobs, log)
+            add(
+                "job_output",
+                "读取后台作业的新增输出（消费型：连续读不重复）。wait=true 时可等它结束。",
+                {
+                    "type": "object",
+                    "properties": {
+                        "job_id": {"type": "string", "description": "run_command 返回的 job id"},
+                        "wait": {"type": "boolean", "description": "是否等到结束/超时"},
+                        "timeout_ms": {"type": "integer", "minimum": 0,
+                                       "description": "wait 的最长等待毫秒"},
+                    },
+                    "required": ["job_id"],
+                },
+                job_output,
+            )
+            add(
+                "job_list",
+                "列出当前所有后台作业（job id / 状态 / 命令 / 运行秒数）。",
+                {"type": "object", "properties": {}},
+                job_list,
+            )
+            add(
+                "job_kill",
+                "杀掉一个后台作业；已结束的作业返回 already finished。",
+                {
+                    "type": "object",
+                    "properties": {
+                        "job_id": {"type": "string", "description": "要终止的 job id"},
+                    },
+                    "required": ["job_id"],
+                },
+                job_kill,
+            )
     return server

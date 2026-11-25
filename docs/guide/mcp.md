@@ -144,8 +144,8 @@ tools = ["get_volume", "set_volume"]    # 白名单（想全开就留空，但�
 | `mail` | `mail_search` / `read` / `summary` / `draft` / `send` / `to_event` | 6 |
 | `files` | `read_file` / `list_dir` / `glob` / `grep` | 4 |
 | `write` | `write_file` / `edit_file`（要 `[agent] allow_write = true`） | 2 |
-| `shell` | `run_command`（要 `[agent] allow_shell = true`，高风险） | 1 |
-| `harness` | agent 17（含邮件 6）+ 记忆 3 + 技能 8 = **28 项**，对齐 DSH；写 / 命令 / 发送各有闸门；★仅 API 角色★ | 28 |
+| `shell` | `run_command` + `job_output` / `job_list` / `job_kill`（要 `[agent] allow_shell = true`，高风险） | 4 |
+| `harness` | agent 20（含邮件 6 + 后台作业 3）+ 记忆 3 + 技能 8 = **31 项**，对齐 DSH；写 / 命令 / 发送各有闸门；★仅 API 角色★ | 31 |
 
 三条要记住的：
 

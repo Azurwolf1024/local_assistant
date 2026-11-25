@@ -2,7 +2,7 @@
 
 本地 4B 模型能稳定驾驭的工具就那十个（见 README 第 1.2 节），所以默认这十个
 对所有角色都一样。**harness 预设虽然列在这里，但只对 `engine = "api"` 的角色展开**
-（`pipeline._api_extra_tools` 在本地角色直接返回空集），本地小模型永远不会看到 28 项。
+（`pipeline._api_extra_tools` 在本地角色直接返回空集），本地小模型永远不会看到 31 项。
 云端模型更强，可以多背几个工具 —— 具体加哪些见下面的预设。
 
     角色卡（人格文件）里的 ``api_tools`` 写预设名或具体工具名即可
@@ -70,6 +70,7 @@ PRESETS: dict[str, dict] = {
             "mail_summary", "mail_draft", "mail_send", "mail_to_event",
             "end_listening", "read_file", "list_dir", "glob", "grep",
             "write_file", "edit_file", "run_command",
+            "job_output", "job_list", "job_kill",
             # 记忆（request_dream 默认 hidden，点名才露）
             "mcp__memory__recall", "mcp__memory__remember",
             "mcp__memory__request_dream",

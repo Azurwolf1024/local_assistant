@@ -113,7 +113,7 @@ python main.py memory --who amiya            # 她记得什么、知识库读到
   "name": "蓝色大肥鱼",
   "engine": "api",              // ★这个角色走云端★
   "api_model": "deepseek-chat", // 空 = 跟 [api] model
-  "api_tools": ["harness"]       // 蓝色大肥鱼的真实配置（展开成 28 项 DSH 工具）
+  "api_tools": ["harness"]       // 蓝色大肥鱼的真实配置（展开成 31 项 DSH 工具）
 }
 ```
 
@@ -159,7 +159,7 @@ api_key_file = "D:/你的路径/assistant.txt"
 API 角色可以在 `api_tools`（或 `[api] extra_tools`）里按 **预设名** 或 **具体工具名**
 点名多开。现在有的预设是 `memory`（recall / remember / request_dream）、`skills`（八个生活技能）、
 `web`、`weather`、`files`、`mail`（含 `mail_send`，但发送要审批卡签名）、`harness`（对齐
-DeepSeek Harness 的 28 项：agent + 邮件 + 记忆 + 技能）；
+DeepSeek Harness 的 31 项：agent + 后台作业 + 邮件 + 记忆 + 技能）；
 也可以直接点名一个被白名单挡住的工具，例如
 `"api_tools": ["mcp__memory__memory_stats"]`。预设表在
 [`voice_loop/tool_presets.py`](../../voice_loop/tool_presets.py)：加一个预设 = 加一行，
@@ -339,7 +339,7 @@ max_tool_chars = 6000     # 单个工具结果喂回模型的上限
 - `files` → `read_file` + `list_dir` + `glob` + `grep`
 - `write` → `write_file` + `edit_file`（需要先在 `[agent]` 里显式开启）
 - `shell` → `run_command`（需要先在 `[agent]` 里显式开启）
-- `harness` → 对齐 DSH 的 **28 项**：agent 17（已含邮件 6）+ 记忆 3 + 技能 8；
+- `harness` → 对齐 DSH 的 **31 项**：agent 20（已含邮件 6 + job 3）+ 记忆 3 + 技能 8；
   ★只对 `engine = "api"` 的角色生效★，本地小模型即使写了也不会展开；
   写 / 命令 / 发送各有闸门，不可用的自动跳过并告警
 
