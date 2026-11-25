@@ -124,6 +124,22 @@ def _turn_stamp(stats: TurnStats, *, first: bool) -> str:
     return end.isoformat(timespec="seconds")
 
 
+def _api_tool_entries(llm, settings, character) -> list[str]:
+    """API 角色点名的预设/工具名（未展开）；本地角色、agent 关掉时为空。
+
+    做成模块级函数是为了让只带这几样属性的轻量对象也能算工具集（自测里常用）。
+    """
+    if str(getattr(llm, "engine", "local")) != "api":
+        return []
+    if not bool(getattr(getattr(settings, "agent", None), "enabled", True)):
+        return []
+    entries = list(getattr(character, "api_tools", None) or []) if character is not None else []
+    if not entries:
+        api_cfg = getattr(settings, "api", None)
+        entries = list(getattr(api_cfg, "extra_tools", []) or [])
+    return entries
+
+
 class VoiceLoop:
     """把各个组件串成一条可交互的语音链路。
 
@@ -1492,19 +1508,22 @@ class VoiceLoop:
         return stats
 
     def _api_extra_tools(self) -> set[str]:
-        """API 角色额外点名的工具（预设名已展开）。本地角色永远为空。"""
-        if str(getattr(self.llm, "engine", "local")) != "api":
-            return set()
-        if not bool(getattr(getattr(self.settings, "agent", None), "enabled", True)):
-            return set()
+        """API 角色**固定暴露**给模型的工具（预设名已展开）。本地角色永远为空。"""
         from . import tool_presets  # noqa: PLC0415
 
-        char = self.character
-        entries = list(char.api_tools or []) if char is not None else []
-        if not entries:
-            api_cfg = getattr(self.settings, "api", None)
-            entries = list(getattr(api_cfg, "extra_tools", []) or [])
-        return tool_presets.expand(entries)
+        return tool_presets.expand(_api_tool_entries(self.llm, self.settings, self.character))
+
+    def _api_authorized_tools(self) -> set[str]:
+        """API 角色**有权调用**的工具（渐进式含长尾）。本地角色永远为空。
+
+        ★跟 _api_extra_tools 分开★：渐进式角色固定只暴露 11 项（护 KV cache），
+        但 tool_invoke 要能调到按需发现的长尾工具（shell / 写文件 / 邮件…），
+        所以授权集合取完整 harness。是否真的注册仍由各 server 的 [agent] 闸门决定。
+        """
+        from . import tool_presets  # noqa: PLC0415
+
+        return tool_presets.authorized(
+            _api_tool_entries(self.llm, self.settings, self.character))
 
     def _visible_tool_names(self) -> set[str]:
         """这一轮模型真正看得见的工具名（本地 = 白名单；API + 点名才多开 hidden）。"""
@@ -1768,8 +1787,12 @@ class VoiceLoop:
             return None
         extra = self._api_extra_tools()
         if self.mcp is not None and (self.mcp.names() or extra):
-            # 元工具统一调用入口要用同一份允许集合，发现不等于授权。
-            self.mcp.meta_allowed = self.mcp.names(include=extra)
+            # ★元工具统一调用入口的授权集合 ≠ 固定暴露集合★：
+            # 渐进式角色固定只看 11 项，但长尾工具（shell / 写文件 / 邮件…）
+            # 要靠 discover → tool_invoke 调到，所以这里用完整授权集。
+            # 「发现不等于授权」仍成立：是否注册由各 server 的 [agent] 闸门决定，
+            # 邮件发送还有人工审批卡 —— visible 的是目录，authorized 的是闸门。
+            self.mcp.meta_allowed = self.mcp.names(include=self._api_authorized_tools())
             if extra:
                 missing = self.mcp.missing(extra)
                 if missing:

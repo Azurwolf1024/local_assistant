@@ -90,6 +90,11 @@ PRESETS: dict[str, dict] = {
             "web_search", "read_file", "end_listening",
             "tool_groups", "tool_search", "tool_describe", "tool_invoke",
         ],
+        # ★固定暴露 ≠ 授权范围★：长尾工具不进固定数组是为了护 KV cache，
+        # 但 tool_invoke 的闸门必须放行它们，否则「搜得到、调不动」。
+        # 授权全集 = 完整 harness（仍受各 server 的 [agent] 闸门约束 ——
+        # allow_shell / allow_write 没开时那些工具根本不注册，自然也调不到）。
+        "authorizes": "harness",
     },
     # ★下一步讨论好的额外工具加在这里★，例如：
     #   "web": {"title": "联网", "tools": ["web_search", "web_fetch"]},
@@ -97,7 +102,10 @@ PRESETS: dict[str, dict] = {
 
 
 def expand(entries) -> set[str]:
-    """把「预设名 + 具体工具名」展开成一组工具名（保持去重）。"""
+    """把「预设名 + 具体工具名」展开成一组工具名（保持去重）。
+
+    这是**固定暴露**给模型的工具名；渐进式预设只展开它的核心工具。
+    """
     out: set[str] = set()
     for entry in entries or []:
         name = str(entry or "").strip()
@@ -111,11 +119,37 @@ def expand(entries) -> set[str]:
     return out
 
 
+def authorized(entries) -> set[str]:
+    """这一轮角色**有权通过 tool_invoke 调用**的工具名（渐进式含长尾）。
+
+    ★为什么要跟 expand 分开★：渐进式角色为了护 KV cache，只把高频工具放进
+    模型每轮固定的 tools 数组；长尾工具（shell / 写文件 / 邮件…）靠
+    tool_search 发现后经 tool_invoke 调用。如果授权集合也用那份固定数组，
+    长尾工具就「搜得到、看得到参数、一调用就被拒」——等于渐进式白做了。
+
+    这里把带 ``authorizes`` 的预设展开成它指向的完整预设（harness-progressive
+    → harness），其余预设仍按自身 tools 展开。注意：**这不是绕过闸门** ——
+    write_file / run_command 等是否注册由各 server 按 ``[agent] allow_*`` 决定，
+    没开时工具根本不在宿主里，进不了这份集合，也调不到。
+    """
+    out = expand(entries)
+    for entry in entries or []:
+        name = str(entry or "").strip()
+        preset = PRESETS.get(name)
+        if preset is None:
+            continue
+        target = preset.get("authorizes")
+        if target and str(target) in PRESETS:
+            out.update(str(t) for t in PRESETS[str(target)].get("tools") or [])
+    return out
+
+
 def describe() -> list[dict]:
     """给控制台 / 文档用：现在有哪些预设、各展开成什么。"""
     return [
         {"name": name, "title": info.get("title", ""),
          "mode": str(info.get("mode") or "full"),
-         "tools": list(info.get("tools") or [])}
+         "tools": list(info.get("tools") or []),
+         "authorizes": str(info.get("authorizes") or "")}
         for name, info in PRESETS.items()
     ]

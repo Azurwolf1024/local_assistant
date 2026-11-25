@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT))
 from voice_loop.mcp.host import MCPHost                  # noqa: E402
 from voice_loop.mcp.protocol import ToolSpec             # noqa: E402
 from voice_loop.mcp.servers import meta as meta_srv      # noqa: E402
-from voice_loop.tool_presets import expand               # noqa: E402
+from voice_loop.tool_presets import authorized, expand    # noqa: E402
 from voice_loop.tools import harness_hint                # noqa: E402
 
 PASS, FAIL = "√", "×"
@@ -118,10 +118,42 @@ def test_preset_and_hint() -> None:
           "tool_search" in harness_hint(progressive | {"ask_user"}), True)
 
 
+def test_progressive_authorization() -> None:
+    print("\n[4] 渐进式：固定暴露 11 项，但授权全集含长尾（否则 discover 后调不动）")
+    progressive = expand(["harness-progressive"])
+    auth = authorized(["harness-progressive"])
+    check("固定数组仍是 11 项（KV cache 优化不动）", len(progressive), 11)
+    check("授权全集含完整 harness 31 项 + 4 个元工具（35）", len(auth), 35, str(len(auth)))
+    check("harness 31 项一个不漏", expand(["harness"]) <= auth, True)
+    check("★run_command / write_file 在授权集里★",
+          {"run_command", "write_file"} <= auth, True,
+          str(sorted({"run_command", "write_file"} - auth)))
+    check("固定集与授权集确实不同", progressive < auth, True,
+          f"固定 {len(progressive)} / 授权 {len(auth)}")
+
+    # 闸门边界：没注册的工具（= allow_shell 关掉时）进不了 names()，也调不到。
+    host = fake_host()  # 只有 now/read_file/run_command/mail_send/tool_search 注册
+    names = host.names(include=auth)
+    check("已注册的 run_command 授权后可见", "run_command" in names, True)
+    check("★没注册的 write_file 不会因为授权全集而放行★", "write_file" not in names, True)
+    host.meta_allowed = names
+    ok, text = host.invoke("run_command", {"command": "x"}, allowed=names)
+    check("授权后的 run_command 不再被角色闸门挡住",
+          "这个角色不能调用" not in text, True, text)
+    ok, text = host.invoke("write_file", {"path": "x"}, allowed=names)
+    check("没注册的 write_file 仍被挡住", "不能调用" in text or "没有这个工具" in text,
+          True, text)
+
+    # 非渐进式预设行为不变
+    check("普通 harness 授权 = 展开", authorized(["harness"]), expand(["harness"]))
+    check("web 预设授权不变", authorized(["web"]), expand(["web"]))
+
+
 def main() -> int:
     test_catalog()
     test_meta_server()
     test_preset_and_hint()
+    test_progressive_authorization()
     print("\n" + "=" * 60)
     if _failures:
         print("  工具发现自测失败：" + "、".join(_failures))
