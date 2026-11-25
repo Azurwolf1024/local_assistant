@@ -79,6 +79,18 @@ PRESETS: dict[str, dict] = {
             "list_memos", "add_memo", "now", "fix_last",
         ],
     },
+    "harness-progressive": {
+        "title": "渐进式 harness（核心工具 + 工具发现，为模块化扩展准备）",
+        "mode": "progressive",
+        # 只把高频工具放进模型每轮固定的 tools 数组；长尾工具按需经
+        # tool_search / tool_describe / tool_invoke 找到并调用。
+        # ask_user / update_plan 是 harness 内置，不在这里点名。
+        "tools": [
+            "now", "list_events", "next_event", "add_event",
+            "web_search", "read_file", "end_listening",
+            "tool_groups", "tool_search", "tool_describe", "tool_invoke",
+        ],
+    },
     # ★下一步讨论好的额外工具加在这里★，例如：
     #   "web": {"title": "联网", "tools": ["web_search", "web_fetch"]},
 }
@@ -103,6 +115,7 @@ def describe() -> list[dict]:
     """给控制台 / 文档用：现在有哪些预设、各展开成什么。"""
     return [
         {"name": name, "title": info.get("title", ""),
+         "mode": str(info.get("mode") or "full"),
          "tools": list(info.get("tools") or [])}
         for name, info in PRESETS.items()
     ]

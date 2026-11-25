@@ -91,11 +91,17 @@
           table([
             { key: "name", label: "预设", render: (r) => h("span", { class: "mono", text: r.name }) },
             { key: "title", label: "是什么" },
+            { key: "mode", label: "暴露方式", render: (r) => (r.mode === "progressive"
+                ? h("span", { class: "tag ok", text: "渐进：核心 + 按需发现" })
+                : h("span", { class: "tag", text: "全量" })) },
             { key: "count", label: "几个", cls: "num" },
             { key: "tools", label: "展开成", render: (r) => h("span", { class: "mono wrap-path", text: r.tools.join("、") }) },
           ], presets, { emptyText: "还没定义预设。" }),
           h("p", { class: "muted", text: "也可以直接写具体工具名（不是预设的名字就当成一个工具去 MCP 宿主里找）。"
             + "找不到的名字只打警告，不会让一轮对话失败。" }),
+          h("p", { class: "muted", text: "渐进式预设的 tools 数组固定较小，长工具靠 "
+            + (data.discovery?.tools || []).join(" / ") + " 按需发现。"
+            + (data.discovery?.note || "") }),
         ]));
 
         // ---- 3. 每个角色会多开什么 ----
@@ -111,9 +117,13 @@
                 ? h("span", { class: "mono wrap-path", text: (r.expanded || []).join("、") || "（空）" })
                 : h("span", { class: "muted", text: r.why || "不生效" }) },
             { key: "count", label: "多开", cls: "num", render: (r) => (r.active ? String((r.expanded || []).length) : "0") },
+            { key: "discoverable", label: "按需可发现", render: (r) => (r.mode === "progressive" && r.active
+                ? h("span", { class: "mono wrap-path", text: "另 " + (r.discoverable || []).length + " 项：" + (r.discoverable || []).join("、") })
+                : h("span", { class: "muted", text: "—" })) },
           ], chars, { emptyText: "还没有角色文件。" }),
-          h("p", { class: "muted", text: "「多开」是在默认白名单（skills 8 + memory 2）之上的增量；"
-            + "真实总数看上面服务自报的那一行。工具越多模型越容易选错，18 个以内在实测里是稳的。" }),
+          h("p", { class: "muted", text: "「多开」是在默认白名单之上的增量；真实固定数量看上面服务自报那一行。"
+            + "渐进式角色另有一批「按需可发现」工具，不进每轮 tools 数组——发现不等于授权，"
+            + "调用仍受白名单 / guard 约束。" }),
         ]));
 
         // ---- 4. MCP 服务器 ----

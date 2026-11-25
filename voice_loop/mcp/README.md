@@ -406,6 +406,7 @@ handler 照旧。
 | `write` | `write_file` `edit_file` | 2（要 `allow_write`） |
 | `shell` | `run_command` | 1（要 `allow_shell`） |
 | `harness` | agent 20（含邮件 6 + 后台作业 3）+ 记忆 3 + 技能 8 = **31 项**；对齐 DSH，写 / 命令 / 发送仍各有闸门；★仅 API 角色★ | 31 |
+| `harness-progressive` | 核心 7 + 元工具 4 = **11 项**；长工具靠 `tool_groups` / `tool_search` / `tool_describe` / `tool_invoke` 按需发现；发现不等于授权，invoke 仍走原闸门；★仅 API 角色★ | 11 |
 
 **接入点只有三处**（都在 `pipeline.py`）：
 

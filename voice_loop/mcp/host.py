@@ -22,6 +22,7 @@ import logging
 import time
 
 from .client import MCPClient, make_transport
+from .discovery import card_for, validate_arguments
 from .protocol import MCPError, ToolSpec
 
 SEP = "__"
@@ -39,6 +40,8 @@ class MCPHost:
         self.settings = settings
         self.log = logger or logging.getLogger("voice_loop")
         self.deps = deps or {}
+        self.deps["host"] = self      # 给 inproc 的 meta 服务器用（发现/统一调用）
+        self.meta_allowed: set[str] | None = None   # 本轮角色可见工具，由 pipeline 设置
         self._clients: dict[str, MCPClient] = {}
         self._routes: dict[str, tuple[str, str]] = {}   # 模型看到的名字 -> (服务器, 服务器内的名字)
         self._specs: list[ToolSpec] = []
@@ -184,6 +187,44 @@ class MCPHost:
         """点名了、但没有任何服务器提供这些工具（给上层打警告用）。"""
         self.start()
         return [str(n) for n in (include or ()) if str(n) not in self._all_specs]
+
+    # ----------------------------------------------------------- 渐进式发现
+    def catalog(self, *, allowed=None, include=()) -> list[dict]:
+        """所有工具的紧凑卡片（含 hidden），按组/名字排序。
+
+        ``allowed`` 只决定卡片上的 ``allowed`` 标记：能搜到 ≠ 能调用。
+        """
+        self.start()
+        names = set(self._all_specs)
+        names.update(str(n) for n in (include or ()) if str(n) in self._all_specs)
+        visible = {str(n) for n in allowed} if allowed is not None else None
+        cards = [card_for(self._all_specs[name], allowed=(
+            visible is None or name in visible)) for name in names]
+        cards = [c for c in cards if c.group != "meta"]
+        cards.sort(key=lambda c: (c.group, c.name))
+        return [c.to_dict() for c in cards]
+
+    def tool_describe(self, name: str) -> dict | None:
+        """一个工具的完整卡片 + JSON schema（只查，不执行）。"""
+        self.start()
+        spec = self._all_specs.get(str(name or ""))
+        if spec is None:
+            return None
+        card = card_for(spec)
+        return {**card.to_dict(), "input_schema": spec.input_schema,
+                "description": spec.description}
+
+    def invoke(self, name: str, arguments: dict | None = None, *, allowed=None) -> tuple[bool, str]:
+        """元工具统一调用入口：先校验参数，再走原来的 call()/权限闸门。"""
+        self.start()
+        name = str(name or "")
+        spec = self._all_specs.get(name)
+        if spec is None:
+            return False, f"没有这个工具：{name}"
+        why = validate_arguments(spec.input_schema, arguments)
+        if why:
+            return False, f"参数不合法：{why}"
+        return self.call(name, arguments, allowed=allowed)
 
     def handleable(self, name: str, *, allowed=None) -> bool:
         self.start()

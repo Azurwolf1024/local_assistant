@@ -113,7 +113,7 @@ python main.py memory --who amiya            # 她记得什么、知识库读到
   "name": "蓝色大肥鱼",
   "engine": "api",              // ★这个角色走云端★
   "api_model": "deepseek-chat", // 空 = 跟 [api] model
-  "api_tools": ["harness"]       // 蓝色大肥鱼的真实配置（展开成 31 项 DSH 工具）
+  "api_tools": ["harness-progressive"]  // 蓝色大肥鱼现用：预设多开 11 项，长工具按需发现
 }
 ```
 
@@ -340,6 +340,8 @@ max_tool_chars = 6000     # 单个工具结果喂回模型的上限
 - `write` → `write_file` + `edit_file`（需要先在 `[agent]` 里显式开启）
 - `shell` → `run_command`（需要先在 `[agent]` 里显式开启）
 - `harness` → 对齐 DSH 的 **31 项**：agent 20（已含邮件 6 + job 3）+ 记忆 3 + 技能 8；
+- `harness-progressive` → **11 项**（核心 7 + 元工具 4）：工具定义固定更小，长工具用
+  `tool_search` / `tool_describe` / `tool_invoke` 按需发现；发现不等于授权。
   ★只对 `engine = "api"` 的角色生效★，本地小模型即使写了也不会展开；
   写 / 命令 / 发送各有闸门，不可用的自动跳过并告警
 

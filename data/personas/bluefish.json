@@ -22,13 +22,13 @@
   "engine": "api",
   "api_model": "deepseek-chat",
   "api_tools": [
-    "harness"
+    "harness-progressive"
   ],
   "temperature": 0.8,
   "default": false,
   "enabled": true,
   "knowledge_all": false,
-  "notes": "★原生 API 角色（2026-11-18 加）★：engine=api，默认模型 deepseek-chat（DeepSeek）；backend=api 走 DeepSeek 官方 TTS（音色 stella），失败自动退回本地 Piper（voice 那一栏就是退路）。api_tools=「harness」 展开为对齐 DSH 的 28 项：agent + 邮件含发送 + 记忆 + 技能；写 / 命令仍受 [agent] 闸门。内置 ask_user（会反过来问你问题）和 update_plan（写步骤计划），以及 end_listening（你说「不用听了」时它自己结束这次聆听、回待唤醒）。★发信必须人工批准★：mail_draft 只建草稿，右下角审批卡上点「发送」才会真发出去，模型没有绕过路径（见 docs/guide/mail.md）。本地角色看不到这些工具（但本地角色自己也有 weather 工具）。没有 API key 时流水线会自动退回本地模型，不会把嘴弄哑。",
+  "notes": "★原生 API 角色（2026-11-18 加，2026-11-25 切渐进式）★：engine=api，默认模型 deepseek-chat（DeepSeek）；backend=api 走 DeepSeek 官方 TTS（音色 stella），失败自动退回本地 Piper（voice 那一栏就是退路）。api_tools=「harness-progressive」：预设多开 11 项（日程/报时、web_search、read_file、end_listening + tool_groups/tool_search/tool_describe/tool_invoke），加默认白名单后每轮固定约 18 个工具；其余长尾工具（邮件、写文件、命令、记忆、后台作业等）按需先搜再调。发现不等于授权：写 / 命令仍受 [agent] 闸门。内置 ask_user（会反过来问你问题）和 update_plan（写步骤计划）。★发信必须人工批准★：mail_draft 只建草稿，右下角审批卡上点「发送」才会真发出去，模型没有绕过路径（见 docs/guide/mail.md）。本地角色看不到这些工具（但本地角色自己也有 weather 工具）。没有 API key 时流水线会自动退回本地模型，不会把嘴弄哑。",
   "style": [
     "“傲娇”与“天然呆”：她性格软萌温顺，爱撒娇，但被调侃时会“炸毛”反驳（比如被叫“大肥鱼”）。同时她也有点“天然呆”，会敬业地满足各种奇怪要求。她干活时爱偷个小懒、爱吃白饭（token）。"
   ],

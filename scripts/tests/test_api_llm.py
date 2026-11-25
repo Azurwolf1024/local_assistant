@@ -337,9 +337,13 @@ def test_shipped_characters() -> None:
     check("它是 API 角色", fish.engine, "api")
     check("模型是 deepseek-chat", fish.api_model, "deepseek-chat")
     check("TTS 也走官方 API", (fish.backend, fish.tts_voice), ("deepseek", "stella"))
-    check("额外开放了工具（预设展开后含 web / mail）",
-          {"web_search", "mail_search"} <= expand(fish.api_tools),
+    fixed = expand(fish.api_tools)
+    check("固定工具含 web，走渐进式发现",
+          "web_search" in fixed and fish.api_tools == ["harness-progressive"],
           detail=str(fish.api_tools))
+    check("邮件不进固定数组，但仍在完整 harness 里可发现",
+          "mail_search" not in fixed and "mail_search" in expand(["harness"]),
+          detail=str(sorted(fixed)))
     check("退路是出厂 Piper（不碰克隆素材）",
           (fish.voice_ref, fish.voice_model, (fish.tts or {}).get("fallback")),
           ("", "", ["piper:zh_CN-huayan-medium"]))

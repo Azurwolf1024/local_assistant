@@ -296,12 +296,13 @@ def section_misc(base: str, tmp: Path) -> None:
     code, tools = request(base, "GET", "/api/tools")
     check("工具静态清单 200", code, 200)
     check("报告了预设", sorted(p["name"] for p in tools["presets"])[:3],
-          ["files", "harness", "mail"], detail=str([p["name"] for p in tools["presets"]]))
+          ["files", "harness", "harness-progressive"],
+          detail=str([p["name"] for p in tools["presets"]]))
     check("报告了服务器（顺序 = config 里的顺序）",
           [s["name"] for s in tools["mcp"]["servers"]][:1], ["skills"],
           detail=str([s["name"] for s in tools["mcp"]["servers"]]))
     check("★hidden 的服务器也列出来（否则「为什么没露出来」没法解释）★",
-          [s["name"] for s in tools["mcp"]["servers"] if s["hidden"]], ["agent", "mail"],
+          [s["name"] for s in tools["mcp"]["servers"] if s["hidden"]], ["meta", "agent", "mail"],
           detail=str([(s["name"], s["hidden"]) for s in tools["mcp"]["servers"]]))
     check("报告了 agent 边界（这台机器已给 API 角色开写/命令）",
           (tools["agent"]["allow_write"], tools["agent"]["allow_shell"]), (True, True))

@@ -60,9 +60,11 @@ def register(app, ctx) -> None:
 
         presets = [
             {"name": p["name"], "title": p["title"], "tools": p["tools"],
-             "count": len(p["tools"])}
+             "mode": p.get("mode", "full"), "count": len(p["tools"])}
             for p in tool_presets.describe()
         ]
+        full_set = tool_presets.expand(["harness"])
+        meta_tools = ["tool_groups", "tool_search", "tool_describe", "tool_invoke"]
 
         global_extra = [str(x) for x in (getattr(api, "extra_tools", None) or [])]
         characters = []
@@ -72,6 +74,11 @@ def register(app, ctx) -> None:
             # ★跟流水线 _api_extra_tools 同一套规则★：角色自己没写就退回 [api] extra_tools
             entries = own or global_extra
             active = engine == "api" and agent_on
+            expanded = sorted(tool_presets.expand(entries)) if active else []
+            progressive = any(
+                p["name"] == name and p.get("mode") == "progressive" for name in entries
+                for p in presets
+            )
             characters.append({
                 "id": getattr(char, "id", ""),
                 "name": getattr(char, "name", "") or getattr(char, "id", ""),
@@ -84,7 +91,9 @@ def register(app, ctx) -> None:
                      "title": next((p["title"] for p in presets if p["name"] == name), "")}
                     for name in entries
                 ],
-                "expanded": sorted(tool_presets.expand(entries)) if active else [],
+                "expanded": expanded,
+                "mode": "progressive" if progressive else "full",
+                "discoverable": sorted(full_set - set(expanded)) if progressive and active else [],
                 "active": active,
                 "why": "" if active else (
                     "本地引擎（Ollama）：只有默认那几个工具" if engine != "api"
@@ -110,6 +119,11 @@ def register(app, ctx) -> None:
                 "extra_tools": global_extra,
             },
             "presets": presets,
+            "discovery": {
+                "tools": meta_tools,
+                "note": "渐进式预设只固定暴露核心工具；其它工具按需通过元工具发现。"
+                        "发现不等于授权，tool_invoke 仍走角色白名单与 guard。",
+            },
             "characters": characters,
             "runtime_tools": [
                 {"name": "ask_user", "desc": "缺关键信息时向用户提问（harness 内置）"},

@@ -146,6 +146,7 @@ tools = ["get_volume", "set_volume"]    # 白名单（想全开就留空，但�
 | `write` | `write_file` / `edit_file`（要 `[agent] allow_write = true`） | 2 |
 | `shell` | `run_command` + `job_output` / `job_list` / `job_kill`（要 `[agent] allow_shell = true`，高风险） | 4 |
 | `harness` | agent 20（含邮件 6 + 后台作业 3）+ 记忆 3 + 技能 8 = **31 项**，对齐 DSH；写 / 命令 / 发送各有闸门；★仅 API 角色★ | 31 |
+| `harness-progressive` | 核心 7 + 元工具 4 = **11 项**；长工具靠 `tool_search` / `tool_describe` / `tool_invoke` 按需发现，tools 数组固定更省 token、护缓存；★仅 API 角色★ | 11 |
 
 三条要记住的：
 

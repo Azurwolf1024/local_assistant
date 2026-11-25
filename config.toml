@@ -777,6 +777,16 @@ module = "voice_loop.mcp.servers.memory"
 tools = ["recall", "remember"]   # 白名单：想全开就删掉这一行
 timeout = 10
 
+# ★渐进式发现（2026-11-25）★：4 个元工具默认 hidden，只给
+# api_tools = ["harness-progressive"] 的角色点名；发现不等于授权，invoke 仍走原闸门。
+[[mcp.servers]]
+name = "meta"
+transport = "inproc"
+module = "voice_loop.mcp.servers.meta"
+hidden = true
+namespace = false
+timeout = 10
+
 # ★harness agent 工具（DeepSeek 官方 Search / Fetch + 工作区文件 + 可选命令）★
 # 默认 hidden，不露给任何角色。API 角色在人格文件里写 "api_tools": ["web", "files"]
 # 才会看到；本地 4B 看不到，也就不会误调。

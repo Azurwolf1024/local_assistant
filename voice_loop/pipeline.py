@@ -1768,6 +1768,8 @@ class VoiceLoop:
             return None
         extra = self._api_extra_tools()
         if self.mcp is not None and (self.mcp.names() or extra):
+            # 元工具统一调用入口要用同一份允许集合，发现不等于授权。
+            self.mcp.meta_allowed = self.mcp.names(include=extra)
             if extra:
                 missing = self.mcp.missing(extra)
                 if missing:

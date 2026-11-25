@@ -90,6 +90,11 @@ def harness_hint(tool_names) -> str:
             file_rule += ("；★shell 没有审批卡，调用即执行，务必先看结果末尾的 "
                           "[exit code: N]，长命令用 run_in_background + job_output")
         rules.append(file_rule + "。")
+    if has("tool_search", "tool_describe", "tool_invoke"):
+        rules.append(
+            "找不到合适工具时先用 tool_search 搜，必要时 tool_describe 看参数，"
+            "再用 tool_invoke 调；能搜到不等于能调用，别编造没列出的工具名。"
+        )
     if has("mail_search", "mail_read", "mail_summary", "mail_draft", "mail_send"):
         rules.append(
             "★邮件用 mail_*：「邮箱 / 邮件 / 收件箱 / 谁给我发了」说的是邮件；"
