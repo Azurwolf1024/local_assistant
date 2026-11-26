@@ -100,6 +100,35 @@ body {
 .btn.danger:hover { background: rgba(248, 113, 113, .12); border-color: var(--err); }
 .btn.ghost { background: transparent; border-color: transparent; color: var(--fg-dim); }
 .btn.ghost:hover { color: var(--fg); background: var(--bg-raise); }
+/* 顶栏 ASR / TTS 滑动开关：dsh 那种细描边小控件，开=accent 轨道，关=灰轨道 */
+.switch {
+  display: inline-flex; align-items: center; gap: 7px;
+  border: 0; background: transparent; color: var(--fg-dim);
+  padding: 3px 6px; border-radius: 999px; cursor: pointer;
+  font: inherit; font-size: 12px; white-space: nowrap;
+  transition: color .18s;
+}
+.switch .track {
+  position: relative; width: 28px; height: 16px; flex: none;
+  border-radius: 999px; background: var(--bg-inset);
+  border: 1px solid var(--line); transition: background .2s, border-color .2s;
+}
+.switch .thumb {
+  position: absolute; top: 2px; left: 2px; width: 10px; height: 10px;
+  border-radius: 50%; background: var(--fg-dim);
+  transition: transform .2s ease, background .2s, box-shadow .2s;
+}
+.switch .label { transition: color .18s; }
+.switch.on .track { background: var(--accent); border-color: var(--accent); }
+.switch.on .thumb {
+  transform: translateX(12px); background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .28);
+}
+.switch.on .label { color: var(--accent); font-weight: 600; }
+.switch.off:hover { color: var(--fg); }
+.switch.off:hover .track { border-color: var(--accent); }
+.switch:focus-visible { outline: none; box-shadow: var(--ring); }
+.switch:disabled { opacity: .45; cursor: not-allowed; }
 
 .layout { display: flex; flex: 1; min-height: 0; }
 .tabs {

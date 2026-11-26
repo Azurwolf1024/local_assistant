@@ -52,7 +52,7 @@ KEEP_DONE_SEC = 900.0        # 回执保留多久（控制台最多等十几秒�
 TMP_PREFIX = ".tmp-"         # 临时文件前缀：小圆点开头，不会被当成请求扫到
 
 # 命令表（服务侧实现见本文件下面的 execute；能力在 pipeline 里）
-COMMANDS = ("ping", "say", "ask", "character", "toast", "tools", "sync")
+COMMANDS = ("ping", "say", "ask", "character", "toast", "tools", "sync", "asr", "tts")
 
 # harness 运行时自带的两个工具（不在 MCP 里，见 voice_loop/harness.py）
 RUNTIME_TOOLS = {
@@ -304,6 +304,8 @@ def _describe(loop: Any) -> dict:
         "character_id": getattr(char, "id", "") or "",
         "character_name": getattr(char, "name", "") or "",
         "character_title": getattr(char, "title", "") or "",
+        "asr_enabled": bool(getattr(loop, "asr_enabled", False)),
+        "tts_enabled": bool(getattr(loop, "tts_enabled", True)),
         "tts": label,
         "tts_loaded": bool(getattr(tts, "loaded", False)),
         "in_session": bool(getattr(session, "active", False)),
@@ -494,6 +496,28 @@ def execute(loop: Any, req: Request) -> Reply:
             if bool(args.get("force")) and callable(reload_voice):
                 reload_voice()
             return Reply(id=req.id, ok=True, text=getattr(char, "name", cid), at=t0, data=_describe(loop))
+
+        if cmd in ("asr", "tts"):
+            # 控制台顶栏两个 pill：只切运行时标志，不改配置、不重启服务。
+            attr = "asr_enabled" if cmd == "asr" else "tts_enabled"
+            default = bool(getattr(loop, "asr_enabled", False)) if cmd == "asr" \
+                else bool(getattr(loop, "tts_enabled", True))
+            now = bool(getattr(loop, attr, default))
+            want = bool(args.get("enabled")) if "enabled" in args else (not now)
+            setattr(loop, attr, want)
+            if cmd == "tts" and not want:
+                speaker = getattr(loop, "speaker", None)
+                if speaker is not None and hasattr(speaker, "interrupt"):
+                    try:
+                        speaker.interrupt()
+                    except Exception:  # noqa: BLE001 - 停音失败不该让按钮报错
+                        pass
+            name = "语音识别" if cmd == "asr" else "语音播报"
+            return Reply(
+                id=req.id, ok=True,
+                text=f"{name}已{'开启' if want else '关闭'}", at=t0,
+                data={**_describe(loop), cmd: want},
+            )
 
         if cmd == "tools":
             # ★模型能 call 的 tool★：控制台的「工具」页直接画这一份（服务在跑才有真数据）

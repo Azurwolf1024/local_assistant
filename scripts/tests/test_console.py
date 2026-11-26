@@ -313,6 +313,14 @@ def section_misc(base: str, tmp: Path) -> None:
     check("服务没跑时 live 如实失败（不拿静态推算冒充）", (code, live["ok"]), (200, False))
     check("并且说明原因", "服务" in str(live.get("error") or ""), True, detail=str(live.get("error")))
 
+    code, eng = request(base, "GET", "/api/engine")
+    check("顶栏引擎状态接口 200", code, 200)
+    check("服务没跑时 ASR/TTS 状态是未知",
+          (eng["ok"], eng["running"], eng["asr"], eng["tts"]),
+          (False, False, None, None), detail=str(eng))
+    code, bad = request(base, "POST", "/api/engine", {"kind": "nope"})
+    check("非法 kind 被挡住", (code, bad["ok"]), (200, False), detail=str(bad))
+
     code, chars = request(base, "GET", "/api/chat/characters")
     check("聊天角色列表 200", code, 200)
     check("列表里有角色", [c["id"] for c in chars["items"]], ["amiya"])

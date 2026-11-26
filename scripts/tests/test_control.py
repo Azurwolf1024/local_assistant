@@ -70,6 +70,8 @@ class FakeLoop:
         self.spoken: list[str] = []
         self.asked: list[str] = []
         self.switched: list[str] = []
+        self.asr_enabled = True
+        self.tts_enabled = True
         self.boom = False
 
     def _tts_label(self) -> str:
@@ -190,6 +192,18 @@ def section_5(tmp: Path) -> None:
     check("ping 有回执", ping is not None and ping.ok)
     check("ping 报告了角色与声线", ping is not None and ping.data.get("character_name"), "阿米娅")
     check("ping 报告了 TTS 标签", ping is not None and ping.data.get("tts"), "ZipVoice(阿米娅)")
+    check("ping 报告了 ASR/TTS 运行时开关",
+          (ping is not None and ping.data.get("asr_enabled"),
+           ping is not None and ping.data.get("tts_enabled")), (True, True))
+
+    asr = run("asr", enabled=False)
+    check("关识别只切运行时标志",
+          asr is not None and asr.ok and loop.asr_enabled is False, True)
+    check("回执带回新状态", asr is not None and asr.data.get("asr"), False)
+    tts = run("tts", enabled=False)
+    check("关播报同理", tts is not None and tts.ok and loop.tts_enabled is False, True)
+    tts = run("tts")
+    check("不传 enabled 就翻转回来", loop.tts_enabled is True, True)
 
     ask = run("ask", text="现在几点了")
     check("ask 走了一轮问答", loop.asked, ["现在几点了"])

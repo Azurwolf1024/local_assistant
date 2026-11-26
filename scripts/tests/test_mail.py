@@ -21,7 +21,7 @@ import os
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -299,7 +299,8 @@ def test_triage(tmp: Path) -> None:
     def fake_llm(system: str, user: str) -> str:
         calls.append(user[:30])
         return json.dumps({"important": 88, "category": "interview", "needs_reply": True,
-                           "deadline": "2026-11-25", "one_line": "约面试时间"},
+                           "deadline": (date.today() + timedelta(days=3)).isoformat(),
+                           "one_line": "约面试时间"},
                           ensure_ascii=False)
 
     store = make_store(tmp / "b")
@@ -310,7 +311,8 @@ def test_triage(tmp: Path) -> None:
     msg = store.get("t4")
     info4 = triage2.classify(msg)
     check("模型能抬高分数并带上要回复/截止", (info4["level"], info4["needs_reply"],
-                                          info4["deadline"]), ("high", True, "2026-11-25"))
+                                          info4["deadline"]),
+          ("high", True, (date.today() + timedelta(days=3)).isoformat()))
     check("★只把主题+前 N 字发出去★", all(len(c) < 120 for c in calls), True)
 
     before = len(calls)

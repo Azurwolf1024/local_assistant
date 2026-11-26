@@ -349,6 +349,9 @@ class VoiceLoop:
         self._last_miss = ""          # 上一次没命中的短句（避免刷屏）
 
         self.tts_enabled = True
+        # ★运行时开关★：控制台顶栏两个 pill 只改这两个标志，不动配置、不重启服务。
+        # asr_enabled 初值跟构造函数拿不拿麦克风一致（纯文本服务天然是关的）。
+        self.asr_enabled = bool(self.enable_listening and self.mic is not None)
 
         # 语音打断：它还在说话时你一开口就停下来听你说
         self.bargein: BargeInDetector | None = (
@@ -575,6 +578,9 @@ class VoiceLoop:
         """
         if self.mic is None:
             raise RuntimeError("当前是纯文本模式，没有麦克风")
+        # 控制台关掉识别后：不收音、不跑 ASR，直接当这一轮没听到。
+        if not getattr(self, "asr_enabled", True):
+            return None
         # 上一轮被打断时已经把他的话收下来了，直接交给上层处理，不然就白丢了
         if self._barge_audio is not None:
             audio, self._barge_audio = self._barge_audio, None
@@ -1747,7 +1753,7 @@ class VoiceLoop:
                 f"{i}. {o}" for i, o in enumerate(options, 1))
         print(f"\n[AI 提问] {spoken}\n", flush=True)
 
-        if self.mic is None or self.asr is None:
+        if self.mic is None or self.asr is None or not self.asr_enabled:
             try:
                 answer = input("你的回答：").strip()
             except (EOFError, KeyboardInterrupt):
@@ -2587,6 +2593,9 @@ class VoiceLoop:
                         self._end_listen_requested = False
                         print("\n[已结束聆听] 这次对话到此为止。\n", flush=True)
                         return
+                    if not self.asr_enabled:
+                        time.sleep(0.25)
+                        continue
                     audio = self.listen_once() if mode == "vad" else self.record_ptt()
                 except KeyboardInterrupt:
                     raise
@@ -2757,6 +2766,11 @@ class VoiceLoop:
                     # 等待上限压到 5 秒：这样空闲回收、唤醒词热加载、stop 信号
                     # 都能在几秒内生效，而不是被 listen_timeout（默认 30s）拖住。
                     base_wait = float(self.settings.audio.listen_timeout) or 5.0
+                    if not self.asr_enabled:
+                        # 关识别时仍每 0.25s 回来处理控制台命令 / 提醒 / 热重载，
+                        # 只是不去开麦收音；文字对话和 TTS 照常可用。
+                        time.sleep(0.25)
+                        continue
                     audio = self.listen_once(quick=not in_session, timeout=min(5.0, base_wait))
                 except KeyboardInterrupt:
                     raise

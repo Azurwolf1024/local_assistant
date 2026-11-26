@@ -14,6 +14,9 @@ window.Console = (function () {
   let currentCtx = null;
   let eventSource = null;
   let lastStatus = null;
+  let engineSeq = 0;          // 防旧回执覆盖新状态
+  let lastSvcRunning = null;  // 只在服务「运行状态变了」时才去 ping
+  let engineState = { ok: false, running: false, asr: null, tts: null };
 
   // ------------------------------------------------------------------ DOM 小工具
   const $ = (sel) => document.querySelector(sel);
@@ -135,11 +138,57 @@ window.Console = (function () {
     // 停止按钮：只要还有残留可清（或真在跑）就能点
     $("#svc-start").disabled = !!status.running;
     $("#svc-stop").disabled = !status.running && !status.pid_stale && !status.log_pending_stop;
+    // ★只有服务起/停这一刻才重新拉一次开关状态★：SSE status 每次心跳都 ping
+    // 的话，服务正忙时 ping 超时会把开关闪成「未知」，下一轮又亮，看着像抽风。
+    const running = !!status.running;
+    if (running !== lastSvcRunning) {
+      lastSvcRunning = running;
+      refreshEngine();
+    }
+  }
+
+  // 顶栏两个滑动开关：状态以最后一次成功回执为准，ping 失败不把界面闪回关闭。
+  function applyEngine(state) {
+    if (!state) return;
+    const running = state.running === true;
+    if (state.ok) {
+      // 成功回执才更新已知状态；失败回执只更新运行状态。
+      if (typeof state.asr === "boolean") engineState.asr = state.asr;
+      if (typeof state.tts === "boolean") engineState.tts = state.tts;
+      engineState.ok = true;
+    } else if (!running) {
+      engineState = { ok: false, running: false, asr: null, tts: null };
+    }
+    engineState.running = running;
+    [["asr", "识别"], ["tts", "播报"]].forEach(([kind, label]) => {
+      const btn = $("#" + kind + "-toggle");
+      if (!btn) return;
+      const on = running && engineState[kind] === true;
+      btn.classList.toggle("on", on);
+      btn.classList.toggle("off", !on);
+      btn.setAttribute("aria-pressed", on ? "true" : "false");
+      btn.disabled = !running;
+      btn.title = !running ? "服务没在跑，先点「启动服务」"
+        : (!state.ok ? "服务正忙，状态暂未刷新（仍可点）"
+          : (on ? "点击关闭" + label : "点击开启" + label));
+    });
+  }
+
+  async function refreshEngine() {
+    const seq = ++engineSeq;
+    try {
+      const state = await api.get("/api/engine");
+      if (seq !== engineSeq) return;   // 有更新的请求在飞，丢掉这份旧结果
+      applyEngine(state);
+    } catch (_e) {
+      if (seq === engineSeq) applyEngine({ ok: false, running: !!lastSvcRunning });
+    }
   }
 
   async function refreshStatus() {
     try {
       applyStatus(await api.get("/api/service"));
+      refreshEngine();
     } catch (_e) { /* 状态读不到就保持原样，别扰动界面 */ }
   }
 
@@ -228,12 +277,29 @@ window.Console = (function () {
     connectStream();
   }
 
+  [["asr", "语音识别"], ["tts", "语音播报"]].forEach(([kind, name]) => {
+    const btn = $("#" + kind + "-toggle");
+    if (!btn) return;
+    btn.onclick = () => api.safe(async () => {
+      const seq = ++engineSeq;        // 点下去这一刻起，旧 ping 回执都不作数
+      btn.disabled = true;
+      const r = await api.post("/api/engine", { kind });
+      if (seq !== engineSeq) return r;
+      applyEngine(r);
+      btn.disabled = false;
+      toast(r.ok ? (r.text || name + "已切换") : (r.error || name + "切换失败"),
+            r.ok ? "ok" : "err");
+      return r;
+    });
+  });
+
   $("#svc-start").onclick = () => api.safe(async () => {
     const btn = $("#svc-start");
     btn.disabled = true;
     toast("正在启动服务（最长等 25 秒）…", "warn", 25000);
     const r = await api.post("/api/service/start");
     applyStatus(r.status);
+    refreshEngine();
     btn.disabled = false;
     toast(r.message || (r.started ? "已启动" : "没起来"), r.started ? "ok" : "err", r.started ? 6000 : 20000);
     return r;
@@ -244,6 +310,7 @@ window.Console = (function () {
     toast("正在停止服务…", "warn", 20000);
     const r = await api.post("/api/service/stop");
     applyStatus(r.status);
+    refreshEngine();
     btn.disabled = false;
     toast(r.message || (r.stopped ? "已停止" : "没停成"), r.stopped ? "ok" : "err", r.stopped ? 6000 : 20000);
     return r;

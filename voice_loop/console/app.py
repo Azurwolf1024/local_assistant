@@ -166,7 +166,7 @@ def load_panels(app, ctx: ConsoleContext) -> tuple[list[str], dict[str, str]]:
 def create_app(settings: Settings, logger: logging.Logger | None = None):
     """建 FastAPI 应用。测试直接用它，不必真的监听端口。"""
     try:
-        from fastapi import FastAPI, Request
+        from fastapi import Body, FastAPI, Request
         from fastapi.responses import FileResponse, JSONResponse
         from fastapi.staticfiles import StaticFiles
     except ImportError as exc:  # pragma: no cover - 只在没装依赖时发生
@@ -282,6 +282,45 @@ def create_app(settings: Settings, logger: logging.Logger | None = None):
                 "can_stop": st.running or st.pid_stale or st.log_pending,
             },
         }
+
+    def _engine_reply(reply, kind: str = "") -> dict:
+        """把服务回执压成顶栏两个开关能用的小状态。
+
+        ★`running` 和 `ok` 分开★：服务在跑但正忙（ping 超时）时 `ok=false`，
+        前端据此保留上次已知状态，不把开关闪成关闭。
+        """
+        data = getattr(reply, "data", None) or {}
+        out = {
+            "ok": bool(getattr(reply, "ok", False)),
+            "running": bool(service_ctl.status(settings).running),
+            "error": str(getattr(reply, "error", "") or ""),
+            "text": str(getattr(reply, "text", "") or ""),
+            "asr": None if "asr_enabled" not in data else bool(data["asr_enabled"]),
+            "tts": None if "tts_enabled" not in data else bool(data["tts_enabled"]),
+        }
+        if kind:
+            out["kind"] = kind
+        return out
+
+    @app.get("/api/engine")
+    def api_engine_get():
+        """顶栏开关的真实状态：只问服务，不读配置推算。"""
+        reply = ctx.call_service("ping", timeout=3.0)
+        return _engine_reply(reply)
+
+    @app.post("/api/engine")
+    def api_engine_set(payload: dict = Body(default={})):
+        """切 ASR / TTS。不传 enabled 就翻转；服务没跑时直接说清楚。"""
+        kind = str((payload or {}).get("kind") or "").strip().lower()
+        running = bool(service_ctl.status(settings).running)
+        if kind not in ("asr", "tts"):
+            return {"ok": False, "running": running,
+                    "error": "kind 只能是 asr 或 tts", "asr": None, "tts": None}
+        args = {}
+        if "enabled" in (payload or {}):
+            args["enabled"] = bool(payload["enabled"])
+        reply = ctx.call_service(kind, timeout=6.0, **args)
+        return _engine_reply(reply, kind)
 
     @app.post("/api/service/start")
     def api_service_start():
